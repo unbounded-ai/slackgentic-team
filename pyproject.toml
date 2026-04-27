@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=82.0.1", "wheel>=0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slackgentic-team"
+version = "0.1.0"
+description = "Slack control plane for local coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Unbounded AI" }
+]
+keywords = ["agents", "claude", "codex", "slack", "socket-mode"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "aiosqlite>=0.22.1",
+  "pexpect>=4.9.0",
+  "pydantic>=2.13.3",
+  "slack-sdk>=3.41.0",
+  "watchfiles>=1.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.8.0",
+]
+
+[project.urls]
+Repository = "https://github.com/unbounded-ai/slackgentic-team"
+Issues = "https://github.com/unbounded-ai/slackgentic-team/issues"
+
+[project.scripts]
+slackgentic = "agent_harness.cli:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "PIE", "RUF", "SIM", "UP"]
+ignore = ["E501"]

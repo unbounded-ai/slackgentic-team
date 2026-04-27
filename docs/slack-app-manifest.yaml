@@ -1,0 +1,44 @@
+_metadata:
+  major_version: 1
+  minor_version: 1
+display_information:
+  name: slackgentic-local
+  description: Slack control plane for local Codex and Claude agent sessions.
+  background_color: "#2457A6"
+features:
+  bot_user:
+    display_name: Slackgentic Team
+    always_online: true
+  slash_commands:
+    - command: /slackgentic-local
+      description: Set up and manage your local agent team.
+      usage_hint: setup | status | hire 2 claude agents | fire @riley | show roster
+      should_escape: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - channels:manage
+      - channels:read
+      - channels:write.invites
+      - chat:write
+      - chat:write.customize
+      - commands
+      - groups:history
+      - groups:read
+      - groups:write
+      - groups:write.invites
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  is_hosted: false
