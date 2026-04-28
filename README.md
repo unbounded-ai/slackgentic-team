@@ -175,6 +175,21 @@ Task buttons:
 
 ## Reset Local State
 
+Archive the configured Slack agent channel before resetting state:
+
+```sh
+.venv/bin/slackgentic slack close-channel --yes
+```
+
+If local state was already deleted, pass the channel id explicitly:
+
+```sh
+.venv/bin/slackgentic slack close-channel --channel C1234567890 --yes
+```
+
+This archives the Slack channel and clears Slackgentic's local channel pointer
+when it matches the configured agent channel.
+
 Reset the local SQLite runtime state when you want Slack setup to create a fresh
 channel, roster, task history, and avatar override setting:
 

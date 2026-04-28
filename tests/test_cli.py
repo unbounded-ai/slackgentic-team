@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from agent_harness.cli import main
 from agent_harness.service import UnsafeServiceRestartError
+from agent_harness.slack_app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
+from agent_harness.store import Store
 
 
 class CliTests(unittest.TestCase):
@@ -58,6 +60,89 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(all(not path.exists() for path in paths))
             self.assertIn("setup", output.getvalue())
+
+    def test_close_channel_requires_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite"
+            config = Path(tmp) / "config.json"
+            config.write_text('{"SLACK_BOT_TOKEN": "xoxb-test"}')
+            store = Store(db)
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_CHANNEL_ID, "C1")
+            finally:
+                store.close()
+
+            output = io.StringIO()
+            with (
+                patch("agent_harness.slack_client.SlackGateway") as gateway,
+                redirect_stdout(output),
+            ):
+                code = main(
+                    [
+                        "slack",
+                        "close-channel",
+                        "--config-file",
+                        str(config),
+                        "--db",
+                        str(db),
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            gateway.assert_not_called()
+            self.assertIn("--yes", output.getvalue())
+
+    def test_close_channel_archives_configured_channel_and_clears_state(self):
+        archived = []
+
+        class FakeSlackGateway:
+            def __init__(self, bot_token):
+                self.bot_token = bot_token
+
+            def archive_channel(self, channel_id):
+                archived.append((self.bot_token, channel_id))
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite"
+            config = Path(tmp) / "config.json"
+            config.write_text('{"SLACK_BOT_TOKEN": "xoxb-test"}')
+            store = Store(db)
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_CHANNEL_ID, "C1")
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+            finally:
+                store.close()
+
+            output = io.StringIO()
+            with (
+                patch("agent_harness.slack_client.SlackGateway", FakeSlackGateway),
+                redirect_stdout(output),
+            ):
+                code = main(
+                    [
+                        "slack",
+                        "close-channel",
+                        "--config-file",
+                        str(config),
+                        "--db",
+                        str(db),
+                        "--yes",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(archived, [("xoxb-test", "C1")])
+            store = Store(db)
+            try:
+                store.init_schema()
+                self.assertIsNone(store.get_setting(SETTING_CHANNEL_ID))
+                self.assertIsNone(store.get_setting(SETTING_ROSTER_TS))
+            finally:
+                store.close()
+            self.assertIn("archived Slack channel C1", output.getvalue())
 
     def test_service_restart_reports_unsafe_restart(self):
         output = io.StringIO()

@@ -7,6 +7,7 @@ from agent_harness.team import build_initial_model_team, build_initialization_me
 class FakeSlackClient:
     def __init__(self):
         self.messages = []
+        self.archived_channels = []
 
     def auth_test(self):
         return type("SlackResponse", (), {"data": {"ok": True, "bot_id": "B1"}})()
@@ -29,6 +30,10 @@ class FakeSlackClient:
                 },
             },
         }
+
+    def conversations_archive(self, channel):
+        self.archived_channels.append(channel)
+        return {"ok": True}
 
 
 class SlackGatewayTests(unittest.TestCase):
@@ -69,6 +74,14 @@ class SlackGatewayTests(unittest.TestCase):
         gateway.post_thread_reply(SlackThreadRef("C1", "171.000001"), "hello", username="localuser")
 
         self.assertEqual(gateway.client.messages[0]["username"], "localuser")
+
+    def test_archive_channel_calls_slack_api(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        self.assertTrue(gateway.archive_channel("C1"))
+
+        self.assertEqual(gateway.client.archived_channels, ["C1"])
 
 
 if __name__ == "__main__":

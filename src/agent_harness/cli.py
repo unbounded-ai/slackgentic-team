@@ -189,6 +189,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Confirm deletion of the configured state database",
     )
+    slack_close_channel = slack_sub.add_parser(
+        "close-channel",
+        help="Archive the configured Slack agent channel",
+    )
+    slack_close_channel.add_argument("--config-file", type=Path)
+    slack_close_channel.add_argument("--db", type=Path)
+    slack_close_channel.add_argument(
+        "--channel",
+        help="Slack channel id to archive, defaulting to the configured agent channel",
+    )
+    slack_close_channel.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Confirm archiving the Slack channel",
+    )
     slack_doctor = slack_sub.add_parser("doctor", help="Check local Slack E2E config")
     slack_doctor.add_argument("--config-file", type=Path)
     slack_doctor.add_argument("--db", type=Path)
@@ -308,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
             config = AppConfig.model_validate({**config.model_dump(), **overrides})
         if args.slack_command == "reset-state":
             return _reset_slack_state(config, yes=args.yes)
+        if args.slack_command == "close-channel":
+            return _close_slack_channel(config, channel_id=args.channel, yes=args.yes)
         if args.slack_command == "doctor":
             return _slack_doctor(config)
         if args.slack_command == "serve":
@@ -540,6 +558,60 @@ def _reset_slack_state(config, yes: bool = False) -> int:
         f"`{config.slack.slash_command} setup` in Slack to initialize fresh state."
     )
     return 0
+
+
+def _close_slack_channel(config, channel_id: str | None = None, yes: bool = False) -> int:
+    from slack_sdk.errors import SlackApiError
+
+    from agent_harness.slack_app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
+    from agent_harness.slack_client import SlackGateway
+
+    if not config.slack.bot_token:
+        print("SLACK_BOT_TOKEN is required to archive a Slack channel.")
+        return 2
+
+    store = Store(config.state_db)
+    try:
+        store.init_schema()
+        resolved_channel_id = (
+            channel_id
+            or config.slack.channel_id
+            or store.get_setting(SETTING_CHANNEL_ID)
+            or store.get_setting("slack_channel_id")
+        )
+        if not resolved_channel_id:
+            print("No Slack channel is configured. Pass `--channel C123...` to archive one.")
+            return 2
+        if not yes:
+            print(f"This will archive Slack channel {resolved_channel_id}.")
+            print("Re-run with `slackgentic slack close-channel --yes` to confirm.")
+            return 2
+
+        try:
+            archived = SlackGateway(config.slack.bot_token).archive_channel(resolved_channel_id)
+        except SlackApiError as exc:
+            error = exc.response.get("error") if exc.response else str(exc)
+            print(f"failed to archive Slack channel {resolved_channel_id}: {error}")
+            return 1
+
+        cleared = []
+        for key in (SETTING_CHANNEL_ID, "slack_channel_id"):
+            if store.get_setting(key) == resolved_channel_id:
+                store.delete_setting(key)
+                cleared.append(key)
+        if cleared and store.get_setting(SETTING_ROSTER_TS):
+            store.delete_setting(SETTING_ROSTER_TS)
+            cleared.append(SETTING_ROSTER_TS)
+
+        if archived:
+            print(f"archived Slack channel {resolved_channel_id}")
+        else:
+            print(f"Slack channel {resolved_channel_id} was already archived")
+        if cleared:
+            print(f"cleared local channel state from {config.state_db}")
+        return 0
+    finally:
+        store.close()
 
 
 def _sqlite_state_paths(path: Path) -> list[Path]:

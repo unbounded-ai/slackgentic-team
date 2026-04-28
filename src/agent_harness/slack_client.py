@@ -52,6 +52,17 @@ class SlackGateway:
         if user_ids:
             self.client.conversations_invite(channel=channel_id, users=",".join(user_ids))
 
+    def archive_channel(self, channel_id: str) -> bool:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self.client.conversations_archive(channel=channel_id)
+        except SlackApiError as exc:
+            if exc.response.get("error") == "already_archived":
+                return False
+            raise
+        return True
+
     def open_view(self, trigger_id: str, view: dict[str, Any]) -> None:
         self.client.views_open(trigger_id=trigger_id, view=view)
 

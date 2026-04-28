@@ -286,6 +286,10 @@ class Store:
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def delete_setting(self, key: str) -> None:
+        self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        self.conn.commit()
+
     def upsert_team_agent(self, agent: TeamAgent) -> None:
         self.conn.execute(
             """
