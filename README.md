@@ -5,6 +5,42 @@ local coding-agent sessions visible in Slack, routes work to lightweight agent
 personas, mirrors external terminal sessions, and keeps all runtime state on the
 developer's machine.
 
+## Quick Install
+
+Fresh install from GitHub:
+
+```sh
+git clone https://github.com/unbounded-ai/slackgentic-team.git
+cd slackgentic-team
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/slackgentic slack setup
+```
+
+Install it as a user service so the Slack daemon and Codex app-server stay
+running:
+
+```sh
+.venv/bin/slackgentic service install
+.venv/bin/slackgentic service status
+```
+
+Then open Slack and run:
+
+```text
+/slackgentic-<you> setup
+```
+
+For manual debugging, run the Slack daemon in the foreground instead of
+installing the service:
+
+```sh
+.venv/bin/slackgentic slack serve
+```
+
+Minimum prerequisites: Python 3.11+, Slack workspace permission to create a
+Socket Mode app, and `codex` and/or `claude` on `PATH`.
+
 ## Highlights
 
 - Socket Mode Slack app: no public callback URL, tunnel, or relay server.
@@ -37,7 +73,7 @@ sent through a hosted Slackgentic service.
 - `codex` and/or `claude` on `PATH` for the providers you want to use.
 - macOS or Linux for optional user-service installation.
 
-## Installation
+## Local Development Install
 
 ```sh
 python -m venv .venv
@@ -77,16 +113,23 @@ Use an explicit teammate suffix when the default OS username is not right:
 .venv/bin/slackgentic slack setup --instance riley
 ```
 
-Run the daemon:
+Install and run the daemon as a user service:
+
+```sh
+.venv/bin/slackgentic service install
+.venv/bin/slackgentic service status
+```
+
+Agent posts use the bundled numbered cartoon avatar bank by default:
+`docs/assets/avatars/1.png` through `docs/assets/avatars/500.png`. When this
+repository is public, Slack fetches those PNGs from GitHub's raw asset URLs.
+Set `SLACKGENTIC_AGENT_AVATAR_BASE_URL` to a different public HTTPS directory,
+or set it to `off` to disable custom agent icons.
+
+For foreground debugging, run:
 
 ```sh
 .venv/bin/slackgentic slack serve
-```
-
-Or combine setup and serving:
-
-```sh
-.venv/bin/slackgentic slack setup --serve
 ```
 
 ## Slack Usage
@@ -130,6 +173,22 @@ Task buttons:
 - `Pause` stops the process and puts the task back in queued state.
 - `Cancel` stops the process and marks the task cancelled.
 
+## Reset Local State
+
+Reset the local SQLite runtime state when you want Slack setup to create a fresh
+channel, roster, task history, and avatar override setting:
+
+```sh
+.venv/bin/slackgentic slack reset-state --yes
+```
+
+This preserves Slack app credentials in `~/.slackgentic-team/config.json`.
+Recreate Slack app credentials only when needed:
+
+```sh
+.venv/bin/slackgentic slack setup --force
+```
+
 ## External Sessions
 
 Slackgentic discovers external Codex and Claude sessions from local transcript
@@ -137,7 +196,8 @@ files and mirrors visible output into Slack threads.
 
 ### Codex App Server
 
-The Slack daemon starts a local Codex app-server by default:
+When `slackgentic slack serve` is run directly, the Slack daemon starts a local
+Codex app-server by default:
 
 ```text
 ws://127.0.0.1:47684
@@ -187,17 +247,43 @@ Install the daemon as a user service:
 slackgentic service install
 ```
 
-On macOS this writes a launchd agent at
-`~/Library/LaunchAgents/com.slackgentic-team.daemon.plist`. On Linux this writes
-a systemd user unit at `~/.config/systemd/user/slackgentic-team.service`.
+On macOS this writes launchd agents for both the Slack daemon and the Codex
+app-server:
+
+- `~/Library/LaunchAgents/com.slackgentic-team.daemon.plist`
+- `~/Library/LaunchAgents/com.slackgentic-team.codex-app-server.plist`
+
+On Linux this writes systemd user units for both services:
+
+- `~/.config/systemd/user/slackgentic-team.service`
+- `~/.config/systemd/user/slackgentic-team-codex-app-server.service`
 
 Service commands:
 
 ```sh
+slackgentic service start
+slackgentic service restart
 slackgentic service status
 slackgentic service print
 slackgentic service uninstall
 ```
+
+`service install` starts both managed services. `service start` starts the Codex
+app-server service first and then the Slack daemon. Installed services run the
+Codex app-server as a sibling service and set
+`SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART=false` on the daemon, so remote Codex
+sessions can be started normally:
+
+```sh
+codex --dangerously-bypass-approvals-and-sandbox --remote ws://127.0.0.1:47684
+```
+
+`service restart` is scoped to the installed launchd label or systemd user unit,
+but it refuses to restart older service definitions that may still own the Codex
+app-server. Use `slackgentic service install` to rewrite the service definition
+first; this can disconnect remote sessions once if they are connected to the
+older daemon-owned app-server. `slackgentic service restart --force` bypasses
+the check and may disconnect `codex --remote` sessions.
 
 ## Configuration
 
@@ -219,6 +305,7 @@ Environment variables override stored values:
 | `SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART` | Whether the daemon starts Codex app-server. |
 | `SLACKGENTIC_CODEX_AGENTS` | Default initial Codex roster count. |
 | `SLACKGENTIC_CLAUDE_AGENTS` | Default initial Claude roster count. |
+| `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS directory for numbered avatar PNGs; use `off` to disable icons. |
 
 ## Development
 

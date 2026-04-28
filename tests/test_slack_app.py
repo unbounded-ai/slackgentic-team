@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent_harness.models import (
@@ -11,7 +12,12 @@ from agent_harness.models import (
     SlackThreadRef,
 )
 from agent_harness.slack import encode_action_value
-from agent_harness.slack_app import SETTING_ROSTER_TS, SlackReplyTarget, SlackTeamController
+from agent_harness.slack_app import (
+    DEFAULT_AGENT_AVATAR_BASE_URL,
+    SETTING_ROSTER_TS,
+    SlackReplyTarget,
+    SlackTeamController,
+)
 from agent_harness.slack_client import PostedMessage
 from agent_harness.store import Store
 from agent_harness.team import build_initial_model_team
@@ -68,10 +74,13 @@ class FakeGateway:
         return PostedMessage(thread.channel_id, ts, thread.thread_ts)
 
     def post_session_parent(self, channel_id, text, persona, icon_url=None, blocks=None):
-        return self.post_message(channel_id, text, blocks=blocks)
+        posted = self.post_message(channel_id, text, blocks=blocks)
+        self.posts[-1]["icon_url"] = icon_url
+        return posted
 
     def post_task_parent(self, channel_id, text, agent, blocks=None, icon_url=None):
         posted = self.post_message(channel_id, text, blocks=blocks)
+        self.posts[-1]["icon_url"] = icon_url
         from agent_harness.models import SlackThreadRef
 
         return SlackThreadRef(channel_id, posted.ts, posted.ts)
@@ -477,6 +486,114 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_review_request_displays_full_command_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 1):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody review the repo",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks()
+                self.assertEqual(tasks[0].prompt, "review the repo")
+                rendered = gateway.posts[0]["blocks"][0]["text"]["text"]
+                self.assertIn("*Task:* review the repo", rendered)
+            finally:
+                store.close()
+
+    def test_agent_avatar_base_url_is_used_for_agent_posts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                store.set_setting("slack.agent_avatar_base_url", "https://cdn.example.test/avatars/")
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody do update the README",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                agent = store.list_team_agents()[0]
+                self.assertEqual(
+                    gateway.posts[0]["icon_url"],
+                    f"https://cdn.example.test/avatars/{agent.avatar_slug}.png",
+                )
+            finally:
+                store.close()
+
+    def test_agent_avatar_base_url_defaults_to_github_raw_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody do update the README",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                agent = store.list_team_agents()[0]
+                self.assertEqual(
+                    gateway.posts[0]["icon_url"],
+                    f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{agent.avatar_slug}.png",
+                )
+            finally:
+                store.close()
+
     def test_channel_work_request_accepts_other_bot_posting_mechanisms(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -682,6 +799,122 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(bridge.sent[0][0].session_id, "s1")
                 self.assertEqual(bridge.sent[0][1], "what are you working on?")
                 self.assertEqual(bridge.sent[0][3], "U1")
+            finally:
+                store.close()
+
+    def test_external_session_thread_somebody_review_routes_to_claude_reviewer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(codex_count=1, claude_count=1):
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "sOmEbOdY ReVieW the repo cleanup plan",
+                            "ts": "171.000002",
+                            "thread_ts": "171.000001",
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertEqual(len(tasks), 1)
+                task = tasks[0]
+                reviewer = store.get_team_agent(task.agent_id)
+                self.assertEqual(task.thread_ts, "171.000001")
+                self.assertEqual(task.kind.value, "review")
+                self.assertEqual(reviewer.provider_preference, Provider.CLAUDE)
+                self.assertEqual(task.metadata["external_session_provider"], Provider.CODEX.value)
+                self.assertEqual(task.metadata["external_session_id"], "s1")
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(bridge.sent, [])
+            finally:
+                store.close()
+
+    def test_external_session_thread_explicit_agent_request_routes_by_handle_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=1)
+                target_agent = replace(
+                    agents[1],
+                    agent_id="agent_another_agent_name",
+                    handle="another-agent-name",
+                )
+                store.upsert_team_agent(agents[0])
+                store.upsert_team_agent(target_agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "@ANOTHER-AGENT-NAME do inspect the setup docs",
+                            "ts": "171.000002",
+                            "thread_ts": "171.000001",
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].agent_id, target_agent.agent_id)
+                self.assertEqual(tasks[0].prompt, "inspect the setup docs")
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(runtime.started[0][1].handle, "another-agent-name")
+                self.assertEqual(bridge.sent, [])
             finally:
                 store.close()
 

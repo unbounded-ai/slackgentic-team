@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -56,6 +57,11 @@ SETTING_CHANNEL_ID = "slack.channel_id"
 SETTING_ROSTER_TS = "slack.roster_ts"
 SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
+SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
+DEFAULT_AGENT_AVATAR_BASE_URL = (
+    "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
+)
+DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 
 
 @dataclass(frozen=True)
@@ -206,6 +212,7 @@ class SlackTeamController:
             format_agent_assignment(result.agent, result.request.prompt, event.get("user")),
             result.agent,
             blocks=blocks,
+            icon_url=self._agent_icon_url(result.agent),
         )
         self.store.update_agent_task_thread(
             result.task.task_id,
@@ -264,9 +271,15 @@ class SlackTeamController:
                 SlackThreadRef(target.channel_id, target.thread_ts),
                 text,
                 persona=agent,
+                icon_url=self._agent_icon_url(agent),
             )
         else:
-            self.gateway.post_session_parent(target.channel_id, text, agent)
+            self.gateway.post_session_parent(
+                target.channel_id,
+                text,
+                agent,
+                icon_url=self._agent_icon_url(agent),
+            )
 
     def hire_agents(self, count: int, provider: Provider | None = None):
         all_agents = self.store.list_team_agents(include_fired=True)
@@ -277,6 +290,7 @@ class SlackTeamController:
             provider,
             start_sort_order=self.store.next_team_sort_order(),
             balance_agents=active_agents,
+            randomize_identities=True,
         )
         for agent in hired:
             self.store.upsert_team_agent(agent)
@@ -317,7 +331,12 @@ class SlackTeamController:
         agents = self.store.list_team_agents()
         messages = build_initialization_messages(agents)
         if messages:
-            self.gateway.post_team_initialization(channel_id, agents, messages)
+            self.gateway.post_team_initialization(
+                channel_id,
+                agents,
+                messages,
+                icon_url_for=self._agent_icon_url,
+            )
 
     def publish_usage(self, channel_id: str) -> str:
         day = day_string("today")
@@ -371,7 +390,12 @@ class SlackTeamController:
         ts = self.refresh_or_post_roster(channel_id)
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=roster_ts or ts)
         for agent in hired:
-            self.gateway.post_thread_reply(thread, format_agent_introduction(agent), persona=agent)
+            self.gateway.post_thread_reply(
+                thread,
+                format_agent_introduction(agent),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
 
     def _fire_from_action(
         self,
@@ -467,6 +491,8 @@ class SlackTeamController:
         session = self.store.get_session_for_slack_thread(self.team_id, channel_id, thread_ts)
         if session is None:
             return False
+        if self._handle_external_thread_work_request(session, event, text):
+            return True
         if self.session_bridge is None:
             self.gateway.post_thread_reply(
                 SlackThreadRef(channel_id, thread_ts),
@@ -479,6 +505,38 @@ class SlackTeamController:
             SlackThreadRef(channel_id, thread_ts),
             slack_user=event.get("user"),
         )
+
+    def _handle_external_thread_work_request(self, session, event: dict, text: str) -> bool:
+        active_agents = self.store.list_team_agents()
+        request = parse_work_request(text, [agent.handle for agent in active_agents])
+        if request is None:
+            return False
+        channel_id = event["channel"]
+        thread_ts = event["thread_ts"]
+        author_agent = (
+            self.store.get_team_agent(request.author_handle) if request.author_handle else None
+        )
+        result = assign_work_request(
+            self.store,
+            request,
+            channel_id,
+            requested_by_slack_user=event.get("user"),
+            author_agent=author_agent,
+            extra_metadata=self._external_thread_task_metadata(session, channel_id, thread_ts),
+        )
+        if result is None:
+            return True
+        posted = self.gateway.post_thread_reply(
+            SlackThreadRef(channel_id, thread_ts),
+            format_agent_assignment(result.agent, result.request.prompt, event.get("user")),
+            persona=result.agent,
+            icon_url=self._agent_icon_url(result.agent),
+        )
+        self.store.update_agent_task_thread(result.task.task_id, thread_ts, posted.ts)
+        task = self.store.get_agent_task(result.task.task_id) or result.task
+        if self.runtime:
+            self.runtime.start_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
+        return True
 
     def _handle_thread_work_request(
         self,
@@ -517,6 +575,7 @@ class SlackTeamController:
             SlackThreadRef(channel_id, thread_ts),
             format_agent_assignment(result.agent, result.request.prompt, event.get("user")),
             persona=result.agent,
+            icon_url=self._agent_icon_url(result.agent),
         )
         self.store.update_agent_task_thread(result.task.task_id, thread_ts, posted.ts)
         task = self.store.get_agent_task(result.task.task_id) or result.task
@@ -562,6 +621,7 @@ class SlackTeamController:
             thread,
             format_agent_handoff_assignment(result.agent, agent, result.request.prompt),
             persona=result.agent,
+            icon_url=self._agent_icon_url(result.agent),
         )
         self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
         reviewer_task = self.store.get_agent_task(result.task.task_id) or result.task
@@ -617,11 +677,13 @@ class SlackTeamController:
             thread,
             format_agent_handoff_request(agent, target_agent, visible_prompt),
             persona=agent,
+            icon_url=self._agent_icon_url(agent),
         )
         posted = self.gateway.post_thread_reply(
             thread,
             format_agent_handoff_assignment(target_agent, agent, result.request.prompt),
             persona=target_agent,
+            icon_url=self._agent_icon_url(target_agent),
         )
         self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
         delegated_task = self.store.get_agent_task(result.task.task_id) or result.task
@@ -648,6 +710,7 @@ class SlackTeamController:
             SlackThreadRef(channel_id, thread_ts),
             format_agent_assignment(agent, result.request.prompt, event.get("user")),
             persona=agent,
+            icon_url=self._agent_icon_url(agent),
         )
         self.store.update_agent_task_thread(result.task.task_id, thread_ts, posted.ts)
         task = self.store.get_agent_task(result.task.task_id) or result.task
@@ -667,6 +730,23 @@ class SlackTeamController:
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
+        context = self._thread_context(channel_id, thread_ts)
+        if context:
+            metadata["thread_context"] = context
+        return metadata
+
+    def _external_thread_task_metadata(
+        self,
+        session,
+        channel_id: str,
+        thread_ts: str,
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "external_session_provider": session.provider.value,
+            "external_session_id": session.session_id,
+        }
+        if session.cwd:
+            metadata["cwd"] = str(session.cwd)
         context = self._thread_context(channel_id, thread_ts)
         if context:
             metadata["thread_context"] = context
@@ -728,6 +808,16 @@ class SlackTeamController:
             self.gateway.add_reaction(channel_id, message_ts, choose_reaction(agent, text))
         except Exception:
             LOGGER.debug("failed to add Slack reaction", exc_info=True)
+
+    def _agent_icon_url(self, agent) -> str | None:
+        base_url = (
+            self.store.get_setting(SETTING_AGENT_AVATAR_BASE_URL)
+            or os.environ.get("SLACKGENTIC_AGENT_AVATAR_BASE_URL")
+            or DEFAULT_AGENT_AVATAR_BASE_URL
+        ).strip()
+        if base_url.lower() in DISABLED_AVATAR_BASE_VALUES:
+            return None
+        return f"{base_url.rstrip('/')}/{agent.avatar_slug}.png"
 
     def _is_agent_channel(self, channel_id: str) -> bool:
         configured = (

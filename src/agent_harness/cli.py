@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -121,14 +120,30 @@ def main(argv: list[str] | None = None) -> int:
     service_install.add_argument("--config-file", type=Path)
     service_install.add_argument("--workdir", type=Path)
     service_install.add_argument("--print-only", action="store_true")
+    service_install.add_argument("--no-codex-app-server", action="store_true")
+    service_install.add_argument("--codex-app-server-url", default="ws://127.0.0.1:47684")
+    service_install.add_argument("--codex-binary", type=Path)
     service_uninstall = service_sub.add_parser("uninstall", help="Stop and remove the service")
     service_uninstall.add_argument("--name", default="slackgentic-team")
+    service_start = service_sub.add_parser("start", help="Start installed services")
+    service_start.add_argument("--name", default="slackgentic-team")
+    service_start.add_argument("--no-codex-app-server", action="store_true")
+    service_restart = service_sub.add_parser("restart", help="Restart the daemon service")
+    service_restart.add_argument("--name", default="slackgentic-team")
+    service_restart.add_argument(
+        "--force",
+        action="store_true",
+        help="Restart even if the installed service may own the Codex app-server",
+    )
     service_status = service_sub.add_parser("status", help="Show service status")
     service_status.add_argument("--name", default="slackgentic-team")
     service_print = service_sub.add_parser("print", help="Print the service definition")
     service_print.add_argument("--name", default="slackgentic-team")
     service_print.add_argument("--config-file", type=Path)
     service_print.add_argument("--workdir", type=Path)
+    service_print.add_argument("--no-codex-app-server", action="store_true")
+    service_print.add_argument("--codex-app-server-url", default="ws://127.0.0.1:47684")
+    service_print.add_argument("--codex-binary", type=Path)
 
     run_once = sub.add_parser("index-once", help="Index local sessions into SQLite")
     run_once.add_argument("--db", type=Path)
@@ -162,6 +177,18 @@ def main(argv: list[str] | None = None) -> int:
     slack_serve.add_argument("--config-file", type=Path)
     slack_serve.add_argument("--db", type=Path)
     slack_serve.add_argument("--home", type=Path)
+    slack_reset_state = slack_sub.add_parser(
+        "reset-state",
+        help="Delete local SQLite runtime state while preserving Slack credentials",
+    )
+    slack_reset_state.add_argument("--config-file", type=Path)
+    slack_reset_state.add_argument("--db", type=Path)
+    slack_reset_state.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Confirm deletion of the configured state database",
+    )
     slack_doctor = slack_sub.add_parser("doctor", help="Check local Slack E2E config")
     slack_doctor.add_argument("--config-file", type=Path)
     slack_doctor.add_argument("--db", type=Path)
@@ -192,14 +219,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "claude-channel":
         from agent_harness.claude_channel import (
+            _current_slackgentic_invocation,
             install_claude_mcp_server,
             mcp_config,
             run_channel_server,
         )
 
         if args.print_mcp_config:
-            command = shutil.which("slackgentic") or str(Path(sys.argv[0]).expanduser().resolve())
-            print(json.dumps(mcp_config(command), indent=2, sort_keys=True))
+            command, command_args = _current_slackgentic_invocation()
+            print(json.dumps(mcp_config(command, command_args), indent=2, sort_keys=True))
             return 0
         if args.install:
             install_claude_mcp_server()
@@ -271,52 +299,90 @@ def main(argv: list[str] | None = None) -> int:
         overrides = {
             key: value
             for key, value in {
-                "state_db": args.db,
-                "home": args.home,
+                "state_db": getattr(args, "db", None),
+                "home": getattr(args, "home", None),
             }.items()
             if value is not None
         }
         if overrides:
             config = AppConfig.model_validate({**config.model_dump(), **overrides})
+        if args.slack_command == "reset-state":
+            return _reset_slack_state(config, yes=args.yes)
         if args.slack_command == "doctor":
             return _slack_doctor(config)
         if args.slack_command == "serve":
+            return run_slack_app(config)
+        if args.slack_command == "setup" and args.serve:
             return run_slack_app(config)
     raise AssertionError(args.command)
 
 
 def _service(args: argparse.Namespace) -> int:
     from agent_harness.service import (
+        UnsafeServiceRestartError,
+        build_codex_app_server_service_spec,
         build_service_spec,
-        install_service,
-        render_service,
-        service_status,
-        uninstall_service,
+        install_services,
+        render_services,
+        restart_service,
+        service_statuses,
+        start_services,
+        uninstall_services,
     )
 
     if args.service_command in {"install", "print"}:
-        spec = build_service_spec(
+        daemon_spec = build_service_spec(
             name=args.name,
             working_directory=args.workdir,
             config_file=args.config_file,
         )
+        specs = [daemon_spec]
+        if not args.no_codex_app_server:
+            specs.append(
+                build_codex_app_server_service_spec(
+                    name=args.name,
+                    executable=args.codex_binary,
+                    working_directory=args.workdir,
+                    url=args.codex_app_server_url,
+                ),
+            )
         if args.service_command == "print" or args.print_only:
-            path, content = render_service(spec)
-            print(f"# {path}")
-            if isinstance(content, bytes):
-                print(content.decode())
-            else:
-                print(content)
+            for path, content in render_services(specs):
+                print(f"# {path}")
+                if isinstance(content, bytes):
+                    print(content.decode())
+                else:
+                    print(content)
             return 0
-        path = install_service(spec)
-        print(f"installed service at {path}")
+        paths = install_services(specs)
+        for path in paths:
+            print(f"installed service at {path}")
         return 0
     if args.service_command == "uninstall":
-        path = uninstall_service(args.name)
-        print(f"removed service at {path}")
+        for path in uninstall_services(args.name):
+            print(f"removed service at {path}")
         return 0
+    if args.service_command == "start":
+        statuses = start_services(
+            args.name,
+            include_codex_app_server=not args.no_codex_app_server,
+        )
+        if all(status == 0 for status in statuses):
+            print(f"started services for {args.name}")
+            return 0
+        return 1
+    if args.service_command == "restart":
+        try:
+            result = restart_service(args.name, force=args.force)
+        except UnsafeServiceRestartError as exc:
+            print(f"refusing unsafe service restart: {exc}")
+            return 2
+        if result == 0:
+            print(f"restarted service {args.name}")
+        return result
     if args.service_command == "status":
-        return service_status(args.name)
+        statuses = service_statuses(args.name)
+        return 0 if all(status == 0 for status in statuses) else 1
     raise AssertionError(args.service_command)
 
 
@@ -383,6 +449,7 @@ def _team(args: argparse.Namespace) -> int:
                 provider,
                 start_sort_order=store.next_team_sort_order(),
                 balance_agents=active_agents,
+                randomize_identities=True,
             )
             for agent in hired:
                 store.upsert_team_agent(agent)
@@ -447,6 +514,41 @@ def _print_team_agents(agents: list[Any], as_json: bool) -> int:
         provider = agent.provider_preference.value if agent.provider_preference else "unmapped"
         print(f"@{agent.handle} {agent.full_name} [{provider}] {agent.role}")
     return 0
+
+
+def _reset_slack_state(config, yes: bool = False) -> int:
+    state_db = config.state_db.expanduser()
+    if not yes:
+        print(f"This will delete local Slackgentic runtime state: {state_db}")
+        print("Slack credentials and app configuration are preserved.")
+        print("Re-run with `slackgentic slack reset-state --yes` to confirm.")
+        return 2
+
+    removed: list[Path] = []
+    for path in _sqlite_state_paths(state_db):
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+
+    if removed:
+        for path in removed:
+            print(f"removed {path}")
+    else:
+        print(f"state database did not exist: {state_db}")
+    print(
+        "Run `slackgentic slack serve`, then use "
+        f"`{config.slack.slash_command} setup` in Slack to initialize fresh state."
+    )
+    return 0
+
+
+def _sqlite_state_paths(path: Path) -> list[Path]:
+    return [
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+    ]
 
 
 def _slack_doctor(config) -> int:

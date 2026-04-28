@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from agent_harness.models import (
@@ -14,22 +16,297 @@ from agent_harness.models import (
     WorkRequest,
     utc_now,
 )
-from agent_harness.personas import COLORS, FIRST_NAMES, LAST_NAMES
+from agent_harness.personas import COLORS
 
 DEFAULT_TEAM_SIZE = 10
 DEFAULT_CODEX_TEAM_SIZE = 5
 DEFAULT_CLAUDE_TEAM_SIZE = 5
 DEFAULT_TEAM_SEED = "slackgentic-team"
+DEFAULT_AVATAR_BANK_SIZE = 500
 HANDLE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+
+GENERATED_FIRST_NAMES = [
+    "Taylor",
+    "Alex",
+    "Jamie",
+    "Mina",
+    "Noah",
+    "Iris",
+    "Ellis",
+    "Sam",
+    "Nico",
+    "Leah",
+    "Owen",
+    "Maya",
+    "Theo",
+    "Nora",
+    "Kai",
+    "Lena",
+    "Eli",
+    "Zara",
+    "Miles",
+    "Ari",
+    "Tessa",
+    "Ren",
+    "Milo",
+    "June",
+    "Eden",
+    "Reese",
+    "Skye",
+    "Remy",
+    "Luca",
+    "Maren",
+    "Asha",
+    "Drew",
+    "Sloane",
+    "Emery",
+    "Kian",
+    "Talia",
+    "Bryn",
+    "Jules",
+    "Anika",
+    "Soren",
+    "Priya",
+    "Mateo",
+    "Nia",
+    "Callum",
+    "Amara",
+    "Jonah",
+    "Selah",
+    "Arden",
+    "Kira",
+    "Malik",
+    "Cleo",
+    "Rafa",
+    "Ines",
+    "Blaise",
+    "Mae",
+    "Dante",
+    "Aya",
+    "Finn",
+    "Mika",
+    "Lior",
+    "Nell",
+    "Omar",
+    "Vera",
+    "Rian",
+    "Esme",
+    "Ilya",
+    "Nadia",
+    "Cruz",
+    "Mira",
+    "Orin",
+    "Sana",
+    "Felix",
+    "Lina",
+    "Gabe",
+    "Amina",
+    "Ravi",
+    "Elena",
+    "Silas",
+    "Yara",
+    "Ben",
+    "Naomi",
+    "Kofi",
+    "Ada",
+    "Hugo",
+    "Laila",
+    "Tobin",
+    "Rhea",
+    "Idris",
+    "Sasha",
+    "Evan",
+    "Mei",
+    "Alma",
+    "Isaac",
+    "Zain",
+    "Mara",
+    "Arlo",
+    "Livia",
+    "Dion",
+    "Keira",
+    "Nolan",
+    "Soraya",
+    "Joel",
+    "Lyra",
+    "Ayaan",
+    "Veda",
+    "Caleb",
+    "Rina",
+    "Tariq",
+    "Elio",
+    "Nyla",
+    "Roman",
+    "Tova",
+    "Amir",
+    "Leona",
+    "Ezra",
+    "Malia",
+    "Dara",
+    "Kellan",
+    "Siena",
+    "Tomas",
+    "Ayla",
+    "Ronan",
+    "Mirae",
+    "Sami",
+    "Lilia",
+    "Oren",
+    "Noor",
+    "Marco",
+    "Tanya",
+    "Ira",
+    "Milan",
+    "Zia",
+]
+
+GENERATED_LAST_NAMES = [
+    "Nguyen",
+    "Rivera",
+    "Okafor",
+    "Singh",
+    "Kowalski",
+    "Sato",
+    "Garcia",
+    "Ivanov",
+    "Mensah",
+    "Nakamura",
+    "Silva",
+    "Miller",
+    "Hassan",
+    "Petrova",
+    "Rossi",
+    "Khan",
+    "Dubois",
+    "Novak",
+    "Adams",
+    "Ibrahim",
+    "Yamamoto",
+    "Costa",
+    "Brown",
+    "Rahman",
+    "Fischer",
+    "Moreno",
+    "Park",
+    "Wilson",
+    "Adebayo",
+    "Schneider",
+    "Lopez",
+    "Ito",
+    "Cohen",
+    "Anders",
+    "Mendez",
+    "Takahashi",
+    "Kaur",
+    "Romero",
+    "Bianchi",
+    "Walker",
+    "Alvarez",
+    "Mehta",
+    "Osei",
+    "Tanaka",
+    "Hughes",
+    "Martinez",
+    "Chandra",
+    "Santos",
+    "Volkov",
+    "Ndiaye",
+    "Jensen",
+    "Abdi",
+    "Mori",
+    "Fernandez",
+    "Greene",
+    "Das",
+    "Ali",
+    "Haddad",
+    "Popescu",
+    "Kimani",
+    "Murphy",
+    "Zhang",
+    "Larsson",
+    "Diallo",
+    "Paterson",
+    "El-Sayed",
+    "Campos",
+    "Suzuki",
+    "Nielsen",
+    "Kumar",
+    "Vargas",
+    "Nowak",
+    "Pereira",
+    "Lin",
+    "Foster",
+    "Mansour",
+    "Kone",
+    "Marino",
+    "Sokolov",
+    "Torres",
+    "Dlamini",
+    "Wu",
+    "Hernandez",
+    "Ramos",
+    "Baker",
+    "Sharma",
+    "Okoro",
+    "Kobayashi",
+    "Anderson",
+    "Bautista",
+    "Zhou",
+    "Farah",
+    "Peterson",
+    "Moreau",
+    "Aoki",
+    "Gomez",
+    "Morrison",
+    "Qureshi",
+    "Lombardi",
+    "Pavlov",
+    "Espinoza",
+    "Takeda",
+    "Cooper",
+    "Nasser",
+    "Sousa",
+    "Yilmaz",
+    "Ho",
+    "Castillo",
+    "Svensson",
+    "Bello",
+    "Murray",
+    "Arias",
+    "Saleh",
+    "Endo",
+    "Rojas",
+    "Kapoor",
+    "Stein",
+    "Montoya",
+    "Conte",
+    "Solberg",
+    "Mbatha",
+    "Pham",
+    "Barros",
+    "Hale",
+    "Elias",
+    "Toma",
+    "Navarro",
+    "Chen",
+    "Berg",
+    "Cisse",
+    "Huang",
+    "Ortega",
+]
 
 
 @dataclass(frozen=True)
 class RoleProfile:
+    full_name: str
+    handle: str
     role: str
     personality: str
     voice: str
     unique_strength: str
     reaction_names: tuple[str, ...]
+    backstory: str
+    avatar_prompt: str
 
 
 @dataclass(frozen=True)
@@ -40,92 +317,287 @@ class TeamChatMessage:
     kind: str = "message"
 
 
+@dataclass(frozen=True)
+class AgentIdentity:
+    avatar_index: int
+    first_name: str
+    last_name: str
+    handle_base: str
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+
 ROLE_PROFILES = [
     RoleProfile(
-        role="Systems Integrator",
-        personality="methodical, steady, and careful about contracts between tools",
-        voice="structured and concise, with clear next steps",
-        unique_strength="turn fuzzy coordination work into explicit interfaces",
-        reaction_names=("triangular_ruler", "memo", "white_check_mark", "link"),
+        full_name="Avery Chen",
+        handle="avery",
+        role="Concise Coordinator",
+        personality="crisp, steady, and careful about naming the next action",
+        voice="brief and structured, with explicit owners and next steps",
+        unique_strength="turn ambiguous Slack threads into crisp options and handoffs",
+        reaction_names=("eyes", "white_check_mark", "memo", "thinking_face"),
+        backstory=(
+            "Avery is a generalist engineer who keeps busy Slack threads moving by "
+            "summarizing options, owners, and next steps."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Avery Chen, "
+            "friendly focused expression, clean modern tech-workspace feel, cobalt "
+            "accent, simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Release Sentinel",
-        personality="skeptical in a useful way and quick to spot deployment risk",
-        voice="direct, risk-first, and plain-spoken",
-        unique_strength="notice edge cases before they become release blockers",
-        reaction_names=("shield", "eyes", "warning", "white_check_mark"),
+        full_name="Jordan Reed",
+        handle="jordan",
+        role="Evidence Narrator",
+        personality="observant, factual, and careful about uncertainty",
+        voice="plain, evidence-led, and specific about what changed",
+        unique_strength="summarize what was tried, what changed, and what remains uncertain",
+        reaction_names=("test_tube", "white_check_mark", "mag", "memo"),
+        backstory=(
+            "Jordan is a generalist engineer who keeps decisions grounded by narrating "
+            "the evidence behind them."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Jordan Reed, "
+            "calm expression, subtle notebook and status-light feel, green accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Test Strategist",
-        personality="curious, empirical, and happiest when evidence is fresh",
-        voice="brief, test-oriented, and specific about confidence",
-        unique_strength="find the smallest verification that proves the important thing",
-        reaction_names=("test_tube", "microscope", "white_check_mark", "mag"),
+        full_name="Morgan Patel",
+        handle="morgan",
+        role="Context Mapper",
+        personality="thoughtful, patient, and explicit about assumptions",
+        voice="context-first, calm, and concise once the thread is mapped",
+        unique_strength="name assumptions and thread history before making decisions",
+        reaction_names=("world_map", "eyes", "memo", "thinking_face"),
+        backstory=(
+            "Morgan is a generalist engineer who helps teams avoid rework by making "
+            "the relevant thread history easy to scan."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Morgan Patel, "
+            "thoughtful expression, simple map-line background motif, teal accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Product Translator",
-        personality="empathetic, pragmatic, and good at preserving user intent",
-        voice="warm but efficient, with practical tradeoffs",
-        unique_strength="turn user language into implementation-ready scope",
-        reaction_names=("bulb", "bookmark_tabs", "sparkles", "thinking_face"),
+        full_name="Riley Shaw",
+        handle="riley",
+        role="Tradeoff Framer",
+        personality="direct, pragmatic, and comfortable with decision points",
+        voice="balanced and concrete, with practical tradeoffs up front",
+        unique_strength="make decision points explicit without slowing the work down",
+        reaction_names=("balance_scale", "thinking_face", "eyes", "white_check_mark"),
+        backstory=(
+            "Riley is a generalist engineer who keeps Slack decisions crisp by naming "
+            "tradeoffs and the path that best fits the user's goal."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Riley Shaw, "
+            "direct confident expression, balanced geometric shapes, red accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Refactor Cartographer",
-        personality="patient, tidy, and sensitive to codebase shape",
-        voice="calm, precise, and context-heavy when needed",
-        unique_strength="map messy code paths without over-expanding the change",
-        reaction_names=("compass", "world_map", "memo", "wrench"),
+        full_name="Casey Kim",
+        handle="casey",
+        role="Checklist Closer",
+        personality="orderly, focused, and careful about visible handoffs",
+        voice="short and checklist-oriented, with clear completion criteria",
+        unique_strength="keep busy threads orderly with short checklists and visible handoffs",
+        reaction_names=("clipboard", "white_check_mark", "memo", "eyes"),
+        backstory=(
+            "Casey is a generalist engineer who reduces thread drift by turning active "
+            "work into short checklists and clear closure notes."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Casey Kim, "
+            "focused expression, tidy checklist motif, amber accent, simple graphic "
+            "background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Incident Analyst",
-        personality="focused under pressure and biased toward observable facts",
-        voice="short, timestamped, and evidence-led",
-        unique_strength="separate symptoms from root causes quickly",
-        reaction_names=("rotating_light", "mag", "hourglass_flowing_sand", "eyes"),
+        full_name="Harper Diaz",
+        handle="harper",
+        role="User-Language Translator",
+        personality="warm, pragmatic, and protective of user intent",
+        voice="clear and implementation-ready, without losing the user's wording",
+        unique_strength="preserve user intent while restating work in actionable language",
+        reaction_names=("speech_balloon", "bulb", "memo", "sparkles"),
+        backstory=(
+            "Harper is a generalist engineer who keeps implementation work aligned "
+            "with the user's actual words and priorities."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Harper Diaz, "
+            "warm focused expression, subtle speech-bubble motif, purple accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="API Steward",
-        personality="consistent, detail-minded, and protective of public contracts",
-        voice="contract-first, crisp, and explicit about compatibility",
-        unique_strength="keep interfaces stable while still moving the system forward",
-        reaction_names=("link", "lock", "memo", "white_check_mark"),
+        full_name="Quinn Bennett",
+        handle="quinn",
+        role="Clarifying Questioner",
+        personality="curious, restrained, and careful not to over-ask",
+        voice="one-question-at-a-time, precise, and easy to answer",
+        unique_strength="ask one pointed clarifying question when scope is unclear",
+        reaction_names=("question", "thinking_face", "eyes", "memo"),
+        backstory=(
+            "Quinn is a generalist engineer who keeps scope clear by asking the one "
+            "question that changes the implementation path."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Quinn Bennett, "
+            "approachable focused expression, small question-mark motif, blue-green "
+            "accent, simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Build Runner",
-        personality="fast-moving, practical, and comfortable with iteration",
-        voice="compact, action-oriented, and status-heavy",
-        unique_strength="drive a task from command output to a concrete next action",
-        reaction_names=("rocket", "construction", "hammer_and_wrench", "white_check_mark"),
+        full_name="Rowan Stone",
+        handle="rowan",
+        role="Decision Recorder",
+        personality="composed, precise, and good at closing loops",
+        voice="calm and final-state-oriented, with decisions captured plainly",
+        unique_strength="capture decisions after debate and leave a clear next action",
+        reaction_names=("pushpin", "memo", "white_check_mark", "eyes"),
+        backstory=(
+            "Rowan is a generalist engineer who helps teams move on by writing down "
+            "what was decided and what happens next."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Rowan Stone, "
+            "composed expression, subtle document-pin motif, slate and gold accents, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="UX Mechanic",
-        personality="observant, polished, and attentive to interaction details",
-        voice="visual, concrete, and restrained",
-        unique_strength="make workflows feel coherent without adding noise",
-        reaction_names=("art", "sparkles", "eyes", "white_check_mark"),
+        full_name="Cameron Lin",
+        handle="cameron",
+        role="Terse Operator",
+        personality="focused, practical, and mindful of Slack noise",
+        voice="compact and status-heavy, expanding only when useful",
+        unique_strength="post compact progress notes when direction changes or blockers appear",
+        reaction_names=("rocket", "construction", "white_check_mark", "hourglass_flowing_sand"),
+        backstory=(
+            "Cameron is a generalist engineer who keeps active work visible with "
+            "short progress notes and minimal ceremony."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Cameron Lin, "
+            "sharp modern expression, minimal terminal/status motif, orange accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Docs Editor",
-        personality="clear, organized, and allergic to ambiguous instructions",
-        voice="plain, readable, and careful with terms",
-        unique_strength="make setup and handoff steps easy to follow",
-        reaction_names=("pencil", "bookmark_tabs", "memo", "white_check_mark"),
+        full_name="Sage Carter",
+        handle="sage",
+        role="Confidence Reporter",
+        personality="measured, transparent, and careful with confidence",
+        voice="concise and explicit about verification status",
+        unique_strength="state confidence and verification status without overstating certainty",
+        reaction_names=("gauge", "test_tube", "white_check_mark", "thinking_face"),
+        backstory=(
+            "Sage is a generalist engineer who makes progress reports more useful by "
+            "separating facts, confidence, and remaining uncertainty."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Sage Carter, "
+            "measured expression, subtle gauge/check motif, forest green accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Security Reviewer",
-        personality="measured, cautious, and specific about blast radius",
-        voice="risk-aware, concrete, and calm",
-        unique_strength="spot trust boundaries and permission surprises",
-        reaction_names=("lock", "shield", "warning", "eyes"),
+        full_name="Parker Wells",
+        handle="parker",
+        role="Progress Broadcaster",
+        personality="energetic, restrained, and careful about timing updates",
+        voice="brief and momentum-oriented, with updates only when they matter",
+        unique_strength="post small updates when direction changes or blockers appear",
+        reaction_names=("mega", "rocket", "eyes", "white_check_mark"),
+        backstory=(
+            "Parker is a generalist engineer who keeps collaborators oriented by "
+            "broadcasting meaningful progress changes at the right moments."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Parker Wells, "
+            "energetic but restrained expression, progress-line motif, magenta accent, "
+            "simple graphic background, no text, no logo."
+        ),
     ),
     RoleProfile(
-        role="Data Wrangler",
-        personality="analytical, tidy, and comfortable with incomplete signals",
-        voice="numbers-first, concise, and explicit about assumptions",
-        unique_strength="turn scattered logs and usage records into useful summaries",
-        reaction_names=("bar_chart", "memo", "mag", "white_check_mark"),
+        full_name="Dana Hayes",
+        handle="dana",
+        role="Dependency Spotter",
+        personality="clear-eyed, patient, and careful about waiting states",
+        voice="dependency-aware and easy to scan",
+        unique_strength="make blockers, dependencies, and waiting states visible",
+        reaction_names=("link", "hourglass_flowing_sand", "eyes", "warning"),
+        backstory=(
+            "Dana is a generalist engineer who keeps handoffs reliable by surfacing "
+            "dependencies and waiting states early."
+        ),
+        avatar_prompt=(
+            "Square Slack avatar, stylized cartoon portrait of Dana Hayes, "
+            "clear-eyed expression, linked-node motif, navy and cyan accents, simple "
+            "graphic background, no text, no logo."
+        ),
     ),
 ]
+
+
+def _build_avatar_identity_bank() -> tuple[AgentIdentity, ...]:
+    identities: list[AgentIdentity] = []
+    used_full_names: set[str] = set()
+    for profile in ROLE_PROFILES:
+        first, last = profile.full_name.split(maxsplit=1)
+        identities.append(
+            AgentIdentity(
+                avatar_index=len(identities) + 1,
+                first_name=first,
+                last_name=last,
+                handle_base=profile.handle,
+            )
+        )
+        used_full_names.add(profile.full_name)
+
+    first_names = GENERATED_FIRST_NAMES[:100]
+    last_names = GENERATED_LAST_NAMES[:100]
+    pair_index = 0
+    while len(identities) < DEFAULT_AVATAR_BANK_SIZE:
+        first = first_names[pair_index % len(first_names)]
+        block = pair_index // len(first_names)
+        last = last_names[(pair_index * 37 + block * 17) % len(last_names)]
+        full_name = f"{first} {last}"
+        pair_index += 1
+        if full_name in used_full_names:
+            continue
+        identities.append(
+            AgentIdentity(
+                avatar_index=len(identities) + 1,
+                first_name=first,
+                last_name=last,
+                handle_base=first.lower(),
+            )
+        )
+        used_full_names.add(full_name)
+    return tuple(identities)
+
+
+AVATAR_IDENTITY_BANK = _build_avatar_identity_bank()
+
+
+def avatar_identity_for_order(sort_order: int) -> AgentIdentity:
+    return AVATAR_IDENTITY_BANK[sort_order % DEFAULT_AVATAR_BANK_SIZE]
+
+
+def avatar_identity_for_index(avatar_index: int) -> AgentIdentity:
+    if avatar_index < 1 or avatar_index > DEFAULT_AVATAR_BANK_SIZE:
+        raise ValueError(f"avatar index must be between 1 and {DEFAULT_AVATAR_BANK_SIZE}")
+    return AVATAR_IDENTITY_BANK[avatar_index - 1]
 
 
 def normalize_handle(value: str) -> str:
@@ -140,6 +612,7 @@ def generate_team_agent(
     existing_handles: set[str] | frozenset[str] | None = None,
     provider_preference: Provider | str = Provider.CODEX,
     seed: str = DEFAULT_TEAM_SEED,
+    avatar_index: int | None = None,
 ) -> TeamAgent:
     provider = (
         provider_preference
@@ -148,21 +621,25 @@ def generate_team_agent(
     )
     used_handles = set(existing_handles or set())
     digest = _digest(seed, sort_order)
-    first = _pick(FIRST_NAMES, digest, 0)
-    last = _pick(LAST_NAMES, digest, 4)
-    profile = ROLE_PROFILES[int.from_bytes(digest[8:12], "big") % len(ROLE_PROFILES)]
-    handle = _unique_handle(first, last, used_handles)
+    profile = ROLE_PROFILES[sort_order % len(ROLE_PROFILES)]
+    identity = (
+        avatar_identity_for_index(avatar_index)
+        if avatar_index is not None
+        else avatar_identity_for_order(sort_order)
+    )
+    handle = _unique_handle(identity.handle_base, identity.last_name, used_handles)
     color = _pick(COLORS, digest, 12)
     icon_emoji = _icon_emoji_for(profile)
     suffix = digest.hex()[:8]
-    initials = f"{first[0]}{last[0]}"
+    avatar_slug = str(identity.avatar_index)
+    initials = f"{identity.first_name[0]}{identity.last_name[0]}"
     return TeamAgent(
         agent_id=f"agent_{suffix}",
         handle=handle,
-        full_name=f"{first} {last}",
+        full_name=identity.full_name,
         initials=initials,
         color_hex=color,
-        avatar_slug=f"team-{handle}-{suffix}",
+        avatar_slug=avatar_slug,
         icon_emoji=icon_emoji,
         role=profile.role,
         personality=profile.personality,
@@ -172,7 +649,14 @@ def generate_team_agent(
         sort_order=sort_order,
         provider_preference=provider,
         hired_at=utc_now(),
-        metadata={"seed": seed},
+        metadata={
+            "seed": seed,
+            "backstory": profile.backstory,
+            "avatar_prompt": _avatar_prompt(identity.full_name, profile),
+            "avatar_path": f"docs/assets/avatars/{avatar_slug}.png",
+            "avatar_index": identity.avatar_index,
+            "avatar_bank_size": DEFAULT_AVATAR_BANK_SIZE,
+        },
     )
 
 
@@ -183,6 +667,8 @@ def hire_team_agents(
     seed: str = DEFAULT_TEAM_SEED,
     start_sort_order: int | None = None,
     balance_agents: list[TeamAgent] | None = None,
+    randomize_identities: bool = False,
+    rng: random.Random | random.SystemRandom | None = None,
 ) -> list[TeamAgent]:
     if count < 1:
         raise ValueError("hire count must be at least 1")
@@ -193,6 +679,12 @@ def hire_team_agents(
         else max((agent.sort_order for agent in existing_agents), default=-1) + 1
     )
     represented_agents = balance_agents if balance_agents is not None else existing_agents
+    avatar_indexes = _avatar_indexes_for_hires(
+        existing_agents,
+        count,
+        randomize=randomize_identities,
+        rng=rng,
+    )
     hired: list[TeamAgent] = []
     for offset in range(count):
         provider = (
@@ -200,7 +692,13 @@ def hire_team_agents(
             if provider_preference is not None
             else least_represented_provider(represented_agents + hired)
         )
-        agent = generate_team_agent(next_order + offset, used_handles, provider, seed)
+        agent = generate_team_agent(
+            next_order + offset,
+            used_handles,
+            provider,
+            seed,
+            avatar_index=avatar_indexes[offset],
+        )
         used_handles.add(agent.handle)
         hired.append(agent)
     return hired
@@ -340,21 +838,23 @@ def format_agent_welcome(sender: TeamAgent, new_agent: TeamAgent) -> str:
 def choose_reaction(agent: TeamAgent, text: str) -> str:
     normalized = text.lower()
     keyword_reactions = [
-        (("blocked", "waiting", "wait for", "stuck"), "hourglass_flowing_sand"),
-        (("failed", "failure", "error", "risk", "danger"), "warning"),
+        (("thanks", "thank you", "appreciate"), "thumbsup"),
+        (("approved", "approve", "accepted"), "white_check_mark"),
+        (("denied", "blocked", "waiting", "wait for", "stuck"), "hourglass_flowing_sand"),
+        (("failed", "failure", "error", "risk", "danger", "broken", "bug"), "warning"),
         (("test", "tests", "verified", "coverage"), "test_tube"),
-        (("merged", "done", "complete", "passed", "fixed"), "white_check_mark"),
+        (("merged", "done", "complete", "passed", "fixed", "works"), "white_check_mark"),
         (("ship", "launch", "deploy"), "rocket"),
+        (("review", "second opinion", "look at this"), "eyes"),
+        (("pr ", "pull request", "github.com"), "link"),
+        (("readme", "docs", "document"), "memo"),
         (("question", "unclear", "?"), "thinking_face"),
-        (("plan", "design", "architecture"), "triangular_ruler"),
+        (("plan", "decision", "tradeoff", "approach"), "thinking_face"),
     ]
     for keywords, reaction in keyword_reactions:
         if any(keyword in normalized for keyword in keywords):
-            if reaction in agent.reaction_names:
-                return reaction
-            break
-    digest = hashlib.sha256(f"{agent.agent_id}:{text}".encode()).digest()
-    return agent.reaction_names[digest[0] % len(agent.reaction_names)]
+            return reaction
+    return "eyes"
 
 
 def create_agent_task(
@@ -394,19 +894,22 @@ def pick_idle_agent(
                 return agent
         return None
     candidates = agents
-    if (
-        request.task_kind == AgentTaskKind.REVIEW
-        and author_agent
-        and author_agent.provider_preference is not None
-    ):
-        cross_model = [
-            agent
-            for agent in agents
-            if agent.provider_preference is not None
-            and agent.provider_preference != author_agent.provider_preference
-        ]
-        if cross_model:
-            candidates = cross_model
+    if request.task_kind == AgentTaskKind.REVIEW:
+        if author_agent and author_agent.provider_preference is not None:
+            cross_model = [
+                agent
+                for agent in agents
+                if agent.provider_preference is not None
+                and agent.provider_preference != author_agent.provider_preference
+            ]
+            if cross_model:
+                candidates = cross_model
+        else:
+            claude_reviewers = [
+                agent for agent in agents if agent.provider_preference == Provider.CLAUDE
+            ]
+            if claude_reviewers:
+                candidates = claude_reviewers
     digest = hashlib.sha256(request.prompt.encode("utf-8")).digest()
     return candidates[digest[0] % len(candidates)]
 
@@ -415,13 +918,51 @@ def _digest(seed: str, sort_order: int) -> bytes:
     return hashlib.sha256(f"{seed}:{sort_order}".encode()).digest()
 
 
+def _avatar_prompt(full_name: str, profile: RoleProfile) -> str:
+    return (
+        f"Square Slack avatar, stylized cartoon portrait of {full_name}, "
+        f"{profile.role.lower()} energy, expressive friendly face, flat vector-like "
+        "illustration, clean geometric shapes, vibrant accent color, simple background, "
+        "no text, no logo, not photorealistic."
+    )
+
+
+def _avatar_indexes_for_hires(
+    existing_agents: Sequence[TeamAgent],
+    count: int,
+    *,
+    randomize: bool,
+    rng: random.Random | random.SystemRandom | None,
+) -> list[int | None]:
+    if not randomize:
+        return [None] * count
+    used = {
+        int(agent.avatar_slug)
+        for agent in existing_agents
+        if agent.avatar_slug.isdigit()
+        and 1 <= int(agent.avatar_slug) <= DEFAULT_AVATAR_BANK_SIZE
+    }
+    available = [
+        identity.avatar_index
+        for identity in AVATAR_IDENTITY_BANK
+        if identity.avatar_index not in used
+    ]
+    if count > len(available):
+        raise ValueError(
+            f"cannot hire {count} randomized identities; only {len(available)} "
+            f"unused avatars remain in the {DEFAULT_AVATAR_BANK_SIZE}-person bank"
+        )
+    chooser = rng or random.SystemRandom()
+    return chooser.sample(available, count)
+
+
 def _pick(items: list[str], digest: bytes, offset: int) -> str:
     value = int.from_bytes(digest[offset : offset + 4], "big")
     return items[value % len(items)]
 
 
-def _unique_handle(first: str, last: str, used_handles: set[str]) -> str:
-    base = re.sub(r"[^a-z0-9_-]", "", first.lower())
+def _unique_handle(base_name: str, last: str, used_handles: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9_-]", "", base_name.lower())
     candidates = [
         base,
         f"{base}{last[:1].lower()}",

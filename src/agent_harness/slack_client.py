@@ -254,4 +254,8 @@ class SlackGateway:
 
 
 def _identity_name(identity: Persona | TeamAgent) -> str:
-    return getattr(identity, "username", identity.full_name)
+    name = getattr(identity, "username", identity.full_name)
+    provider = getattr(identity, "provider_preference", None) or getattr(identity, "provider", None)
+    if provider is None:
+        return name
+    return f"{name} [{provider.value}]"

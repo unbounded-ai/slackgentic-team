@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pexpect
 
@@ -12,6 +13,8 @@ class FakeChild:
         self.after = ""
         self.before = ""
         self.calls = 0
+        self.sent = []
+        self.eof_sent = False
 
     def expect(self, pattern, timeout):
         self.calls += 1
@@ -20,6 +23,12 @@ class FakeChild:
             return 0
         self.before = "tail"
         raise pexpect.EOF("done")
+
+    def send(self, value):
+        self.sent.append(value)
+
+    def sendeof(self):
+        self.eof_sent = True
 
 
 class RunnerTests(unittest.TestCase):
@@ -41,7 +50,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--ephemeral", args)
         self.assertIn('projects."/tmp/repo".trust_level="trusted"', args)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", args)
-        self.assertEqual(args[-3:], ["-C", "/tmp/repo", "fix it"])
+        self.assertEqual(args[-3:], ["-C", "/tmp/repo", "-"])
+        self.assertNotIn("fix it", args)
 
     def test_codex_command_uses_non_interactive_permissions_by_default(self):
         command, args = build_command(
@@ -75,7 +85,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--no-session-persistence", args)
         self.assertIn("--dangerously-skip-permissions", args)
         self.assertIn("--worktree", args)
-        self.assertEqual(args[-1], "fix it")
+        self.assertEqual(args[-1], "-")
+        self.assertNotIn("fix it", args)
 
     def test_managed_process_read_available_keeps_eof_tail(self):
         process = ManagedAgentProcess(
@@ -84,6 +95,51 @@ class RunnerTests(unittest.TestCase):
         process.child = FakeChild()
 
         self.assertEqual(process.read_available(), "firsttail")
+
+    def test_managed_process_sends_prompt_over_stdin(self):
+        child = FakeChild()
+        calls = []
+
+        def fake_spawn(command, args, **kwargs):
+            calls.append((command, args, kwargs))
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(provider=Provider.CODEX, prompt="hidden prompt", cwd=Path("/tmp/repo"))
+        )
+
+        with patch("pexpect.spawn", fake_spawn):
+            process.start()
+
+        self.assertEqual(calls[0][0], "codex")
+        self.assertNotIn("hidden prompt", calls[0][1])
+        self.assertEqual(child.sent, ["hidden prompt", "\n"])
+        self.assertTrue(child.eof_sent)
+
+    def test_managed_process_sends_claude_prompt_over_stdin(self):
+        child = FakeChild()
+        calls = []
+
+        def fake_spawn(command, args, **kwargs):
+            calls.append((command, args, kwargs))
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="hidden claude prompt",
+                cwd=Path("/tmp/repo"),
+            )
+        )
+
+        with patch("pexpect.spawn", fake_spawn):
+            process.start()
+
+        self.assertEqual(calls[0][0], "claude")
+        self.assertEqual(calls[0][1][-1], "-")
+        self.assertNotIn("hidden claude prompt", calls[0][1])
+        self.assertEqual(child.sent, ["hidden claude prompt", "\n"])
+        self.assertTrue(child.eof_sent)
 
 
 if __name__ == "__main__":

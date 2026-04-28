@@ -42,8 +42,23 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNotNone(request)
         assert request is not None
         self.assertEqual(request.task_kind, AgentTaskKind.REVIEW)
+        self.assertEqual(
+            request.prompt,
+            "review @riley's PR https://github.com/acme/app/pull/42",
+        )
         self.assertEqual(request.author_handle, "riley")
         self.assertEqual(request.pr_url, "https://github.com/acme/app/pull/42")
+
+    def test_parse_non_pr_review_request_as_review_task(self):
+        request = parse_work_request(
+            "Somebody review the repo and suggest cleanup improvements",
+            ["riley", "sage"],
+        )
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.assignment_mode, AssignmentMode.ANYONE)
+        self.assertEqual(request.task_kind, AgentTaskKind.REVIEW)
+        self.assertEqual(request.prompt, "review the repo and suggest cleanup improvements")
 
     def test_parse_lightweight_handles(self):
         self.assertEqual(parse_lightweight_handles("ask @Riley and @sage"), ["riley", "sage"])

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import getpass
+import html
 import logging
 import os
 import re
@@ -26,6 +27,10 @@ from agent_harness.slack_client import SlackGateway
 from agent_harness.store import Store
 
 LOGGER = logging.getLogger(__name__)
+SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
+    r"<channel\b(?=[^>]*\bsource=[\"']slackgentic[\"'])[^>]*>.*?</channel>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 HUMAN_DISPLAY_NAME_SETTING = "slack.human_display_name"
 HUMAN_IMAGE_URL_SETTING = "slack.human_image_url"
 
@@ -348,6 +353,12 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
     text = _claude_message_text(message)
     if not text:
         return None
+    if event.event_type == "user" and _has_slackgentic_channel_block(text):
+        return None
+    if event.event_type == "assistant":
+        text = _remove_slackgentic_channel_blocks(text)
+        if not text:
+            return None
     author = "user" if event.event_type == "user" else "assistant"
     return RenderedSessionEvent(text, author)
 
@@ -392,6 +403,17 @@ def _clean_text(text: str) -> str:
     no_ansi = re.sub(r"\x1b[@-_][0-?]*[ -/]*[@-~]", "", no_ansi)
     no_control = "".join(ch for ch in no_ansi if ch in "\n\t" or ord(ch) >= 32)
     return no_control.strip()
+
+
+def _has_slackgentic_channel_block(text: str) -> bool:
+    return bool(SLACKGENTIC_CHANNEL_BLOCK_RE.search(html.unescape(text)))
+
+
+def _remove_slackgentic_channel_blocks(text: str) -> str:
+    decoded = html.unescape(text)
+    if not SLACKGENTIC_CHANNEL_BLOCK_RE.search(decoded):
+        return text
+    return SLACKGENTIC_CHANNEL_BLOCK_RE.sub("", decoded).strip()
 
 
 def _short_path(path: Path) -> str:

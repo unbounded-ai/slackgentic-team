@@ -65,7 +65,8 @@ class TaskRuntimeTests(unittest.TestCase):
 
         prompt = build_task_prompt(agent, task)
 
-        self.assertIn("Slack thread context:", prompt)
+        self.assertIn("Private Slack thread context", prompt)
+        self.assertIn("Do not quote this heading", prompt)
         self.assertIn("original answer", prompt)
 
     def test_build_task_prompt_instructs_agent_requested_reviews(self):
@@ -162,6 +163,21 @@ class TaskRuntimeTests(unittest.TestCase):
                 '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}\n'
                 '{"type":"user","message":{"content":'
                 '[{"type":"tool_result","content":"secret"}]}}\n'
+                '{"type":"result","subtype":"success","is_error":false,"result":"Final"}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Final"])
+        self.assertEqual(buffer, "")
+
+    def test_claude_json_output_ignores_assistant_text_and_artifacts_before_result(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CLAUDE,
+            (
+                '{"type":"assistant","message":{"content":['
+                '{"type":"text","text":"Interim artifact list"},'
+                '{"type":"artifact","title":"notes.md","content":"extra"},'
+                '{"type":"tool_use","name":"Read"}]}}\n'
                 '{"type":"result","subtype":"success","is_error":false,"result":"Final"}\n'
             ),
         )

@@ -45,7 +45,7 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertEqual(len(gateway.client.messages), len(messages))
         replies = gateway.client.messages[1:]
         self.assertTrue(all(message["thread_ts"] == thread.thread_ts for message in replies))
-        self.assertIn("username", gateway.client.messages[0])
+        self.assertEqual(gateway.client.messages[0]["username"], "Avery Chen [codex]")
 
     def test_auth_test_returns_plain_dict(self):
         gateway = object.__new__(SlackGateway)

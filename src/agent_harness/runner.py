@@ -39,7 +39,7 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             args.extend(["--sandbox", "workspace-write"])
         if request.model:
             args.extend(["--model", request.model])
-        args.extend(["-C", str(request.cwd), request.prompt])
+        args.extend(["-C", str(request.cwd), "-"])
         return request.codex_binary, args
     if request.provider == Provider.CLAUDE:
         args = [
@@ -54,7 +54,7 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             args.extend(["--model", request.model])
         if request.worktree:
             args.extend(["--worktree", request.worktree])
-        args.append(request.prompt)
+        args.append("-")
         return request.claude_binary, args
     raise ValueError(f"unsupported provider: {request.provider}")
 
@@ -84,6 +84,10 @@ class ManagedAgentProcess:
             encoding="utf-8",
             timeout=0.1,
         )
+        self.child.send(self.request.prompt)
+        if not self.request.prompt.endswith("\n"):
+            self.child.send("\n")
+        self.child.sendeof()
 
     def send(self, message: str) -> None:
         if self.child is None:

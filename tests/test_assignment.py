@@ -57,6 +57,28 @@ class AssignmentTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_non_pr_review_assignment_prefers_claude_reviewer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(codex_count=1, claude_count=1):
+                    store.upsert_team_agent(agent)
+
+                result = assign_channel_work_request(
+                    store,
+                    "Somebody review the repo and suggest cleanup improvements",
+                    channel_id="C1",
+                    requested_by_slack_user="U1",
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result.task.kind, AgentTaskKind.REVIEW)
+                self.assertEqual(result.agent.provider_preference, Provider.CLAUDE)
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

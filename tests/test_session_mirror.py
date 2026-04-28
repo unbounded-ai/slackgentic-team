@@ -370,6 +370,54 @@ class SessionMirrorTests(unittest.TestCase):
         self.assertIsNone(render_session_event(tool_event))
         self.assertEqual(render_session_event(text_event), "done")
 
+    def test_render_claude_event_hides_slackgentic_channel_user_event(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="user",
+            metadata={
+                "message": {
+                    "content": (
+                        '<channel source="slackgentic" session_id="s1" '
+                        'slack_channel="C1" slack_thread_ts="171.000001">'
+                        "approve it"
+                        "</channel>"
+                    )
+                }
+            },
+        )
+
+        self.assertIsNone(render_session_event(event))
+
+    def test_render_claude_event_strips_echoed_slackgentic_channel_block(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "I saw this:\n"
+                                "&lt;channel source=&quot;slackgentic&quot;&gt;"
+                                "approve it"
+                                "&lt;/channel&gt;\nDone."
+                            ),
+                        }
+                    ]
+                }
+            },
+        )
+
+        rendered = render_session_event(event)
+        self.assertEqual(rendered, "I saw this:\n\nDone.")
+        assert rendered is not None
+        self.assertNotIn("channel source", rendered)
+
     def test_codex_parent_warns_when_session_lacks_remote_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

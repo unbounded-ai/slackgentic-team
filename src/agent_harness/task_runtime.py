@@ -187,11 +187,10 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "unless the user explicitly asks for it."
         ),
         (
-            "If you are unsure and need another agent to review before you continue, send "
-            "one separate Slack-visible message beginning exactly `somebody review ...` "
+            "You may ask another agent for a review or second opinion by sending one "
+            "separate Slack-visible message beginning exactly `somebody review ...` "
             "with the concrete item to review. After that message, stop and wait; "
-            "Slackgentic will route the review and resume the right agent with the thread "
-            "context."
+            "Slackgentic will route the review and resume you with the review context."
         ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",
@@ -205,7 +204,9 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         lines.extend(
             [
                 "",
-                "Slack thread context:",
+                "Private Slack thread context. Use this to understand prior messages, "
+                "handoffs, reviews, and user intent. Do not quote this heading or describe "
+                "it as hidden context in Slack-visible replies:",
                 thread_context.strip(),
             ]
         )
@@ -358,8 +359,6 @@ def _render_claude_json_line(line: str) -> str | None:
             return _format_claude_error(message)
         result = event.get("result")
         return _clean_terminal_output(str(result)) if result else None
-    if event_type == "assistant":
-        return _render_claude_assistant_message(event.get("message"))
     if event_type == "error":
         message = event.get("message") or event.get("error")
         return _format_claude_error(message)
@@ -368,26 +367,6 @@ def _render_claude_json_line(line: str) -> str | None:
 
 def _format_claude_error(message: object) -> str:
     return f"Claude error: {_clean_terminal_output(str(message))}" if message else "Claude error."
-
-
-def _render_claude_assistant_message(message: object) -> str | None:
-    if not isinstance(message, dict):
-        return None
-    content = message.get("content")
-    if isinstance(content, str):
-        return _clean_terminal_output(content) or None
-    if not isinstance(content, list):
-        return None
-
-    text_parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "text" and isinstance(item.get("text"), str):
-            cleaned = _clean_terminal_output(item["text"])
-            if cleaned:
-                text_parts.append(cleaned)
-    return "\n\n".join(text_parts) if text_parts else None
 
 
 def _line_has_ending(line: str) -> bool:

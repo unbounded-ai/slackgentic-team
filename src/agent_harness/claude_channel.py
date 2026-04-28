@@ -18,10 +18,12 @@ CHANNEL_NAME = "slackgentic"
 CHANNEL_VERSION = "0.1.0"
 CHANNEL_INSTRUCTIONS = (
     "Slackgentic forwards Slack thread replies into this Claude Code session as "
-    '<channel source="slackgentic" ...> events. Treat each event as a user message '
-    "from Slack for this existing session. Respond normally in the terminal; "
+    '<channel source="slackgentic" ...> events. Treat only the body of each event '
+    "as the user's Slack message for this existing session. Never quote, repeat, "
+    "or discuss the channel tags or metadata. Respond normally in the terminal; "
     "Slackgentic mirrors your visible assistant responses back to the Slack thread. "
-    "Do not mention this transport unless it is directly relevant."
+    "When you need Slack approval or a Slack choice, use the Slackgentic MCP tools "
+    "instead of asking only in prose."
 )
 
 
@@ -75,6 +77,7 @@ class ClaudeChannelServer:
                     "result": {
                         "protocolVersion": protocol,
                         "capabilities": {
+                            "tools": {},
                             "experimental": {
                                 "claude/channel": {},
                             },
@@ -228,7 +231,10 @@ def run_channel_server(db_path: Path | None = None) -> int:
 
 
 def install_claude_mcp_server(command: str | None = None) -> None:
-    resolved = command or _current_slackgentic_command()
+    if command is None:
+        resolved, command_args = _current_slackgentic_invocation()
+    else:
+        resolved, command_args = command, []
     subprocess.run(
         [
             "claude",
@@ -239,34 +245,48 @@ def install_claude_mcp_server(command: str | None = None) -> None:
             CHANNEL_NAME,
             "--",
             resolved,
+            *command_args,
             "claude-channel",
         ],
         check=True,
     )
 
 
-def mcp_config(command: str = "slackgentic") -> dict[str, Any]:
+def mcp_config(command: str = "slackgentic", args: list[str] | None = None) -> dict[str, Any]:
     return {
         "mcpServers": {
             CHANNEL_NAME: {
                 "command": command,
-                "args": ["claude-channel"],
+                "args": [*(args or []), "claude-channel"],
             }
         }
     }
 
 
 def _current_slackgentic_command() -> str:
+    command, _ = _current_slackgentic_invocation()
+    return command
+
+
+def _current_slackgentic_invocation() -> tuple[str, list[str]]:
     candidate = Path(sys.argv[0])
     if candidate.name == "slackgentic":
         try:
-            return str(candidate.expanduser().resolve())
+            return str(candidate.expanduser().resolve()), []
         except OSError:
-            return str(candidate)
+            return str(candidate), []
     found = shutil.which("slackgentic")
     if found:
-        return found
-    return str(candidate)
+        return found, []
+    if candidate.name == "__main__.py" and candidate.parent.name == "agent_harness":
+        return sys.executable, ["-m", "agent_harness"]
+    try:
+        resolved = candidate.expanduser().resolve()
+    except OSError:
+        resolved = candidate
+    if os.access(resolved, os.X_OK):
+        return str(resolved), []
+    return sys.executable, [str(resolved)]
 
 
 def _is_identifier(value: str) -> bool:

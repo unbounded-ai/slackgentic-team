@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -53,7 +54,10 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 response = json.loads(output.getvalue())
                 self.assertEqual(response["id"], 1)
+                self.assertIn("tools", response["result"]["capabilities"])
                 self.assertIn("claude/channel", response["result"]["capabilities"]["experimental"])
+                self.assertIn("Slackgentic MCP tools", response["result"]["instructions"])
+                self.assertIn("Never quote, repeat", response["result"]["instructions"])
                 self.assertTrue(server._ready.is_set())
             finally:
                 store.close()
@@ -144,6 +148,14 @@ class ClaudeChannelTests(unittest.TestCase):
             {"command": "slackgentic", "args": ["claude-channel"]},
         )
 
+    def test_mcp_config_includes_python_module_invocation_args(self):
+        config = mcp_config("/usr/bin/python3", ["-m", "agent_harness"])
+
+        self.assertEqual(
+            config["mcpServers"]["slackgentic"],
+            {"command": "/usr/bin/python3", "args": ["-m", "agent_harness", "claude-channel"]},
+        )
+
     def test_install_registers_user_scoped_claude_mcp_server(self):
         calls = []
 
@@ -166,6 +178,41 @@ class ClaudeChannelTests(unittest.TestCase):
                         CHANNEL_NAME,
                         "--",
                         "/opt/slackgentic",
+                        "claude-channel",
+                    ],
+                    True,
+                )
+            ],
+        )
+
+    def test_install_registers_python_module_when_slackgentic_script_is_unavailable(self):
+        calls = []
+
+        def fake_run(args, check):
+            calls.append((args, check))
+
+        with (
+            patch("agent_harness.claude_channel.shutil.which", return_value=None),
+            patch.object(sys, "argv", ["/repo/src/agent_harness/__main__.py"]),
+            patch("subprocess.run", fake_run),
+        ):
+            install_claude_mcp_server()
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    [
+                        "claude",
+                        "mcp",
+                        "add",
+                        "--scope",
+                        "user",
+                        CHANNEL_NAME,
+                        "--",
+                        sys.executable,
+                        "-m",
+                        "agent_harness",
                         "claude-channel",
                     ],
                     True,

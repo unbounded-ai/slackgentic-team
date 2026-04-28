@@ -49,12 +49,13 @@ def _parse_anyone_request(
     for pattern in patterns:
         match = re.match(pattern, text, flags=re.IGNORECASE)
         if match:
+            verb = match.groupdict().get("verb") or ""
             prompt = _clean_prompt(match.group("prompt"))
             if prompt:
                 return _work_request(
-                    prompt=prompt,
+                    prompt=_command_prompt(verb, prompt),
                     assignment_mode=AssignmentMode.ANYONE,
-                    verb=match.groupdict().get("verb") or _infer_verb(prompt),
+                    verb=verb or _infer_verb(prompt),
                     known_handles=known_handles,
                 )
     return None
@@ -83,13 +84,14 @@ def _parse_specific_request(
         for pattern in patterns:
             match = re.match(pattern, text, flags=re.IGNORECASE)
             if match:
+                verb = match.groupdict().get("verb") or ""
                 prompt = _clean_prompt(match.group("prompt"))
                 if prompt:
                     return _work_request(
-                        prompt=prompt,
+                        prompt=_command_prompt(verb, prompt),
                         assignment_mode=AssignmentMode.SPECIFIC,
                         requested_handle=handle,
-                        verb=match.groupdict().get("verb") or _infer_verb(prompt),
+                        verb=verb or _infer_verb(prompt),
                         known_handles=handles,
                     )
     return None
@@ -116,7 +118,7 @@ def _work_request(
 
 def _task_kind_for(verb: str, prompt: str, pr_url: str | None) -> AgentTaskKind:
     normalized = f"{verb} {prompt}".lower()
-    if "review" in normalized and (" pr" in normalized or "pull request" in normalized or pr_url):
+    if re.search(r"\breview\b", normalized):
         return AgentTaskKind.REVIEW
     return AgentTaskKind.WORK
 
@@ -142,6 +144,12 @@ def _extract_author_handle(prompt: str, known_handles: list[str] | tuple[str, ..
 
 def _clean_prompt(value: str) -> str:
     return value.strip(" \t\n\r.").strip()
+
+
+def _command_prompt(verb: str, prompt: str) -> str:
+    if verb.lower() == "review" and not re.match(r"^review\b", prompt, flags=re.IGNORECASE):
+        return f"review {prompt}"
+    return prompt
 
 
 def _infer_verb(prompt: str) -> str:

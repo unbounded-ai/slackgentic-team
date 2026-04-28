@@ -83,6 +83,52 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_persistent_command_approval_can_be_resolved_by_another_handler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            result = {}
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                responder = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                thread = SlackThreadRef("C1", "171.000001")
+
+                def run_request():
+                    result["value"] = requester.handle_persistent_request(
+                        "item/commandExecution/requestApproval",
+                        {"command": ["rm", "-rf", "build"], "reason": "cleanup"},
+                        thread,
+                    )
+
+                worker = threading.Thread(target=run_request)
+                worker.start()
+                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+
+                value = gateway.replies[0]["blocks"][1]["elements"][0]["value"]
+                handled = responder.handle_block_action(
+                    decode_action_value(value),
+                    "C1",
+                    gateway.replies[0]["ts"],
+                )
+
+                worker.join(timeout=1)
+                self.assertTrue(handled)
+                self.assertEqual(result["value"], {"decision": "accept"})
+                self.assertEqual(gateway.updates[-1]["text"], "Approved Claude request.")
+            finally:
+                store.close()
+
 
 def _wait_for(predicate, attempts=50):
     event = threading.Event()

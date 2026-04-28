@@ -55,18 +55,25 @@ If the default suffix is not what you want, choose one explicitly:
 .venv/bin/slackgentic slack setup --instance riley
 ```
 
-## 3. Run locally
+## 3. Install the local service
 
 ```sh
 .venv/bin/slackgentic slack doctor
+.venv/bin/slackgentic service install
+.venv/bin/slackgentic service status
+```
+
+This installs user-level services for the Slackgentic Slack daemon and Codex
+app-server. For foreground debugging instead of a persistent service, run:
+
+```sh
 .venv/bin/slackgentic slack serve
 ```
 
-Or combine setup and the local Socket Mode server:
-
-```sh
-.venv/bin/slackgentic slack setup --serve
-```
+Agent posts use numbered cartoon PNGs from `docs/assets/avatars` by default.
+When the repository is public, Slack fetches them from GitHub's raw asset URLs.
+Set `SLACKGENTIC_AGENT_AVATAR_BASE_URL` to a different public HTTPS directory,
+or set it to `off` to disable custom agent icons.
 
 ## 4. Set up from Slack
 
@@ -118,6 +125,14 @@ Use roster buttons or commands:
 /slackgentic-<you> usage
 /slackgentic-<you> status
 ```
+
+Wipe local runtime state and start fresh:
+
+```sh
+.venv/bin/slackgentic slack reset-state --yes
+```
+
+This keeps Slack credentials in `~/.slackgentic-team/config.json`.
 
 Task thread buttons:
 
