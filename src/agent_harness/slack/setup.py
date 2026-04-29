@@ -69,6 +69,20 @@ class CreatedSlackApp:
     raw: dict[str, Any]
 
 
+class SlackApiError(RuntimeError):
+    def __init__(
+        self,
+        label: str,
+        error: str | None,
+        errors: Any | None = None,
+    ) -> None:
+        self.label = label
+        self.error = error
+        self.errors = errors
+        suffix = f" ({errors})" if errors else ""
+        super().__init__(f"Slack {label} failed: {error}{suffix}")
+
+
 def build_slack_manifest(
     instance_slug: str | None = None,
     slash_command_override: str | None = None,
@@ -144,7 +158,11 @@ def run_interactive_setup(options: SlackSetupOptions | None = None) -> int:
     print(f"Using Slack app instance `{instance}` with slash command `{slash_command}`.")
     config_token = _configuration_token(options, existing)
     print("Creating the Slack app from the bundled Socket Mode manifest...")
-    created = create_slack_app(config_token, build_socket_mode_manifest(instance))
+    created = _create_slack_app_with_retry(
+        config_token,
+        build_socket_mode_manifest(instance),
+        options,
+    )
     print(f"Created Slack app {created.app_id or '(unknown app id)'}.")
 
     bot_token = _bot_token(created, options)
@@ -190,10 +208,16 @@ def update_slack_app_manifest(options: SlackManifestUpdateOptions | None = None)
         existing,
     )
     manifest = build_socket_mode_manifest(instance, slash_command_override=slash_command)
-    _slack_api_post(
-        "apps.manifest.update",
+    _update_slack_app_manifest_with_retry(
         config_token,
-        {"app_id": str(app_id), "manifest": json.dumps(manifest)},
+        str(app_id),
+        manifest,
+        options=SlackSetupOptions(
+            config_file=options.config_file,
+            open_browser=False,
+            bootstrap_tools=options.bootstrap_tools,
+            instance=instance,
+        ),
     )
     save_stored_config(
         {
@@ -218,6 +242,54 @@ def create_slack_app(config_token: str, manifest: dict[str, Any]) -> CreatedSlac
         app_id=response.get("app_id") or app.get("app_id") or app.get("id"),
         raw=response,
     )
+
+
+def _create_slack_app_with_retry(
+    config_token: str,
+    manifest: dict[str, Any],
+    options: SlackSetupOptions,
+) -> CreatedSlackApp:
+    try:
+        return create_slack_app(config_token, manifest)
+    except SlackApiError as exc:
+        refreshed = _refreshed_config_token_after_revocation(exc, config_token, options)
+        if not refreshed:
+            raise
+        return create_slack_app(refreshed, manifest)
+
+
+def _update_slack_app_manifest_with_retry(
+    config_token: str,
+    app_id: str,
+    manifest: dict[str, Any],
+    *,
+    options: SlackSetupOptions,
+) -> None:
+    payload = {"app_id": app_id, "manifest": json.dumps(manifest)}
+    try:
+        _slack_api_post("apps.manifest.update", config_token, payload)
+    except SlackApiError as exc:
+        refreshed = _refreshed_config_token_after_revocation(exc, config_token, options)
+        if not refreshed:
+            raise
+        _slack_api_post("apps.manifest.update", refreshed, payload)
+
+
+def _refreshed_config_token_after_revocation(
+    exc: SlackApiError,
+    old_token: str,
+    options: SlackSetupOptions,
+) -> str | None:
+    if exc.error != "token_revoked":
+        return None
+    print("Slack CLI workspace authorization was revoked. Starting `slack login` again.")
+    refreshed = _slack_cli_config_token(options, force_login=True)
+    if not refreshed:
+        return None
+    if refreshed == old_token:
+        return None
+    print("Captured refreshed Slack CLI workspace authorization. Retrying Slack API call.")
+    return refreshed
 
 
 def _configured_slash_command(existing: dict[str, Any], instance: str) -> str:
@@ -329,18 +401,26 @@ def _verify_app_token(app_token: str) -> None:
     _slack_api_post("apps.connections.open", app_token, {})
 
 
-def _slack_cli_config_token(options: SlackSetupOptions) -> str | None:
-    credentials = _read_slack_cli_credentials()
-    token = _token_from_slack_cli_credentials(credentials)
-    if token:
-        print("Using Slack CLI workspace authorization for app creation.")
-        return token
+def _slack_cli_config_token(
+    options: SlackSetupOptions,
+    *,
+    force_login: bool = False,
+) -> str | None:
+    if not force_login:
+        credentials = _read_slack_cli_credentials()
+        token = _token_from_slack_cli_credentials(credentials)
+        if token:
+            print("Using Slack CLI workspace authorization for app creation.")
+            return token
     if not options.bootstrap_tools:
         return None
     slack_cli = _ensure_slack_cli()
     if not slack_cli:
         return None
-    print("Slack CLI is not authorized yet. Starting `slack login`.")
+    if force_login:
+        print("Refreshing Slack CLI authorization with `slack login`.")
+    else:
+        print("Slack CLI is not authorized yet. Starting `slack login`.")
     print(
         "Send the printed /slackauthticket command in Slack, approve the modal, "
         "and enter the challenge code here."
@@ -444,9 +524,7 @@ def _open_slack_request(request: urllib.request.Request, label: str) -> dict[str
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Slack {label} request failed: {exc}") from exc
     if not data.get("ok"):
-        errors = data.get("errors")
-        suffix = f" ({errors})" if errors else ""
-        raise RuntimeError(f"Slack {label} failed: {data.get('error')}{suffix}")
+        raise SlackApiError(label, data.get("error"), data.get("errors"))
     return data
 
 
