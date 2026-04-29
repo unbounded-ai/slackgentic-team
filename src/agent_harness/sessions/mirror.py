@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agent_harness.models import (
@@ -36,6 +36,8 @@ HUMAN_DISPLAY_NAME_SETTING = "slack.human_display_name"
 HUMAN_IMAGE_URL_SETTING = "slack.human_image_url"
 EXTERNAL_SESSION_AGENT_PREFIX = "external_session_agent."
 EXTERNAL_SESSION_IGNORED_PREFIX = "external_session_ignored."
+EXTERNAL_SESSION_LIVE_TARGET_PREFIX = "external_session_live_target."
+EXTERNAL_SESSION_MISSING_TARGET_PREFIX = "external_session_missing_target."
 EXTERNAL_SESSION_SUMMARY_PREFIX = "external_session_summary."
 PENDING_EXTERNAL_SESSION_PREFIX = "external_session_pending."
 CAPACITY_NOTICE_TS_PREFIX = "external_session_capacity_notice_ts."
@@ -108,6 +110,8 @@ class SessionMirror:
         active_session_keys: set[str] = set()
         for provider in self.providers:
             for session in provider.discover():
+                if self._external_terminal_session_closed(session):
+                    session = replace(session, status=SessionStatus.DONE)
                 self.store.upsert_session(session)
                 self._cleanup_hidden_external_session_summary(session)
                 if self._skip_managed_task_session(session, channel_id):
@@ -117,6 +121,9 @@ class SessionMirror:
                 active_session_keys.add(_external_session_key(session.provider, session.session_id))
                 sync_sessions.append((provider, session))
         self._cleanup_inactive_external_sessions(active_session_keys, channel_id)
+        sync_sessions.sort(
+            key=lambda item: self._thread_for_session(item[1], channel_id) is not None
+        )
         for provider, session in sync_sessions:
             agent = self._team_agent_for_session(session, active_session_keys, channel_id)
             if agent is None:
@@ -365,6 +372,33 @@ class SessionMirror:
         self._update_capacity_notice_if_clear(channel_id, session.provider)
         return agent
 
+    def _external_terminal_session_closed(self, session: AgentSession) -> bool:
+        if session.provider != Provider.CLAUDE or session.status != SessionStatus.ACTIVE:
+            return False
+        live_target_key = _external_session_live_target_key(session)
+        assigned_key = _external_session_agent_setting_key(session)
+        was_tracked = bool(
+            self.store.get_setting(live_target_key) or self.store.get_setting(assigned_key)
+        )
+        target = self._live_terminal_target(session)
+        if target is not None:
+            self.store.set_setting(live_target_key, str(target.pid))
+            self.store.delete_setting(_external_session_missing_target_key(session))
+            return False
+        if not was_tracked:
+            return False
+        missing_target_key = _external_session_missing_target_key(session)
+        if self.store.get_setting(missing_target_key):
+            return True
+        self.store.set_setting(missing_target_key, utc_now().isoformat())
+        return False
+
+    def _live_terminal_target(self, session: AgentSession):
+        targets = self.terminal_notifier.targets_for_session(session)
+        if len(targets) != 1:
+            return None
+        return targets[0]
+
     def _active_external_agent_ids(
         self,
         active_session_keys: set[str],
@@ -385,7 +419,12 @@ class SessionMirror:
         channel_id: str,
     ) -> None:
         providers_to_refresh: set[Provider] = set()
-        for prefix in (EXTERNAL_SESSION_AGENT_PREFIX, PENDING_EXTERNAL_SESSION_PREFIX):
+        for prefix in (
+            EXTERNAL_SESSION_AGENT_PREFIX,
+            PENDING_EXTERNAL_SESSION_PREFIX,
+            EXTERNAL_SESSION_LIVE_TARGET_PREFIX,
+            EXTERNAL_SESSION_MISSING_TARGET_PREFIX,
+        ):
             for key in list(self.store.list_settings(prefix)):
                 session_key = key.removeprefix(prefix)
                 if session_key in active_session_keys:
@@ -576,6 +615,14 @@ def _external_session_agent_setting_key(session: AgentSession) -> str:
 
 def _external_session_summary_key(session: AgentSession) -> str:
     return f"{EXTERNAL_SESSION_SUMMARY_PREFIX}{_external_session_key(session.provider, session.session_id)}"
+
+
+def _external_session_live_target_key(session: AgentSession) -> str:
+    return f"{EXTERNAL_SESSION_LIVE_TARGET_PREFIX}{_external_session_key(session.provider, session.session_id)}"
+
+
+def _external_session_missing_target_key(session: AgentSession) -> str:
+    return f"{EXTERNAL_SESSION_MISSING_TARGET_PREFIX}{_external_session_key(session.provider, session.session_id)}"
 
 
 def _ignored_external_session_key(session: AgentSession) -> str:

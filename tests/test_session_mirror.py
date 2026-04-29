@@ -16,16 +16,20 @@ class FakeGateway:
         self.replies = []
         self.posts = []
         self.updates = []
+        self.calls = []
 
     def post_message(self, channel_id, text, blocks=None, thread_ts=None):
+        self.calls.append(("post_message", channel_id, text))
         self.posts.append((channel_id, text, blocks, thread_ts))
         ts = f"170.{len(self.posts):06d}"
         return type("Posted", (), {"ts": ts})()
 
     def update_message(self, channel_id, ts, text, blocks=None):
+        self.calls.append(("update_message", channel_id, ts, text))
         self.updates.append((channel_id, ts, text, blocks))
 
     def post_session_parent(self, channel_id, text, persona, icon_url=None, blocks=None):
+        self.calls.append(("post_session_parent", channel_id, text))
         self.parents.append((channel_id, text, persona))
         ts = f"171.{len(self.parents):06d}"
         return type("Posted", (), {"ts": ts})()
@@ -40,6 +44,7 @@ class FakeGateway:
         icon_emoji=None,
         blocks=None,
     ):
+        self.calls.append(("post_thread_reply", thread.channel_id, thread.thread_ts, text))
         self.replies.append((thread, text, persona, username, icon_url))
         ts = f"173.{len(self.replies):06d}"
         return type("Posted", (), {"ts": ts})()
@@ -311,6 +316,88 @@ class SessionMirrorTests(unittest.TestCase):
                     "make the README punchier",
                 )
                 self.assertEqual(gateway.updates, [])
+            finally:
+                store.close()
+
+    def test_new_external_session_is_mirrored_before_existing_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=2, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                existing = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="existing",
+                    transcript_path=Path(tmp) / "existing.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                new = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="new",
+                    transcript_path=Path(tmp) / "new.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                store.set_setting("external_session_agent.codex.existing", agents[0].agent_id)
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "existing",
+                    "T1",
+                    SlackThreadRef("C1", "171.existing", "171.existing"),
+                )
+                existing_provider = FakeProvider(
+                    existing,
+                    [
+                        AgentEvent(
+                            provider=Provider.CODEX,
+                            session_id="existing",
+                            timestamp=None,
+                            event_type="event_msg",
+                            line_number=1,
+                            metadata={
+                                "payload": {
+                                    "type": "agent_message",
+                                    "message": "existing visible",
+                                }
+                            },
+                        )
+                    ],
+                )
+                new_provider = FakeProvider(
+                    new,
+                    [
+                        AgentEvent(
+                            provider=Provider.CODEX,
+                            session_id="new",
+                            timestamp=None,
+                            event_type="event_msg",
+                            line_number=1,
+                            metadata={
+                                "payload": {"type": "agent_message", "message": "new visible"}
+                            },
+                        )
+                    ],
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [existing_provider, new_provider],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.calls[0][0], "post_session_parent")
+                self.assertEqual(
+                    gateway.calls[1], ("post_thread_reply", "C1", "171.000001", "new visible")
+                )
+                self.assertEqual(
+                    gateway.calls[3],
+                    ("post_thread_reply", "C1", "171.existing", "existing visible"),
+                )
             finally:
                 store.close()
 
@@ -1315,6 +1402,75 @@ class SessionMirrorTests(unittest.TestCase):
                 mirror.sync_once()
 
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+            finally:
+                store.close()
+
+    def test_closed_live_claude_terminal_frees_assigned_agent_without_exit_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=0, claude_count=1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                )
+                notifier = FakeTerminalNotifier(
+                    [
+                        TerminalTarget(
+                            pid=123,
+                            tty="ttys001",
+                            cwd=Path(tmp),
+                            command=(
+                                "claude --dangerously-load-development-channels server:slackgentic"
+                            ),
+                        )
+                    ]
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([session], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=notifier,
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(store.get_setting("external_session_live_target.claude.s1"), "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+
+                notifier.targets = []
+                mirror.sync_once()
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agents[0].agent_id,
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
+                self.assertIsNone(store.get_setting("external_session_live_target.claude.s1"))
+                self.assertIsNone(store.get_setting("external_session_missing_target.claude.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
+                )
                 self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
             finally:
                 store.close()

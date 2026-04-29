@@ -697,6 +697,8 @@ class Store:
         for prefix in (
             "external_session_agent.",
             "external_session_pending.",
+            "external_session_live_target.",
+            "external_session_missing_target.",
             "external_session_summary.",
             "session_channel_notice.",
         ):
