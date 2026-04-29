@@ -238,13 +238,60 @@ class SlackGateway:
         channel_id: str,
         thread_ts: str,
         limit: int = 20,
+        oldest: str | None = None,
     ) -> list[dict[str, Any]]:
-        response = self.client.conversations_replies(
-            channel=channel_id,
-            ts=thread_ts,
-            limit=limit,
-        )
-        return list(response.get("messages") or [])
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        remaining = max(1, limit)
+        while remaining > 0:
+            kwargs: dict[str, Any] = {
+                "channel": channel_id,
+                "ts": thread_ts,
+                "limit": min(remaining, 200),
+            }
+            if oldest:
+                kwargs["oldest"] = oldest
+                kwargs["inclusive"] = False
+            if cursor:
+                kwargs["cursor"] = cursor
+            response = self.client.conversations_replies(**kwargs)
+            page = list(response.get("messages") or [])
+            messages.extend(page)
+            remaining -= len(page)
+            metadata = response.get("response_metadata") or {}
+            cursor = metadata.get("next_cursor")
+            if not cursor or not page:
+                break
+        return messages
+
+    def channel_messages(
+        self,
+        channel_id: str,
+        oldest: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        remaining = max(1, limit)
+        while remaining > 0:
+            kwargs: dict[str, Any] = {
+                "channel": channel_id,
+                "limit": min(remaining, 200),
+            }
+            if oldest:
+                kwargs["oldest"] = oldest
+                kwargs["inclusive"] = False
+            if cursor:
+                kwargs["cursor"] = cursor
+            response = self.client.conversations_history(**kwargs)
+            page = list(response.get("messages") or [])
+            messages.extend(page)
+            remaining -= len(page)
+            metadata = response.get("response_metadata") or {}
+            cursor = metadata.get("next_cursor")
+            if not cursor or not page:
+                break
+        return messages
 
     def update_message(
         self,
