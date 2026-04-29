@@ -1258,9 +1258,11 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertTrue(handled)
-                self.assertNotIn("specific agent is busy", gateway.thread_replies[-1]["text"])
+                self.assertEqual(gateway.thread_replies, [])
                 self.assertEqual(len(runtime.started), 1)
                 task, agent, thread = runtime.started[0]
+                self.assertEqual(task.task_id, original.task_id)
+                self.assertIn("this better", task.prompt)
                 self.assertEqual(agent.handle, "cruz")
                 self.assertEqual(thread.thread_ts, "171.thread")
                 self.assertEqual(task.session_provider, Provider.CLAUDE)
@@ -2378,17 +2380,15 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 tasks = store.list_agent_tasks(include_done=True)
-                self.assertEqual(len(tasks), 3)
-                self.assertEqual(tasks[-1].agent_id, parent_task.agent_id)
-                self.assertEqual(tasks[-1].prompt, "reply with DELEGATED_OK")
-                self.assertIn("DELEGATED_OK", tasks[-1].metadata["thread_context"])
+                self.assertEqual(len(tasks), 2)
                 self.assertEqual(len(runtime.started), 3)
+                continued_task = runtime.started[-1][0]
+                self.assertEqual(continued_task.task_id, parent_task.task_id)
+                self.assertEqual(continued_task.agent_id, parent_task.agent_id)
+                self.assertEqual(continued_task.prompt, "reply with DELEGATED_OK")
+                self.assertIn("DELEGATED_OK", continued_task.metadata["thread_context"])
                 self.assertIn(
                     f"@{codex_agent.handle}, please reply with DELEGATED_OK",
-                    gateway.thread_replies[-2]["text"],
-                )
-                self.assertIn(
-                    f"@{reviewer.handle}",
                     gateway.thread_replies[-1]["text"],
                 )
                 self.assertNotIn("for <@U1>", gateway.thread_replies[-1]["text"])
@@ -2540,11 +2540,121 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 tasks = store.list_agent_tasks(include_done=True)
-                self.assertEqual(len(tasks), 3)
-                followup = tasks[-1]
+                self.assertEqual(len(tasks), 2)
+                followup = runtime.started[-1][0]
+                self.assertEqual(followup.task_id, parent_task.task_id)
                 self.assertEqual(followup.agent_id, original.agent_id)
                 self.assertIn("Continue the original task", followup.prompt)
                 self.assertIn("test coverage", followup.metadata["thread_context"])
+            finally:
+                store.close()
+
+    def test_give_it_back_to_named_agent_survives_review_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(1, 2)
+                claude_agents = [
+                    agent for agent in agents if agent.provider_preference == Provider.CLAUDE
+                ]
+                codex_agent = next(
+                    agent for agent in agents if agent.provider_preference == Provider.CODEX
+                )
+                mika = replace(claude_agents[0], handle="mika", full_name="Mika Dlamini")
+                owen = replace(claude_agents[1], handle="owen", full_name="Owen Kowalski")
+                evan = replace(codex_agent, handle="evan", full_name="Evan Silva")
+                for agent in (mika, owen, evan):
+                    store.upsert_team_agent(agent)
+                original_task = replace(
+                    create_agent_task(
+                        mika,
+                        "hi",
+                        "C1",
+                        requested_by_slack_user="U1",
+                    ),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CLAUDE,
+                    session_id="claude-mika",
+                )
+                store.upsert_agent_task(original_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": (
+                                "somebody help @mika do a better job at a greeting. "
+                                "Then ask somebody else to improve it further. "
+                                "Then give it back to mika"
+                            ),
+                            "ts": "171.000002",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                helper_task = store.list_agent_tasks(include_done=True)[-1]
+                helper = store.get_team_agent(helper_task.agent_id)
+                self.assertIsNotNone(helper)
+                self.assertNotEqual(helper_task.agent_id, mika.agent_id)
+                self.assertEqual(helper_task.metadata["delegate_to_agent_id"], mika.agent_id)
+                self.assertIn("Slack thread context", helper_task.metadata["delegate_prompt"])
+
+                handled = controller.handle_runtime_agent_message(
+                    helper_task,
+                    helper,
+                    SlackThreadRef("C1", "171.thread"),
+                    "somebody review this improved greeting for @mika",
+                )
+
+                self.assertTrue(handled)
+                review_task = store.list_agent_tasks(include_done=True)[-1]
+                reviewer = store.get_team_agent(review_task.agent_id)
+                self.assertIsNotNone(reviewer)
+                self.assertEqual(review_task.metadata["delegate_to_agent_id"], mika.agent_id)
+                self.assertIn("Slack thread context", review_task.metadata["delegate_prompt"])
+
+                reviewer_text = "Here's a warmer version.\n\n@mika - over to you."
+                gateway.post_thread_reply(
+                    SlackThreadRef("C1", "171.thread"),
+                    reviewer_text,
+                    persona=reviewer,
+                )
+                handled = controller.handle_runtime_agent_message(
+                    review_task,
+                    reviewer,
+                    SlackThreadRef("C1", "171.thread"),
+                    reviewer_text,
+                )
+
+                self.assertFalse(handled)
+                self.assertEqual(len(store.list_agent_tasks(include_done=True)), 3)
+
+                controller.handle_runtime_task_done(
+                    review_task,
+                    reviewer,
+                    SlackThreadRef("C1", "171.thread"),
+                )
+
+                self.assertEqual(len(store.list_agent_tasks(include_done=True)), 3)
+                continued_task, continued_agent, _ = runtime.started[-1]
+                self.assertEqual(continued_task.task_id, original_task.task_id)
+                self.assertEqual(continued_agent.agent_id, mika.agent_id)
+                self.assertIn("Continue the original task", continued_task.prompt)
+                self.assertIn("warmer version", continued_task.metadata["thread_context"])
             finally:
                 store.close()
 
@@ -2676,9 +2786,11 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 tasks = store.list_agent_tasks(include_done=True)
-                self.assertEqual(len(tasks), 3)
-                self.assertEqual(tasks[-1].agent_id, original.agent_id)
-                self.assertIn("Continue the original task", tasks[-1].prompt)
+                self.assertEqual(len(tasks), 2)
+                followup = runtime.started[-1][0]
+                self.assertEqual(followup.task_id, parent_task.task_id)
+                self.assertEqual(followup.agent_id, original.agent_id)
+                self.assertIn("Continue the original task", followup.prompt)
             finally:
                 store.close()
 
@@ -2848,12 +2960,14 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertTrue(handled)
                 tasks = store.list_agent_tasks(include_done=True)
-                followup = tasks[-1]
+                self.assertEqual(len(tasks), 2)
+                self.assertEqual(len(runtime.started), 1)
+                followup, agent, _ = runtime.started[0]
+                self.assertEqual(followup.task_id, mina_task.task_id)
                 self.assertEqual(followup.agent_id, mina.agent_id)
                 self.assertEqual(followup.session_id, "claude-session-mina")
                 self.assertIn("say it like a person", followup.prompt)
-                self.assertEqual(len(runtime.started), 1)
-                self.assertEqual(runtime.started[0][1].handle, "minaa")
+                self.assertEqual(agent.handle, "minaa")
             finally:
                 store.close()
 

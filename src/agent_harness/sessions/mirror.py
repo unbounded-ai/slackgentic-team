@@ -397,7 +397,7 @@ class SessionMirror:
         return agent
 
     def _external_terminal_session_closed(self, session: AgentSession) -> bool:
-        if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
+        if session.provider != Provider.CLAUDE:
             return False
         if session.status != SessionStatus.ACTIVE:
             return False

@@ -110,6 +110,18 @@ CAPACITY_MESSAGE = (
     "automatically."
 )
 CLAUDE_EXTERNAL_COMMAND = "claude --dangerously-load-development-channels server:slackgentic"
+REVIEW_DELEGATE_PROMPT = (
+    "Continue the original task using @{sender_handle}'s review above. "
+    "Address any required changes, then give the user the final result "
+    "or a concise status update. If no changes are needed, say so."
+)
+REVIEW_DELEGATE_VISIBLE_PROMPT = "continue using my review above."
+THREAD_CONTEXT_DELEGATE_PROMPT = (
+    "Continue the original task using the Slack thread context above. "
+    "Address any required changes, then give the user the final result "
+    "or a concise status update. If no changes are needed, say so."
+)
+THREAD_CONTEXT_DELEGATE_VISIBLE_PROMPT = "continue using the thread context above."
 
 
 @dataclass(frozen=True)
@@ -1267,13 +1279,19 @@ class SlackTeamController:
         if request is None:
             return False
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
-        metadata["delegate_to_agent_id"] = agent.agent_id
-        metadata["delegate_prompt"] = (
-            "Continue the original task using @{sender_handle}'s review above. "
-            "Address any required changes, then give the user the final result "
-            "or a concise status update. If no changes are needed, say so."
-        )
-        metadata["delegate_visible_prompt"] = "continue using my review above."
+        delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
+        if not isinstance(delegate_to_agent_id, str):
+            delegate_to_agent_id = agent.agent_id
+        metadata["delegate_to_agent_id"] = delegate_to_agent_id
+        delegate_prompt = task.metadata.get("delegate_prompt")
+        if not isinstance(delegate_prompt, str) or not delegate_prompt.strip():
+            delegate_prompt = REVIEW_DELEGATE_PROMPT
+        metadata["delegate_prompt"] = delegate_prompt
+        delegate_visible_prompt = task.metadata.get("delegate_visible_prompt")
+        if isinstance(delegate_visible_prompt, str) and delegate_visible_prompt.strip():
+            metadata["delegate_visible_prompt"] = delegate_visible_prompt
+        else:
+            metadata["delegate_visible_prompt"] = REVIEW_DELEGATE_VISIBLE_PROMPT
         result = assign_work_request(
             self.store,
             request,
@@ -1351,14 +1369,12 @@ class SlackTeamController:
             thread.thread_ts,
         )
         if same_thread_task is not None:
-            return self._start_same_thread_agent_followup(
+            return self._continue_same_thread_agent_task(
                 request,
+                same_thread_task,
                 target_agent,
                 thread,
                 requested_by_slack_user=task.requested_by_slack_user,
-                author_agent=agent,
-                context_task=same_thread_task,
-                sender_agent=agent,
             )
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
         metadata["delegated_from_task_id"] = task.task_id
@@ -1568,6 +1584,33 @@ class SlackTeamController:
             self.runtime.start_task(task, agent, thread)
         return True
 
+    def _continue_same_thread_agent_task(
+        self,
+        request: WorkRequest,
+        previous_task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        *,
+        requested_by_slack_user: str | None,
+        request_message_ts: str | None = None,
+    ) -> bool:
+        if self.runtime and self.runtime.send_to_task(previous_task.task_id, request.prompt):
+            return True
+        metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
+        if request_message_ts:
+            metadata["request_message_ts"] = request_message_ts
+        task = replace(
+            previous_task,
+            prompt=request.prompt,
+            status=AgentTaskStatus.ACTIVE,
+            requested_by_slack_user=requested_by_slack_user
+            or previous_task.requested_by_slack_user,
+            metadata=metadata,
+        )
+        if not self.runtime:
+            return True
+        return self.runtime.start_task(task, agent, thread)
+
     def _latest_task_for_agent_thread(
         self,
         agent_id: str,
@@ -1637,6 +1680,26 @@ class SlackTeamController:
             assignment_mode=AssignmentMode.SPECIFIC,
             requested_handle=target_agent.handle,
         )
+        target_previous_task = self._latest_task_for_agent_thread(
+            target_agent.agent_id,
+            thread.channel_id,
+            thread.thread_ts,
+        )
+        if target_previous_task is not None:
+            self.gateway.post_thread_reply(
+                thread,
+                format_agent_handoff_request(agent, target_agent, visible_prompt),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            if self._continue_same_thread_agent_task(
+                request,
+                target_previous_task,
+                target_agent,
+                thread,
+                requested_by_slack_user=task.requested_by_slack_user,
+            ):
+                return
         result = assign_work_request(
             self.store,
             request,
@@ -1647,11 +1710,6 @@ class SlackTeamController:
         )
         if result is None:
             return
-        target_previous_task = self._latest_task_for_agent_thread(
-            target_agent.agent_id,
-            thread.channel_id,
-            thread.thread_ts,
-        )
         delegated_task = self._task_with_prior_session(result.task, target_previous_task)
         self.store.upsert_agent_task(delegated_task)
         self.gateway.post_thread_reply(
@@ -2358,6 +2416,23 @@ def _thread_delegation_intent(
 
 def _explicit_agent_delegation_intent(text: str, agent) -> ThreadDelegationIntent | None:
     handle = re.escape(agent.handle)
+    back_patterns = [
+        rf"\b(?:give|hand|pass|send)\s+(?:it|this|the\s+(?:task|work|result|thread))\s+back\s+to\s+@?{handle}(?:\s+to\s+(?P<prompt>.+))?",
+        rf"\breturn\s+(?:it|this|the\s+(?:task|work|result|thread))\s+to\s+@?{handle}(?:\s+to\s+(?P<prompt>.+))?",
+    ]
+    for pattern in back_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        prompt = (match.groupdict().get("prompt") or "").strip()
+        if prompt:
+            return ThreadDelegationIntent(agent.agent_id, prompt)
+        return ThreadDelegationIntent(
+            target_agent_id=agent.agent_id,
+            prompt_template=THREAD_CONTEXT_DELEGATE_PROMPT,
+            visible_prompt_template=THREAD_CONTEXT_DELEGATE_VISIBLE_PROMPT,
+        )
+
     exact_patterns = [
         rf"\b(?:ask|tell|have)\s+@?{handle}\s+to\s+(?P<prompt>.+)",
         rf"\bgive\s+@?{handle}\s+(?:a\s+)?task\s+to\s+(?P<prompt>.+)",

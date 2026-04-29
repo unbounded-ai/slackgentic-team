@@ -652,7 +652,7 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_tracked_codex_session_is_freed_when_terminal_disappears(self):
+    def test_tracked_codex_session_is_not_freed_when_terminal_disappears(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
@@ -690,12 +690,20 @@ class SessionMirrorTests(unittest.TestCase):
                 mirror.sync_once()
                 mirror.sync_once()
 
-                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
-                self.assertEqual(store.get_session(Provider.CODEX, "s1").status, SessionStatus.DONE)
                 self.assertEqual(
-                    [reply[1] for reply in gateway.replies], ["Session ended; freed up this agent."]
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
                 )
-                self.assertEqual(refreshed_channels, ["C1"])
+                self.assertEqual(
+                    store.get_setting("external_session_live_target.codex.s1"),
+                    "123",
+                )
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "s1").status,
+                    SessionStatus.ACTIVE,
+                )
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, [])
             finally:
                 store.close()
 
