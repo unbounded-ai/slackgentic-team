@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
     AgentSession,
     AgentTask,
     AgentTaskKind,
@@ -506,6 +507,9 @@ class Store:
         exclude_agent_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
     ) -> PendingWorkRequest:
         now = utc_now()
+        metadata = dict(extra_metadata or {})
+        if request.dangerous_mode:
+            metadata[DANGEROUS_MODE_METADATA_KEY] = True
         pending = PendingWorkRequest(
             pending_id=f"pending_{uuid.uuid4().hex[:12]}",
             channel_id=thread.channel_id,
@@ -514,7 +518,7 @@ class Store:
             request=request,
             requested_by_slack_user=requested_by_slack_user,
             author_agent_id=author_agent.agent_id if author_agent else None,
-            extra_metadata=dict(extra_metadata or {}),
+            extra_metadata=metadata,
             exclude_agent_ids=tuple(sorted(exclude_agent_ids or ())),
             status=PendingWorkRequestStatus.PENDING,
             created_at=now,

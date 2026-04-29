@@ -116,6 +116,17 @@ Specific agent:
 @riley do update the README with install steps
 ```
 
+Dangerous mode for one managed task:
+
+```text
+#dangerous-mode @riley repair the local service installer
+```
+
+Slackgentic strips the tag from the prompt, launches that task with Codex
+`--dangerously-bypass-approvals-and-sandbox` or Claude
+`--dangerously-skip-permissions`, and marks active dangerous-mode tasks on the
+roster.
+
 PR review:
 
 ```text

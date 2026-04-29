@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
     AgentSession,
     AgentTaskStatus,
     AssignmentMode,
@@ -360,13 +361,18 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "write a tiny validation note",
+                            "text": "#dangerous-mode write a tiny validation note",
                             "ts": "171.000001",
                         }
                     }
                 )
 
                 self.assertEqual(len(store.list_pending_work_requests()), 1)
+                self.assertTrue(
+                    store.list_pending_work_requests()[0].extra_metadata[
+                        DANGEROUS_MODE_METADATA_KEY
+                    ]
+                )
                 self.assertIn(
                     "resume this thread automatically",
                     gateway.thread_replies[-1]["text"],
@@ -387,6 +393,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(runtime.started), 1)
                 task, agent, thread = runtime.started[0]
                 self.assertEqual(task.prompt, "write a tiny validation note")
+                self.assertTrue(task.metadata[DANGEROUS_MODE_METADATA_KEY])
                 self.assertEqual(agent.provider_preference, Provider.CODEX)
                 self.assertEqual(thread.thread_ts, "171.000001")
                 self.assertTrue(
@@ -487,6 +494,29 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
                 self.assertIn("Free up", blocks)
                 self.assertIn("Available", blocks)
+            finally:
+                store.close()
+
+    def test_roster_marks_dangerous_mode_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "rewrite installer", "C1"),
+                    metadata={DANGEROUS_MODE_METADATA_KEY: True},
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("Queued: Dangerous mode: Slack task: rewrite installer", blocks)
             finally:
                 store.close()
 
@@ -1165,6 +1195,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("/slackgentic-ilshat <command>", text)
                 self.assertIn("/slackgentic-ilshat hire 3 agents", text)
                 self.assertIn("or just `status`", text)
+                self.assertIn("#dangerous-mode", text)
                 self.assertIn("Codex outside Slack", text)
                 self.assertIn("Claude outside Slack", text)
                 self.assertIn("slackgentic claude-channel --install", text)
@@ -1172,6 +1203,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("Write anything in this channel", blocks)
                 self.assertIn("type them directly in this channel", blocks)
                 self.assertIn("Thread subtasks", blocks)
+                self.assertIn("Dangerous mode", blocks)
                 self.assertIn("Sessions started outside Slack", blocks)
                 self.assertIn("slackgentic claude-channel --install", blocks)
                 self.assertIn(("C1", gateway.posts[-1]["ts"]), gateway.pins)
@@ -1385,6 +1417,44 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].thread_ts, "171.000001")
                 self.assertEqual(gateway.thread_replies[0]["thread"].thread_ts, "171.000001")
                 self.assertIn(("C1", "171.000001", "hourglass_flowing_sand"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_channel_work_request_accepts_dangerous_mode_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "#dangerous-mode Update the README",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks()
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].prompt, "Update the README")
+                self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
+                started_task, _, _ = runtime.started[0]
+                self.assertTrue(started_task.metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertNotIn("#dangerous-mode", gateway.thread_replies[0]["text"])
             finally:
                 store.close()
 
@@ -3617,12 +3687,13 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "Somebody summarize pyproject",
+                            "text": "#dangerous-mode Somebody summarize pyproject",
                             "ts": "171.000001",
                         }
                     }
                 )
                 parent_task = store.list_agent_tasks(include_done=True)[0]
+                self.assertTrue(parent_task.metadata[DANGEROUS_MODE_METADATA_KEY])
                 store.update_agent_task_status(parent_task.task_id, AgentTaskStatus.DONE)
                 resolved_task = store.get_agent_task(parent_task.task_id)
                 self.assertIsNotNone(resolved_task)
@@ -3650,6 +3721,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].prompt, "let's do it!")
                 self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
                 self.assertEqual(tasks[0].thread_ts, parent_task.thread_ts)
+                self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
                 self.assertEqual(len(runtime.started), 2)
                 self.assertEqual(runtime.started[-1][0].task_id, parent_task.task_id)
                 self.assertEqual(len(gateway.updates), 1)

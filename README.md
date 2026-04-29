@@ -97,6 +97,7 @@ Start work by typing in the agent channel:
 Inspect the repo and summarize the test command
 @riley update the README with install steps
 Somebody review @riley's PR https://github.com/org/repo/pull/42
+#dangerous-mode @riley repair the local service installer
 ```
 
 Slackgentic reacts right away, replies in your thread, launches the selected
@@ -107,6 +108,11 @@ In the main channel, write anything to hand it to an available agent. Use
 `@agentname ...` when you want a specific agent. Inside a task thread, reply
 with `somebody ...` to bring in another agent for a subtask; the original agent
 then picks the thread back up with that new context.
+
+Add `#dangerous-mode` to a task when you want that managed agent process to run
+with Codex `--dangerously-bypass-approvals-and-sandbox` or Claude
+`--dangerously-skip-permissions`. Slackgentic strips the tag from the task
+prompt and marks active dangerous-mode tasks on the roster.
 
 ### Thread = Context Boundary
 

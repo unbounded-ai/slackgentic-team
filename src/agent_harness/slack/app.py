@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agent_harness.config import AppConfig, load_config_from_env
 from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
     AgentTask,
     AgentTaskStatus,
     AssignmentMode,
@@ -97,6 +98,7 @@ from agent_harness.team.routing import (
     canonicalize_agent_mentions,
     parse_lightweight_handles,
     parse_work_request,
+    strip_dangerous_mode_tag,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -595,9 +597,10 @@ class SlackTeamController:
             if task is None:
                 continue
             label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Occupied"
+            detail_prefix = "Dangerous mode: " if _task_dangerous_mode(task) else ""
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
-                f"Slack task: {_shorten(task.prompt, 140)}",
+                f"{detail_prefix}Slack task: {_shorten(task.prompt, 140)}",
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
                 task_id=task.task_id,
             )
@@ -736,6 +739,11 @@ class SlackTeamController:
                     "In a task thread, reply with `somebody ...` to bring in "
                     "another agent for a subtask; the original agent picks it "
                     "back up with the added context."
+                ),
+                (
+                    "Add `#dangerous-mode` to a task to launch that agent with "
+                    "Codex no-sandbox/no-approval mode or Claude skip-permissions. "
+                    "The roster marks active dangerous-mode tasks."
                 ),
                 (
                     "Run commands by typing them directly in this channel, "
@@ -1704,6 +1712,8 @@ class SlackTeamController:
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         if request_message_ts:
             metadata["request_message_ts"] = request_message_ts
+        if request.dangerous_mode or _task_dangerous_mode(previous_task):
+            metadata[DANGEROUS_MODE_METADATA_KEY] = True
         task = replace(
             previous_task,
             prompt=request.prompt,
@@ -2456,6 +2466,10 @@ def _shorten(value: str, limit: int) -> str:
     return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
 
 
+def _task_dangerous_mode(task: AgentTask) -> bool:
+    return bool(task.metadata.get(DANGEROUS_MODE_METADATA_KEY))
+
+
 def _parse_work_request_for_agents(
     text: str,
     agents,
@@ -2478,7 +2492,8 @@ def _multi_specific_work_requests(
 ) -> list[WorkRequest]:
     known_handles = [agent.handle for agent in agents]
     for candidate in _routing_text_candidates(text, split_newlines=split_newlines):
-        canonical_text = canonicalize_agent_mentions(candidate, agents)
+        stripped_candidate, dangerous_mode = strip_dangerous_mode_tag(candidate)
+        canonical_text = canonicalize_agent_mentions(stripped_candidate, agents)
         parsed = _multi_specific_prompt(canonical_text, set(known_handles))
         if parsed is None:
             continue
@@ -2489,6 +2504,8 @@ def _multi_specific_work_requests(
         for handle in ordered_handles:
             request = parse_work_request(f"@{handle} {prompt}", known_handles)
             if request is not None and request.assignment_mode == AssignmentMode.SPECIFIC:
+                if dangerous_mode and not request.dangerous_mode:
+                    request = replace(request, dangerous_mode=True)
                 requests.append(request)
         if len(requests) >= 2:
             return requests

@@ -6,7 +6,13 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
-from agent_harness.models import AgentTaskKind, AgentTaskStatus, Provider, SlackThreadRef
+from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
+    AgentTaskKind,
+    AgentTaskStatus,
+    Provider,
+    SlackThreadRef,
+)
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
     ManagedTaskRuntime,
@@ -514,6 +520,36 @@ class TaskRuntimeTests(unittest.TestCase):
                     if current and current.status == AgentTaskStatus.ACTIVE:
                         break
                     time.sleep(0.01)
+            finally:
+                store.close()
+
+    def test_runtime_uses_task_dangerous_mode_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                return OneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "rewrite the installer", "C1")
+                task = replace(task, metadata={DANGEROUS_MODE_METADATA_KEY: True})
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(requests[0].dangerous)
             finally:
                 store.close()
 
