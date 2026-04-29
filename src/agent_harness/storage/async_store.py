@@ -6,7 +6,7 @@ from pathlib import Path
 import aiosqlite
 
 from agent_harness.models import AgentSession
-from agent_harness.store import SCHEMA
+from agent_harness.storage.store import SCHEMA
 
 
 class AsyncStore:
@@ -20,7 +20,7 @@ class AsyncStore:
         self.conn.row_factory = aiosqlite.Row
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, _exc_type, _exc, _tb) -> None:
         if self.conn:
             await self.conn.close()
 

@@ -16,14 +16,82 @@ from agent_harness.models import (
     WorkRequest,
     utc_now,
 )
-from agent_harness.personas import COLORS
 
-DEFAULT_TEAM_SIZE = 10
-DEFAULT_CODEX_TEAM_SIZE = 5
-DEFAULT_CLAUDE_TEAM_SIZE = 5
+DEFAULT_TEAM_SIZE = 2
+DEFAULT_CODEX_TEAM_SIZE = 1
+DEFAULT_CLAUDE_TEAM_SIZE = 1
 DEFAULT_TEAM_SEED = "slackgentic-team"
 DEFAULT_AVATAR_BANK_SIZE = 500
+MAX_TEAM_AGENTS = 500
+AGENT_LIMIT_MESSAGE = "You definitely do not need that many agents."
 HANDLE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+AGENT_CONTEXT_PLACEHOLDER = "outside-work context"
+
+COLORS = [
+    "#2457a6",
+    "#1c7c54",
+    "#8f4d12",
+    "#7a3b8f",
+    "#b53d4d",
+    "#0f766e",
+    "#71501d",
+    "#315f72",
+    "#7c5caa",
+    "#a4472f",
+]
+
+OUTSIDE_WORK_INTERESTS = [
+    "bakes sourdough with handwritten fermentation notes",
+    "plays pickup futsal before sunrise",
+    "collects vintage transit maps",
+    "restores mechanical keyboards",
+    "hosts tiny dinner parties around regional noodle dishes",
+    "keeps a notebook of obscure jazz organ records",
+    "does long-distance open-water swimming",
+    "paints small gouache studies of storefront signs",
+    "builds modular-synth patches on weekends",
+    "learns card magic from old library books",
+    "repairs espresso machines for friends",
+    "runs a neighborhood film-club spreadsheet",
+    "throws pottery bowls with uneven glazes",
+    "studies abandoned railway stations",
+    "plays table tennis with a defensive chopping style",
+    "makes hot sauce from balcony-grown peppers",
+    "collects matchbooks from closed restaurants",
+    "practices bebop lines on a tenor sax",
+    "designs tiny crossword puzzles",
+    "keeps scorecards from minor-league baseball games",
+    "learns folk dances from archival videos",
+    "roasts coffee in small batches",
+    "maps city staircases during weekend walks",
+    "builds elaborate playlists for road trips",
+    "restores mid-century desk lamps",
+    "cooks one regional dumpling recipe at a time",
+    "plays curling in a late-night league",
+    "binds notebooks by hand",
+    "takes black-and-white photos of old signage",
+    "studies chess endgames on paper boards",
+    "makes zines about local history",
+    "practices calligraphy with fountain pens",
+    "tracks every ramen shop visited in a ledger",
+    "plays drums in a garage surf-rock band",
+    "forages for edible plants with a field guide",
+    "collects library stamps in used books",
+    "builds miniature room dioramas",
+    "keeps a personal museum of obsolete connectors",
+    "runs a monthly soup swap",
+    "learns lockpicking as a puzzle hobby",
+    "plays ultimate frisbee on windy fields",
+    "records ambient sounds from train platforms",
+    "makes cyanotype prints",
+    "studies map projections for fun",
+    "cooks elaborate breakfasts on cast iron",
+    "plays bocce in a neighborhood league",
+    "repairs fountain pens",
+    "collects regional potato-chip flavors",
+    "learns harmonica standards",
+    "keeps a spreadsheet of hiking trail sandwiches",
+]
 
 GENERATED_FIRST_NAMES = [
     "Taylor",
@@ -333,218 +401,134 @@ ROLE_PROFILES = [
     RoleProfile(
         full_name="Avery Chen",
         handle="avery",
-        role="Concise Coordinator",
-        personality="crisp, steady, and careful about naming the next action",
-        voice="brief and structured, with explicit owners and next steps",
-        unique_strength="turn ambiguous Slack threads into crisp options and handoffs",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("eyes", "white_check_mark", "memo", "thinking_face"),
-        backstory=(
-            "Avery is a generalist engineer who keeps busy Slack threads moving by "
-            "summarizing options, owners, and next steps."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Avery Chen, "
-            "friendly focused expression, clean modern tech-workspace feel, cobalt "
-            "accent, simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Jordan Reed",
         handle="jordan",
-        role="Evidence Narrator",
-        personality="observant, factual, and careful about uncertainty",
-        voice="plain, evidence-led, and specific about what changed",
-        unique_strength="summarize what was tried, what changed, and what remains uncertain",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("test_tube", "white_check_mark", "mag", "memo"),
-        backstory=(
-            "Jordan is a generalist engineer who keeps decisions grounded by narrating "
-            "the evidence behind them."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Jordan Reed, "
-            "calm expression, subtle notebook and status-light feel, green accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Morgan Patel",
         handle="morgan",
-        role="Context Mapper",
-        personality="thoughtful, patient, and explicit about assumptions",
-        voice="context-first, calm, and concise once the thread is mapped",
-        unique_strength="name assumptions and thread history before making decisions",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("world_map", "eyes", "memo", "thinking_face"),
-        backstory=(
-            "Morgan is a generalist engineer who helps teams avoid rework by making "
-            "the relevant thread history easy to scan."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Morgan Patel, "
-            "thoughtful expression, simple map-line background motif, teal accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Riley Shaw",
         handle="riley",
-        role="Tradeoff Framer",
-        personality="direct, pragmatic, and comfortable with decision points",
-        voice="balanced and concrete, with practical tradeoffs up front",
-        unique_strength="make decision points explicit without slowing the work down",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("balance_scale", "thinking_face", "eyes", "white_check_mark"),
-        backstory=(
-            "Riley is a generalist engineer who keeps Slack decisions crisp by naming "
-            "tradeoffs and the path that best fits the user's goal."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Riley Shaw, "
-            "direct confident expression, balanced geometric shapes, red accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Casey Kim",
         handle="casey",
-        role="Checklist Closer",
-        personality="orderly, focused, and careful about visible handoffs",
-        voice="short and checklist-oriented, with clear completion criteria",
-        unique_strength="keep busy threads orderly with short checklists and visible handoffs",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("clipboard", "white_check_mark", "memo", "eyes"),
-        backstory=(
-            "Casey is a generalist engineer who reduces thread drift by turning active "
-            "work into short checklists and clear closure notes."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Casey Kim, "
-            "focused expression, tidy checklist motif, amber accent, simple graphic "
-            "background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Harper Diaz",
         handle="harper",
-        role="User-Language Translator",
-        personality="warm, pragmatic, and protective of user intent",
-        voice="clear and implementation-ready, without losing the user's wording",
-        unique_strength="preserve user intent while restating work in actionable language",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("speech_balloon", "bulb", "memo", "sparkles"),
-        backstory=(
-            "Harper is a generalist engineer who keeps implementation work aligned "
-            "with the user's actual words and priorities."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Harper Diaz, "
-            "warm focused expression, subtle speech-bubble motif, purple accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Quinn Bennett",
         handle="quinn",
-        role="Clarifying Questioner",
-        personality="curious, restrained, and careful not to over-ask",
-        voice="one-question-at-a-time, precise, and easy to answer",
-        unique_strength="ask one pointed clarifying question when scope is unclear",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("question", "thinking_face", "eyes", "memo"),
-        backstory=(
-            "Quinn is a generalist engineer who keeps scope clear by asking the one "
-            "question that changes the implementation path."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Quinn Bennett, "
-            "approachable focused expression, small question-mark motif, blue-green "
-            "accent, simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Rowan Stone",
         handle="rowan",
-        role="Decision Recorder",
-        personality="composed, precise, and good at closing loops",
-        voice="calm and final-state-oriented, with decisions captured plainly",
-        unique_strength="capture decisions after debate and leave a clear next action",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("pushpin", "memo", "white_check_mark", "eyes"),
-        backstory=(
-            "Rowan is a generalist engineer who helps teams move on by writing down "
-            "what was decided and what happens next."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Rowan Stone, "
-            "composed expression, subtle document-pin motif, slate and gold accents, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Cameron Lin",
         handle="cameron",
-        role="Terse Operator",
-        personality="focused, practical, and mindful of Slack noise",
-        voice="compact and status-heavy, expanding only when useful",
-        unique_strength="post compact progress notes when direction changes or blockers appear",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("rocket", "construction", "white_check_mark", "hourglass_flowing_sand"),
-        backstory=(
-            "Cameron is a generalist engineer who keeps active work visible with "
-            "short progress notes and minimal ceremony."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Cameron Lin, "
-            "sharp modern expression, minimal terminal/status motif, orange accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Sage Carter",
         handle="sage",
-        role="Confidence Reporter",
-        personality="measured, transparent, and careful with confidence",
-        voice="concise and explicit about verification status",
-        unique_strength="state confidence and verification status without overstating certainty",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("gauge", "test_tube", "white_check_mark", "thinking_face"),
-        backstory=(
-            "Sage is a generalist engineer who makes progress reports more useful by "
-            "separating facts, confidence, and remaining uncertainty."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Sage Carter, "
-            "measured expression, subtle gauge/check motif, forest green accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Parker Wells",
         handle="parker",
-        role="Progress Broadcaster",
-        personality="energetic, restrained, and careful about timing updates",
-        voice="brief and momentum-oriented, with updates only when they matter",
-        unique_strength="post small updates when direction changes or blockers appear",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("mega", "rocket", "eyes", "white_check_mark"),
-        backstory=(
-            "Parker is a generalist engineer who keeps collaborators oriented by "
-            "broadcasting meaningful progress changes at the right moments."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Parker Wells, "
-            "energetic but restrained expression, progress-line motif, magenta accent, "
-            "simple graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
     RoleProfile(
         full_name="Dana Hayes",
         handle="dana",
-        role="Dependency Spotter",
-        personality="clear-eyed, patient, and careful about waiting states",
-        voice="dependency-aware and easy to scan",
-        unique_strength="make blockers, dependencies, and waiting states visible",
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=("link", "hourglass_flowing_sand", "eyes", "warning"),
-        backstory=(
-            "Dana is a generalist engineer who keeps handoffs reliable by surfacing "
-            "dependencies and waiting states early."
-        ),
-        avatar_prompt=(
-            "Square Slack avatar, stylized cartoon portrait of Dana Hayes, "
-            "clear-eyed expression, linked-node motif, navy and cyan accents, simple "
-            "graphic background, no text, no logo."
-        ),
+        backstory=AGENT_CONTEXT_PLACEHOLDER,
+        avatar_prompt=AGENT_CONTEXT_PLACEHOLDER,
     ),
 ]
 
@@ -613,6 +597,7 @@ def generate_team_agent(
     provider_preference: Provider | str = Provider.CODEX,
     seed: str = DEFAULT_TEAM_SEED,
     avatar_index: int | None = None,
+    outside_interests: Sequence[str] | None = None,
 ) -> TeamAgent:
     provider = (
         provider_preference
@@ -633,6 +618,8 @@ def generate_team_agent(
     suffix = digest.hex()[:8]
     avatar_slug = str(identity.avatar_index)
     initials = f"{identity.first_name[0]}{identity.last_name[0]}"
+    interests = tuple(outside_interests or _outside_interests_for_digest(digest))
+    personal_context = _personal_context_from_interests(interests)
     return TeamAgent(
         agent_id=f"agent_{suffix}",
         handle=handle,
@@ -641,17 +628,19 @@ def generate_team_agent(
         color_hex=color,
         avatar_slug=avatar_slug,
         icon_emoji=icon_emoji,
-        role=profile.role,
-        personality=profile.personality,
-        voice=profile.voice,
-        unique_strength=profile.unique_strength,
+        role=AGENT_CONTEXT_PLACEHOLDER,
+        personality=AGENT_CONTEXT_PLACEHOLDER,
+        voice=AGENT_CONTEXT_PLACEHOLDER,
+        unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=profile.reaction_names,
         sort_order=sort_order,
         provider_preference=provider,
         hired_at=utc_now(),
         metadata={
             "seed": seed,
-            "backstory": profile.backstory,
+            "backstory": personal_context,
+            "outside_interests": list(interests),
+            "personal_context": personal_context,
             "avatar_prompt": _avatar_prompt(identity.full_name, profile),
             "avatar_path": f"docs/assets/avatars/{avatar_slug}.png",
             "avatar_index": identity.avatar_index,
@@ -667,6 +656,7 @@ def hire_team_agents(
     seed: str = DEFAULT_TEAM_SEED,
     start_sort_order: int | None = None,
     balance_agents: list[TeamAgent] | None = None,
+    avatar_agents: list[TeamAgent] | None = None,
     randomize_identities: bool = False,
     rng: random.Random | random.SystemRandom | None = None,
 ) -> list[TeamAgent]:
@@ -679,11 +669,13 @@ def hire_team_agents(
         else max((agent.sort_order for agent in existing_agents), default=-1) + 1
     )
     represented_agents = balance_agents if balance_agents is not None else existing_agents
+    represented_avatars = avatar_agents if avatar_agents is not None else existing_agents
+    chooser = rng or (random.SystemRandom() if randomize_identities else None)
     avatar_indexes = _avatar_indexes_for_hires(
-        existing_agents,
+        represented_avatars,
         count,
         randomize=randomize_identities,
-        rng=rng,
+        rng=chooser,
     )
     hired: list[TeamAgent] = []
     for offset in range(count):
@@ -698,6 +690,9 @@ def hire_team_agents(
             provider,
             seed,
             avatar_index=avatar_indexes[offset],
+            outside_interests=(
+                _random_outside_interests(chooser) if randomize_identities and chooser else None
+            ),
         )
         used_handles.add(agent.handle)
         hired.append(agent)
@@ -709,6 +704,8 @@ def build_initial_team(
 ) -> list[TeamAgent]:
     if size < 1:
         raise ValueError("team size must be at least 1")
+    if size > MAX_TEAM_AGENTS:
+        raise ValueError(AGENT_LIMIT_MESSAGE)
     codex_count = (size + 1) // 2
     claude_count = size // 2
     return build_initial_model_team(codex_count, claude_count, seed)
@@ -723,6 +720,8 @@ def build_initial_model_team(
         raise ValueError("model-specific team sizes cannot be negative")
     if codex_count + claude_count < 1:
         raise ValueError("team size must be at least 1")
+    if codex_count + claude_count > MAX_TEAM_AGENTS:
+        raise ValueError(AGENT_LIMIT_MESSAGE)
     agents: list[TeamAgent] = []
     for provider, count in ((Provider.CODEX, codex_count), (Provider.CLAUDE, claude_count)):
         if count:
@@ -751,23 +750,35 @@ def team_avatar_svg(agent: TeamAgent, size: int = 256) -> str:
     )
 
 
+def agent_identity_label(agent: TeamAgent) -> str:
+    provider = agent.provider_preference.value if agent.provider_preference else "unmapped"
+    return f"{agent.full_name} [{provider}] @{agent.handle}"
+
+
+def agent_personal_context(agent: TeamAgent) -> str:
+    configured = agent.metadata.get("personal_context")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    interests_value = agent.metadata.get("outside_interests")
+    if isinstance(interests_value, list):
+        interests = tuple(str(item).strip() for item in interests_value if str(item).strip())
+        if len(interests) >= 3:
+            return _personal_context_from_interests(interests[:3])
+    digest = hashlib.sha256(f"{agent.agent_id}:{agent.sort_order}".encode()).digest()
+    return _personal_context_from_interests(_outside_interests_for_digest(digest))
+
+
 def runtime_personality_prompt(agent: TeamAgent) -> str:
     return (
         f"You are {agent.full_name}, known in Slack as @{agent.handle}. "
-        f"Your role is {agent.role}. Your personality is {agent.personality}. "
-        f"Your voice is {agent.voice}. Your distinctive strength is that you "
-        f"{agent.unique_strength}. Keep work updates useful, concrete, and aligned "
-        "with this persona without roleplaying beyond the engineering task."
+        "Personal context is explicitly included so it can lightly carry into "
+        f"your personality when you chat: {agent_personal_context(agent)}. "
+        "Do not roleplay beyond the engineering task."
     )
 
 
 def format_agent_introduction(agent: TeamAgent) -> str:
-    provider = agent.provider_preference.value if agent.provider_preference else "agent"
-    return (
-        f"Hi, I'm {agent.full_name} (@{agent.handle}). I'm the {agent.role.lower()} here: "
-        f"I {agent.unique_strength}. I tend to be {agent.personality}, and my updates are "
-        f"{agent.voice}. I usually run on {provider}."
-    )
+    return f"Hi, I'm @{agent.handle}. Outside work: {agent_personal_context(agent)}."
 
 
 def format_agent_assignment(agent: TeamAgent, prompt: str, requester: str | None = None) -> str:
@@ -817,19 +828,10 @@ def build_initialization_messages(agents: list[TeamAgent]) -> list[TeamChatMessa
 
 def format_agent_welcome(sender: TeamAgent, new_agent: TeamAgent) -> str:
     variants = [
-        (f"Welcome, @{new_agent.handle}. I'll bring {sender.role.lower()} coverage when it helps."),
-        (
-            f"Glad you're here, @{new_agent.handle}. Your {new_agent.role.lower()} "
-            "lens should pair well with mine."
-        ),
-        (
-            f"Welcome aboard, @{new_agent.handle}. I'll watch the handoff points "
-            f"around {sender.unique_strength}."
-        ),
-        (
-            f"Good to meet you, @{new_agent.handle}. I'll keep my updates "
-            f"{sender.voice} when our work overlaps."
-        ),
+        f"Welcome, @{new_agent.handle}.",
+        f"Glad you're here, @{new_agent.handle}.",
+        f"Welcome aboard, @{new_agent.handle}.",
+        f"Good to meet you, @{new_agent.handle}.",
     ]
     digest = _digest(sender.agent_id, new_agent.sort_order)
     return variants[digest[0] % len(variants)]
@@ -921,8 +923,8 @@ def _digest(seed: str, sort_order: int) -> bytes:
 def _avatar_prompt(full_name: str, profile: RoleProfile) -> str:
     return (
         f"Square Slack avatar, stylized cartoon portrait of {full_name}, "
-        f"{profile.role.lower()} energy, expressive friendly face, flat vector-like "
-        "illustration, clean geometric shapes, vibrant accent color, simple background, "
+        "expressive friendly face, flat vector-like illustration, clean geometric "
+        "shapes, vibrant accent color, simple background, "
         "no text, no logo, not photorealistic."
     )
 
@@ -939,8 +941,7 @@ def _avatar_indexes_for_hires(
     used = {
         int(agent.avatar_slug)
         for agent in existing_agents
-        if agent.avatar_slug.isdigit()
-        and 1 <= int(agent.avatar_slug) <= DEFAULT_AVATAR_BANK_SIZE
+        if agent.avatar_slug.isdigit() and 1 <= int(agent.avatar_slug) <= DEFAULT_AVATAR_BANK_SIZE
     }
     available = [
         identity.avatar_index
@@ -954,6 +955,28 @@ def _avatar_indexes_for_hires(
         )
     chooser = rng or random.SystemRandom()
     return chooser.sample(available, count)
+
+
+def _outside_interests_for_digest(digest: bytes) -> tuple[str, str, str]:
+    ranked = sorted(
+        OUTSIDE_WORK_INTERESTS,
+        key=lambda item: hashlib.sha256(digest + item.encode("utf-8")).digest(),
+    )
+    return ranked[0], ranked[1], ranked[2]
+
+
+def _random_outside_interests(
+    rng: random.Random | random.SystemRandom,
+) -> tuple[str, str, str]:
+    first, second, third = rng.sample(OUTSIDE_WORK_INTERESTS, 3)
+    return first, second, third
+
+
+def _personal_context_from_interests(interests: Sequence[str]) -> str:
+    clean = [interest.strip() for interest in interests if interest.strip()]
+    if len(clean) >= 3:
+        return f"{clean[0]}; {clean[1]}; and {clean[2]}"
+    return "; ".join(clean) or "keeps a few low-key hobbies outside work"
 
 
 def _pick(items: list[str], digest: bytes, offset: int) -> str:
@@ -982,14 +1005,6 @@ def _icon_emoji_for(profile: RoleProfile) -> str:
 
 
 def _assignment_opener(agent: TeamAgent) -> str:
-    if "risk" in agent.voice or "cautious" in agent.personality:
-        return "I'll take this and call out risk as I go"
-    if "test" in agent.voice or "evidence" in agent.personality:
-        return "I'll take this and verify the important behavior"
-    if "visual" in agent.voice:
-        return "I'll take this and keep the workflow details visible"
-    if "action" in agent.voice:
-        return "I'll take this and keep progress moving"
     return "I'll take this"
 
 

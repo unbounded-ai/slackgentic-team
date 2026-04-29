@@ -1,10 +1,16 @@
 import unittest
+from unittest.mock import patch
 
-from agent_harness.slack_setup import (
+from agent_harness.slack.setup import (
     APP_TOKEN_RE,
     BOT_SCOPES,
     BOT_TOKEN_RE,
+    CreatedSlackApp,
+    SlackApiError,
+    SlackSetupOptions,
     _configured_slash_command,
+    _create_slack_app_with_retry,
+    _install_claude_channel_if_available,
     build_socket_mode_manifest,
     extract_token,
     recursive_token_search,
@@ -60,6 +66,68 @@ class SlackSetupTests(unittest.TestCase):
         payload = {"credentials": {"nested": ["nope", {"token": "secret xapp-1-A-B"}]}}
 
         self.assertEqual(recursive_token_search(payload, APP_TOKEN_RE), "xapp-1-A-B")
+
+    def test_create_app_retries_after_revoked_slack_cli_token(self):
+        calls = []
+
+        def fake_create(token, manifest):
+            calls.append(token)
+            if token == "old-token":
+                raise SlackApiError("apps.manifest.create", "token_revoked")
+            return CreatedSlackApp(app_id="A123", raw={})
+
+        with (
+            patch("agent_harness.slack.setup.create_slack_app", side_effect=fake_create),
+            patch(
+                "agent_harness.slack.setup._slack_cli_config_token",
+                return_value="new-token",
+            ) as refresh,
+        ):
+            created = _create_slack_app_with_retry(
+                "old-token",
+                build_socket_mode_manifest("riley"),
+                SlackSetupOptions(),
+            )
+
+        self.assertEqual(created.app_id, "A123")
+        self.assertEqual(calls, ["old-token", "new-token"])
+        refresh.assert_called_once()
+        self.assertTrue(refresh.call_args.kwargs["force_login"])
+
+    def test_create_app_does_not_retry_unrelated_slack_api_errors(self):
+        with (
+            patch(
+                "agent_harness.slack.setup.create_slack_app",
+                side_effect=SlackApiError("apps.manifest.create", "invalid_auth"),
+            ),
+            patch("agent_harness.slack.setup._slack_cli_config_token") as refresh,
+            self.assertRaises(SlackApiError),
+        ):
+            _create_slack_app_with_retry(
+                "bad-token",
+                build_socket_mode_manifest("riley"),
+                SlackSetupOptions(),
+            )
+
+        refresh.assert_not_called()
+
+    def test_initial_setup_installs_claude_channel_when_claude_is_available(self):
+        with (
+            patch("agent_harness.slack.setup.shutil.which", return_value="/usr/bin/claude"),
+            patch("agent_harness.sessions.claude_channel.install_claude_mcp_server") as install,
+        ):
+            _install_claude_channel_if_available()
+
+        install.assert_called_once_with()
+
+    def test_initial_setup_skips_claude_channel_when_claude_is_missing(self):
+        with (
+            patch("agent_harness.slack.setup.shutil.which", return_value=None),
+            patch("agent_harness.sessions.claude_channel.install_claude_mcp_server") as install,
+        ):
+            _install_claude_channel_if_available()
+
+        install.assert_not_called()
 
 
 if __name__ == "__main__":

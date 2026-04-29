@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_harness.jsonl import first_jsonl_record, iter_jsonl
 from agent_harness.models import (
     AgentEvent,
     AgentSession,
@@ -17,6 +16,7 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
+from agent_harness.storage.jsonl import first_jsonl_record, iter_jsonl
 
 
 class CodexProvider:

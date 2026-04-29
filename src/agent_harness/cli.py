@@ -7,24 +7,32 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_harness.assignment import assign_channel_work_request
 from agent_harness.models import AgentTaskKind, Provider
-from agent_harness.personas import avatar_svg, generate_persona
 from agent_harness.providers import ClaudeProvider, CodexProvider
+from agent_harness.providers.usage import (
+    collect_daily_usage,
+    collect_weekly_usage,
+    day_string,
+    format_daily_usage,
+)
 from agent_harness.slack import (
     build_setup_modal,
     build_start_session_modal,
     build_team_roster_blocks,
     parse_thread_ref,
 )
-from agent_harness.store import Store
+from agent_harness.storage.store import Store
 from agent_harness.team import (
+    AGENT_LIMIT_MESSAGE,
+    DEFAULT_CLAUDE_TEAM_SIZE,
+    DEFAULT_CODEX_TEAM_SIZE,
+    MAX_TEAM_AGENTS,
     build_initial_model_team,
     build_initialization_messages,
     hire_team_agents,
     runtime_personality_prompt,
 )
-from agent_harness.usage import collect_daily_usage, day_string, format_daily_usage
+from agent_harness.team.assignment import assign_channel_work_request
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,11 +48,6 @@ def main(argv: list[str] | None = None) -> int:
     usage.add_argument("--date", default="today")
     usage.add_argument("--home", type=Path)
     usage.add_argument("--json", action="store_true")
-
-    persona = sub.add_parser("persona", help="Generate deterministic session persona")
-    persona.add_argument("provider", choices=[item.value for item in Provider])
-    persona.add_argument("session_id")
-    persona.add_argument("--svg", action="store_true")
 
     modal = sub.add_parser("modal", help="Print Slack modal payloads")
     modal.add_argument("kind", choices=["start", "setup"])
@@ -75,8 +78,8 @@ def main(argv: list[str] | None = None) -> int:
 
     team_init = team_sub.add_parser("init", help="Create the initial agent roster")
     team_init.add_argument("--db", type=Path, required=True)
-    team_init.add_argument("--codex", type=int, default=5)
-    team_init.add_argument("--claude", type=int, default=5)
+    team_init.add_argument("--codex", type=int, default=DEFAULT_CODEX_TEAM_SIZE)
+    team_init.add_argument("--claude", type=int, default=DEFAULT_CLAUDE_TEAM_SIZE)
     team_init.add_argument("--json", action="store_true")
 
     team_list = team_sub.add_parser("list", help="List team agents")
@@ -215,8 +218,6 @@ def main(argv: list[str] | None = None) -> int:
         return _scan(args)
     if args.command == "usage":
         return _usage(args)
-    if args.command == "persona":
-        return _persona(args)
     if args.command == "modal":
         payload = build_start_session_modal() if args.kind == "start" else build_setup_modal()
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -234,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"initialized {args.db}")
         return 0
     if args.command == "claude-channel":
-        from agent_harness.claude_channel import (
+        from agent_harness.sessions.claude_channel import (
             _current_slackgentic_invocation,
             install_claude_mcp_server,
             mcp_config,
@@ -260,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         return _service(args)
     if args.command == "index-once":
         from agent_harness.config import AppConfig
-        from agent_harness.daemon import AgentDaemon
+        from agent_harness.sessions.indexer import AgentDaemon
 
         config = AppConfig.model_validate(
             {
@@ -279,10 +280,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "slack":
         from agent_harness.config import AppConfig, load_config_from_env
-        from agent_harness.slack_app import run_slack_app
+        from agent_harness.slack.app import run_slack_app
 
         if args.slack_command == "setup":
-            from agent_harness.slack_setup import SlackSetupOptions, run_interactive_setup
+            from agent_harness.slack.setup import SlackSetupOptions, run_interactive_setup
 
             result = run_interactive_setup(
                 SlackSetupOptions(
@@ -297,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             if result != 0 or not args.serve:
                 return result
         if args.slack_command == "update-manifest":
-            from agent_harness.slack_setup import (
+            from agent_harness.slack.setup import (
                 SlackManifestUpdateOptions,
                 update_slack_app_manifest,
             )
@@ -429,16 +430,7 @@ def _usage(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(_jsonable(snapshots), indent=2, sort_keys=True))
     else:
-        print(format_daily_usage(day, snapshots))
-    return 0
-
-
-def _persona(args: argparse.Namespace) -> int:
-    persona = generate_persona(args.provider, args.session_id)
-    if args.svg:
-        print(avatar_svg(persona))
-    else:
-        print(json.dumps(_jsonable(persona), indent=2, sort_keys=True))
+        print(format_daily_usage(day, snapshots, collect_weekly_usage(day, home=args.home)))
     return 0
 
 
@@ -447,6 +439,9 @@ def _team(args: argparse.Namespace) -> int:
     try:
         store.init_schema()
         if args.team_command == "init":
+            if args.codex + args.claude > MAX_TEAM_AGENTS:
+                print(f"{AGENT_LIMIT_MESSAGE} Max team size is {MAX_TEAM_AGENTS}.")
+                return 2
             existing = store.list_team_agents(include_fired=True)
             if existing:
                 agents = store.list_team_agents()
@@ -461,12 +456,16 @@ def _team(args: argparse.Namespace) -> int:
             provider = None if args.provider == "auto" else Provider(args.provider)
             all_agents = store.list_team_agents(include_fired=True)
             active_agents = store.list_team_agents()
+            if len(active_agents) + args.count > MAX_TEAM_AGENTS:
+                print(f"{AGENT_LIMIT_MESSAGE} Max team size is {MAX_TEAM_AGENTS}.")
+                return 2
             hired = hire_team_agents(
                 all_agents,
                 args.count,
                 provider,
                 start_sort_order=store.next_team_sort_order(),
                 balance_agents=active_agents,
+                avatar_agents=active_agents,
                 randomize_identities=True,
             )
             for agent in hired:
@@ -530,7 +529,7 @@ def _print_team_agents(agents: list[Any], as_json: bool) -> int:
         return 0
     for agent in agents:
         provider = agent.provider_preference.value if agent.provider_preference else "unmapped"
-        print(f"@{agent.handle} {agent.full_name} [{provider}] {agent.role}")
+        print(f"{agent.full_name} [{provider}] @{agent.handle}")
     return 0
 
 
@@ -553,18 +552,15 @@ def _reset_slack_state(config, yes: bool = False) -> int:
             print(f"removed {path}")
     else:
         print(f"state database did not exist: {state_db}")
-    print(
-        "Run `slackgentic slack serve`, then use "
-        f"`{config.slack.slash_command} setup` in Slack to initialize fresh state."
-    )
+    print(f"Run `slackgentic service restart`, then use `{config.slack.slash_command} setup`.")
     return 0
 
 
 def _close_slack_channel(config, channel_id: str | None = None, yes: bool = False) -> int:
     from slack_sdk.errors import SlackApiError
 
-    from agent_harness.slack_app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
-    from agent_harness.slack_client import SlackGateway
+    from agent_harness.slack.app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
+    from agent_harness.slack.client import SlackGateway
 
     if not config.slack.bot_token:
         print("SLACK_BOT_TOKEN is required to archive a Slack channel.")
@@ -624,6 +620,8 @@ def _sqlite_state_paths(path: Path) -> list[Path]:
 
 
 def _slack_doctor(config) -> int:
+    from agent_harness.runtime.power import format_power_doctor_lines, inspect_macos_power
+
     checks = [
         ("SLACK_BOT_TOKEN", bool(config.slack.bot_token)),
         ("SLACK_APP_TOKEN", bool(config.slack.app_token)),
@@ -639,6 +637,9 @@ def _slack_doctor(config) -> int:
     print(f"slash command {config.slack.slash_command}")
     print(f"state db {config.state_db}")
     print(f"default cwd {config.commands.default_cwd}")
+    print("power")
+    for line in format_power_doctor_lines(inspect_macos_power()):
+        print(f"  {line}")
     return 0 if ok else 2
 
 

@@ -2,27 +2,33 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentTaskKind, AgentTaskStatus, Provider, SlackThreadRef
-from agent_harness.store import Store
-from agent_harness.task_runtime import (
+from agent_harness.runtime.tasks import (
+    AGENT_THREAD_DONE_SIGNAL,
     ManagedTaskRuntime,
     _clean_terminal_output,
+    _extract_agent_control_signals,
+    _latest_codex_transcript_message,
     _process_output_chunks,
     _requested_repo_cwd,
     build_task_prompt,
 )
+from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 
 
 class FakeGateway:
     def __init__(self):
         self.replies = []
+        self.icon_urls = []
 
-    def post_thread_reply(self, thread, text, persona=None):
+    def post_thread_reply(self, thread, text, persona=None, icon_url=None):
         self.replies.append(text)
+        self.icon_urls.append(icon_url)
 
 
 class OneShotProcess:
@@ -44,6 +50,58 @@ class OneShotProcess:
 
     def terminate(self):
         pass
+
+
+class SessionIdProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                '{"type":"thread.started","thread_id":"codex-thread-1"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'
+            )
+        return ""
+
+
+class ThreadDoneSignalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                '{"type":"item.completed","item":{"type":"agent_message",'
+                f'"text":"Sounds good.\\n{AGENT_THREAD_DONE_SIGNAL}"'
+                "}}\n"
+            )
+        return ""
+
+
+class SilentProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        self.reads += 1
+        return ""
+
+
+class SessionOnlyProcess(OneShotProcess):
+    session_id = "session-fallback"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return f'{{"type":"thread.started","thread_id":"{self.session_id}"}}\n'
+        return ""
+
+
+class ProgressOnlySessionProcess(OneShotProcess):
+    session_id = "session-progress-final-fallback"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                f'{{"type":"thread.started","thread_id":"{self.session_id}"}}\n'
+                '{"type":"event_msg","payload":{"type":"agent_message","message":"Working"}}\n'
+            )
+        return ""
 
 
 class TaskRuntimeTests(unittest.TestCase):
@@ -78,17 +136,40 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("somebody review", prompt)
         self.assertIn("stop and wait", prompt)
 
+    def test_build_task_prompt_instructs_thread_done_signal(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "work carefully", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn(AGENT_THREAD_DONE_SIGNAL, prompt)
+        self.assertIn("marks the whole thread done", prompt)
+
+    def test_build_task_prompt_instructs_named_session_agent_callback_format(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "offer options to @nell", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("separate final paragraph", prompt)
+        self.assertIn("@nell pick one before I proceed", prompt)
+        self.assertIn("Do not put that callback handle inline", prompt)
+
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            default = root / "slackgentic-team"
+            default = root
             talos = root / "talos"
-            default.mkdir()
             talos.mkdir()
 
             cwd = _requested_repo_cwd("in talos summarize the test command", default)
 
             self.assertEqual(cwd, talos)
+
+    def test_requested_repo_cwd_ignores_missing_root(self):
+        missing = Path("/tmp/slackgentic-missing-root-for-test")
+
+        self.assertEqual(_requested_repo_cwd("in talos summarize tests", missing), missing)
 
     def test_command_config_accepts_env_aliases(self):
         config = AgentCommandConfig.model_validate(
@@ -121,6 +202,28 @@ class TaskRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(chunks, ["OK"])
+        self.assertEqual(buffer, "")
+
+    def test_codex_exec_json_output_renders_event_msg_agent_message(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            ('{"type":"event_msg","payload":{"type":"agent_message","message":"Visible final"}}\n'),
+        )
+
+        self.assertEqual(chunks, ["Visible final"])
+        self.assertEqual(buffer, "")
+
+    def test_codex_exec_json_output_renders_response_item_assistant_message(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            (
+                '{"type":"response_item","payload":{"type":"message",'
+                '"role":"assistant","content":[{"type":"output_text",'
+                '"text":"Visible response"}]}}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Visible response"])
         self.assertEqual(buffer, "")
 
     def test_codex_exec_json_output_hides_tool_events(self):
@@ -201,6 +304,48 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(chunks, ["OK"])
         self.assertEqual(buffer, "")
 
+    def test_agent_control_signal_is_stripped_from_visible_text(self):
+        visible, signals = _extract_agent_control_signals(
+            f"Sounds good.\n{AGENT_THREAD_DONE_SIGNAL}\n"
+        )
+
+        self.assertEqual(visible, "Sounds good.")
+        self.assertEqual(signals, [AGENT_THREAD_DONE_SIGNAL])
+
+    def test_codex_transcript_fallback_uses_latest_agent_message_since_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            session_id = "session-fallback"
+            path = (
+                home
+                / ".codex"
+                / "sessions"
+                / "2026"
+                / "04"
+                / "29"
+                / f"rollout-2026-04-29T01-17-28-{session_id}.jsonl"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "\n".join(
+                    [
+                        '{"timestamp":"2026-04-29T05:00:00Z","type":"event_msg",'
+                        '"payload":{"type":"agent_message","message":"old"}}',
+                        '{"timestamp":"2026-04-29T05:01:00Z","type":"event_msg",'
+                        '"payload":{"type":"agent_message","message":"new"}}',
+                    ]
+                )
+                + "\n"
+            )
+
+            message = _latest_codex_transcript_message(
+                session_id,
+                home,
+                since=datetime.fromisoformat("2026-04-29T05:00:30+00:00"),
+            )
+
+            self.assertEqual(message, "new")
+
     def test_runtime_does_not_post_process_lifecycle_message_on_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -221,12 +366,154 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
                 for _ in range(50):
-                    current = store.get_agent_task(task.task_id)
-                    if current and current.status == AgentTaskStatus.DONE:
+                    if gateway.replies:
                         break
                     time.sleep(0.01)
 
                 self.assertEqual(gateway.replies, ["Done"])
+                self.assertEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.ACTIVE,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_posts_visible_chunks_with_agent_avatar_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "finish with avatar", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                    agent_icon_url=lambda item: f"https://example.com/{item.handle}.png",
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Done"])
+                self.assertEqual(gateway.icon_urls, [f"https://example.com/{agent.handle}.png"])
+            finally:
+                store.close()
+
+    def test_runtime_cancels_silent_process_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "finish silently", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=SilentProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and current.status == AgentTaskStatus.CANCELLED:
+                        break
+                    time.sleep(0.01)
+
+                self.assertIn("finished without a Slack-visible response", gateway.replies[-1])
+                self.assertEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.CANCELLED,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_captures_codex_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "remember this", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=SessionIdProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and current.session_id == "codex-thread-1":
+                        break
+                    time.sleep(0.01)
+
+                current = store.get_agent_task(task.task_id)
+                self.assertIsNotNone(current)
+                assert current is not None
+                self.assertEqual(current.session_provider, Provider.CODEX)
+                self.assertEqual(current.session_id, "codex-thread-1")
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and current.status == AgentTaskStatus.ACTIVE:
+                        break
+                    time.sleep(0.01)
+            finally:
+                store.close()
+
+    def test_runtime_resumes_task_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                return OneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "continue", "C1")
+                task = replace(
+                    task,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                )
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertEqual(requests[0].resume_session_id, "codex-thread-1")
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and current.status == AgentTaskStatus.ACTIVE:
+                        break
+                    time.sleep(0.01)
             finally:
                 store.close()
 
@@ -254,13 +541,161 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
                 for _ in range(50):
-                    current = store.get_agent_task(task.task_id)
-                    if current and current.status == AgentTaskStatus.DONE:
+                    if seen:
                         break
                     time.sleep(0.01)
 
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(seen[0][3], "Done")
+                self.assertEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.ACTIVE,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_hides_agent_control_signal_and_notifies_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "close the thread", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ThreadDoneSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(
+                            (task.task_id, agent.agent_id, thread.thread_ts, signal)
+                        )
+                        or True
+                    ),
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if seen_controls:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Sounds good."])
+                self.assertEqual(
+                    seen_controls,
+                    [(task.task_id, agent.agent_id, "171.000001", AGENT_THREAD_DONE_SIGNAL)],
+                )
+                self.assertEqual(done_callbacks, [])
+            finally:
+                store.close()
+
+    def test_runtime_recovers_visible_message_from_codex_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "help", "C1")
+                store.upsert_agent_task(task)
+                path = (
+                    home
+                    / ".codex"
+                    / "sessions"
+                    / "2026"
+                    / "04"
+                    / "29"
+                    / f"rollout-2026-04-29T01-17-28-{SessionOnlyProcess.session_id}.jsonl"
+                )
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    f'{{"timestamp":"{task.created_at.isoformat()}","type":"event_msg",'
+                    '"payload":{"type":"agent_message","message":"Recovered answer"}}\n'
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=SessionOnlyProcess,
+                    poll_seconds=0.01,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Recovered answer"])
+                self.assertEqual(done_callbacks, [task.task_id])
+                self.assertEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.ACTIVE,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_recovers_unseen_final_message_after_progress_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "help", "C1")
+                store.upsert_agent_task(task)
+                path = (
+                    home
+                    / ".codex"
+                    / "sessions"
+                    / "2026"
+                    / "04"
+                    / "29"
+                    / (f"rollout-2026-04-29T01-17-28-{ProgressOnlySessionProcess.session_id}.jsonl")
+                )
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    f'{{"timestamp":"{task.created_at.isoformat()}","type":"event_msg",'
+                    '"payload":{"type":"agent_message","message":"Working"}}\n'
+                    f'{{"timestamp":"{task.created_at.isoformat()}","type":"event_msg",'
+                    '"payload":{"type":"agent_message","message":"Recovered final"}}\n'
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                seen = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ProgressOnlySessionProcess,
+                    poll_seconds=0.01,
+                    on_agent_message=lambda task, agent, thread, text: seen.append(text) or True,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if len(gateway.replies) >= 2:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Working", "Recovered final"])
+                self.assertEqual(seen, ["Working", "Recovered final"])
+                self.assertEqual(done_callbacks, [task.task_id])
             finally:
                 store.close()
 

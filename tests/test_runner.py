@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pexpect
 
 from agent_harness.models import Provider
-from agent_harness.runner import LaunchRequest, ManagedAgentProcess, build_command
+from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess, build_command
 
 
 class FakeChild:
@@ -47,7 +47,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--json", args)
         self.assertIn("--color", args)
         self.assertIn("never", args)
-        self.assertIn("--ephemeral", args)
+        self.assertNotIn("--ephemeral", args)
         self.assertIn('projects."/tmp/repo".trust_level="trusted"', args)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", args)
         self.assertEqual(args[-3:], ["-C", "/tmp/repo", "-"])
@@ -82,11 +82,44 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--print", args)
         self.assertIn("--output-format", args)
         self.assertIn("json", args)
-        self.assertIn("--no-session-persistence", args)
+        self.assertNotIn("--no-session-persistence", args)
         self.assertIn("--dangerously-skip-permissions", args)
         self.assertIn("--worktree", args)
-        self.assertEqual(args[-1], "-")
-        self.assertNotIn("fix it", args)
+        self.assertEqual(args[-1], "fix it")
+
+    def test_codex_resume_command_uses_existing_session(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="continue",
+                cwd=Path("/tmp/repo"),
+                resume_session_id="thread-1",
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertEqual(args[:2], ["exec", "resume"])
+        self.assertIn("thread-1", args)
+        self.assertEqual(args[-1], "continue")
+        self.assertNotIn("--color", args)
+        self.assertNotIn("--sandbox", args)
+        self.assertNotIn("-C", args)
+        self.assertNotEqual(args[-1], "-")
+
+    def test_claude_resume_command_uses_existing_session(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="continue",
+                cwd=Path("/tmp/repo"),
+                resume_session_id="session-1",
+            )
+        )
+
+        self.assertEqual(command, "claude")
+        self.assertIn("--resume", args)
+        self.assertIn("session-1", args)
+        self.assertEqual(args[-1], "continue")
 
     def test_managed_process_read_available_keeps_eof_tail(self):
         process = ManagedAgentProcess(
@@ -116,7 +149,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(child.sent, ["hidden prompt", "\n"])
         self.assertTrue(child.eof_sent)
 
-    def test_managed_process_sends_claude_prompt_over_stdin(self):
+    def test_managed_codex_resume_process_does_not_send_stdin(self):
+        child = FakeChild()
+
+        def fake_spawn(command, args, **kwargs):
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="hidden prompt",
+                cwd=Path("/tmp/repo"),
+                resume_session_id="thread-1",
+            )
+        )
+
+        with patch("pexpect.spawn", fake_spawn):
+            process.start()
+
+        self.assertEqual(child.sent, [])
+        self.assertFalse(child.eof_sent)
+
+    def test_managed_process_sends_claude_prompt_as_argument(self):
         child = FakeChild()
         calls = []
 
@@ -136,10 +190,9 @@ class RunnerTests(unittest.TestCase):
             process.start()
 
         self.assertEqual(calls[0][0], "claude")
-        self.assertEqual(calls[0][1][-1], "-")
-        self.assertNotIn("hidden claude prompt", calls[0][1])
-        self.assertEqual(child.sent, ["hidden claude prompt", "\n"])
-        self.assertTrue(child.eof_sent)
+        self.assertEqual(calls[0][1][-1], "hidden claude prompt")
+        self.assertEqual(child.sent, [])
+        self.assertFalse(child.eof_sent)
 
 
 if __name__ == "__main__":

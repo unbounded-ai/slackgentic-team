@@ -11,8 +11,8 @@ from typing import Any
 
 from agent_harness.config import load_config_from_env
 from agent_harness.models import SlackThreadRef
-from agent_harness.slack_agent_requests import SlackAgentRequestHandler
-from agent_harness.store import Store
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.storage.store import Store
 
 CHANNEL_NAME = "slackgentic"
 CHANNEL_VERSION = "0.1.0"
@@ -23,8 +23,17 @@ CHANNEL_INSTRUCTIONS = (
     "or discuss the channel tags or metadata. Respond normally in the terminal; "
     "Slackgentic mirrors your visible assistant responses back to the Slack thread. "
     "When you need Slack approval or a Slack choice, use the Slackgentic MCP tools "
-    "instead of asking only in prose."
+    "`request_approval` or `request_user_input`; do not use Claude's built-in "
+    "`AskUserQuestion` for Slack-mediated approvals or choices. Use "
+    "`request_user_input` when Slack should choose among multiple options; use "
+    "`request_approval` only for one concrete yes/no approval. Before a large "
+    "file edit that may require Slack approval, summarize the intended change "
+    "first because Claude may expose only a truncated native tool input preview."
 )
+SLACKGENTIC_MCP_TOOL_NAMES = {
+    f"mcp__{CHANNEL_NAME}__request_approval",
+    f"mcp__{CHANNEL_NAME}__request_user_input",
+}
 
 
 class ClaudeChannelServer:
@@ -80,6 +89,7 @@ class ClaudeChannelServer:
                             "tools": {},
                             "experimental": {
                                 "claude/channel": {},
+                                "claude/channel/permission": {},
                             },
                         },
                         "serverInfo": {
@@ -94,6 +104,10 @@ class ClaudeChannelServer:
             return
         if method == "notifications/initialized":
             self._ready.set()
+            return
+        if method == "notifications/claude/channel/permission_request":
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            self._handle_permission_request_notification(params)
             return
         if method == "ping" and message_id is not None:
             self._write({"jsonrpc": "2.0", "id": message_id, "result": {}})
@@ -205,6 +219,58 @@ class ClaudeChannelServer:
         )
         return _tool_result(json.dumps(response, sort_keys=True))
 
+    def _handle_permission_request_notification(self, params: dict[str, Any]) -> None:
+        request_id = params.get("request_id")
+        if request_id is None:
+            return
+        worker = threading.Thread(
+            target=self._handle_permission_request_worker,
+            args=(str(request_id), dict(params)),
+            daemon=True,
+            name=f"slackgentic-claude-permission-{request_id}",
+        )
+        worker.start()
+
+    def _handle_permission_request_worker(
+        self,
+        request_id: str,
+        params: dict[str, Any],
+    ) -> None:
+        behavior = "deny"
+        if _is_slackgentic_mcp_tool(_string_param(params, "tool_name")):
+            self._write(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel/permission",
+                    "params": {"request_id": request_id, "behavior": "allow"},
+                }
+            )
+            return
+        if self.request_handler is not None and self._current_thread is not None:
+            try:
+                request_params = dict(params)
+                request_params["request_id"] = request_id
+                request_params["tool_name"] = _string_param(params, "tool_name")
+                request_params["description"] = _string_param(params, "description")
+                request_params["input_preview"] = _string_param(params, "input_preview")
+                response = self.request_handler.handle_persistent_request(
+                    "claude/channel/permission",
+                    request_params,
+                    self._current_thread,
+                    provider_label="Claude",
+                )
+            except Exception:
+                response = None
+            if isinstance(response, dict) and response.get("behavior") == "allow":
+                behavior = "allow"
+        self._write(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/claude/channel/permission",
+                "params": {"request_id": request_id, "behavior": behavior},
+            }
+        )
+
     def _write(self, message: dict[str, Any]) -> None:
         with self._write_lock:
             sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -218,7 +284,7 @@ def run_channel_server(db_path: Path | None = None) -> int:
         store.init_schema()
         request_handler = None
         if config.slack.bot_token:
-            from agent_harness.slack_client import SlackGateway
+            from agent_harness.slack.client import SlackGateway
 
             request_handler = SlackAgentRequestHandler(
                 SlackGateway(config.slack.bot_token),
@@ -263,6 +329,47 @@ def mcp_config(command: str = "slackgentic", args: list[str] | None = None) -> d
     }
 
 
+def is_slackgentic_mcp_server_configured(home: Path | None = None) -> bool:
+    home = home or Path.home()
+    for path in (
+        home / ".claude.json",
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+    ):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _contains_slackgentic_mcp_config(value):
+            return True
+    return False
+
+
+def session_transcript_has_slackgentic_mcp(
+    transcript_path: Path,
+    *,
+    max_records: int = 80,
+) -> bool:
+    from agent_harness.storage.jsonl import iter_jsonl
+
+    try:
+        for index, (_, record) in enumerate(iter_jsonl(transcript_path), start=1):
+            if _record_has_slackgentic_mcp(record):
+                return True
+            if index >= max_records:
+                break
+    except OSError:
+        return False
+    return False
+
+
+def claude_session_has_slackgentic_mcp(session: object) -> bool:
+    transcript_path = getattr(session, "transcript_path", None)
+    if isinstance(transcript_path, Path):
+        return session_transcript_has_slackgentic_mcp(transcript_path)
+    return False
+
+
 def _current_slackgentic_command() -> str:
     command, _ = _current_slackgentic_invocation()
     return command
@@ -297,11 +404,56 @@ def _is_identifier(value: str) -> bool:
     )
 
 
+def _contains_slackgentic_mcp_config(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    servers = value.get("mcpServers")
+    if isinstance(servers, dict) and _valid_mcp_server_config(servers.get(CHANNEL_NAME)):
+        return True
+    return any(_contains_slackgentic_mcp_config(child) for child in value.values())
+
+
+def _valid_mcp_server_config(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    command = value.get("command")
+    args = value.get("args")
+    return bool((isinstance(command, str) and command.strip()) or isinstance(args, list))
+
+
+def _record_has_slackgentic_mcp(record: dict[str, Any]) -> bool:
+    candidates: list[object] = [record.get("attachment")]
+    attachments = record.get("attachments")
+    if isinstance(attachments, list):
+        candidates.extend(attachments)
+    return any(_attachment_has_slackgentic_mcp(candidate) for candidate in candidates)
+
+
+def _attachment_has_slackgentic_mcp(attachment: object) -> bool:
+    if not isinstance(attachment, dict):
+        return False
+    added_names = {
+        str(name) for name in attachment.get("addedNames") or [] if isinstance(name, str)
+    }
+    attachment_type = attachment.get("type")
+    if attachment_type == "mcp_instructions_delta":
+        return CHANNEL_NAME in added_names
+    if attachment_type == "deferred_tools_delta":
+        return bool(SLACKGENTIC_MCP_TOOL_NAMES.intersection(added_names))
+    return False
+
+
+def _is_slackgentic_mcp_tool(tool_name: str) -> bool:
+    return tool_name in SLACKGENTIC_MCP_TOOL_NAMES
+
+
 def _tools() -> list[dict[str, Any]]:
     return [
         {
             "name": "request_user_input",
-            "description": "Ask the Slack thread for a choice and wait for the response.",
+            "description": (
+                "Ask the Slack thread to choose among multiple options and wait for the response."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -329,7 +481,10 @@ def _tools() -> list[dict[str, Any]]:
         },
         {
             "name": "request_approval",
-            "description": "Ask the Slack thread to approve or deny an action.",
+            "description": (
+                "Ask the Slack thread to approve or deny one concrete action. "
+                "Do not use this for choosing among options."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -434,3 +589,15 @@ def _string_arg(arguments: dict[str, Any], key: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return ""
+
+
+def _string_param(params: dict[str, Any], key: str) -> str:
+    value = params.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        return str(value)

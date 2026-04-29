@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "slackgentic-team"
 version = "0.1.0"
-description = "Slack control plane for local coding agents"
+description = "Coordinate your local Codex and Claude Code agent team from Slack"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -34,6 +34,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "hypothesis>=6.148.0",
   "ruff>=0.8.0",
 ]
 

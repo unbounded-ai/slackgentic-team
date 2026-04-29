@@ -304,7 +304,9 @@ def draw_role_badge(canvas: Canvas, role_index: int, accent: tuple[int, int, int
         canvas.polygon([(x, y - 9), (x + 7, y + 7), (x - 8, y + 1)], WHITE)
 
 
-def pick(values: list[tuple[int, int, int, int]], digest: bytes, offset: int) -> tuple[int, int, int, int]:
+def pick(
+    values: list[tuple[int, int, int, int]], digest: bytes, offset: int
+) -> tuple[int, int, int, int]:
     return values[digest[offset] % len(values)]
 
 
@@ -313,7 +315,12 @@ def with_alpha(color: tuple[int, int, int, int], alpha: int) -> tuple[int, int, 
 
 
 def darken(color: tuple[int, int, int, int], factor: float) -> tuple[int, int, int, int]:
-    return (math.floor(color[0] * factor), math.floor(color[1] * factor), math.floor(color[2] * factor), color[3])
+    return (
+        math.floor(color[0] * factor),
+        math.floor(color[1] * factor),
+        math.floor(color[2] * factor),
+        color[3],
+    )
 
 
 def write_png(path: Path, width: int, height: int, pixels: list[tuple[int, int, int, int]]) -> None:

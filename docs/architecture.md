@@ -22,18 +22,18 @@ SQLite is the source of truth for local control-plane state:
 
 - discovered sessions;
 - Slack channel and thread mappings;
-- generated session personas;
 - persistent team agents;
 - identity-to-provider mappings for Codex and Claude;
 - channel-originated tasks and PR review tasks;
+- managed thread-to-task ownership for restart-safe follow-ups;
 - cross-thread dependencies;
 - daily usage snapshots;
 - Claude channel delivery queues;
 - pending Slack-mediated agent input and approval requests.
 
-The schema lives in `agent_harness.store.SCHEMA`. The synchronous `Store` is
-used by the Slack daemon and tests; `AsyncStore` is used by the transcript index
-watcher.
+The schema lives in `agent_harness.storage.store.SCHEMA`. The synchronous
+`Store` is used by the Slack daemon and tests; `AsyncStore` is used by the
+transcript index watcher.
 
 ## Slack App
 
@@ -58,7 +58,7 @@ The live dispatch path is:
 ## Identity Model
 
 Slack has one bot user per app. Slackgentic keeps one app per teammate and uses
-per-message identity customization for agent personas:
+per-message identity customization for roster agents:
 
 - deterministic full name and handle;
 - deterministic avatar slug and emoji fallback;
@@ -76,7 +76,7 @@ The roster is separate from discovered provider sessions. A roster member has:
 - a stable handle such as `@riley`;
 - a display name and avatar metadata;
 - a provider preference, currently `codex` or `claude`;
-- role, voice, personality, and reaction preferences;
+- outside-work context and reaction preferences;
 - active or fired status.
 
 Hiring accepts a provider or `auto`. Auto-hiring picks the less represented
@@ -87,8 +87,8 @@ history.
 
 Channel messages are parsed into provider-neutral work requests. Assignment
 filters the active roster to idle agents, creates a queued task row, and posts a
-parent message using the selected persona. That parent message becomes the task
-thread.
+parent message using the selected roster identity. That parent message becomes
+the task thread.
 
 The managed runtime launches the selected provider process, streams visible
 assistant output into the thread, and forwards user replies back into the live
@@ -111,7 +111,12 @@ for input or approval requests from the server.
 Claude live delivery uses a Claude Code channel server. Slackgentic queues
 Slack replies in SQLite, and the channel process emits
 `notifications/claude/channel` messages to the live Claude session. The same
-channel advertises MCP tools for Slack-mediated user input and approval.
+channel advertises MCP tools for Slack-mediated user input and approval, and it
+also advertises Claude's channel permission relay so native tool approval prompts
+can be handled in Slack. Setup tries to register this MCP server automatically;
+if that registration is missing or an already-open Claude session did not load
+it, Slackgentic warns in the session thread instead of treating the channel
+launch flag as sufficient.
 
 If a live channel is unavailable, replies fall back to the provider's supported
 resume command. The exception is `/exit`: Slackgentic tries the live channel

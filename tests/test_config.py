@@ -43,6 +43,21 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.state_db, Path(tmp) / "file.sqlite")
             self.assertEqual(config.config_file, config_file)
 
+    def test_default_team_config_is_one_agent_per_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "config.json"
+            save_stored_config({}, config_file)
+
+            with patch.dict(
+                os.environ,
+                {"SLACKGENTIC_CONFIG_FILE": str(config_file)},
+                clear=True,
+            ):
+                config = load_config_from_env()
+
+            self.assertEqual(config.team.default_codex_agents, 1)
+            self.assertEqual(config.team.default_claude_agents, 1)
+
     def test_save_stored_config_preserves_existing_values_and_uses_private_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_file = Path(tmp) / "config.json"

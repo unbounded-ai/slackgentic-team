@@ -10,23 +10,24 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
-from agent_harness.codex_app_server import (
-    CodexAppServerClient,
-)
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentSession, Provider, SessionStatus, SlackThreadRef, utc_now
-from agent_harness.runner import _codex_trust_override
-from agent_harness.session_terminal import SessionTerminalNotifier, TerminalTarget
+from agent_harness.runtime.codex_app_server import (
+    CodexAppServerClient,
+)
+from agent_harness.runtime.runner import _codex_trust_override
+from agent_harness.runtime.tasks import _process_output_chunks
+from agent_harness.sessions.claude_channel import claude_session_has_slackgentic_mcp
+from agent_harness.sessions.terminal import SessionTerminalNotifier, TerminalTarget
 from agent_harness.slack import dangerous_flag
-from agent_harness.slack_agent_requests import SlackAgentRequestHandler
-from agent_harness.slack_client import SlackGateway
-from agent_harness.store import Store
-from agent_harness.task_runtime import _process_output_chunks
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.slack.client import SlackGateway
+from agent_harness.storage.store import Store
 
 LOGGER = logging.getLogger(__name__)
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -60,6 +61,7 @@ class ExternalSessionBridge:
         codex_live_client: CodexLiveClient | None = None,
         agent_request_handler: SlackAgentRequestHandler | None = None,
         process_killer: ProcessKiller | None = None,
+        live_exit_grace_seconds: float = 5.0,
     ):
         self.store = store
         self.gateway = gateway
@@ -70,6 +72,7 @@ class ExternalSessionBridge:
         self.channel_delivery_timeout = channel_delivery_timeout
         self.codex_app_server_url = codex_app_server_url or commands.codex_app_server_url
         self.codex_live_client = codex_live_client
+        self.live_exit_grace_seconds = live_exit_grace_seconds
         self.agent_request_handler = agent_request_handler or SlackAgentRequestHandler(
             gateway,
             store=store,
@@ -252,6 +255,8 @@ class ExternalSessionBridge:
         target = targets[0]
         if not _slackgentic_channel_enabled(target.command):
             return None
+        if not claude_session_has_slackgentic_mcp(session):
+            return None
         if not _target_start_matches_session(session, target):
             return None
         return target
@@ -266,32 +271,70 @@ class ExternalSessionBridge:
         if session.provider == Provider.CODEX:
             if not self._send_to_codex_app_server(session, prompt, thread):
                 return False
+            self.store.add_session_bridge_prompt(session.provider, session.session_id, prompt)
+            detail = self._terminate_matching_process_after_live_exit(session)
+            message = f"Sent `{prompt}` to the live {session.provider.value} session."
+            if detail:
+                message = f"{message} {detail}"
+            self.gateway.post_thread_reply(thread, message)
+            self._mark_live_session_exited(session, thread)
+            return True
         elif session.provider == Provider.CLAUDE:
-            if not self._send_to_claude_channel(session, prompt, thread, slack_user):
-                return False
+            return self._terminate_live_session(session, thread)
         else:
             return False
-        self.store.add_session_bridge_prompt(session.provider, session.session_id, prompt)
-        self.gateway.post_thread_reply(
-            thread,
-            f"Sent `{prompt}` to the live {session.provider.value} session.",
+
+    def _mark_live_session_exited(self, session: AgentSession, thread: SlackThreadRef) -> None:
+        self.store.clear_external_session_tracking(
+            session.provider,
+            session.session_id,
+            channel_id=thread.channel_id,
         )
-        return True
+        self.store.set_setting(
+            f"external_session_ignored.{session.provider.value}.{session.session_id}",
+            utc_now().isoformat(),
+        )
+        self.store.upsert_session(
+            replace(session, status=SessionStatus.DONE, last_seen_at=utc_now())
+        )
+
+    def _terminate_matching_process_after_live_exit(self, session: AgentSession) -> str | None:
+        targets = self._matching_session_targets(session)
+        if not targets:
+            return None
+        if len(targets) > 1:
+            return (
+                f"I found {len(targets)} matching {session.provider.value} processes and did not "
+                "terminate any of them."
+            )
+        target = targets[0]
+        if self._wait_for_target_exit(session.provider, target, self.live_exit_grace_seconds):
+            return "The matching process exited cleanly."
+        try:
+            self.process_killer(target.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "The matching process had already exited."
+        except Exception as exc:
+            LOGGER.exception("failed to terminate external %s session", session.provider)
+            return f"Failed to terminate the matching process: {exc}"
+        self._restore_terminal_keyboard_mode(target)
+        return (
+            "Terminated the matching process after it did not exit cleanly, and reset "
+            "the terminal keyboard mode."
+        )
 
     def _terminate_live_session(self, session: AgentSession, thread: SlackThreadRef) -> bool:
-        targets = [
-            target
-            for target in self.terminal_notifier.targets_for_session(session)
-            if _target_start_matches_session(session, target)
-        ]
+        targets = self._matching_session_targets(session)
         if not targets:
             self.gateway.post_thread_reply(
                 thread,
                 (
                     f"I could not find a live {session.provider.value} process for this "
-                    "session, so nothing was terminated."
+                    "session, so nothing was terminated. I marked the session closed so "
+                    "the agent can be freed."
                 ),
             )
+            self._mark_live_session_exited(session, thread)
             return True
         if len(targets) > 1:
             self.gateway.post_thread_reply(
@@ -310,6 +353,7 @@ class ExternalSessionBridge:
                 thread,
                 f"That {session.provider.value} session process has already exited.",
             )
+            self._mark_live_session_exited(session, thread)
             return True
         except Exception as exc:
             LOGGER.exception("failed to terminate external %s session", session.provider)
@@ -318,11 +362,57 @@ class ExternalSessionBridge:
                 f"Failed to terminate the {session.provider.value} session: {exc}",
             )
             return True
+        self._restore_terminal_keyboard_mode(target)
         self.gateway.post_thread_reply(
             thread,
             f"Terminated the external {session.provider.value} session.",
         )
+        self._mark_live_session_exited(session, thread)
         return True
+
+    def _matching_session_targets(self, session: AgentSession) -> list[TerminalTarget]:
+        return [
+            target
+            for target in self.terminal_notifier.targets_for_session(session)
+            if _target_start_matches_session(session, target)
+        ]
+
+    def _wait_for_target_exit(
+        self,
+        provider: Provider,
+        target: TerminalTarget,
+        timeout_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            if not self._target_process_is_running(provider, target):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _target_process_is_running(self, provider: Provider, target: TerminalTarget) -> bool:
+        target_lookup = getattr(self.terminal_notifier, "provider_process_for_pid", None)
+        if callable(target_lookup):
+            try:
+                return target_lookup(provider, target.pid) is not None
+            except Exception:
+                LOGGER.debug("failed to look up external session process", exc_info=True)
+        try:
+            os.kill(target.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            LOGGER.debug("failed to probe external session process", exc_info=True)
+            return True
+        return True
+
+    def _restore_terminal_keyboard_mode(self, target: TerminalTarget) -> None:
+        restore_keyboard_mode = getattr(self.terminal_notifier, "restore_keyboard_mode", None)
+        if callable(restore_keyboard_mode):
+            restore_keyboard_mode(target)
 
 
 def build_external_session_prompt(text: str, slack_user: str | None = None) -> str:

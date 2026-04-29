@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from agent_harness.models import AgentTaskStatus, Provider, SessionDependency, SlackThreadRef
-from agent_harness.store import Store
+from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 
 
@@ -59,6 +59,45 @@ class StoreTests(unittest.TestCase):
                 self.assertIsNotNone(active_task)
                 assert active_task is not None
                 self.assertEqual(active_task.status, AgentTaskStatus.QUEUED)
+            finally:
+                store.close()
+
+    def test_managed_thread_task_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite"
+            store = Store(path)
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "keep ownership", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.parent")
+                store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
+                store.update_agent_task_session(task.task_id, Provider.CODEX, "codex-thread-1")
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                store.upsert_managed_thread_task(current, SlackThreadRef("C1", "171.000001"))
+            finally:
+                store.close()
+
+            store = Store(path)
+            try:
+                store.init_schema()
+                restored = store.get_managed_thread_task(
+                    "C1",
+                    "171.000001",
+                    agent.agent_id,
+                )
+
+                self.assertIsNotNone(restored)
+                assert restored is not None
+                self.assertEqual(restored.task_id, task.task_id)
+                self.assertEqual(restored.session_id, "codex-thread-1")
+
+                store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+
+                self.assertIsNone(store.get_managed_thread_task("C1", "171.000001", agent.agent_id))
             finally:
                 store.close()
 

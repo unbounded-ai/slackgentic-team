@@ -4,7 +4,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness.models import AgentSession, Provider
-from agent_harness.session_terminal import SessionTerminalNotifier
+from agent_harness.sessions.terminal import (
+    TERMINAL_KEYBOARD_MODE_RESET,
+    SessionTerminalNotifier,
+    TerminalTarget,
+)
 
 
 class SessionTerminalNotifierTests(unittest.TestCase):
@@ -54,6 +58,54 @@ class SessionTerminalNotifierTests(unittest.TestCase):
             targets = notifier.targets_for_session(session)
 
             self.assertEqual([target.tty for target in targets], ["ttys002"])
+
+    def test_targets_for_session_without_cwd_does_not_scan_processes(self):
+        def fail_process_lister():
+            raise AssertionError("process scan should not run without a session cwd")
+
+        notifier = SessionTerminalNotifier(process_lister=fail_process_lister)
+        session = AgentSession(
+            provider=Provider.CLAUDE,
+            session_id="abcdef123456",
+            transcript_path=Path("session.jsonl"),
+            cwd=None,
+        )
+
+        self.assertEqual(notifier.targets_for_session(session), [])
+
+    def test_provider_process_for_pid_matches_provider_without_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            starts = {101: datetime(2026, 4, 27, 12, 0, tzinfo=UTC)}
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: [
+                    "101 ttys002 codex --remote ws://127.0.0.1:47684",
+                    "102 ttys003 claude --dangerously-skip-permissions",
+                ],
+                cwd_resolver=lambda pid: Path(tmp) if pid == 101 else Path("/other"),
+                start_resolver=lambda pid: starts.get(pid),
+            )
+
+            target = notifier.provider_process_for_pid(Provider.CODEX, 101)
+
+            self.assertIsNotNone(target)
+            self.assertEqual(target.pid, 101)
+            self.assertEqual(target.cwd, Path(tmp))
+
+    def test_restore_keyboard_mode_writes_kitty_keyboard_mode_pop(self):
+        tty_writes = []
+        notifier = SessionTerminalNotifier(
+            tty_writer=lambda tty, text: tty_writes.append((tty, text))
+        )
+        target = TerminalTarget(
+            pid=101,
+            tty="ttys002",
+            cwd=None,
+            command="codex --remote ws://127.0.0.1:47684",
+        )
+
+        self.assertTrue(notifier.restore_keyboard_mode(target))
+
+        self.assertEqual(tty_writes, [("ttys002", TERMINAL_KEYBOARD_MODE_RESET)])
 
     def test_claude_agent_response_never_writes_to_tty(self):
         with tempfile.TemporaryDirectory() as tmp:

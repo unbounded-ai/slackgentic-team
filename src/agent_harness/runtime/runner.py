@@ -17,44 +17,46 @@ class LaunchRequest:
     dangerous: bool = False
     model: str | None = None
     worktree: str | None = None
+    resume_session_id: str | None = None
     codex_binary: str = "codex"
     claude_binary: str = "claude"
 
 
 def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
     if request.provider == Provider.CODEX:
-        args: list[str] = [
-            "exec",
-            "--json",
-            "--color",
-            "never",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "-c",
-            _codex_trust_override(request.cwd),
-        ]
+        args: list[str] = ["exec"]
+        if request.resume_session_id:
+            args.append("resume")
+            args.extend(["--json", "--skip-git-repo-check"])
+        else:
+            args.extend(["--json", "--color", "never", "--skip-git-repo-check"])
+        args.extend(["-c", _codex_trust_override(request.cwd)])
         if request.dangerous:
             args.append(dangerous_flag(Provider.CODEX))
-        else:
+        elif not request.resume_session_id:
             args.extend(["--sandbox", "workspace-write"])
         if request.model:
             args.extend(["--model", request.model])
-        args.extend(["-C", str(request.cwd), "-"])
+        if request.resume_session_id:
+            args.extend([request.resume_session_id, request.prompt])
+        else:
+            args.extend(["-C", str(request.cwd), "-"])
         return request.codex_binary, args
     if request.provider == Provider.CLAUDE:
         args = [
             "--print",
             "--output-format",
             "json",
-            "--no-session-persistence",
         ]
+        if request.resume_session_id:
+            args.extend(["--resume", request.resume_session_id])
         if request.dangerous:
             args.append(dangerous_flag(Provider.CLAUDE))
         if request.model:
             args.extend(["--model", request.model])
         if request.worktree:
             args.extend(["--worktree", request.worktree])
-        args.append("-")
+        args.append(request.prompt)
         return request.claude_binary, args
     raise ValueError(f"unsupported provider: {request.provider}")
 
@@ -83,11 +85,13 @@ class ManagedAgentProcess:
             env=child_env,
             encoding="utf-8",
             timeout=0.1,
+            echo=False,
         )
-        self.child.send(self.request.prompt)
-        if not self.request.prompt.endswith("\n"):
-            self.child.send("\n")
-        self.child.sendeof()
+        if self.request.provider == Provider.CODEX and not self.request.resume_session_id:
+            self.child.send(self.request.prompt)
+            if not self.request.prompt.endswith("\n"):
+                self.child.send("\n")
+            self.child.sendeof()
 
     def send(self, message: str) -> None:
         if self.child is None:

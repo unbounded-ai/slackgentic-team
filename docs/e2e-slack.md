@@ -7,9 +7,8 @@ no browser certificate warning.
 ## 1. Install locally
 
 ```sh
-python -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/slackgentic slack doctor
+python -m venv .venv && source .venv/bin/activate && pip install -e .
+slackgentic slack doctor
 ```
 
 The first doctor run will report missing Slack credentials. That is expected
@@ -26,7 +25,7 @@ export SLACKGENTIC_CLAUDE_BINARY=/path/to/claude
 ## 2. Self-register the Slack app
 
 ```sh
-.venv/bin/slackgentic slack setup
+slackgentic slack setup
 ```
 
 The setup command:
@@ -46,34 +45,43 @@ There is no token paste step and no localhost HTTPS page.
 If you do not want setup to install Slack CLI automatically, use:
 
 ```sh
-.venv/bin/slackgentic slack setup --no-bootstrap-tools
+slackgentic slack setup --no-bootstrap-tools
 ```
 
 If the default suffix is not what you want, choose one explicitly:
 
 ```sh
-.venv/bin/slackgentic slack setup --instance riley
+slackgentic slack setup --instance riley
 ```
 
 ## 3. Install the local service
 
 ```sh
-.venv/bin/slackgentic slack doctor
-.venv/bin/slackgentic service install
-.venv/bin/slackgentic service status
+slackgentic slack doctor
+slackgentic service install && slackgentic service status
 ```
 
 This installs user-level services for the Slackgentic Slack daemon and Codex
-app-server. For foreground debugging instead of a persistent service, run:
+app-server.
 
-```sh
-.venv/bin/slackgentic slack serve
-```
+On macOS, `slackgentic slack doctor` also reports whether active sessions can
+use `caffeinate` and whether the current system settings support network wake.
+Network wake is advisory only; active Slackgentic work is kept awake, but a
+closed-lid or deep-sleeping laptop may still need you to open it.
 
 Agent posts use numbered cartoon PNGs from `docs/assets/avatars` by default.
 When the repository is public, Slack fetches them from GitHub's raw asset URLs.
 Set `SLACKGENTIC_AGENT_AVATAR_BASE_URL` to a different public HTTPS directory,
 or set it to `off` to disable custom agent icons.
+
+`slackgentic slack setup` attempts to register Slackgentic's Claude channel MCP
+server automatically when `claude` is on `PATH`. If setup prints a warning,
+run `slackgentic claude-channel --install` after Claude is available, then
+restart any already-open Claude sessions before using
+`claude --dangerously-load-development-channels server:slackgentic`. The channel
+relays Slack replies and native Claude tool approval prompts. No extra MCP flag
+is needed after registration unless you use `--strict-mcp-config` or a custom
+MCP config that excludes user-level servers.
 
 ## 4. Set up from Slack
 
@@ -84,20 +92,21 @@ In any channel or DM where the app is available:
 ```
 
 Choose the channel name, public/private visibility, Codex agent count, and
-Claude agent count. The app creates the channel, posts the roster, and starts an
-introduction thread.
+Claude agent count, and repos root. The default repos root is two directories
+above the service working directory when possible. The app creates the channel,
+posts a short usage note first, then posts the roster.
 
 ## 5. Start real work
 
 In the agent channel:
 
 ```text
-Somebody do inspect the repo and summarize the test command
+Inspect the repo and summarize the test command
 ```
 
-The harness assigns an idle agent, creates a task thread, launches that agent's
-mapped runtime, and streams terminal output into the thread. Replies in the
-thread are sent back into the managed process.
+The harness assigns an idle agent, replies in the user's message thread,
+launches that agent's mapped runtime, and streams terminal output into the
+thread. Later thread replies continue with the same Slack context.
 
 Specific agent:
 
@@ -116,29 +125,35 @@ author agent.
 
 ## 6. Manage the team
 
-Use roster buttons or commands:
+Use roster buttons or commands. In the agent channel, command bodies also work
+as plain messages, such as `hire 2 claude agents` or `show roster`.
 
 ```text
 /slackgentic-<you> hire 2 claude agents
 /slackgentic-<you> fire @riley
+/slackgentic-<you> fire everyone
 /slackgentic-<you> show roster
+/slackgentic-<you> show repo root
+/slackgentic-<you> repo root ~/code
 /slackgentic-<you> usage
 /slackgentic-<you> status
+hire 2 claude agents
+show roster
+status
 ```
 
 Wipe local runtime state and start fresh:
 
 ```sh
-.venv/bin/slackgentic slack reset-state --yes
+slackgentic slack reset-state --yes
 ```
 
 This keeps Slack credentials in `~/.slackgentic-team/config.json`.
 
 Task thread buttons:
 
-- `Mark Done` terminates any attached managed process and marks the task done.
-- `Pause` terminates the process and puts the task back in queued state.
-- `Cancel` terminates the process and marks the task cancelled.
+- `Finish and free up this agent` terminates any attached managed process and
+  releases the agent for new work.
 
 Usage:
 
@@ -157,10 +172,18 @@ the command again.
 - Slack does not expose a public API for minting the required app-level `xapp-`
   token, so setup still requires clicking Slack's Copy button once for that
   token.
-- Managed processes are in-memory. If `slackgentic slack serve` restarts, old
-  threads remain visible but cannot receive input until task resumption is
-  implemented.
+- Managed child processes cannot be reattached after daemon restart. Old
+  threads remain visible and follow-up replies resume the persisted task/session
+  state, but Slackgentic relaunches the provider process.
 - PR review execution passes the PR URL to Codex/Claude; it does not yet fetch
   and cache GitHub diffs itself.
 - Socket Mode apps are intended for workspace/internal use, not Slack
   Marketplace distribution.
+
+## Development Debugging
+
+Run the Slack daemon in the foreground when debugging service startup locally:
+
+```sh
+slackgentic slack serve
+```
