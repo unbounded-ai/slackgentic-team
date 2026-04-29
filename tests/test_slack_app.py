@@ -1270,6 +1270,83 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_agent_can_callback_assigned_external_session_agent_in_same_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                nell, asha = build_initial_model_team(1, 1)
+                nell = replace(nell, handle="nell", provider_preference=Provider.CODEX)
+                asha = replace(asha, handle="asha", provider_preference=Provider.CLAUDE)
+                store.upsert_team_agent(nell)
+                store.upsert_team_agent(asha)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-external",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                thread = SlackThreadRef("C1", "171.thread", "171.parent")
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.codex-external", nell.agent_id)
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "codex-external",
+                    "T1",
+                    thread,
+                )
+                helper_task = replace(
+                    create_agent_task(
+                        asha,
+                        "tell @nell ideas of what to work on",
+                        "C1",
+                        requested_by_slack_user="U1",
+                    ),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts=thread.thread_ts,
+                    parent_message_ts="171.helper",
+                    session_provider=Provider.CLAUDE,
+                    session_id="claude-helper",
+                    metadata={
+                        "external_session_provider": Provider.CODEX.value,
+                        "external_session_id": "codex-external",
+                    },
+                )
+                store.upsert_agent_task(helper_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+
+                handled = controller.handle_runtime_agent_message(
+                    helper_task,
+                    asha,
+                    thread,
+                    "@nell here are five project ideas",
+                )
+
+                self.assertTrue(handled)
+                self.assertEqual(len(bridge.sent), 1)
+                sent_session, prompt, sent_thread, slack_user = bridge.sent[0]
+                self.assertEqual(sent_session.session_id, "codex-external")
+                self.assertEqual(prompt, "here are five project ideas")
+                self.assertEqual(sent_thread.thread_ts, "171.thread")
+                self.assertEqual(slack_user, "U1")
+                self.assertEqual(gateway.thread_replies, [])
+                self.assertEqual(store.list_pending_work_requests(), [])
+                self.assertEqual(len(store.list_agent_tasks(include_done=True)), 1)
+            finally:
+                store.close()
+
     def test_user_specific_same_thread_followup_uses_requested_agents_prior_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1781,6 +1858,64 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(runtime.started[0][1].handle, "another-agent-name")
                 self.assertEqual(bridge.sent, [])
+            finally:
+                store.close()
+
+    def test_external_session_thread_request_to_assigned_agent_goes_to_live_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = replace(
+                    build_initial_model_team(codex_count=1, claude_count=0)[0], handle="nell"
+                )
+                store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.s1", agent.agent_id)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "@nell pick one of these ideas",
+                            "ts": "171.000002",
+                            "thread_ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(bridge.sent), 1)
+                sent_session, prompt, sent_thread, slack_user = bridge.sent[0]
+                self.assertEqual(sent_session.session_id, "s1")
+                self.assertEqual(prompt, "pick one of these ideas")
+                self.assertEqual(sent_thread.thread_ts, "171.000001")
+                self.assertEqual(slack_user, "U1")
+                self.assertEqual(store.list_agent_tasks(include_done=True), [])
+                self.assertEqual(store.list_pending_work_requests(), [])
+                self.assertEqual(gateway.thread_replies, [])
             finally:
                 store.close()
 

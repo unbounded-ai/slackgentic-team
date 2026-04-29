@@ -1136,6 +1136,14 @@ class SlackTeamController:
         author_agent = (
             self.store.get_team_agent(request.author_handle) if request.author_handle else None
         )
+        target_agent = self.store.get_team_agent(request.requested_handle or "")
+        if target_agent is not None and self._start_external_session_agent_followup(
+            request,
+            target_agent,
+            SlackThreadRef(channel_id, thread_ts),
+            requested_by_slack_user=event.get("user"),
+        ):
+            return True
         same_thread_agent = self._same_thread_requested_agent(request, channel_id, thread_ts)
         if same_thread_agent is not None:
             return self._start_same_thread_agent_followup(
@@ -1362,6 +1370,13 @@ class SlackTeamController:
         target_agent = self.store.get_team_agent(request.requested_handle or "")
         if target_agent is None or target_agent.agent_id == agent.agent_id:
             return False
+        if self._start_external_session_agent_followup(
+            request,
+            target_agent,
+            thread,
+            requested_by_slack_user=task.requested_by_slack_user,
+        ):
+            return True
         if task.metadata.get("delegate_to_agent_id") == target_agent.agent_id:
             return False
         same_thread_task = self._latest_task_for_agent_thread(
@@ -1424,6 +1439,14 @@ class SlackTeamController:
         for request in requests:
             target_agent = self.store.get_team_agent(request.requested_handle or "")
             if target_agent is None:
+                continue
+            if self._start_external_session_agent_followup(
+                request,
+                target_agent,
+                thread,
+                requested_by_slack_user=requested_by_slack_user,
+            ):
+                handled = True
                 continue
             same_thread_agent = self._same_thread_requested_agent(
                 request,
@@ -1584,6 +1607,50 @@ class SlackTeamController:
         if self.runtime:
             self.runtime.start_task(task, agent, thread)
         return True
+
+    def _start_external_session_agent_followup(
+        self,
+        request: WorkRequest,
+        agent,
+        thread: SlackThreadRef,
+        *,
+        requested_by_slack_user: str | None,
+    ) -> bool:
+        session = self._external_session_for_thread_agent(
+            agent,
+            thread.channel_id,
+            thread.thread_ts,
+        )
+        if session is None:
+            return False
+        if self.session_bridge is None:
+            self.gateway.post_thread_reply(
+                thread,
+                "I found the external session thread, but no session bridge is configured.",
+            )
+            return True
+        return self.session_bridge.send_to_session(
+            session,
+            request.prompt,
+            thread,
+            slack_user=requested_by_slack_user,
+        )
+
+    def _external_session_for_thread_agent(
+        self,
+        agent,
+        channel_id: str,
+        thread_ts: str,
+    ):
+        session = self.store.get_session_for_slack_thread(self.team_id, channel_id, thread_ts)
+        if session is None:
+            return None
+        assigned_agent_id = self.store.get_setting(
+            f"{EXTERNAL_SESSION_AGENT_PREFIX}{session.provider.value}.{session.session_id}"
+        )
+        if assigned_agent_id != agent.agent_id:
+            return None
+        return session
 
     def _continue_same_thread_agent_task(
         self,
