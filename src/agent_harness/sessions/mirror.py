@@ -120,7 +120,15 @@ class SessionMirror:
         active_session_keys: set[str] = set()
         for provider in self.providers:
             for session in provider.discover():
+                if self.store.get_setting(_ignored_external_session_key(session)):
+                    if session.status != SessionStatus.ACTIVE:
+                        self.store.upsert_session(session)
+                    continue
                 if self._external_terminal_session_closed(session):
+                    self.store.set_setting(
+                        _ignored_external_session_key(session),
+                        utc_now().isoformat(),
+                    )
                     session = replace(session, status=SessionStatus.DONE)
                 self.store.upsert_session(session)
                 self._cleanup_hidden_external_session_summary(session)

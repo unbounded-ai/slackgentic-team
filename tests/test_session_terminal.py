@@ -55,6 +55,20 @@ class SessionTerminalNotifierTests(unittest.TestCase):
 
             self.assertEqual([target.tty for target in targets], ["ttys002"])
 
+    def test_targets_for_session_without_cwd_does_not_scan_processes(self):
+        def fail_process_lister():
+            raise AssertionError("process scan should not run without a session cwd")
+
+        notifier = SessionTerminalNotifier(process_lister=fail_process_lister)
+        session = AgentSession(
+            provider=Provider.CLAUDE,
+            session_id="abcdef123456",
+            transcript_path=Path("session.jsonl"),
+            cwd=None,
+        )
+
+        self.assertEqual(notifier.targets_for_session(session), [])
+
     def test_provider_process_for_pid_matches_provider_without_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
             starts = {101: datetime(2026, 4, 27, 12, 0, tzinfo=UTC)}

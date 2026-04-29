@@ -1860,10 +1860,27 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
                 self.assertIsNone(store.get_setting("external_session_live_target.claude.s1"))
                 self.assertIsNone(store.get_setting("external_session_missing_target.claude.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
                 self.assertEqual(
                     store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
                 )
                 self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(
+                    [reply[1] for reply in gateway.replies],
+                    ["Session ended; freed up this agent."],
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
+                )
+                self.assertEqual(
+                    [reply[1] for reply in gateway.replies],
+                    ["Session ended; freed up this agent."],
+                )
             finally:
                 store.close()
 

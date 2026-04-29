@@ -185,6 +185,9 @@ def _usage_dedupe_id(record: dict[str, Any]) -> str:
 def _record_text(record: dict[str, Any]) -> str | None:
     message = record.get("message")
     if not isinstance(message, dict):
+        content = record.get("content")
+        if isinstance(content, str):
+            return content
         if isinstance(record.get("type"), str):
             return record["type"]
         return None

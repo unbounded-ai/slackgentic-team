@@ -113,9 +113,11 @@ class SessionTerminalNotifier:
         return root / ".slackgentic" / "terminal-notifications" / filename
 
     def targets_for_session(self, session: AgentSession) -> list[TerminalTarget]:
+        if session.cwd is None:
+            return []
         targets: list[TerminalTarget] = []
         for target in self.provider_processes(session.provider):
-            if session.cwd and target.cwd and _same_path(session.cwd, target.cwd):
+            if target.cwd and _same_path(session.cwd, target.cwd):
                 targets.append(target)
         return _best_session_targets(session, targets)
 
