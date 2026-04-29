@@ -1937,6 +1937,7 @@ class SocketModeSlackApp:
             self.gateway,
             config.commands,
             poll_seconds=config.poll_seconds,
+            home=config.home,
         )
         self.session_bridge = ExternalSessionBridge(
             self.store,

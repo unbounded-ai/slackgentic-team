@@ -7,10 +7,18 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
-from agent_harness.models import AgentTask, AgentTaskStatus, Provider, SlackThreadRef, TeamAgent
+from agent_harness.models import (
+    AgentTask,
+    AgentTaskStatus,
+    Provider,
+    SlackThreadRef,
+    TeamAgent,
+    parse_timestamp,
+)
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
@@ -52,6 +60,7 @@ class ManagedTaskRuntime:
         on_agent_message: AgentMessageCallback | None = None,
         on_agent_control: AgentControlCallback | None = None,
         agent_icon_url: AgentIconUrlCallback | None = None,
+        home: Path | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -62,6 +71,7 @@ class ManagedTaskRuntime:
         self.on_agent_message = on_agent_message
         self.on_agent_control = on_agent_control
         self.agent_icon_url = agent_icon_url
+        self.home = home or Path.home()
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
 
@@ -183,7 +193,20 @@ class ManagedTaskRuntime:
                     self._post_agent_chunk(running, chunk)
                 with self._lock:
                     self._running.pop(task_id, None)
+                try:
+                    completed_task = self.store.get_agent_task(task_id) or running.task
+                except Exception:
+                    LOGGER.debug("failed to load completed task", exc_info=True)
+                    completed_task = running.task
                 if running.visible_message_count == 0 and not running.control_signals:
+                    recovered_message = self._recover_visible_message(completed_task, running)
+                    if recovered_message:
+                        self._post_agent_chunk(running, recovered_message)
+                        if self._handle_agent_control_signals(running, completed_task):
+                            return
+                        if self.on_task_done:
+                            self.on_task_done(completed_task, running.agent, running.thread)
+                        return
                     self.gateway.post_thread_reply(
                         running.thread,
                         (
@@ -196,11 +219,6 @@ class ManagedTaskRuntime:
                     )
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
-                try:
-                    completed_task = self.store.get_agent_task(task_id) or running.task
-                except Exception:
-                    LOGGER.debug("failed to load completed task", exc_info=True)
-                    completed_task = running.task
                 if self._handle_agent_control_signals(running, completed_task):
                     return
                 if self.on_task_done:
@@ -247,6 +265,15 @@ class ManagedTaskRuntime:
             except Exception:
                 LOGGER.exception("failed to handle agent control signal")
         return handled
+
+    def _recover_visible_message(self, task: AgentTask, running: RunningTask) -> str | None:
+        if _provider_for_running(running) != Provider.CODEX or not task.session_id:
+            return None
+        return _latest_codex_transcript_message(
+            task.session_id,
+            self.home,
+            since=task.created_at,
+        )
 
     def _agent_icon_url(self, agent: TeamAgent) -> str | None:
         if self.agent_icon_url is None:
@@ -525,6 +552,68 @@ def _render_codex_response_item(payload: dict) -> str | None:
             if cleaned:
                 parts.append(cleaned)
     return "\n\n".join(parts) if parts else None
+
+
+def _latest_codex_transcript_message(
+    session_id: str,
+    home: Path,
+    *,
+    since: datetime | None = None,
+) -> str | None:
+    sessions_root = home / ".codex" / "sessions"
+    if not sessions_root.exists():
+        return None
+    try:
+        paths = sorted(
+            sessions_root.rglob(f"*{session_id}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in paths:
+        message = _latest_codex_transcript_message_from_path(path, since=since)
+        if message:
+            return message
+    return None
+
+
+def _latest_codex_transcript_message_from_path(
+    path: Path,
+    *,
+    since: datetime | None = None,
+) -> str | None:
+    latest: str | None = None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        timestamp = parse_timestamp(record.get("timestamp"))
+        if since is not None and timestamp is not None and timestamp < since:
+            continue
+        message = _codex_transcript_record_message(record)
+        if message:
+            latest = message
+    return latest
+
+
+def _codex_transcript_record_message(record: dict) -> str | None:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if record.get("type") == "event_msg" and payload.get("type") == "agent_message":
+        message = payload.get("message") or payload.get("text")
+        return _clean_terminal_output(str(message)) if message else None
+    if record.get("type") == "response_item":
+        return _render_codex_response_item(payload)
+    return None
 
 
 def _claude_json_chunks(

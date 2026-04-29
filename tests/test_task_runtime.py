@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
@@ -11,6 +12,7 @@ from agent_harness.runtime.tasks import (
     ManagedTaskRuntime,
     _clean_terminal_output,
     _extract_agent_control_signals,
+    _latest_codex_transcript_message,
     _process_output_chunks,
     _requested_repo_cwd,
     build_task_prompt,
@@ -76,6 +78,16 @@ class ThreadDoneSignalProcess(OneShotProcess):
 class SilentProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         self.reads += 1
+        return ""
+
+
+class SessionOnlyProcess(OneShotProcess):
+    session_id = "session-fallback"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return f'{{"type":"thread.started","thread_id":"{self.session_id}"}}\n'
         return ""
 
 
@@ -276,6 +288,40 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Sounds good.")
         self.assertEqual(signals, [AGENT_THREAD_DONE_SIGNAL])
+
+    def test_codex_transcript_fallback_uses_latest_agent_message_since_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            session_id = "session-fallback"
+            path = (
+                home
+                / ".codex"
+                / "sessions"
+                / "2026"
+                / "04"
+                / "29"
+                / f"rollout-2026-04-29T01-17-28-{session_id}.jsonl"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "\n".join(
+                    [
+                        '{"timestamp":"2026-04-29T05:00:00Z","type":"event_msg",'
+                        '"payload":{"type":"agent_message","message":"old"}}',
+                        '{"timestamp":"2026-04-29T05:01:00Z","type":"event_msg",'
+                        '"payload":{"type":"agent_message","message":"new"}}',
+                    ]
+                )
+                + "\n"
+            )
+
+            message = _latest_codex_transcript_message(
+                session_id,
+                home,
+                since=datetime.fromisoformat("2026-04-29T05:00:30+00:00"),
+            )
+
+            self.assertEqual(message, "new")
 
     def test_runtime_does_not_post_process_lifecycle_message_on_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -524,6 +570,57 @@ class TaskRuntimeTests(unittest.TestCase):
                     [(task.task_id, agent.agent_id, "171.000001", AGENT_THREAD_DONE_SIGNAL)],
                 )
                 self.assertEqual(done_callbacks, [])
+            finally:
+                store.close()
+
+    def test_runtime_recovers_visible_message_from_codex_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "help", "C1")
+                store.upsert_agent_task(task)
+                path = (
+                    home
+                    / ".codex"
+                    / "sessions"
+                    / "2026"
+                    / "04"
+                    / "29"
+                    / f"rollout-2026-04-29T01-17-28-{SessionOnlyProcess.session_id}.jsonl"
+                )
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    f'{{"timestamp":"{task.created_at.isoformat()}","type":"event_msg",'
+                    '"payload":{"type":"agent_message","message":"Recovered answer"}}\n'
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=SessionOnlyProcess,
+                    poll_seconds=0.01,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Recovered answer"])
+                self.assertEqual(done_callbacks, [task.task_id])
+                self.assertEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.ACTIVE,
+                )
             finally:
                 store.close()
 
