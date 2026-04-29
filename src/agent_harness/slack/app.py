@@ -477,9 +477,7 @@ class SlackTeamController:
         request: WorkRequest,
         target: SlackReplyTarget,
     ) -> bool:
-        if not target.thread_ts:
-            return False
-        return request.assignment_mode != AssignmentMode.SPECIFIC
+        return bool(target.thread_ts)
 
     def _resume_pending_work_requests(self, channel_id: str) -> int:
         resumed = 0
@@ -760,6 +758,10 @@ class SlackTeamController:
             self._pin_roster(channel_id, roster_ts)
             return roster_ts
         return self.post_roster(channel_id)
+
+    def handle_external_session_occupancy_change(self, channel_id: str) -> None:
+        self._resume_pending_work_requests(channel_id)
+        self.refresh_or_post_roster(channel_id)
 
     def _pin_roster(self, channel_id: str, message_ts: str) -> None:
         try:
@@ -1904,6 +1906,9 @@ class SocketModeSlackApp:
             channel_id=config.slack.channel_id,
             poll_seconds=max(config.poll_seconds, 2.0),
             codex_app_server_url=codex_app_server_url,
+            on_external_session_occupancy_change=(
+                self.controller.handle_external_session_occupancy_change
+            ),
         )
         self.session_mirror.start()
         self.awake_keeper = ActiveSessionAwakeKeeper(

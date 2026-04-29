@@ -17,6 +17,11 @@ from agent_harness.models import (
 )
 from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_records
 
+CLAUDE_LOCAL_EXIT_MARKERS = (
+    "<command-name>/exit</command-name>",
+    "<local-command-stdout>Bye!</local-command-stdout>",
+)
+
 
 class ClaudeProvider:
     provider = Provider.CLAUDE
@@ -49,6 +54,8 @@ class ClaudeProvider:
         last_seen = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
         age = (datetime.now(UTC) - last_seen).total_seconds()
         status = SessionStatus.ACTIVE if age <= self.active_within_seconds else SessionStatus.IDLE
+        if _session_ended_by_exit(path):
+            status = SessionStatus.DONE
         metadata: dict[str, Any] = {}
         started = _first_timestamp(path)
         cwd: Path | None = None
@@ -195,3 +202,40 @@ def _record_text(record: dict[str, Any]) -> str | None:
         elif item.get("type") == "tool_use":
             text_parts.append(f"tool call: {item.get('name', 'unknown')}")
     return "\n".join(text_parts) if text_parts else None
+
+
+def _session_ended_by_exit(path: Path) -> bool:
+    exited = False
+    for _, record in last_jsonl_records(path, limit=80):
+        text = _record_text(record) or ""
+        if any(marker in text for marker in CLAUDE_LOCAL_EXIT_MARKERS) or text.strip() == "/exit":
+            exited = True
+            continue
+        if exited and _is_normal_conversation_record_after_exit(record, text):
+            exited = False
+    return exited
+
+
+def _is_normal_conversation_record_after_exit(record: dict[str, Any], text: str) -> bool:
+    record_type = record.get("type")
+    if record_type == "assistant":
+        return True
+    if record_type != "user":
+        return False
+    if record.get("isMeta") is True:
+        return False
+    return not _is_local_command_text(text)
+
+
+def _is_local_command_text(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "<local-command-caveat>",
+            "<command-name>",
+            "<command-message>",
+            "<command-args>",
+            "<local-command-stdout>",
+            "<local-command-stderr>",
+        )
+    )

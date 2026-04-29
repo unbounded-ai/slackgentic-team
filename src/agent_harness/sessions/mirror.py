@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +63,7 @@ class SessionMirror:
         poll_seconds: float = 2.0,
         terminal_notifier: SessionTerminalNotifier | None = None,
         codex_app_server_url: str | None = DEFAULT_CODEX_APP_SERVER_URL,
+        on_external_session_occupancy_change: Callable[[str], None] | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -72,6 +73,7 @@ class SessionMirror:
         self.poll_seconds = poll_seconds
         self.terminal_notifier = terminal_notifier or SessionTerminalNotifier()
         self.codex_app_server_url = codex_app_server_url
+        self.on_external_session_occupancy_change = on_external_session_occupancy_change
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -103,20 +105,19 @@ class SessionMirror:
         if not channel_id:
             return
         sync_sessions: list[tuple[AgentProvider, AgentSession]] = []
+        active_session_keys: set[str] = set()
         for provider in self.providers:
             for session in provider.discover():
+                self.store.upsert_session(session)
+                self._cleanup_hidden_external_session_summary(session)
                 if self._skip_managed_task_session(session, channel_id):
                     continue
                 if not self._should_sync_session(session):
                     continue
+                active_session_keys.add(_external_session_key(session.provider, session.session_id))
                 sync_sessions.append((provider, session))
-        active_session_keys = {
-            _external_session_key(session.provider, session.session_id)
-            for _, session in sync_sessions
-        }
         self._cleanup_inactive_external_sessions(active_session_keys, channel_id)
         for provider, session in sync_sessions:
-            self.store.upsert_session(session)
             agent = self._team_agent_for_session(session, active_session_keys, channel_id)
             if agent is None:
                 continue
@@ -359,6 +360,7 @@ class SessionMirror:
             return None
         agent = available[0]
         self.store.set_setting(setting_key, agent.agent_id)
+        self._notify_external_session_occupancy_changed(channel_id)
         self._mark_session_not_pending(session)
         self._update_capacity_notice_if_clear(channel_id, session.provider)
         return agent
@@ -396,6 +398,7 @@ class SessionMirror:
                 providers_to_refresh.add(provider)
                 if prefix != EXTERNAL_SESSION_AGENT_PREFIX:
                     continue
+                self._notify_external_session_occupancy_changed(channel_id)
                 thread = self.store.get_slack_thread_for_session(
                     provider,
                     session_id,
@@ -413,9 +416,7 @@ class SessionMirror:
     def _should_sync_session(self, session: AgentSession) -> bool:
         if self.store.get_setting(_ignored_external_session_key(session)):
             return False
-        return session.status == SessionStatus.ACTIVE or bool(
-            self.store.get_setting(_pending_external_session_key(session))
-        )
+        return session.status == SessionStatus.ACTIVE
 
     def _skip_managed_task_session(self, session: AgentSession, channel_id: str) -> bool:
         if not self.store.has_agent_task_session(session.provider, session.session_id):
@@ -427,8 +428,17 @@ class SessionMirror:
             channel_id=channel_id,
         )
         if changed:
+            self._notify_external_session_occupancy_changed(channel_id)
             self._update_capacity_notice_if_clear(channel_id, session.provider)
         return True
+
+    def _notify_external_session_occupancy_changed(self, channel_id: str) -> None:
+        if self.on_external_session_occupancy_change is None:
+            return
+        try:
+            self.on_external_session_occupancy_change(channel_id)
+        except Exception:
+            LOGGER.debug("failed to refresh external session occupancy", exc_info=True)
 
     def _mark_session_pending(self, session: AgentSession) -> None:
         self.store.set_setting(_pending_external_session_key(session), utc_now().isoformat())
@@ -522,6 +532,11 @@ class SessionMirror:
 
     def _session_summary(self, session: AgentSession) -> str | None:
         return self.store.get_setting(_external_session_summary_key(session))
+
+    def _cleanup_hidden_external_session_summary(self, session: AgentSession) -> None:
+        summary = self._session_summary(session)
+        if summary and _has_claude_local_command_block(summary):
+            self.store.delete_setting(_external_session_summary_key(session))
 
 
 def format_session_parent(session: AgentSession, summary: str | None = None) -> str:
@@ -645,6 +660,8 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
     text = _claude_message_text(message)
     if not text:
         return None
+    if _has_claude_local_command_block(text):
+        return None
     if event.event_type == "user" and _has_slackgentic_channel_block(text):
         return None
     if event.event_type == "assistant":
@@ -720,6 +737,20 @@ def _remove_slackgentic_channel_blocks(text: str) -> str:
     if not SLACKGENTIC_CHANNEL_BLOCK_RE.search(decoded):
         return text
     return SLACKGENTIC_CHANNEL_BLOCK_RE.sub("", decoded).strip()
+
+
+def _has_claude_local_command_block(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "<local-command-caveat>",
+            "<command-name>",
+            "<command-message>",
+            "<command-args>",
+            "<local-command-stdout>",
+            "<local-command-stderr>",
+        )
+    )
 
 
 def _short_path(path: Path) -> str:

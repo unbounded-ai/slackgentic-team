@@ -590,6 +590,63 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_specific_request_for_external_busy_agent_resumes_when_agent_frees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"@{agent.handle} hi",
+                            "ts": "171.000002",
+                            "thread_ts": "171.000001",
+                        }
+                    }
+                )
+
+                pending = store.list_pending_work_requests(channel_id="C1")
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].request.requested_handle, agent.handle)
+                self.assertIn("That specific agent is busy", gateway.thread_replies[-1]["text"])
+
+                store.delete_setting("external_session_agent.claude.s1")
+                controller.handle_external_session_occupancy_change("C1")
+
+                row = store.conn.execute(
+                    "SELECT status FROM pending_work_requests WHERE pending_id = ?",
+                    (pending[0].pending_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "assigned")
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(runtime.started[0][1].agent_id, agent.agent_id)
+                self.assertIn("Capacity is available now", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
     def test_roster_channel_message_posts_in_channel_not_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1034,7 +1091,9 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("specific agent is busy", gateway.thread_replies[-1]["text"])
                 self.assertIn("ask someone else", gateway.thread_replies[-1]["text"])
                 self.assertNotIn("hire more agents", gateway.thread_replies[-1]["text"])
-                self.assertEqual(store.list_pending_work_requests(), [])
+                pending = store.list_pending_work_requests()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].request.requested_handle, agent.handle)
             finally:
                 store.close()
 

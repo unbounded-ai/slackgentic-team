@@ -401,6 +401,92 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_session_assignment_refreshes_occupancy_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(refreshed_channels, ["C1"])
+            finally:
+                store.close()
+
+    def test_inactive_external_session_cleanup_updates_status_and_refreshes_occupancy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                active = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                done = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.DONE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(active)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting(
+                    "external_session_summary.codex.s1",
+                    "<local-command-caveat>internal</local-command-caveat>",
+                )
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(done, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_summary.codex.s1"))
+                self.assertEqual(store.get_session(Provider.CODEX, "s1").status, SessionStatus.DONE)
+                self.assertEqual(
+                    [reply[1] for reply in gateway.replies],
+                    ["Session ended; freed up this agent."],
+                )
+                self.assertEqual(refreshed_channels, ["C1"])
+            finally:
+                store.close()
+
     def test_external_session_does_not_take_agent_with_managed_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -848,6 +934,22 @@ class SessionMirrorTests(unittest.TestCase):
         )
 
         self.assertIsNone(render_session_event(event))
+
+    def test_render_claude_event_hides_local_command_records(self):
+        for text in (
+            "<local-command-caveat>internal</local-command-caveat>",
+            "<command-name>/exit</command-name>\n<command-message>exit</command-message>",
+            "<local-command-stdout>Bye!</local-command-stdout>",
+        ):
+            event = AgentEvent(
+                provider=Provider.CLAUDE,
+                session_id="s1",
+                timestamp=None,
+                event_type="user",
+                metadata={"message": {"content": text}},
+            )
+
+            self.assertIsNone(render_session_event(event))
 
     def test_render_claude_event_strips_echoed_slackgentic_channel_block(self):
         event = AgentEvent(
