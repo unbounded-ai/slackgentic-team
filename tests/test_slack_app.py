@@ -13,6 +13,7 @@ from agent_harness.models import (
     SlackThreadRef,
     WorkRequest,
 )
+from agent_harness.runtime.tasks import AGENT_THREAD_DONE_SIGNAL
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
     DEFAULT_AGENT_AVATAR_BASE_URL,
@@ -937,11 +938,12 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("somebody ...", text)
                 self.assertIn("/slackgentic-ilshat <command>", text)
                 self.assertIn("/slackgentic-ilshat hire 3 agents", text)
-                self.assertIn("/slackgentic-ilshat fire everyone", text)
+                self.assertIn("or just `status`", text)
                 self.assertIn("Codex outside Slack", text)
                 self.assertIn("Claude outside Slack", text)
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn("Write anything in this channel", blocks)
+                self.assertIn("type them directly in this channel", blocks)
                 self.assertIn("Thread subtasks", blocks)
                 self.assertIn("Sessions started outside Slack", blocks)
             finally:
@@ -3235,6 +3237,105 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(statuses[second.task_id], AgentTaskStatus.DONE)
                 self.assertIn(
                     "Finished and freed up this agent.", gateway.thread_replies[-1]["text"]
+                )
+            finally:
+                store.close()
+
+    def test_agent_thread_done_signal_frees_whole_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                first_agent, second_agent = build_initial_model_team(1, 1)
+                store.upsert_team_agent(first_agent)
+                store.upsert_team_agent(second_agent)
+                first = replace(
+                    create_agent_task(first_agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={"request_message_ts": "171.user"},
+                )
+                second = replace(
+                    create_agent_task(second_agent, "follow-up task", "C1"),
+                    status=AgentTaskStatus.QUEUED,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.bot2",
+                    metadata={"request_message_ts": "171.user2"},
+                )
+                outside = replace(
+                    create_agent_task(second_agent, "other thread", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.other",
+                    parent_message_ts="171.other",
+                )
+                store.upsert_agent_task(first)
+                store.upsert_agent_task(second)
+                store.upsert_agent_task(outside)
+                pending = store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.pending"),
+                    WorkRequest(
+                        prompt="queued same thread",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=first_agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_control(
+                    first,
+                    first_agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    AGENT_THREAD_DONE_SIGNAL,
+                )
+
+                self.assertTrue(handled)
+                statuses = {
+                    task.task_id: task.status for task in store.list_agent_tasks(include_done=True)
+                }
+                self.assertEqual(statuses[first.task_id], AgentTaskStatus.DONE)
+                self.assertEqual(statuses[second.task_id], AgentTaskStatus.DONE)
+                self.assertEqual(statuses[outside.task_id], AgentTaskStatus.ACTIVE)
+                row = store.conn.execute(
+                    "SELECT status FROM pending_work_requests WHERE pending_id = ?",
+                    (pending.pending_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "cancelled")
+                self.assertIn(("C1", "171.thread", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_unknown_agent_control_signal_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "SLACKGENTIC: UNKNOWN",
+                )
+
+                self.assertFalse(handled)
+                self.assertEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.ACTIVE,
                 )
             finally:
                 store.close()

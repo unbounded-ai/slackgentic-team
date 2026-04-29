@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
@@ -18,9 +18,11 @@ from agent_harness.team import runtime_personality_prompt
 
 LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
+AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
+AgentControlCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
 AgentIconUrlCallback = Callable[[TeamAgent], str | None]
 
 
@@ -34,6 +36,7 @@ class RunningTask:
     output_buffer: str = ""
     session_buffer: str = ""
     observed_agent_messages: set[str] | None = None
+    control_signals: list[str] = field(default_factory=list)
     visible_message_count: int = 0
 
 
@@ -47,6 +50,7 @@ class ManagedTaskRuntime:
         poll_seconds: float = 1.0,
         on_task_done: TaskDoneCallback | None = None,
         on_agent_message: AgentMessageCallback | None = None,
+        on_agent_control: AgentControlCallback | None = None,
         agent_icon_url: AgentIconUrlCallback | None = None,
     ):
         self.store = store
@@ -56,6 +60,7 @@ class ManagedTaskRuntime:
         self.poll_seconds = poll_seconds
         self.on_task_done = on_task_done
         self.on_agent_message = on_agent_message
+        self.on_agent_control = on_agent_control
         self.agent_icon_url = agent_icon_url
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
@@ -178,7 +183,7 @@ class ManagedTaskRuntime:
                     self._post_agent_chunk(running, chunk)
                 with self._lock:
                     self._running.pop(task_id, None)
-                if running.visible_message_count == 0:
+                if running.visible_message_count == 0 and not running.control_signals:
                     self.gateway.post_thread_reply(
                         running.thread,
                         (
@@ -191,23 +196,33 @@ class ManagedTaskRuntime:
                     )
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
-                completed_task = self.store.get_agent_task(task_id) or running.task
+                try:
+                    completed_task = self.store.get_agent_task(task_id) or running.task
+                except Exception:
+                    LOGGER.debug("failed to load completed task", exc_info=True)
+                    completed_task = running.task
+                if self._handle_agent_control_signals(running, completed_task):
+                    return
                 if self.on_task_done:
                     self.on_task_done(completed_task, running.agent, running.thread)
                 return
             time.sleep(self.poll_seconds)
 
     def _post_agent_chunk(self, running: RunningTask, chunk: str) -> None:
+        visible_text, control_signals = _extract_agent_control_signals(chunk)
+        running.control_signals.extend(control_signals)
+        if not visible_text:
+            return
         self.gateway.post_thread_reply(
             running.thread,
-            chunk,
+            visible_text,
             persona=running.agent,
             icon_url=self._agent_icon_url(running.agent),
         )
         running.visible_message_count += 1
         if self.on_agent_message is None:
             return
-        normalized = chunk.strip()
+        normalized = visible_text.strip()
         if not normalized:
             return
         if running.observed_agent_messages is None:
@@ -219,6 +234,19 @@ class ManagedTaskRuntime:
             self.on_agent_message(running.task, running.agent, running.thread, normalized)
         except Exception:
             LOGGER.exception("failed to handle agent-authored Slack message")
+
+    def _handle_agent_control_signals(self, running: RunningTask, task: AgentTask) -> bool:
+        if self.on_agent_control is None:
+            return False
+        handled = False
+        for signal in dict.fromkeys(running.control_signals):
+            try:
+                handled = (
+                    self.on_agent_control(task, running.agent, running.thread, signal) or handled
+                )
+            except Exception:
+                LOGGER.exception("failed to handle agent control signal")
+        return handled
 
     def _agent_icon_url(self, agent: TeamAgent) -> str | None:
         if self.agent_icon_url is None:
@@ -272,6 +300,13 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "separate Slack-visible message beginning exactly `somebody review ...` "
             "with the concrete item to review. After that message, stop and wait; "
             "Slackgentic will route the review and resume you with the review context."
+        ),
+        (
+            "If the user is clearly closing the whole Slack thread or says no more work "
+            f"is needed, write your normal brief final reply and then add a final line "
+            f"exactly `{AGENT_THREAD_DONE_SIGNAL}`. Slackgentic hides that line and "
+            "marks the whole thread done. Do not use this signal just because your "
+            "current task is complete; use it only when the entire thread should be closed."
         ),
         (
             "When you hand work to a specific agent, use that agent's exact Slackgentic "
@@ -340,6 +375,18 @@ def _slack_chunks(text: str, limit: int = 2800) -> list[str]:
         chunks.append(cleaned[:limit])
         cleaned = cleaned[limit:]
     return chunks
+
+
+def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
+    visible_lines: list[str] = []
+    signals: list[str] = []
+    for line in text.splitlines():
+        normalized = re.sub(r"\s+", " ", line.strip()).upper()
+        if normalized == AGENT_THREAD_DONE_SIGNAL:
+            signals.append(AGENT_THREAD_DONE_SIGNAL)
+            continue
+        visible_lines.append(line)
+    return "\n".join(visible_lines).strip(), signals
 
 
 def _process_output_chunks(

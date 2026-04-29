@@ -7,8 +7,10 @@ from pathlib import Path
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentTaskKind, AgentTaskStatus, Provider, SlackThreadRef
 from agent_harness.runtime.tasks import (
+    AGENT_THREAD_DONE_SIGNAL,
     ManagedTaskRuntime,
     _clean_terminal_output,
+    _extract_agent_control_signals,
     _process_output_chunks,
     _requested_repo_cwd,
     build_task_prompt,
@@ -59,6 +61,18 @@ class SessionIdProcess(OneShotProcess):
         return ""
 
 
+class ThreadDoneSignalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                '{"type":"item.completed","item":{"type":"agent_message",'
+                f'"text":"Sounds good.\\n{AGENT_THREAD_DONE_SIGNAL}"'
+                "}}\n"
+            )
+        return ""
+
+
 class SilentProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         self.reads += 1
@@ -96,6 +110,15 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertIn("somebody review", prompt)
         self.assertIn("stop and wait", prompt)
+
+    def test_build_task_prompt_instructs_thread_done_signal(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "work carefully", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn(AGENT_THREAD_DONE_SIGNAL, prompt)
+        self.assertIn("marks the whole thread done", prompt)
 
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -245,6 +268,14 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(chunks, ["OK"])
         self.assertEqual(buffer, "")
+
+    def test_agent_control_signal_is_stripped_from_visible_text(self):
+        visible, signals = _extract_agent_control_signals(
+            f"Sounds good.\n{AGENT_THREAD_DONE_SIGNAL}\n"
+        )
+
+        self.assertEqual(visible, "Sounds good.")
+        self.assertEqual(signals, [AGENT_THREAD_DONE_SIGNAL])
 
     def test_runtime_does_not_post_process_lifecycle_message_on_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,6 +482,48 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+    def test_runtime_hides_agent_control_signal_and_notifies_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "close the thread", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ThreadDoneSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(
+                            (task.task_id, agent.agent_id, thread.thread_ts, signal)
+                        )
+                        or True
+                    ),
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if seen_controls:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Sounds good."])
+                self.assertEqual(
+                    seen_controls,
+                    [(task.task_id, agent.agent_id, "171.000001", AGENT_THREAD_DONE_SIGNAL)],
+                )
+                self.assertEqual(done_callbacks, [])
             finally:
                 store.close()
 

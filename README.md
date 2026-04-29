@@ -64,11 +64,14 @@ command guide, then starts with one Codex agent and one Claude agent.
 The roster stays updated in-place and pinned when Slack grants the bundled
 pinning scope.
 
-Run commands as:
+Run commands with the slash command:
 
 ```text
 /slackgentic-<you> <command>
 ```
+
+Inside the agent channel, you can also type the command body directly, for
+example `status`, `show roster`, or `hire 3 agents`.
 
 Useful commands:
 
@@ -81,6 +84,9 @@ Useful commands:
 /slackgentic-<you> hire 1 claude agent
 /slackgentic-<you> fire @riley
 /slackgentic-<you> fire everyone
+status
+show roster
+hire 3 agents
 ```
 
 Start work by typing in the agent channel:

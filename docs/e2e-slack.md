@@ -116,7 +116,8 @@ author agent.
 
 ## 6. Manage the team
 
-Use roster buttons or commands:
+Use roster buttons or commands. In the agent channel, command bodies also work
+as plain messages, such as `hire 2 claude agents` or `show roster`.
 
 ```text
 /slackgentic-<you> hire 2 claude agents
@@ -127,6 +128,9 @@ Use roster buttons or commands:
 /slackgentic-<you> repo root ~/code
 /slackgentic-<you> usage
 /slackgentic-<you> status
+hire 2 claude agents
+show roster
+status
 ```
 
 Wipe local runtime state and start fresh:

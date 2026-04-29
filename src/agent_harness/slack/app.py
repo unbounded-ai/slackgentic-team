@@ -35,9 +35,12 @@ from agent_harness.runtime.codex_app_server import (
 )
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
+    AGENT_THREAD_DONE_SIGNAL,
+    ManagedTaskRuntime,
+)
+from agent_harness.runtime.tasks import (
     SETTING_REPO_ROOT as TASK_RUNTIME_REPO_ROOT_SETTING,
 )
-from agent_harness.runtime.tasks import ManagedTaskRuntime
 from agent_harness.sessions.bridge import ExternalSessionBridge
 from agent_harness.sessions.mirror import (
     EXTERNAL_SESSION_AGENT_PREFIX,
@@ -701,9 +704,11 @@ class SlackTeamController:
                     "back up with the added context."
                 ),
                 (
-                    f"Run commands in this channel as `{command} <command>`: "
+                    "Run commands by typing them directly in this channel, "
+                    f"or as `{command} <command>`: "
                     f"`{command} status`, `{command} show roster`, "
-                    f"`{command} hire 3 agents`, `{command} fire everyone`."
+                    f"`{command} hire 3 agents`, or just `status`, "
+                    "`show roster`, `hire 3 agents`."
                 ),
                 f"Codex outside Slack: `{codex_command}` creates a tracking thread here.",
                 (
@@ -1656,6 +1661,51 @@ class SlackTeamController:
         if self.runtime:
             self.runtime.start_task(delegated_task, target_agent, thread)
 
+    def handle_runtime_agent_control(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        if signal != AGENT_THREAD_DONE_SIGNAL:
+            return False
+        return self._complete_task_thread(thread.channel_id, thread.thread_ts)
+
+    def _complete_task_thread(self, channel_id: str, thread_ts: str | None) -> bool:
+        if not thread_ts:
+            return False
+        thread = SlackThreadRef(channel_id, thread_ts)
+        completed = 0
+        for thread_task in self.store.list_agent_tasks(include_done=True):
+            if (
+                thread_task.channel_id == channel_id
+                and thread_task.thread_ts == thread_ts
+                and thread_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
+            ):
+                if self.runtime:
+                    self.runtime.stop_task(thread_task.task_id, AgentTaskStatus.DONE)
+                else:
+                    self.store.update_agent_task_status(thread_task.task_id, AgentTaskStatus.DONE)
+                self._mark_task_complete(thread_task, thread, include_thread=True)
+                completed += 1
+
+        cancelled = 0
+        for pending in self.store.list_pending_work_requests(channel_id=channel_id, limit=500):
+            if pending.thread_ts != thread_ts:
+                continue
+            self.store.update_pending_work_request_status(
+                pending.pending_id,
+                PendingWorkRequestStatus.CANCELLED,
+            )
+            cancelled += 1
+
+        if not completed and not cancelled:
+            return False
+        self._resume_pending_work_requests(channel_id)
+        self.refresh_or_post_roster(channel_id)
+        return True
+
     def _start_thread_followup(self, parent_task: AgentTask, event: dict, text: str, agent) -> bool:
         channel_id = event["channel"]
         thread_ts = event["thread_ts"]
@@ -1905,6 +1955,7 @@ class SocketModeSlackApp:
         )
         self.runtime.on_task_done = self.controller.handle_runtime_task_done
         self.runtime.on_agent_message = self.controller.handle_runtime_agent_message
+        self.runtime.on_agent_control = self.controller.handle_runtime_agent_control
         self.runtime.agent_icon_url = self.controller._agent_icon_url
         self.controller.cancel_orphaned_active_tasks()
         self.session_mirror = SessionMirror(
