@@ -21,7 +21,9 @@ from agent_harness.slack.app import (
     CLAUDE_CHANNEL_PERMISSION_METHOD,
     DEFAULT_AGENT_AVATAR_BASE_URL,
     SETTING_ROSTER_TS,
+    SETTING_SLACK_BACKFILL_LAST_AWAKE,
     ClaudePermissionAutoResolver,
+    SlackMessageBackfill,
     SlackReplyTarget,
     SlackTeamController,
 )
@@ -42,6 +44,8 @@ class FakeGateway:
         self.reactions = []
         self.removed_reactions = []
         self.pins = []
+        self.history_messages = []
+        self.thread_history_messages = {}
 
     def create_channel(self, name, is_private):
         self.channels.append((name, is_private))
@@ -119,21 +123,35 @@ class FakeGateway:
         self.removed_reactions.append((channel_id, ts, reaction_name))
         return True
 
-    def thread_messages(self, channel_id, thread_ts, limit=20):
+    def thread_messages(self, channel_id, thread_ts, limit=20, oldest=None):
         messages = [
             {
                 "username": getattr(item.get("persona"), "full_name", None),
                 "text": item["text"],
+                "ts": item["ts"],
+                "thread_ts": item["thread"].thread_ts,
             }
             for item in self.thread_replies
             if item["thread"].channel_id == channel_id and item["thread"].thread_ts == thread_ts
         ]
+        messages.extend(self.thread_history_messages.get((channel_id, thread_ts), []))
         parents = [
-            {"username": None, "text": item["text"]}
+            {"username": None, "text": item["text"], "ts": item["ts"]}
             for item in self.posts
             if item["channel_id"] == channel_id and item["ts"] == thread_ts
         ]
-        return (parents + messages)[-limit:]
+        combined = parents + messages
+        if oldest:
+            combined = [item for item in combined if float(item.get("ts", 0)) > float(oldest)]
+        return combined[-limit:]
+
+    def channel_messages(self, channel_id, oldest=None, limit=200):
+        messages = [
+            item for item in self.history_messages if item.get("channel", channel_id) == channel_id
+        ]
+        if oldest:
+            messages = [item for item in messages if float(item.get("ts", 0)) > float(oldest)]
+        return messages[:limit]
 
 
 class FakeRuntime:
@@ -1417,6 +1435,141 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].thread_ts, "171.000001")
                 self.assertEqual(gateway.thread_replies[0]["thread"].thread_ts, "171.000001")
                 self.assertIn(("C1", "171.000001", "hourglass_flowing_sand"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_repeated_slack_message_event_is_processed_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                payload = {
+                    "event": {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "Update the README",
+                        "ts": "171.000001",
+                    }
+                }
+
+                controller.handle_event(payload)
+                controller.handle_event(payload)
+
+                self.assertEqual(len(store.list_agent_tasks()), 1)
+                self.assertEqual(len(runtime.started), 1)
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_processes_channel_messages_after_sleep_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                store.set_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE, "171.000000")
+                gateway.history_messages.append(
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "Update docs after wake",
+                        "ts": "171.000010",
+                    }
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.sync_once()
+
+                self.assertEqual(recovered, 1)
+                self.assertEqual(len(store.list_agent_tasks()), 1)
+                self.assertEqual(store.list_agent_tasks()[0].prompt, "Update docs after wake")
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "181.000000")
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_processes_known_thread_replies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody summarize pyproject",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                parent_task = store.list_agent_tasks()[0]
+                gateway.thread_history_messages[("C1", parent_task.thread_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "continue with setup notes",
+                        "ts": "171.000010",
+                        "thread_ts": parent_task.thread_ts,
+                    }
+                ]
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000005")
+
+                self.assertEqual(recovered, 1)
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].prompt, "continue with setup notes")
+                self.assertEqual(len(runtime.started), 2)
             finally:
                 store.close()
 

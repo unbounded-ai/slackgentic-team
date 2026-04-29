@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -108,6 +109,11 @@ SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
+SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
+SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
+SLACK_BACKFILL_FETCH_LIMIT = 500
+SLACK_BACKFILL_GRACE_SECONDS = 5.0
+SLACK_BACKFILL_SLEEP_GAP_SECONDS = 30.0
 DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
@@ -180,6 +186,7 @@ class SlackTeamController:
         self.codex_app_server_url = codex_app_server_url or DEFAULT_CODEX_APP_SERVER_URL
         self.slash_command = slash_command
         self.default_cwd = default_cwd or Path.cwd()
+        self._slack_message_lock = threading.Lock()
         self._normalize_existing_agents()
 
     def handle_block_action(self, payload: dict) -> None:
@@ -290,19 +297,35 @@ class SlackTeamController:
 
     def handle_event(self, payload: dict) -> None:
         event = payload.get("event") or {}
+        channel_id, message_ts = self._recoverable_user_message_ref(event)
+        if channel_id is None or message_ts is None:
+            return
+        with self._slack_message_lock:
+            if self._slack_message_processed(channel_id, message_ts):
+                return
+            self._handle_unprocessed_user_message_event(event, channel_id)
+            self._mark_slack_message_processed(channel_id, message_ts)
+
+    def _recoverable_user_message_ref(self, event: dict) -> tuple[str | None, str | None]:
         event_type = event.get("type")
         if event_type not in {"message", "app_mention"}:
-            return
+            return None, None
         if event.get("subtype"):
-            return
+            return None, None
         bot_id = event.get("bot_id")
         if bot_id and (self.ignored_bot_id is None or bot_id == self.ignored_bot_id):
-            return
+            return None, None
+        if not event.get("user"):
+            return None, None
         channel_id = event.get("channel")
         if not channel_id or not self._is_agent_channel(channel_id):
-            return
-        if self.store.is_mirrored_slack_message(channel_id, event.get("ts")):
-            return
+            return None, None
+        message_ts = event.get("ts")
+        if not message_ts or self.store.is_mirrored_slack_message(channel_id, message_ts):
+            return None, None
+        return channel_id, message_ts
+
+    def _handle_unprocessed_user_message_event(self, event: dict, channel_id: str) -> None:
         self._remember_human_user(event.get("user"), event.get("user_profile"))
         text = event.get("text") or ""
         if self._handle_external_session_thread_reply(event, channel_id, text):
@@ -2133,6 +2156,19 @@ class SlackTeamController:
         if image_url:
             self.store.set_setting(HUMAN_IMAGE_URL_SETTING, image_url)
 
+    def _slack_message_processed(self, channel_id: str, message_ts: str | None) -> bool:
+        if not message_ts:
+            return False
+        return bool(self.store.get_setting(_slack_message_processed_key(channel_id, message_ts)))
+
+    def _mark_slack_message_processed(self, channel_id: str, message_ts: str | None) -> None:
+        if not message_ts:
+            return
+        self.store.set_setting(
+            _slack_message_processed_key(channel_id, message_ts),
+            utc_now().isoformat(),
+        )
+
 
 class ClaudePermissionAutoResolver:
     def __init__(
@@ -2211,6 +2247,154 @@ class ClaudePermissionAutoResolver:
             self._stop.wait(self.poll_seconds)
 
 
+class SlackMessageBackfill:
+    def __init__(
+        self,
+        store: Store,
+        gateway: SlackGateway,
+        controller: SlackTeamController,
+        *,
+        team_id: str,
+        poll_seconds: float = 5.0,
+        sleep_gap_seconds: float = SLACK_BACKFILL_SLEEP_GAP_SECONDS,
+        grace_seconds: float = SLACK_BACKFILL_GRACE_SECONDS,
+        now: Callable[[], float] | None = None,
+    ):
+        self.store = store
+        self.gateway = gateway
+        self.controller = controller
+        self.team_id = team_id
+        self.poll_seconds = poll_seconds
+        self.sleep_gap_seconds = sleep_gap_seconds
+        self.grace_seconds = grace_seconds
+        self.now = now or time.time
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_awake_unix: float | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self.sync_once()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-slack-message-backfill",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def sync_once(self) -> int:
+        now = float(self.now())
+        previous = self._last_awake_unix
+        if previous is None:
+            previous = _float_setting(self.store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE))
+        recovered = 0
+        if previous is not None and now - previous >= self.sleep_gap_seconds:
+            oldest = _slack_ts_from_unix(max(0.0, previous - self.grace_seconds))
+            recovered = self.recover_since(oldest)
+        self._last_awake_unix = now
+        self.store.set_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE, f"{now:.6f}")
+        return recovered
+
+    def recover_since(self, oldest: str) -> int:
+        channel_id = self.controller._configured_agent_channel_id()
+        if not channel_id:
+            return 0
+        events = self._events_since(channel_id, oldest)
+        recovered = 0
+        for event in sorted(events, key=lambda item: _slack_ts_sort_key(item.get("ts"))):
+            event_channel_id, message_ts = self.controller._recoverable_user_message_ref(event)
+            if event_channel_id is None or message_ts is None:
+                continue
+            if self.controller._slack_message_processed(event_channel_id, message_ts):
+                continue
+            try:
+                self.controller.handle_event({"event": event})
+                recovered += 1
+            except Exception:
+                LOGGER.exception(
+                    "failed to process backfilled Slack message %s:%s",
+                    event_channel_id,
+                    message_ts,
+                )
+        return recovered
+
+    def _events_since(self, channel_id: str, oldest: str) -> list[dict]:
+        events_by_ts: dict[str, dict] = {}
+        thread_ts_values = self._known_thread_ts(channel_id)
+        try:
+            channel_messages = self.gateway.channel_messages(
+                channel_id,
+                oldest=oldest,
+                limit=SLACK_BACKFILL_FETCH_LIMIT,
+            )
+        except Exception:
+            LOGGER.exception("failed to fetch Slack channel history for backfill")
+            return []
+        for message in channel_messages:
+            event = _history_message_event(channel_id, message)
+            message_ts = event.get("ts")
+            if isinstance(message_ts, str):
+                events_by_ts[message_ts] = event
+            thread_ts = event.get("thread_ts")
+            if isinstance(thread_ts, str) and thread_ts:
+                thread_ts_values.add(thread_ts)
+            elif isinstance(message_ts, str) and message.get("reply_count"):
+                thread_ts_values.add(message_ts)
+
+        for thread_ts in sorted(thread_ts_values, key=_slack_ts_sort_key):
+            try:
+                thread_messages = self.gateway.thread_messages(
+                    channel_id,
+                    thread_ts,
+                    oldest=oldest,
+                    limit=SLACK_BACKFILL_FETCH_LIMIT,
+                )
+            except Exception:
+                LOGGER.debug(
+                    "failed to fetch Slack thread history for backfill: %s:%s",
+                    channel_id,
+                    thread_ts,
+                    exc_info=True,
+                )
+                continue
+            for message in thread_messages:
+                event = _history_message_event(channel_id, message, default_thread_ts=thread_ts)
+                message_ts = event.get("ts")
+                if isinstance(message_ts, str):
+                    events_by_ts[message_ts] = event
+        return list(events_by_ts.values())
+
+    def _known_thread_ts(self, channel_id: str) -> set[str]:
+        thread_ts_values = {
+            task.thread_ts
+            for task in self.store.list_agent_tasks(include_done=True)
+            if task.channel_id == channel_id and task.thread_ts
+        }
+        for session in self.store.list_sessions():
+            thread = self.store.get_slack_thread_for_session(
+                session.provider,
+                session.session_id,
+                self.team_id,
+                channel_id,
+            )
+            if thread and thread.thread_ts:
+                thread_ts_values.add(thread.thread_ts)
+        return thread_ts_values
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.poll_seconds):
+            try:
+                self.sync_once()
+            except Exception:
+                LOGGER.exception("failed to backfill missed Slack messages")
+
+
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
         if not config.slack.bot_token or not config.slack.app_token:
@@ -2280,6 +2464,14 @@ class SocketModeSlackApp:
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()
+        self.slack_message_backfill = SlackMessageBackfill(
+            self.store,
+            self.gateway,
+            self.controller,
+            team_id=config.slack.team_id or "local",
+            poll_seconds=max(config.poll_seconds, 5.0),
+        )
+        self.slack_message_backfill.start()
         self.claude_permission_auto_resolver = ClaudePermissionAutoResolver(
             self.store,
             self.gateway,
@@ -2294,6 +2486,7 @@ class SocketModeSlackApp:
     def close(self) -> None:
         self.awake_keeper.stop()
         self.claude_permission_auto_resolver.stop()
+        self.slack_message_backfill.stop()
         self.session_mirror.stop()
         if self.codex_app_server:
             self.codex_app_server.close()
@@ -2464,6 +2657,44 @@ def _shorten(value: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
+
+
+def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:
+    return f"{SETTING_SLACK_MESSAGE_PROCESSED_PREFIX}{channel_id}.{message_ts}"
+
+
+def _float_setting(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _slack_ts_from_unix(value: float) -> str:
+    return f"{value:.6f}"
+
+
+def _slack_ts_sort_key(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _history_message_event(
+    channel_id: str,
+    message: dict,
+    *,
+    default_thread_ts: str | None = None,
+) -> dict:
+    event = dict(message)
+    event.setdefault("type", "message")
+    event["channel"] = channel_id
+    if default_thread_ts and event.get("ts") != default_thread_ts:
+        event.setdefault("thread_ts", default_thread_ts)
+    return event
 
 
 def _task_dangerous_mode(task: AgentTask) -> bool:
