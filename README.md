@@ -267,6 +267,8 @@ notes are in [docs/architecture.md](docs/architecture.md).
 - Stabilization.
 - Link threads and wait for one thread to finish before automatically starting
   a follow-up task.
+- Scheduled tasks for recurring or one-off future work, such as nightly repo
+  checks, delayed follow-ups, and periodic review sweeps.
 - More features.
 
 ## License
