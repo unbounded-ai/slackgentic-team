@@ -58,6 +58,14 @@ class OneShotProcess:
         pass
 
 
+class ClaudeOneShotProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return '{"type":"result","subtype":"success","is_error":false,"result":"Done"}\n'
+        return ""
+
+
 class SessionIdProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         if self.reads == 0:
@@ -456,9 +464,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "remember this", "C1")
                 store.upsert_agent_task(task)
+                gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
                     store,
-                    FakeGateway(),
+                    gateway,
                     AgentCommandConfig(),
                     process_factory=SessionIdProcess,
                     poll_seconds=0.01,
@@ -479,6 +488,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 for _ in range(50):
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.ACTIVE:
+                        break
+                    time.sleep(0.01)
+                for _ in range(50):
+                    if gateway.replies:
                         break
                     time.sleep(0.01)
             finally:
@@ -504,9 +517,10 @@ class TaskRuntimeTests(unittest.TestCase):
                     session_id="codex-thread-1",
                 )
                 store.upsert_agent_task(task)
+                gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
                     store,
-                    FakeGateway(),
+                    gateway,
                     AgentCommandConfig(),
                     process_factory=process_factory,
                     poll_seconds=0.01,
@@ -518,6 +532,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 for _ in range(50):
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.ACTIVE:
+                        break
+                    time.sleep(0.01)
+                for _ in range(50):
+                    if gateway.replies:
                         break
                     time.sleep(0.01)
             finally:
@@ -539,9 +557,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 task = create_agent_task(agent, "rewrite the installer", "C1")
                 task = replace(task, metadata={DANGEROUS_MODE_METADATA_KEY: True})
                 store.upsert_agent_task(task)
+                gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
                     store,
-                    FakeGateway(),
+                    gateway,
                     AgentCommandConfig(),
                     process_factory=process_factory,
                     poll_seconds=0.01,
@@ -550,6 +569,52 @@ class TaskRuntimeTests(unittest.TestCase):
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
 
                 self.assertTrue(requests[0].dangerous)
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+            finally:
+                store.close()
+
+    def test_runtime_loads_claude_channel_for_slack_thread_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                (home / ".claude.json").write_text(
+                    '{"mcpServers":{"slackgentic":{"command":"slackgentic"}}}\n',
+                    encoding="utf-8",
+                )
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check prs", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(requests[0].claude_channel)
+                self.assertEqual(requests[0].slack_channel_id, "C1")
+                self.assertEqual(requests[0].slack_thread_ts, "171.000001")
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
             finally:
                 store.close()
 

@@ -87,6 +87,21 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--worktree", args)
         self.assertEqual(args[-1], "fix it")
 
+    def test_claude_command_can_load_slackgentic_channel(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="fix it",
+                cwd=Path("/tmp/repo"),
+                claude_channel=True,
+            )
+        )
+
+        self.assertEqual(command, "claude")
+        self.assertIn("--dangerously-load-development-channels", args)
+        channel_index = args.index("--dangerously-load-development-channels")
+        self.assertEqual(args[channel_index + 1], "server:slackgentic")
+
     def test_codex_resume_command_uses_existing_session(self):
         command, args = build_command(
             LaunchRequest(
@@ -193,6 +208,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls[0][1][-1], "hidden claude prompt")
         self.assertEqual(child.sent, [])
         self.assertFalse(child.eof_sent)
+
+    def test_managed_claude_process_passes_slack_thread_env(self):
+        child = FakeChild()
+        calls = []
+
+        def fake_spawn(command, args, **kwargs):
+            calls.append((command, args, kwargs))
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="hidden claude prompt",
+                cwd=Path("/tmp/repo"),
+                slack_channel_id="C1",
+                slack_thread_ts="171.000001",
+            )
+        )
+
+        with patch("pexpect.spawn", fake_spawn):
+            process.start()
+
+        self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_CHANNEL_ID"], "C1")
+        self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_THREAD_TS"], "171.000001")
 
 
 if __name__ == "__main__":

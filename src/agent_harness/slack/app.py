@@ -1964,7 +1964,7 @@ class SlackTeamController:
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
         context = self._thread_context(channel_id, thread_ts)
-        prompt_context = f"Original task: {parent_task.prompt}"
+        prompt_context = f"Original task: {_task_assignment_prompt(parent_task)}"
         if context:
             metadata["thread_context"] = f"{prompt_context}\n{context}"
         else:

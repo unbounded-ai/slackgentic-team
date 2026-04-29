@@ -3875,6 +3875,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
                 self.assertEqual(tasks[0].thread_ts, parent_task.thread_ts)
                 self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertIn(
+                    "Original task: summarize pyproject",
+                    tasks[0].metadata["thread_context"],
+                )
                 self.assertEqual(len(runtime.started), 2)
                 self.assertEqual(runtime.started[-1][0].task_id, parent_task.task_id)
                 self.assertEqual(len(gateway.updates), 1)
@@ -3893,6 +3897,37 @@ class SlackAppTests(unittest.TestCase):
                     "I'll take this",
                     "\n".join(reply["text"] for reply in gateway.thread_replies),
                 )
+
+                store.update_agent_task_status(parent_task.task_id, AgentTaskStatus.DONE)
+                continued_task = store.get_agent_task(parent_task.task_id)
+                self.assertIsNotNone(continued_task)
+                gateway.updates.clear()
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "try again",
+                            "ts": "171.000003",
+                            "thread_ts": parent_task.thread_ts,
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].task_id, parent_task.task_id)
+                self.assertEqual(tasks[0].prompt, "try again")
+                self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
+                thread_context = tasks[0].metadata["thread_context"]
+                self.assertIn("Original task: summarize pyproject", thread_context)
+                self.assertNotIn("Original task: let's do it!", thread_context)
+                self.assertEqual(len(runtime.started), 3)
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn("summarize pyproject", gateway.updates[0]["text"])
+                self.assertNotIn("try again", gateway.updates[0]["text"])
             finally:
                 store.close()
 

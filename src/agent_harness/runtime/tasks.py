@@ -21,6 +21,7 @@ from agent_harness.models import (
     parse_timestamp,
 )
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
+from agent_harness.sessions.claude_channel import is_slackgentic_mcp_server_configured
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
@@ -90,6 +91,11 @@ class ManagedTaskRuntime:
                 and (task.session_provider is None or task.session_provider == provider)
                 else None
             ),
+            claude_channel=(
+                provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(self.home)
+            ),
+            slack_channel_id=thread.channel_id,
+            slack_thread_ts=thread.thread_ts,
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
