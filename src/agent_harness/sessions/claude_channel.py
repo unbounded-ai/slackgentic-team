@@ -85,6 +85,7 @@ class ClaudeChannelServer:
                             "tools": {},
                             "experimental": {
                                 "claude/channel": {},
+                                "claude/channel/permission": {},
                             },
                         },
                         "serverInfo": {
@@ -99,6 +100,10 @@ class ClaudeChannelServer:
             return
         if method == "notifications/initialized":
             self._ready.set()
+            return
+        if method == "notifications/claude/channel/permission_request":
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            self._handle_permission_request_notification(params)
             return
         if method == "ping" and message_id is not None:
             self._write({"jsonrpc": "2.0", "id": message_id, "result": {}})
@@ -209,6 +214,49 @@ class ClaudeChannelServer:
             provider_label="Claude",
         )
         return _tool_result(json.dumps(response, sort_keys=True))
+
+    def _handle_permission_request_notification(self, params: dict[str, Any]) -> None:
+        request_id = params.get("request_id")
+        if request_id is None:
+            return
+        worker = threading.Thread(
+            target=self._handle_permission_request_worker,
+            args=(str(request_id), dict(params)),
+            daemon=True,
+            name=f"slackgentic-claude-permission-{request_id}",
+        )
+        worker.start()
+
+    def _handle_permission_request_worker(
+        self,
+        request_id: str,
+        params: dict[str, Any],
+    ) -> None:
+        behavior = "deny"
+        if self.request_handler is not None and self._current_thread is not None:
+            try:
+                response = self.request_handler.handle_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": request_id,
+                        "tool_name": _string_param(params, "tool_name"),
+                        "description": _string_param(params, "description"),
+                        "input_preview": _string_param(params, "input_preview"),
+                    },
+                    self._current_thread,
+                    provider_label="Claude",
+                )
+            except Exception:
+                response = None
+            if isinstance(response, dict) and response.get("behavior") == "allow":
+                behavior = "allow"
+        self._write(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/claude/channel/permission",
+                "params": {"request_id": request_id, "behavior": behavior},
+            }
+        )
 
     def _write(self, message: dict[str, Any]) -> None:
         with self._write_lock:
@@ -519,3 +567,15 @@ def _string_arg(arguments: dict[str, Any], key: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return ""
+
+
+def _string_param(params: dict[str, Any], key: str) -> str:
+    value = params.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        return str(value)

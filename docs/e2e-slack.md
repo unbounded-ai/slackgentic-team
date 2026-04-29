@@ -78,9 +78,10 @@ or set it to `off` to disable custom agent icons.
 server automatically when `claude` is on `PATH`. If setup prints a warning,
 run `slackgentic claude-channel --install` after Claude is available, then
 restart any already-open Claude sessions before using
-`claude --dangerously-load-development-channels server:slackgentic`. No extra
-MCP flag is needed after registration unless you use `--strict-mcp-config` or a
-custom MCP config that excludes user-level servers.
+`claude --dangerously-load-development-channels server:slackgentic`. The channel
+relays Slack replies and native Claude tool approval prompts. No extra MCP flag
+is needed after registration unless you use `--strict-mcp-config` or a custom
+MCP config that excludes user-level servers.
 
 ## 4. Set up from Slack
 

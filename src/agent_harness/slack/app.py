@@ -726,8 +726,9 @@ class SlackTeamController:
                 (
                     "Claude outside Slack: run `slackgentic claude-channel --install` once, "
                     f"then `{CLAUDE_EXTERNAL_COMMAND}` creates a tracking thread here. Restart "
-                    "already-open Claude sessions after installing; no extra MCP flag is needed "
-                    "unless you use `--strict-mcp-config`."
+                    "already-open Claude sessions after installing. Slack replies and native "
+                    "Claude tool approvals relay through it; no extra MCP flag is needed unless "
+                    "you use `--strict-mcp-config`."
                 ),
             ]
         )

@@ -262,6 +262,7 @@ class SessionBridgeTests(unittest.TestCase):
                 )
                 _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 store.upsert_session(session)
+                store.set_setting("external_session_agent.claude.s1", "agent-1")
                 thread = threading.Thread(target=deliver_channel_message)
                 thread.start()
 
@@ -274,6 +275,11 @@ class SessionBridgeTests(unittest.TestCase):
                 self.assertEqual(
                     gateway.replies[0][1],
                     "Sent `/exit` to the live claude session.",
+                )
+                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
                 )
             finally:
                 store.close()
@@ -318,6 +324,7 @@ class SessionBridgeTests(unittest.TestCase):
                     last_seen_at=datetime.now(UTC),
                 )
                 store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.codex-s1", "agent-1")
 
                 handled = bridge.send_to_session(session, "/exit", SlackThreadRef("C1", "171"))
 
@@ -326,6 +333,12 @@ class SessionBridgeTests(unittest.TestCase):
                 self.assertEqual(killed, [(123, signal.SIGTERM)])
                 self.assertIn("Sent `/exit` to the live codex session.", gateway.replies[0][1])
                 self.assertIn("Terminated the matching process", gateway.replies[0][1])
+                self.assertIsNone(store.get_setting("external_session_agent.codex.codex-s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.codex-s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "codex-s1").status,
+                    SessionStatus.DONE,
+                )
             finally:
                 store.close()
 
@@ -358,6 +371,7 @@ class SessionBridgeTests(unittest.TestCase):
                     last_seen_at=datetime.now(UTC),
                 )
                 store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.codex-s1", "agent-1")
 
                 handled = bridge.send_to_session(session, "/exit", SlackThreadRef("C1", "171"))
 
@@ -370,6 +384,12 @@ class SessionBridgeTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     store.consume_session_bridge_prompt(Provider.CODEX, "codex-s1", "/exit")
+                )
+                self.assertIsNone(store.get_setting("external_session_agent.codex.codex-s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.codex-s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "codex-s1").status,
+                    SessionStatus.DONE,
                 )
             finally:
                 store.close()

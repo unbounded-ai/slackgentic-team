@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -16,6 +17,7 @@ from agent_harness.sessions.claude_channel import (
     mcp_config,
     session_transcript_has_slackgentic_mcp,
 )
+from agent_harness.slack import decode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
@@ -58,6 +60,10 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertEqual(response["id"], 1)
                 self.assertIn("tools", response["result"]["capabilities"])
                 self.assertIn("claude/channel", response["result"]["capabilities"]["experimental"])
+                self.assertIn(
+                    "claude/channel/permission",
+                    response["result"]["capabilities"]["experimental"],
+                )
                 self.assertIn("Slackgentic MCP tools", response["result"]["instructions"])
                 self.assertIn("Never quote, repeat", response["result"]["instructions"])
                 self.assertTrue(server._ready.is_set())
@@ -139,6 +145,62 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 self.assertIn("Claude requests approval", gateway.replies[0]["text"])
                 self.assertIn("abort", result["content"][0]["text"])
+            finally:
+                store.close()
+
+    def test_permission_request_notification_posts_slack_request_and_returns_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                    poll_seconds=0.01,
+                )
+                server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                with redirect_stdout(output):
+                    server._handle_message(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/claude/channel/permission_request",
+                            "params": {
+                                "request_id": "req-1",
+                                "tool_name": "Bash",
+                                "description": "List files",
+                                "input_preview": "ls ~/code",
+                            },
+                        }
+                    )
+                    self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                    value = gateway.replies[0]["blocks"][1]["elements"][0]["value"]
+                    self.assertTrue(
+                        handler.handle_block_action(
+                            decode_action_value(value),
+                            "C1",
+                            gateway.replies[0]["ts"],
+                        )
+                    )
+                    self.assertTrue(
+                        _wait_for(
+                            lambda: "notifications/claude/channel/permission" in output.getvalue()
+                        )
+                    )
+
+                notification = json.loads(output.getvalue().splitlines()[-1])
+                self.assertEqual(notification["method"], "notifications/claude/channel/permission")
+                self.assertEqual(
+                    notification["params"],
+                    {"request_id": "req-1", "behavior": "allow"},
+                )
+                self.assertIn("Claude requests tool approval", gateway.replies[0]["text"])
+                self.assertEqual(gateway.updates[-1]["text"], "Allowed Claude tool request.")
             finally:
                 store.close()
 
@@ -247,6 +309,15 @@ class ClaudeChannelTests(unittest.TestCase):
                 )
             ],
         )
+
+
+def _wait_for(predicate, attempts=100):
+    event = threading.Event()
+    for _ in range(attempts):
+        if predicate():
+            return True
+        event.wait(0.01)
+    return False
 
 
 if __name__ == "__main__":

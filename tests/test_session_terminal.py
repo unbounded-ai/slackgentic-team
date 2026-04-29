@@ -55,6 +55,24 @@ class SessionTerminalNotifierTests(unittest.TestCase):
 
             self.assertEqual([target.tty for target in targets], ["ttys002"])
 
+    def test_provider_process_for_pid_matches_provider_without_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            starts = {101: datetime(2026, 4, 27, 12, 0, tzinfo=UTC)}
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: [
+                    "101 ttys002 codex --remote ws://127.0.0.1:47684",
+                    "102 ttys003 claude --dangerously-skip-permissions",
+                ],
+                cwd_resolver=lambda pid: Path(tmp) if pid == 101 else Path("/other"),
+                start_resolver=lambda pid: starts.get(pid),
+            )
+
+            target = notifier.provider_process_for_pid(Provider.CODEX, 101)
+
+            self.assertIsNotNone(target)
+            self.assertEqual(target.pid, 101)
+            self.assertEqual(target.cwd, Path(tmp))
+
     def test_claude_agent_response_never_writes_to_tty(self):
         with tempfile.TemporaryDirectory() as tmp:
             tty_writes = []

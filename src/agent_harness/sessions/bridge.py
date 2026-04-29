@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
@@ -275,6 +275,7 @@ class ExternalSessionBridge:
             if detail:
                 message = f"{message} {detail}"
             self.gateway.post_thread_reply(thread, message)
+            self._mark_live_session_exited(session, thread)
             return True
         elif session.provider == Provider.CLAUDE:
             if not self._send_to_claude_channel(session, prompt, thread, slack_user):
@@ -286,7 +287,22 @@ class ExternalSessionBridge:
             thread,
             f"Sent `{prompt}` to the live {session.provider.value} session.",
         )
+        self._mark_live_session_exited(session, thread)
         return True
+
+    def _mark_live_session_exited(self, session: AgentSession, thread: SlackThreadRef) -> None:
+        self.store.clear_external_session_tracking(
+            session.provider,
+            session.session_id,
+            channel_id=thread.channel_id,
+        )
+        self.store.set_setting(
+            f"external_session_ignored.{session.provider.value}.{session.session_id}",
+            utc_now().isoformat(),
+        )
+        self.store.upsert_session(
+            replace(session, status=SessionStatus.DONE, last_seen_at=utc_now())
+        )
 
     def _terminate_matching_process_after_live_exit(self, session: AgentSession) -> str | None:
         targets = [

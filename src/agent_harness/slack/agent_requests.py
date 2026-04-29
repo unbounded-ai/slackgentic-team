@@ -328,6 +328,11 @@ def _approval_action_blocks(pending: PendingAgentRequest) -> list[dict[str, Any]
             ("Deny", "deny", None),
             ("Cancel Turn", "cancel", "danger"),
         ]
+    elif method == "claude/channel/permission":
+        labels = [
+            ("Allow", "approve", "primary"),
+            ("Deny", "deny", "danger"),
+        ]
     elif method == "item/permissions/requestApproval":
         labels = [
             ("Approve Turn", "approve", "primary"),
@@ -388,6 +393,18 @@ def _approval_text(method: str, params: dict[str, Any], provider_label: str) -> 
         if reason:
             lines.append(_truncate(reason, 500))
         return "\n".join(lines)
+    if method == "claude/channel/permission":
+        tool_name = _plain(params.get("tool_name"), "tool")
+        description = _plain(params.get("description"), "")
+        input_preview = _plain(params.get("input_preview"), "")
+        lines = [f"*{provider_label} requests tool approval.*"]
+        if tool_name:
+            lines.append(f"Tool: `{_truncate(tool_name, 200)}`")
+        if description:
+            lines.append(_truncate(description, 500))
+        if input_preview:
+            lines.append(f"Input: `{_truncate(input_preview, 900)}`")
+        return "\n".join(lines)
     if method == "agent/requestApproval":
         title = _plain(params.get("title"), "approval")
         reason = _plain(params.get("reason"), "")
@@ -416,6 +433,8 @@ def _decision_response(method: str, decision: str, params: dict[str, Any]) -> An
                 "scope": "session" if decision == "approve_session" else "turn",
             }
         return {"permissions": {}, "scope": "turn"}
+    if method == "claude/channel/permission":
+        return {"behavior": "allow" if decision == "approve" else "deny"}
     return None
 
 
@@ -451,6 +470,8 @@ def _timeout_response(method: str) -> Any:
         return {"answers": {}}
     if method == "item/permissions/requestApproval":
         return {"permissions": {}, "scope": "turn"}
+    if method == "claude/channel/permission":
+        return {"behavior": "deny"}
     if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
         return {"decision": "cancel"}
     if method in {"execCommandApproval", "applyPatchApproval", "agent/requestApproval"}:
@@ -459,6 +480,12 @@ def _timeout_response(method: str) -> Any:
 
 
 def _resolved_text(method: str, decision: str, provider_label: str) -> str:
+    if method == "claude/channel/permission":
+        return {
+            "approve": f"Allowed {provider_label} tool request.",
+            "deny": f"Denied {provider_label} tool request.",
+            "cancel": f"Denied {provider_label} tool request.",
+        }.get(decision, f"Handled {provider_label} tool request.")
     if method == "item/permissions/requestApproval":
         return {
             "approve": f"Approved {provider_label} permissions for this turn.",

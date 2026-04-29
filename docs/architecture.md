@@ -110,10 +110,12 @@ for input or approval requests from the server.
 Claude live delivery uses a Claude Code channel server. Slackgentic queues
 Slack replies in SQLite, and the channel process emits
 `notifications/claude/channel` messages to the live Claude session. The same
-channel advertises MCP tools for Slack-mediated user input and approval. Setup
-tries to register this MCP server automatically; if that registration is missing
-or an already-open Claude session did not load it, Slackgentic warns in the
-session thread instead of treating the channel launch flag as sufficient.
+channel advertises MCP tools for Slack-mediated user input and approval, and it
+also advertises Claude's channel permission relay so native tool approval prompts
+can be handled in Slack. Setup tries to register this MCP server automatically;
+if that registration is missing or an already-open Claude session did not load
+it, Slackgentic warns in the session thread instead of treating the channel
+launch flag as sufficient.
 
 If a live channel is unavailable, replies fall back to the provider's supported
 resume command. The exception is `/exit`: Slackgentic tries the live channel

@@ -365,8 +365,9 @@ def build_channel_overview_blocks(
                     "*Claude:* run `slackgentic claude-channel --install` once, then "
                     f"`{claude_command}`\n"
                     "Each command creates a tracked Slack thread here. Restart already-open "
-                    "Claude sessions after installing the channel; no extra MCP flag is needed "
-                    "unless you use `--strict-mcp-config`."
+                    "Claude sessions after installing the channel. Slack replies and native "
+                    "Claude tool approvals relay through it; no extra MCP flag is needed unless "
+                    "you use `--strict-mcp-config`."
                 ),
             },
         },

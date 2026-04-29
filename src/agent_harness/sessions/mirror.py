@@ -48,6 +48,7 @@ EXTERNAL_SESSION_MISSING_TARGET_PREFIX = "external_session_missing_target."
 EXTERNAL_SESSION_SUMMARY_PREFIX = "external_session_summary."
 PENDING_EXTERNAL_SESSION_PREFIX = "external_session_pending."
 CAPACITY_NOTICE_TS_PREFIX = "external_session_capacity_notice_ts."
+EXTERNAL_SESSION_START_MATCH_SECONDS = 300
 DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
@@ -397,16 +398,19 @@ class SessionMirror:
         return agent
 
     def _external_terminal_session_closed(self, session: AgentSession) -> bool:
-        if session.provider != Provider.CLAUDE:
+        if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
             return False
         if session.status != SessionStatus.ACTIVE:
             return False
         live_target_key = _external_session_live_target_key(session)
+        stored_pid = _int_setting(self.store.get_setting(live_target_key))
         assigned_key = _external_session_agent_setting_key(session)
-        was_tracked = bool(
-            self.store.get_setting(live_target_key) or self.store.get_setting(assigned_key)
+        was_tracked = bool(stored_pid is not None or self.store.get_setting(assigned_key))
+        target = (
+            self._live_terminal_target(session)
+            or self._stored_live_terminal_target(session, stored_pid)
+            or self._time_matched_terminal_target(session)
         )
-        target = self._live_terminal_target(session)
         if target is not None:
             self.store.set_setting(live_target_key, str(target.pid))
             self.store.delete_setting(_external_session_missing_target_key(session))
@@ -424,6 +428,35 @@ class SessionMirror:
         if len(targets) != 1:
             return None
         return targets[0]
+
+    def _stored_live_terminal_target(self, session: AgentSession, pid: int | None):
+        if pid is None:
+            return None
+        target_for_pid = getattr(self.terminal_notifier, "provider_process_for_pid", None)
+        if not callable(target_for_pid):
+            return None
+        return target_for_pid(session.provider, pid)
+
+    def _time_matched_terminal_target(self, session: AgentSession):
+        if session.provider != Provider.CODEX:
+            return None
+        reference = session.started_at or session.last_seen_at
+        if reference is None:
+            return None
+        provider_processes = getattr(self.terminal_notifier, "provider_processes", None)
+        if not callable(provider_processes):
+            return None
+        matches = []
+        for target in provider_processes(session.provider):
+            if target.started_at is None:
+                continue
+            delta = abs((target.started_at.astimezone() - reference.astimezone()).total_seconds())
+            if delta <= EXTERNAL_SESSION_START_MATCH_SECONDS:
+                matches.append((delta, target))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item[0])
+        return matches[0][1]
 
     def _active_external_agent_ids(
         self,
@@ -694,6 +727,15 @@ def _external_session_live_target_key(session: AgentSession) -> str:
 
 def _external_session_missing_target_key(session: AgentSession) -> str:
     return f"{EXTERNAL_SESSION_MISSING_TARGET_PREFIX}{_external_session_key(session.provider, session.session_id)}"
+
+
+def _int_setting(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _ignored_external_session_key(session: AgentSession) -> str:

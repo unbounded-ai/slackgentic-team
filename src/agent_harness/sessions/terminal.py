@@ -114,32 +114,49 @@ class SessionTerminalNotifier:
 
     def targets_for_session(self, session: AgentSession) -> list[TerminalTarget]:
         targets: list[TerminalTarget] = []
+        for target in self.provider_processes(session.provider):
+            if session.cwd and target.cwd and _same_path(session.cwd, target.cwd):
+                targets.append(target)
+        return _best_session_targets(session, targets)
+
+    def provider_process_for_pid(self, provider: Provider, pid: int) -> TerminalTarget | None:
+        for target in self.provider_processes(provider, require_tty=False):
+            if target.pid == pid:
+                return target
+        return None
+
+    def provider_processes(
+        self,
+        provider: Provider,
+        *,
+        require_tty: bool = True,
+    ) -> list[TerminalTarget]:
+        targets: list[TerminalTarget] = []
         for row in self.process_lister():
             parsed = _parse_process_row(row)
             if parsed is None:
                 continue
             pid, tty, command = parsed
-            if not _is_provider_process(session.provider, command):
+            if not _is_provider_process(provider, command):
                 continue
-            if tty == "??" or not tty:
+            if require_tty and (tty == "??" or not tty):
                 continue
             cwd = self.cwd_resolver(pid)
-            if session.cwd and cwd and _same_path(session.cwd, cwd):
-                try:
-                    started_at = self.start_resolver(pid)
-                except Exception:
-                    LOGGER.debug("failed to resolve session process start time", exc_info=True)
-                    started_at = None
-                targets.append(
-                    TerminalTarget(
-                        pid=pid,
-                        tty=tty,
-                        cwd=cwd,
-                        command=command,
-                        started_at=started_at,
-                    )
+            try:
+                started_at = self.start_resolver(pid)
+            except Exception:
+                LOGGER.debug("failed to resolve session process start time", exc_info=True)
+                started_at = None
+            targets.append(
+                TerminalTarget(
+                    pid=pid,
+                    tty=tty,
+                    cwd=cwd,
+                    command=command,
+                    started_at=started_at,
                 )
-        return _best_session_targets(session, targets)
+            )
+        return targets
 
 
 def _terminal_message(
