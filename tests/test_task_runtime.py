@@ -91,6 +91,19 @@ class SessionOnlyProcess(OneShotProcess):
         return ""
 
 
+class ProgressOnlySessionProcess(OneShotProcess):
+    session_id = "session-progress-final-fallback"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                f'{{"type":"thread.started","thread_id":"{self.session_id}"}}\n'
+                '{"type":"event_msg","payload":{"type":"agent_message","message":"Working"}}\n'
+            )
+        return ""
+
+
 class TaskRuntimeTests(unittest.TestCase):
     def test_build_task_prompt_includes_persona_and_pr_context(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
@@ -131,6 +144,16 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertIn(AGENT_THREAD_DONE_SIGNAL, prompt)
         self.assertIn("marks the whole thread done", prompt)
+
+    def test_build_task_prompt_instructs_named_session_agent_callback_format(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "offer options to @nell", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("separate final paragraph", prompt)
+        self.assertIn("@nell pick one before I proceed", prompt)
+        self.assertIn("Do not put that callback handle inline", prompt)
 
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -621,6 +644,58 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+    def test_runtime_recovers_unseen_final_message_after_progress_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "help", "C1")
+                store.upsert_agent_task(task)
+                path = (
+                    home
+                    / ".codex"
+                    / "sessions"
+                    / "2026"
+                    / "04"
+                    / "29"
+                    / (f"rollout-2026-04-29T01-17-28-{ProgressOnlySessionProcess.session_id}.jsonl")
+                )
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    f'{{"timestamp":"{task.created_at.isoformat()}","type":"event_msg",'
+                    '"payload":{"type":"agent_message","message":"Working"}}\n'
+                    f'{{"timestamp":"{task.created_at.isoformat()}","type":"event_msg",'
+                    '"payload":{"type":"agent_message","message":"Recovered final"}}\n'
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                seen = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ProgressOnlySessionProcess,
+                    poll_seconds=0.01,
+                    on_agent_message=lambda task, agent, thread, text: seen.append(text) or True,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if len(gateway.replies) >= 2:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Working", "Recovered final"])
+                self.assertEqual(seen, ["Working", "Recovered final"])
+                self.assertEqual(done_callbacks, [task.task_id])
             finally:
                 store.close()
 

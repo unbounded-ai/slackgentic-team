@@ -735,6 +735,125 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_idle_tracked_codex_session_stays_assigned_when_terminal_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                idle = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(idle)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(idle, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp),
+                                command="codex --remote ws://127.0.0.1:47684",
+                                started_at=started,
+                            )
+                        ],
+                    ),
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s1"), "123")
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "s1").status,
+                    SessionStatus.IDLE,
+                )
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, [])
+            finally:
+                store.close()
+
+    def test_idle_external_session_thread_reclaims_agent_when_terminal_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                idle = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(idle, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp),
+                                command="codex --remote ws://127.0.0.1:47684",
+                                started_at=started,
+                            )
+                        ],
+                    ),
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s1"), "123")
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, ["C1"])
+            finally:
+                store.close()
+
     def test_codex_session_can_match_terminal_by_start_time_after_cwd_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -827,6 +946,61 @@ class SessionMirrorTests(unittest.TestCase):
                 )
 
                 mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_live_target.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_missing_target.codex.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "s1").status,
+                    SessionStatus.DONE,
+                )
+                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(refreshed_channels, ["C1"])
+            finally:
+                store.close()
+
+    def test_idle_tracked_codex_session_is_freed_when_terminal_disappears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                idle = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(idle)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(idle, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([]),
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+
                 mirror.sync_once()
 
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))

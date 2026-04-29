@@ -4,7 +4,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness.models import AgentSession, Provider
-from agent_harness.sessions.terminal import SessionTerminalNotifier
+from agent_harness.sessions.terminal import (
+    TERMINAL_KEYBOARD_MODE_RESET,
+    SessionTerminalNotifier,
+    TerminalTarget,
+)
 
 
 class SessionTerminalNotifierTests(unittest.TestCase):
@@ -86,6 +90,22 @@ class SessionTerminalNotifierTests(unittest.TestCase):
             self.assertIsNotNone(target)
             self.assertEqual(target.pid, 101)
             self.assertEqual(target.cwd, Path(tmp))
+
+    def test_restore_keyboard_mode_writes_kitty_keyboard_mode_pop(self):
+        tty_writes = []
+        notifier = SessionTerminalNotifier(
+            tty_writer=lambda tty, text: tty_writes.append((tty, text))
+        )
+        target = TerminalTarget(
+            pid=101,
+            tty="ttys002",
+            cwd=None,
+            command="codex --remote ws://127.0.0.1:47684",
+        )
+
+        self.assertTrue(notifier.restore_keyboard_mode(target))
+
+        self.assertEqual(tty_writes, [("ttys002", TERMINAL_KEYBOARD_MODE_RESET)])
 
     def test_claude_agent_response_never_writes_to_tty(self):
         with tempfile.TemporaryDirectory() as tmp:

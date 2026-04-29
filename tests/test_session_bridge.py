@@ -32,6 +32,7 @@ class FakeTerminalNotifier:
         self.user_messages = []
         self.agent_responses = []
         self.targets = targets or []
+        self.keyboard_restores = []
 
     def notify_user_message(self, session, text):
         self.user_messages.append((session, text))
@@ -43,6 +44,27 @@ class FakeTerminalNotifier:
 
     def targets_for_session(self, session):
         return self.targets
+
+    def provider_process_for_pid(self, provider, pid):
+        return None
+
+    def restore_keyboard_mode(self, target):
+        self.keyboard_restores.append(target)
+        return True
+
+
+class FakeRunningTerminalNotifier(FakeTerminalNotifier):
+    def __init__(self, targets=None):
+        super().__init__(targets)
+        self.running_pids = {target.pid for target in self.targets}
+
+    def provider_process_for_pid(self, provider, pid):
+        if pid not in self.running_pids:
+            return None
+        for target in self.targets:
+            if target.pid == pid:
+                return target
+        return None
 
 
 class FakeCodexLiveClient:
@@ -207,10 +229,14 @@ class SessionBridgeTests(unittest.TestCase):
                 self.assertFalse(
                     store.consume_session_bridge_prompt(Provider.CLAUDE, "s1", "/exit")
                 )
+                self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
+                )
             finally:
                 store.close()
 
-    def test_exit_request_uses_claude_channel_before_sigterm(self):
+    def test_exit_request_terminates_claude_channel_session_without_slash_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             killed = []
@@ -225,20 +251,6 @@ class SessionBridgeTests(unittest.TestCase):
                     )
                 ]
             )
-            delivered = threading.Event()
-
-            def deliver_channel_message():
-                worker_store = Store(Path(tmp) / "state.sqlite")
-                try:
-                    for _ in range(50):
-                        rows = worker_store.pending_claude_channel_messages(123)
-                        if rows:
-                            worker_store.mark_claude_channel_message_delivered(int(rows[0]["id"]))
-                            delivered.set()
-                            return
-                        delivered.wait(0.01)
-                finally:
-                    worker_store.close()
 
             try:
                 store.init_schema()
@@ -263,19 +275,19 @@ class SessionBridgeTests(unittest.TestCase):
                 _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 store.upsert_session(session)
                 store.set_setting("external_session_agent.claude.s1", "agent-1")
-                thread = threading.Thread(target=deliver_channel_message)
-                thread.start()
 
                 handled = bridge.send_to_session(session, "/exit", SlackThreadRef("C1", "171"))
 
-                thread.join(timeout=1)
                 self.assertTrue(handled)
-                self.assertTrue(delivered.is_set())
-                self.assertEqual(killed, [])
+                self.assertEqual(killed, [(123, signal.SIGTERM)])
                 self.assertEqual(
                     gateway.replies[0][1],
-                    "Sent `/exit` to the live claude session.",
+                    "Terminated the external claude session.",
                 )
+                row = store.conn.execute(
+                    "SELECT COUNT(*) AS count FROM claude_channel_messages"
+                ).fetchone()
+                self.assertEqual(row["count"], 0)
                 self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
                 self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
                 self.assertEqual(
@@ -284,7 +296,7 @@ class SessionBridgeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_exit_request_uses_codex_remote_then_terminates_matching_process(self):
+    def test_exit_request_uses_codex_remote_then_waits_for_clean_exit(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             killed = []
@@ -330,9 +342,68 @@ class SessionBridgeTests(unittest.TestCase):
 
                 self.assertTrue(handled)
                 self.assertEqual(live.calls, [("codex-s1", "/exit", Path(tmp))])
-                self.assertEqual(killed, [(123, signal.SIGTERM)])
+                self.assertEqual(killed, [])
                 self.assertIn("Sent `/exit` to the live codex session.", gateway.replies[0][1])
-                self.assertIn("Terminated the matching process", gateway.replies[0][1])
+                self.assertIn("The matching process exited cleanly.", gateway.replies[0][1])
+                self.assertEqual(terminal.keyboard_restores, [])
+                self.assertIsNone(store.get_setting("external_session_agent.codex.codex-s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.codex-s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "codex-s1").status,
+                    SessionStatus.DONE,
+                )
+            finally:
+                store.close()
+
+    def test_exit_request_kills_codex_after_grace_and_resets_keyboard_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            killed = []
+            live = FakeCodexLiveClient()
+            started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+            target = TerminalTarget(
+                pid=123,
+                tty="ttys001",
+                cwd=Path(tmp),
+                command="codex --remote ws://localhost:47684",
+                started_at=started,
+            )
+            terminal = FakeRunningTerminalNotifier([target])
+
+            try:
+                store.init_schema()
+                gateway = FakeGateway()
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    terminal_notifier=terminal,
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    codex_live_client=live,
+                    process_killer=lambda pid, sig: killed.append((pid, sig)),
+                    live_exit_grace_seconds=0,
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=datetime.now(UTC),
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.codex-s1", "agent-1")
+
+                handled = bridge.send_to_session(session, "/exit", SlackThreadRef("C1", "171"))
+
+                self.assertTrue(handled)
+                self.assertEqual(live.calls, [("codex-s1", "/exit", Path(tmp))])
+                self.assertEqual(killed, [(123, signal.SIGTERM)])
+                self.assertEqual(terminal.keyboard_restores, [target])
+                self.assertIn("Sent `/exit` to the live codex session.", gateway.replies[0][1])
+                self.assertIn("did not exit cleanly", gateway.replies[0][1])
+                self.assertIn("reset the terminal keyboard mode", gateway.replies[0][1])
                 self.assertIsNone(store.get_setting("external_session_agent.codex.codex-s1"))
                 self.assertIsNotNone(store.get_setting("external_session_ignored.codex.codex-s1"))
                 self.assertEqual(

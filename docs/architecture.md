@@ -25,6 +25,7 @@ SQLite is the source of truth for local control-plane state:
 - persistent team agents;
 - identity-to-provider mappings for Codex and Claude;
 - channel-originated tasks and PR review tasks;
+- managed thread-to-task ownership for restart-safe follow-ups;
 - cross-thread dependencies;
 - daily usage snapshots;
 - Claude channel delivery queues;

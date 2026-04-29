@@ -62,6 +62,19 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(request.requested_handle, "riley")
         self.assertEqual(request.prompt, "update the failing test")
 
+    def test_parse_specific_handle_request_with_dash_separator(self):
+        for separator in ("-", "\u2014"):
+            with self.subTest(separator=separator):
+                request = parse_work_request(
+                    f"@riley {separator} pick one before proceeding",
+                    ["riley"],
+                )
+                self.assertIsNotNone(request)
+                assert request is not None
+                self.assertEqual(request.assignment_mode, AssignmentMode.SPECIFIC)
+                self.assertEqual(request.requested_handle, "riley")
+                self.assertEqual(request.prompt, "pick one before proceeding")
+
     def test_parse_review_request_with_author_and_pr_url(self):
         request = parse_work_request(
             "Somebody review @riley's PR https://github.com/acme/app/pull/42",

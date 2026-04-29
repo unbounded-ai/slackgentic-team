@@ -162,9 +162,10 @@ def _parse_specific_request(
     for handle in handles:
         handle_pattern = rf"@?{re.escape(handle)}"
         verb_pattern = "|".join(re.escape(verb) for verb in TASK_VERBS)
+        separator_pattern = r"(?::|,|-|\u2013|\u2014)"
         patterns = [
             (
-                rf"^(?:please\s+)?{handle_pattern}\b\s*[:,]?\s*(?:please\s+)?"
+                rf"^(?:please\s+)?{handle_pattern}\b\s*{separator_pattern}?\s*(?:please\s+)?"
                 rf"(?P<verb>{verb_pattern})\s+(?P<prompt>.+)$"
             ),
             rf"^(?:please\s+)?ask\s+{handle_pattern}\b\s+to\s+(?P<prompt>.+)$",
@@ -172,7 +173,10 @@ def _parse_specific_request(
                 rf"^(?:can|could)\s+{handle_pattern}\b\s+(?:please\s+)?"
                 rf"(?P<verb>{verb_pattern})\s+(?P<prompt>.+)$"
             ),
-            rf"^(?:please\s+)?{handle_pattern}\b\s*[:,]?\s+(?P<prompt>.+)$",
+            (
+                rf"^(?:please\s+)?{handle_pattern}\b\s*{separator_pattern}?"
+                rf"\s+(?P<prompt>.+)$"
+            ),
         ]
         for pattern in patterns:
             match = re.match(pattern, text, flags=re.IGNORECASE)

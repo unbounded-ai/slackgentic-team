@@ -172,9 +172,9 @@ the command again.
 - Slack does not expose a public API for minting the required app-level `xapp-`
   token, so setup still requires clicking Slack's Copy button once for that
   token.
-- Managed processes are in-memory. If the daemon restarts, old threads remain
-  visible; follow-up replies start fresh managed tasks with the same Slack
-  thread context rather than resuming the exact old process.
+- Managed child processes cannot be reattached after daemon restart. Old
+  threads remain visible and follow-up replies resume the persisted task/session
+  state, but Slackgentic relaunches the provider process.
 - PR review execution passes the PR URL to Codex/Claude; it does not yet fetch
   and cache GitHub diffs itself.
 - Socket Mode apps are intended for workspace/internal use, not Slack

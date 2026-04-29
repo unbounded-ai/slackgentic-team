@@ -124,7 +124,7 @@ class SessionMirror:
                     if session.status != SessionStatus.ACTIVE:
                         self.store.upsert_session(session)
                     continue
-                if self._external_terminal_session_closed(session):
+                if self._external_terminal_session_closed(session, channel_id):
                     self.store.set_setting(
                         _ignored_external_session_key(session),
                         utc_now().isoformat(),
@@ -134,9 +134,11 @@ class SessionMirror:
                 self._cleanup_hidden_external_session_summary(session)
                 if self._skip_managed_task_session(session, channel_id):
                     continue
-                if not self._should_sync_session(session):
+                if not self._should_keep_external_session(session, channel_id):
                     continue
                 active_session_keys.add(_external_session_key(session.provider, session.session_id))
+                if not self._should_sync_session(session, channel_id):
+                    continue
                 sync_sessions.append((provider, session))
         self._cleanup_inactive_external_sessions(active_session_keys, channel_id)
         sync_sessions.sort(
@@ -405,15 +407,25 @@ class SessionMirror:
         self._update_capacity_notice_if_clear(channel_id, session.provider)
         return agent
 
-    def _external_terminal_session_closed(self, session: AgentSession) -> bool:
+    def _external_terminal_session_closed(
+        self,
+        session: AgentSession,
+        channel_id: str,
+    ) -> bool:
         if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
             return False
-        if session.status != SessionStatus.ACTIVE:
+        if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             return False
         live_target_key = _external_session_live_target_key(session)
         stored_pid = _int_setting(self.store.get_setting(live_target_key))
         assigned_key = _external_session_agent_setting_key(session)
-        was_tracked = bool(stored_pid is not None or self.store.get_setting(assigned_key))
+        was_tracked = bool(
+            stored_pid is not None
+            or self.store.get_setting(assigned_key)
+            or self._thread_for_session(session, channel_id) is not None
+        )
+        if session.status == SessionStatus.IDLE and not was_tracked:
+            return False
         target = (
             self._live_terminal_target(session)
             or self._stored_live_terminal_target(session, stored_pid)
@@ -519,10 +531,35 @@ class SessionMirror:
         for provider in providers_to_refresh:
             self._update_capacity_notice_if_clear(channel_id, provider)
 
-    def _should_sync_session(self, session: AgentSession) -> bool:
+    def _should_keep_external_session(self, session: AgentSession, channel_id: str) -> bool:
         if self.store.get_setting(_ignored_external_session_key(session)):
             return False
-        return session.status == SessionStatus.ACTIVE
+        if session.status == SessionStatus.ACTIVE:
+            return True
+        if session.status != SessionStatus.IDLE:
+            return False
+        return self._tracked_external_session(session, channel_id)
+
+    def _should_sync_session(self, session: AgentSession, channel_id: str) -> bool:
+        if self.store.get_setting(_ignored_external_session_key(session)):
+            return False
+        if session.status == SessionStatus.ACTIVE:
+            return True
+        if session.status != SessionStatus.IDLE:
+            return False
+        return bool(
+            self.store.get_setting(_external_session_agent_setting_key(session))
+            or self.store.get_setting(_external_session_live_target_key(session))
+        )
+
+    def _tracked_external_session(self, session: AgentSession, channel_id: str) -> bool:
+        return bool(
+            self.store.get_setting(_external_session_agent_setting_key(session))
+            or self.store.get_setting(_external_session_live_target_key(session))
+            or self.store.get_setting(_external_session_missing_target_key(session))
+            or self.store.get_setting(_pending_external_session_key(session))
+            or self._thread_for_session(session, channel_id) is not None
+        )
 
     def _skip_managed_task_session(self, session: AgentSession, channel_id: str) -> bool:
         managed_task = self._managed_task_for_session(session)

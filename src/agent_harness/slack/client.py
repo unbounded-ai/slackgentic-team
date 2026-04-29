@@ -256,7 +256,7 @@ class SlackGateway:
             "ts": ts,
             "text": normalize_slack_mrkdwn(text),
         }
-        if blocks:
+        if blocks is not None:
             kwargs["blocks"] = blocks
         self.client.chat_update(**kwargs)
 

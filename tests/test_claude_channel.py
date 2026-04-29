@@ -66,6 +66,8 @@ class ClaudeChannelTests(unittest.TestCase):
                 )
                 self.assertIn("Slackgentic MCP tools", response["result"]["instructions"])
                 self.assertIn("Never quote, repeat", response["result"]["instructions"])
+                self.assertIn("request_user_input", response["result"]["instructions"])
+                self.assertIn("multiple options", response["result"]["instructions"])
                 self.assertTrue(server._ready.is_set())
             finally:
                 store.close()
@@ -111,9 +113,11 @@ class ClaudeChannelTests(unittest.TestCase):
                     server._handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 
                 response = json.loads(output.getvalue())
-                tool_names = [tool["name"] for tool in response["result"]["tools"]]
-                self.assertIn("request_user_input", tool_names)
-                self.assertIn("request_approval", tool_names)
+                tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+                self.assertIn("request_user_input", tools)
+                self.assertIn("request_approval", tools)
+                self.assertIn("multiple options", tools["request_user_input"]["description"])
+                self.assertIn("one concrete action", tools["request_approval"]["description"])
             finally:
                 store.close()
 
@@ -179,7 +183,12 @@ class ClaudeChannelTests(unittest.TestCase):
                         }
                     )
                     self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
-                    value = gateway.replies[0]["blocks"][1]["elements"][0]["value"]
+                    actions = next(
+                        block
+                        for block in gateway.replies[0]["blocks"]
+                        if block["type"] == "actions"
+                    )
+                    value = actions["elements"][0]["value"]
                     self.assertTrue(
                         handler.handle_block_action(
                             decode_action_value(value),
@@ -201,6 +210,107 @@ class ClaudeChannelTests(unittest.TestCase):
                 )
                 self.assertIn("Claude requests tool approval", gateway.replies[0]["text"])
                 self.assertEqual(gateway.updates[-1]["text"], "Allowed Claude tool request.")
+            finally:
+                store.close()
+
+    def test_slackgentic_mcp_permission_request_is_auto_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                    poll_seconds=0.01,
+                )
+                server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                for tool_name in (
+                    "mcp__slackgentic__request_approval",
+                    "mcp__slackgentic__request_user_input",
+                ):
+                    with redirect_stdout(output):
+                        server._handle_message(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "notifications/claude/channel/permission_request",
+                                "params": {
+                                    "request_id": tool_name,
+                                    "tool_name": tool_name,
+                                    "description": "Ask Slack",
+                                    "input_preview": "{}",
+                                },
+                            }
+                        )
+                        self.assertTrue(
+                            _wait_for(
+                                lambda: (
+                                    output.getvalue().count(
+                                        "notifications/claude/channel/permission"
+                                    )
+                                    >= 1
+                                )
+                            )
+                        )
+
+                    notification = json.loads(output.getvalue().splitlines()[-1])
+                    self.assertEqual(
+                        notification["params"],
+                        {"request_id": tool_name, "behavior": "allow"},
+                    )
+                    output.seek(0)
+                    output.truncate(0)
+
+                self.assertEqual(gateway.replies, [])
+                row_count = store.conn.execute(
+                    "SELECT COUNT(*) FROM slack_agent_requests"
+                ).fetchone()
+                self.assertEqual(row_count[0], 0)
+            finally:
+                store.close()
+
+    def test_permission_request_preserves_full_tool_input_when_present(self):
+        class CapturingHandler:
+            def __init__(self):
+                self.params = None
+
+            def handle_persistent_request(self, method, params, thread, provider_label=None):
+                self.params = params
+                return {"behavior": "allow"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            handler = CapturingHandler()
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                with redirect_stdout(output):
+                    server._handle_permission_request_worker(
+                        "req-1",
+                        {
+                            "tool_name": "Edit",
+                            "description": "Edit file",
+                            "input_preview": '{"file_path":"truncated…',
+                            "input": {"file_path": "/tmp/README.md", "new_string": "after"},
+                            "display": {"diff": "diff text"},
+                        },
+                    )
+
+                self.assertEqual(
+                    handler.params["input"],
+                    {"file_path": "/tmp/README.md", "new_string": "after"},
+                )
+                self.assertEqual(handler.params["display"], {"diff": "diff text"})
+                notification = json.loads(output.getvalue())
+                self.assertEqual(notification["params"]["behavior"], "allow")
             finally:
                 store.close()
 

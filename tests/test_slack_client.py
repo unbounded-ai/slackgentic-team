@@ -7,6 +7,7 @@ from agent_harness.team import build_initial_model_team, build_initialization_me
 class FakeSlackClient:
     def __init__(self):
         self.messages = []
+        self.updates = []
         self.archived_channels = []
 
     def auth_test(self):
@@ -16,6 +17,10 @@ class FakeSlackClient:
         ts = f"1712345678.{len(self.messages):06d}"
         self.messages.append({"ts": ts, **kwargs})
         return {"ts": ts}
+
+    def chat_update(self, **kwargs):
+        self.updates.append(kwargs)
+        return {"ok": True}
 
     def users_info(self, user):
         return {
@@ -82,6 +87,14 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertTrue(gateway.archive_channel("C1"))
 
         self.assertEqual(gateway.client.archived_channels, ["C1"])
+
+    def test_update_message_can_send_empty_blocks_to_clear_buttons(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        gateway.update_message("C1", "171.000001", "done", blocks=[])
+
+        self.assertEqual(gateway.client.updates[0]["blocks"], [])
 
 
 if __name__ == "__main__":

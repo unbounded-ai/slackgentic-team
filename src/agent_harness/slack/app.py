@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -61,7 +63,10 @@ from agent_harness.slack import (
     is_dependency_intent,
     parse_thread_ref,
 )
-from agent_harness.slack.agent_requests import AGENT_REQUEST_ACTIONS
+from agent_harness.slack.agent_requests import (
+    AGENT_REQUEST_ACTIONS,
+    render_persistent_agent_request,
+)
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import (
@@ -110,6 +115,16 @@ CAPACITY_MESSAGE = (
     "automatically."
 )
 CLAUDE_EXTERNAL_COMMAND = "claude --dangerously-load-development-channels server:slackgentic"
+CLAUDE_CHANNEL_PERMISSION_METHOD = "claude/channel/permission"
+SLACKGENTIC_MCP_PERMISSION_TOOLS = frozenset(
+    {
+        "mcp__slackgentic__request_approval",
+        "mcp__slackgentic__request_user_input",
+    }
+)
+AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT = (
+    "Allowed internal Claude Slackgentic request; rendering the Slack prompt now."
+)
 REVIEW_DELEGATE_PROMPT = (
     "Continue the original task using @{sender_handle}'s review above. "
     "Address any required changes, then give the user the final result "
@@ -1039,10 +1054,12 @@ class SlackTeamController:
             return True
         if self._record_dependency_if_requested(task.task_id, event, text, agent):
             return True
-        if self.runtime and self.runtime.send_to_task(task.task_id, text):
+        active_task = self._active_thread_task_for_agent(task, channel_id, thread_ts)
+        target_task = active_task or task
+        if self.runtime and self.runtime.send_to_task(target_task.task_id, text):
             return True
         if agent:
-            return self._start_thread_followup(task, event, text, agent)
+            return self._start_thread_followup(target_task, event, text, agent)
         if task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
             return True
         self.gateway.post_thread_reply(
@@ -1352,13 +1369,14 @@ class SlackTeamController:
                     task,
                     agent,
                     thread,
+                    text,
                 ):
                     handled = True
             return handled
         request = _parse_work_request_for_agents(text, active_agents, split_newlines=True)
         if request is None or request.assignment_mode != AssignmentMode.SPECIFIC:
             return False
-        return self._start_agent_authored_specific_request(request, task, agent, thread)
+        return self._start_agent_authored_specific_request(request, task, agent, thread, text)
 
     def _start_agent_authored_specific_request(
         self,
@@ -1366,6 +1384,7 @@ class SlackTeamController:
         task: AgentTask,
         agent,
         thread: SlackThreadRef,
+        text: str,
     ) -> bool:
         target_agent = self.store.get_team_agent(request.requested_handle or "")
         if target_agent is None or target_agent.agent_id == agent.agent_id:
@@ -1375,6 +1394,7 @@ class SlackTeamController:
             target_agent,
             thread,
             requested_by_slack_user=task.requested_by_slack_user,
+            delivery_text=_agent_authored_external_callback_text(text, request),
         ):
             return True
         if task.metadata.get("delegate_to_agent_id") == target_agent.agent_id:
@@ -1615,6 +1635,7 @@ class SlackTeamController:
         thread: SlackThreadRef,
         *,
         requested_by_slack_user: str | None,
+        delivery_text: str | None = None,
     ) -> bool:
         session = self._external_session_for_thread_agent(
             agent,
@@ -1631,7 +1652,7 @@ class SlackTeamController:
             return True
         return self.session_bridge.send_to_session(
             session,
-            request.prompt,
+            delivery_text or request.prompt,
             thread,
             slack_user=requested_by_slack_user,
         )
@@ -1661,8 +1682,13 @@ class SlackTeamController:
         *,
         requested_by_slack_user: str | None,
         request_message_ts: str | None = None,
+        try_live_send: bool = True,
     ) -> bool:
-        if self.runtime and self.runtime.send_to_task(previous_task.task_id, request.prompt):
+        if (
+            try_live_send
+            and self.runtime
+            and self.runtime.send_to_task(previous_task.task_id, request.prompt)
+        ):
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         if request_message_ts:
@@ -1673,11 +1699,29 @@ class SlackTeamController:
             status=AgentTaskStatus.ACTIVE,
             requested_by_slack_user=requested_by_slack_user
             or previous_task.requested_by_slack_user,
+            updated_at=utc_now(),
             metadata=metadata,
         )
+        self.store.upsert_agent_task(task)
         if not self.runtime:
             return True
         return self.runtime.start_task(task, agent, thread)
+
+    def _active_thread_task_for_agent(
+        self,
+        task: AgentTask,
+        channel_id: str,
+        thread_ts: str,
+    ) -> AgentTask | None:
+        managed_task = self.store.get_managed_thread_task(channel_id, thread_ts, task.agent_id)
+        if managed_task is not None:
+            return managed_task
+        latest_task = self._latest_task_for_agent_thread(task.agent_id, channel_id, thread_ts)
+        if latest_task and latest_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+            return latest_task
+        if task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+            return task
+        return None
 
     def _latest_task_for_agent_thread(
         self,
@@ -1715,7 +1759,9 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
     ) -> None:
-        if _is_subtask(task):
+        if _is_subtask(task) or _is_external_thread_helper_task(task):
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+            task = self.store.get_agent_task(task.task_id) or task
             self._mark_task_complete(task, thread)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
@@ -1848,6 +1894,16 @@ class SlackTeamController:
         request = parse_work_request(f"@{agent.handle} {text}", [agent.handle])
         if request is None:
             return False
+        if parent_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+            return self._continue_same_thread_agent_task(
+                request,
+                parent_task,
+                agent,
+                SlackThreadRef(channel_id, thread_ts),
+                requested_by_slack_user=event.get("user"),
+                request_message_ts=event.get("ts"),
+                try_live_send=False,
+            )
         extra_metadata = self._thread_task_metadata(parent_task, channel_id, thread_ts)
         extra_metadata["request_message_ts"] = event.get("ts")
         result = assign_work_request(
@@ -2064,6 +2120,83 @@ class SlackTeamController:
             self.store.set_setting(HUMAN_IMAGE_URL_SETTING, image_url)
 
 
+class ClaudePermissionAutoResolver:
+    def __init__(
+        self,
+        store: Store,
+        gateway: SlackGateway,
+        poll_seconds: float = 1.0,
+    ):
+        self.store = store
+        self.gateway = gateway
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._reformatted_tokens: set[str] = set()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-claude-permission-auto-resolver",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def resolve_once(self) -> int:
+        resolved = 0
+        for row in self.store.list_pending_slack_agent_requests(CLAUDE_CHANNEL_PERMISSION_METHOD):
+            if not _is_slackgentic_mcp_permission_request(row["params_json"]):
+                self._reformat_once(row)
+                continue
+            self.store.resolve_slack_agent_request(row["token"], {"behavior": "allow"})
+            resolved += 1
+            if row["message_ts"]:
+                try:
+                    self.gateway.update_message(
+                        row["thread_channel_id"],
+                        row["message_ts"],
+                        AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
+                        blocks=[],
+                    )
+                except Exception:
+                    LOGGER.debug("failed to update auto-allowed Claude permission", exc_info=True)
+        return resolved
+
+    def _reformat_once(self, row) -> None:
+        token = str(row["token"])
+        if token in self._reformatted_tokens or not row["message_ts"]:
+            return
+        self._reformatted_tokens.add(token)
+        try:
+            text, blocks = render_persistent_agent_request(
+                row,
+                fallback_channel_id=row["thread_channel_id"],
+            )
+            self.gateway.update_message(
+                row["thread_channel_id"],
+                row["message_ts"],
+                text,
+                blocks=blocks,
+            )
+        except Exception:
+            LOGGER.debug("failed to reformat Claude permission prompt", exc_info=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.resolve_once()
+            except Exception:
+                LOGGER.exception("failed to auto-resolve Claude Slackgentic permission")
+            self._stop.wait(self.poll_seconds)
+
+
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
         if not config.slack.bot_token or not config.slack.app_token:
@@ -2133,6 +2266,12 @@ class SocketModeSlackApp:
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()
+        self.claude_permission_auto_resolver = ClaudePermissionAutoResolver(
+            self.store,
+            self.gateway,
+            poll_seconds=min(max(config.poll_seconds, 0.2), 2.0),
+        )
+        self.claude_permission_auto_resolver.start()
         self.awake_keeper = ActiveSessionAwakeKeeper(
             lambda: self.runtime.has_running_tasks() or self.session_mirror.has_active_sessions()
         )
@@ -2140,6 +2279,7 @@ class SocketModeSlackApp:
 
     def close(self) -> None:
         self.awake_keeper.stop()
+        self.claude_permission_auto_resolver.stop()
         self.session_mirror.stop()
         if self.codex_app_server:
             self.codex_app_server.close()
@@ -2209,6 +2349,17 @@ def run_slack_app(config: AppConfig | None = None) -> int:
 def _first_action(payload: dict) -> dict | None:
     actions = payload.get("actions") or []
     return actions[0] if actions else None
+
+
+def _is_slackgentic_mcp_permission_request(params_json: str) -> bool:
+    try:
+        params = json.loads(params_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(params, dict):
+        return False
+    tool_name = params.get("tool_name")
+    return isinstance(tool_name, str) and tool_name in SLACKGENTIC_MCP_PERMISSION_TOOLS
 
 
 def _is_view_submission_request(request) -> bool:
@@ -2348,6 +2499,13 @@ def _agent_authored_review_request(text: str, agents) -> WorkRequest | None:
         if request is not None:
             return request
     return None
+
+
+def _agent_authored_external_callback_text(text: str, request: WorkRequest) -> str:
+    stripped = text.strip()
+    if "\n" not in stripped:
+        return request.prompt
+    return stripped
 
 
 def _routing_text_candidates(text: str, *, split_newlines: bool) -> list[str]:
@@ -2544,6 +2702,13 @@ def _is_subtask(task: AgentTask) -> bool:
     return any(
         isinstance(task.metadata.get(key), str)
         for key in ("parent_task_id", "delegated_from_task_id", "delegate_to_agent_id")
+    )
+
+
+def _is_external_thread_helper_task(task: AgentTask) -> bool:
+    return isinstance(task.metadata.get("external_session_id"), str) and isinstance(
+        task.metadata.get("external_session_provider"),
+        str,
     )
 
 

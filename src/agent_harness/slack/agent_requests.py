@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import shlex
 import threading
@@ -249,9 +250,17 @@ class SlackAgentRequestHandler:
         )
 
 
+def render_persistent_agent_request(
+    row: Any, *, fallback_channel_id: str
+) -> tuple[str, list[dict[str, Any]]]:
+    return _request_message(_pending_from_row(row, fallback_channel_id=fallback_channel_id))
+
+
 def _request_message(pending: PendingAgentRequest) -> tuple[str, list[dict[str, Any]]]:
     if pending.method == "item/tool/requestUserInput":
         return _input_request_message(pending)
+    if pending.method == "claude/channel/permission":
+        return _claude_permission_request_message(pending)
     text = _approval_text(pending.method, pending.params, pending.provider_label)
     return text, [
         {"type": "section", "text": {"type": "mrkdwn", "text": _mrkdwn(text)}},
@@ -311,6 +320,79 @@ def _input_request_message(pending: PendingAgentRequest) -> tuple[str, list[dict
         }
     )
     return text, blocks[:50]
+
+
+def _claude_permission_request_message(
+    pending: PendingAgentRequest,
+) -> tuple[str, list[dict[str, Any]]]:
+    tool_name = _plain(pending.params.get("tool_name"), "tool")
+    description = _plain(pending.params.get("description"), "")
+    fallback = f"{pending.provider_label} requests tool approval: {tool_name}"
+    summary_lines = [f"*{pending.provider_label} requests tool approval.*"]
+    if tool_name:
+        summary_lines.append(f"Tool: `{_truncate(tool_name, 200)}`")
+    if description:
+        summary_lines.append(_truncate(description, 500))
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": _mrkdwn("\n".join(summary_lines))},
+        }
+    ]
+    diff_text = _permission_diff_text(pending.params)
+    if not diff_text and _is_truncated_edit_permission(pending.params):
+        blocks.extend(_truncated_edit_permission_blocks(pending.params))
+        blocks.extend(_approval_action_blocks(pending))
+        return fallback, blocks[:50]
+    input_text = diff_text or _permission_input_text(pending.params)
+    if input_text:
+        chunks = _block_text_chunks(input_text, 2500)
+        for index, chunk in enumerate(chunks[:6]):
+            if diff_text:
+                heading = "*Proposed diff*\n" if index == 0 else ""
+                fence = "diff\n"
+            else:
+                heading = "*Input preview*\n" if index == 0 else ""
+                fence = ""
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"{heading}```{fence}{_code_block_text(chunk)}```",
+                    },
+                }
+            )
+        if len(chunks) > 6:
+            label = "Diff" if diff_text else "Input preview"
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"{label} is too large for one Slack message.",
+                        }
+                    ],
+                }
+            )
+        if _permission_input_was_truncated_before_slackgentic(pending.params):
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                "Claude only provided this truncated preview to Slackgentic. "
+                                "Review the full request in the Claude terminal before allowing."
+                            ),
+                        }
+                    ],
+                }
+            )
+    blocks.extend(_approval_action_blocks(pending))
+    return fallback, blocks[:50]
 
 
 def _approval_action_blocks(pending: PendingAgentRequest) -> list[dict[str, Any]]:
@@ -621,6 +703,187 @@ def _permissions_summary(value: object) -> str:
         if isinstance(write, list):
             parts.append(f"write paths: `{len(write)}`")
     return ", ".join(parts)
+
+
+def _permission_diff_text(params: dict[str, Any]) -> str:
+    explicit = _explicit_permission_diff(params)
+    if explicit:
+        return explicit
+    tool_name = _plain(params.get("tool_name"), "")
+    if tool_name not in {"Edit", "MultiEdit"}:
+        return ""
+    input_value = _permission_input_object(params)
+    if not isinstance(input_value, dict):
+        return ""
+    file_path = _plain(input_value.get("file_path"), "file")
+    edits = input_value.get("edits")
+    if isinstance(edits, list):
+        diffs = [_edit_diff_text(file_path, edit) for edit in edits if isinstance(edit, dict)]
+        return "\n\n".join(diff for diff in diffs if diff)
+    return _edit_diff_text(file_path, input_value)
+
+
+def _is_truncated_edit_permission(params: dict[str, Any]) -> bool:
+    return _plain(params.get("tool_name"), "") in {
+        "Edit",
+        "MultiEdit",
+    } and _permission_input_was_truncated_before_slackgentic(params)
+
+
+def _truncated_edit_permission_blocks(params: dict[str, Any]) -> list[dict[str, Any]]:
+    file_path = _truncated_preview_field(params, "file_path")
+    lines = ["*Diff unavailable in Slack.*"]
+    if file_path:
+        lines.append(f"File: `{_truncate(file_path, 240)}`")
+    lines.append(
+        "Claude only sent Slackgentic a shortened native preview for this edit. "
+        "The Claude terminal has the proposed diff."
+    )
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": _mrkdwn("\n".join(lines))},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Restart this Claude session after the current turn to enable "
+                        "Slack diffs when Claude includes full edit payloads."
+                    ),
+                }
+            ],
+        },
+    ]
+
+
+def _truncated_preview_field(params: dict[str, Any], key: str) -> str:
+    preview = _plain(params.get("input_preview"), "")
+    if not preview:
+        return ""
+    marker = f'"{key}":"'
+    start = preview.find(marker)
+    if start < 0:
+        return ""
+    start += len(marker)
+    end = preview.find('"', start)
+    if end < 0:
+        return ""
+    return preview[start:end]
+
+
+def _explicit_permission_diff(params: dict[str, Any]) -> str:
+    for key in ("diff", "input_diff", "preview_diff"):
+        value = _plain(params.get(key), "")
+        if value:
+            return value
+    display = params.get("display")
+    if isinstance(display, str) and display.strip():
+        return display.strip()
+    if isinstance(display, dict):
+        for key in ("diff", "content", "text"):
+            value = _plain(display.get(key), "")
+            if value:
+                return value
+    return ""
+
+
+def _edit_diff_text(file_path: str, edit: dict[str, Any]) -> str:
+    old_string = edit.get("old_string")
+    new_string = edit.get("new_string")
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        return ""
+    lines = difflib.unified_diff(
+        old_string.splitlines(),
+        new_string.splitlines(),
+        fromfile=f"{file_path} (current)",
+        tofile=f"{file_path} (proposed)",
+        lineterm="",
+    )
+    return "\n".join(lines) or "(no textual diff)"
+
+
+def _permission_input_object(params: dict[str, Any]) -> object:
+    for key in ("input", "arguments", "tool_input", "parameters"):
+        if key in params:
+            value = params[key]
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    return value
+            return value
+    preview = _plain(params.get("input_preview"), "")
+    if preview:
+        try:
+            return json.loads(preview)
+        except json.JSONDecodeError:
+            return preview
+    return None
+
+
+def _permission_input_text(params: dict[str, Any]) -> str:
+    for key in ("input", "arguments", "tool_input", "parameters"):
+        if key in params:
+            return _format_input_value(params[key])
+    return _format_input_value(params.get("input_preview"))
+
+
+def _permission_input_was_truncated_before_slackgentic(params: dict[str, Any]) -> bool:
+    if any(key in params for key in ("input", "arguments", "tool_input", "parameters")):
+        return False
+    preview = _plain(params.get("input_preview"), "")
+    if not preview:
+        return False
+    stripped = preview.rstrip()
+    return stripped.endswith(("…", "...")) or "…," in stripped
+
+
+def _format_input_value(value: object) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, sort_keys=True)
+    text = _plain(value, "")
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return _format_jsonish_preview(text)
+    return json.dumps(parsed, indent=2, sort_keys=True)
+
+
+def _format_jsonish_preview(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith(("{", "[")):
+        return stripped
+    formatted = stripped
+    formatted = formatted.replace('{"', '{\n  "')
+    formatted = formatted.replace(',"', ',\n  "')
+    formatted = formatted.replace('"}', '"\n}')
+    return formatted
+
+
+def _block_text_chunks(text: str, limit: int) -> list[str]:
+    if not text:
+        return []
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < max(1, limit // 2):
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    return chunks
+
+
+def _code_block_text(text: str) -> str:
+    return text.replace("```", "` ` `")
 
 
 def _plain(value: object, default: str = "") -> str:

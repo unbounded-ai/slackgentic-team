@@ -90,6 +90,23 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent_status
   ON agent_tasks(agent_id, status);
 
+CREATE TABLE IF NOT EXISTS managed_thread_tasks (
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  session_provider TEXT,
+  session_id TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (channel_id, thread_ts, agent_id),
+  FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id),
+  FOREIGN KEY(agent_id) REFERENCES team_agents(agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_managed_thread_tasks_task
+  ON managed_thread_tasks(task_id);
+
 CREATE TABLE IF NOT EXISTS pending_work_requests (
   pending_id TEXT NOT NULL PRIMARY KEY,
   channel_id TEXT NOT NULL,
@@ -428,14 +445,29 @@ class Store:
 
     def update_agent_task_status(self, task_id: str, status: AgentTaskStatus) -> None:
         with self._lock:
+            updated_at = utc_now().isoformat()
             self.conn.execute(
                 """
                 UPDATE agent_tasks
                 SET status = ?, updated_at = ?
                 WHERE task_id = ?
                 """,
-                (status.value, utc_now().isoformat(), task_id),
+                (status.value, updated_at, task_id),
             )
+            if status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+                self.conn.execute(
+                    "DELETE FROM managed_thread_tasks WHERE task_id = ?",
+                    (task_id,),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE managed_thread_tasks
+                    SET status = ?, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (status.value, updated_at, task_id),
+                )
             self.conn.commit()
 
     def update_agent_task_session(
@@ -445,13 +477,22 @@ class Store:
         session_id: str | None,
     ) -> None:
         with self._lock:
+            updated_at = utc_now().isoformat()
             self.conn.execute(
                 """
                 UPDATE agent_tasks
                 SET session_provider = ?, session_id = ?, updated_at = ?
                 WHERE task_id = ?
                 """,
-                (provider.value, session_id, utc_now().isoformat(), task_id),
+                (provider.value, session_id, updated_at, task_id),
+            )
+            self.conn.execute(
+                """
+                UPDATE managed_thread_tasks
+                SET session_provider = ?, session_id = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (provider.value, session_id, updated_at, task_id),
             )
             self.conn.commit()
 
@@ -579,6 +620,71 @@ class Store:
             (channel_id, thread_ts),
         ).fetchone()
         return _agent_task_from_row(row) if row else None
+
+    def upsert_managed_thread_task(self, task: AgentTask, thread: SlackThreadRef) -> None:
+        if not thread.thread_ts:
+            return
+        with self._lock:
+            current = self.get_agent_task(task.task_id) or task
+            self.conn.execute(
+                """
+                INSERT INTO managed_thread_tasks (
+                  channel_id, thread_ts, agent_id, task_id, status,
+                  session_provider, session_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, thread_ts, agent_id) DO UPDATE SET
+                  task_id = excluded.task_id,
+                  status = excluded.status,
+                  session_provider = excluded.session_provider,
+                  session_id = excluded.session_id,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    thread.channel_id,
+                    thread.thread_ts,
+                    current.agent_id,
+                    current.task_id,
+                    current.status.value,
+                    current.session_provider.value if current.session_provider else None,
+                    current.session_id,
+                    utc_now().isoformat(),
+                ),
+            )
+            self.conn.commit()
+
+    def get_managed_thread_task(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        agent_id: str | None = None,
+    ) -> AgentTask | None:
+        where = "managed.channel_id = ? AND managed.thread_ts = ?"
+        params: list[object] = [channel_id, thread_ts]
+        if agent_id is not None:
+            where += " AND managed.agent_id = ?"
+            params.append(agent_id)
+        params.extend([AgentTaskStatus.QUEUED.value, AgentTaskStatus.ACTIVE.value])
+        row = self.conn.execute(
+            f"""
+            SELECT task.*
+            FROM managed_thread_tasks managed
+            JOIN agent_tasks task ON task.task_id = managed.task_id
+            WHERE {where}
+              AND task.status IN (?, ?)
+            ORDER BY managed.updated_at DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return _agent_task_from_row(row) if row else None
+
+    def delete_managed_thread_task(self, task_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM managed_thread_tasks WHERE task_id = ?",
+                (task_id,),
+            )
+            self.conn.commit()
 
     def has_agent_task_session(self, provider: Provider, session_id: str) -> bool:
         row = self.conn.execute(
@@ -954,6 +1060,34 @@ class Store:
             return True, json.loads(row["response_json"])
         except (TypeError, json.JSONDecodeError):
             return True, None
+
+    def list_pending_slack_agent_requests(self, method: str | None = None) -> list[sqlite3.Row]:
+        if method is None:
+            return list(
+                self.conn.execute(
+                    """
+                    SELECT token, provider_label, method, params_json, thread_channel_id,
+                           thread_ts, message_ts, answers_json, response_json,
+                           resolved_at, created_at
+                    FROM slack_agent_requests
+                    WHERE resolved_at IS NULL
+                    ORDER BY created_at
+                    """
+                )
+            )
+        return list(
+            self.conn.execute(
+                """
+                SELECT token, provider_label, method, params_json, thread_channel_id,
+                       thread_ts, message_ts, answers_json, response_json,
+                       resolved_at, created_at
+                FROM slack_agent_requests
+                WHERE resolved_at IS NULL AND method = ?
+                ORDER BY created_at
+                """,
+                (method,),
+            )
+        )
 
     def mark_slack_message_mirrored(
         self,

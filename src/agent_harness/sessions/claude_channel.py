@@ -24,7 +24,11 @@ CHANNEL_INSTRUCTIONS = (
     "Slackgentic mirrors your visible assistant responses back to the Slack thread. "
     "When you need Slack approval or a Slack choice, use the Slackgentic MCP tools "
     "`request_approval` or `request_user_input`; do not use Claude's built-in "
-    "`AskUserQuestion` for Slack-mediated approvals or choices."
+    "`AskUserQuestion` for Slack-mediated approvals or choices. Use "
+    "`request_user_input` when Slack should choose among multiple options; use "
+    "`request_approval` only for one concrete yes/no approval. Before a large "
+    "file edit that may require Slack approval, summarize the intended change "
+    "first because Claude may expose only a truncated native tool input preview."
 )
 SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__request_approval",
@@ -233,16 +237,25 @@ class ClaudeChannelServer:
         params: dict[str, Any],
     ) -> None:
         behavior = "deny"
+        if _is_slackgentic_mcp_tool(_string_param(params, "tool_name")):
+            self._write(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel/permission",
+                    "params": {"request_id": request_id, "behavior": "allow"},
+                }
+            )
+            return
         if self.request_handler is not None and self._current_thread is not None:
             try:
+                request_params = dict(params)
+                request_params["request_id"] = request_id
+                request_params["tool_name"] = _string_param(params, "tool_name")
+                request_params["description"] = _string_param(params, "description")
+                request_params["input_preview"] = _string_param(params, "input_preview")
                 response = self.request_handler.handle_persistent_request(
                     "claude/channel/permission",
-                    {
-                        "request_id": request_id,
-                        "tool_name": _string_param(params, "tool_name"),
-                        "description": _string_param(params, "description"),
-                        "input_preview": _string_param(params, "input_preview"),
-                    },
+                    request_params,
                     self._current_thread,
                     provider_label="Claude",
                 )
@@ -430,11 +443,17 @@ def _attachment_has_slackgentic_mcp(attachment: object) -> bool:
     return False
 
 
+def _is_slackgentic_mcp_tool(tool_name: str) -> bool:
+    return tool_name in SLACKGENTIC_MCP_TOOL_NAMES
+
+
 def _tools() -> list[dict[str, Any]]:
     return [
         {
             "name": "request_user_input",
-            "description": "Ask the Slack thread for a choice and wait for the response.",
+            "description": (
+                "Ask the Slack thread to choose among multiple options and wait for the response."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -462,7 +481,10 @@ def _tools() -> list[dict[str, Any]]:
         },
         {
             "name": "request_approval",
-            "description": "Ask the Slack thread to approve or deny an action.",
+            "description": (
+                "Ask the Slack thread to approve or deny one concrete action. "
+                "Do not use this for choosing among options."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {

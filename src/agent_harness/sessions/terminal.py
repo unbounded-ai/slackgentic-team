@@ -17,6 +17,7 @@ StartResolver = Callable[[int], datetime | None]
 LogWriter = Callable[[Path, str], None]
 TtyWriter = Callable[[str, str], None]
 LOGGER = logging.getLogger(__name__)
+TERMINAL_KEYBOARD_MODE_RESET = "\x1b[<u"
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,16 @@ class SessionTerminalNotifier:
             if target.pid == pid:
                 return target
         return None
+
+    def restore_keyboard_mode(self, target: TerminalTarget) -> bool:
+        if not target.tty or target.tty == "??":
+            return False
+        try:
+            self.tty_writer(target.tty, TERMINAL_KEYBOARD_MODE_RESET)
+        except Exception:
+            LOGGER.debug("failed to restore terminal keyboard mode", exc_info=True)
+            return False
+        return True
 
     def provider_processes(
         self,

@@ -103,10 +103,12 @@ class ManagedTaskRuntime:
                 icon_url=self._agent_icon_url(agent),
             )
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(task.task_id)
             return False
 
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
         self.store.update_agent_task_session(task.task_id, provider, task.session_id)
+        self.store.upsert_managed_thread_task(task, thread)
         worker = threading.Thread(
             target=self._stream_task,
             args=(task.task_id,),
@@ -198,8 +200,14 @@ class ManagedTaskRuntime:
                 except Exception:
                     LOGGER.debug("failed to load completed task", exc_info=True)
                     completed_task = running.task
+                recovered_message = self._recover_unseen_visible_message(completed_task, running)
+                if recovered_message:
+                    self._post_agent_chunk(running, recovered_message)
                 if running.visible_message_count == 0 and not running.control_signals:
-                    recovered_message = self._recover_visible_message(completed_task, running)
+                    recovered_message = self._recover_unseen_visible_message(
+                        completed_task,
+                        running,
+                    )
                     if recovered_message:
                         self._post_agent_chunk(running, recovered_message)
                         if self._handle_agent_control_signals(running, completed_task):
@@ -238,16 +246,19 @@ class ManagedTaskRuntime:
             icon_url=self._agent_icon_url(running.agent),
         )
         running.visible_message_count += 1
+        normalized = visible_text.strip()
+        already_observed = False
+        if normalized:
+            if running.observed_agent_messages is None:
+                running.observed_agent_messages = set()
+            already_observed = normalized in running.observed_agent_messages
+            running.observed_agent_messages.add(normalized)
         if self.on_agent_message is None:
             return
-        normalized = visible_text.strip()
         if not normalized:
             return
-        if running.observed_agent_messages is None:
-            running.observed_agent_messages = set()
-        if normalized in running.observed_agent_messages:
+        if already_observed:
             return
-        running.observed_agent_messages.add(normalized)
         try:
             self.on_agent_message(running.task, running.agent, running.thread, normalized)
         except Exception:
@@ -274,6 +285,21 @@ class ManagedTaskRuntime:
             self.home,
             since=task.created_at,
         )
+
+    def _recover_unseen_visible_message(
+        self,
+        task: AgentTask,
+        running: RunningTask,
+    ) -> str | None:
+        message = self._recover_visible_message(task, running)
+        if not message:
+            return None
+        normalized = message.strip()
+        if not normalized:
+            return None
+        if running.observed_agent_messages and normalized in running.observed_agent_messages:
+            return None
+        return message
 
     def _agent_icon_url(self, agent: TeamAgent) -> str | None:
         if self.agent_icon_url is None:
@@ -338,6 +364,13 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         (
             "When you hand work to a specific agent, use that agent's exact Slackgentic "
             "`@handle` from the thread or roster."
+        ),
+        (
+            "When you need a named external/session agent in the Slack thread to choose, "
+            "continue, or respond, put your context and options first. Then end with a "
+            "separate final paragraph whose first token is that agent's `@handle`, for "
+            "example `@nell pick one before I proceed`. Do not put that callback handle "
+            "inline near the beginning or bury it before the options."
         ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",

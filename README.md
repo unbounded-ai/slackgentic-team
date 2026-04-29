@@ -266,8 +266,9 @@ notes are in [docs/architecture.md](docs/architecture.md).
 
 - Slack still requires clicking token copy buttons for the app-level `xapp-`
   token.
-- Managed process state is in memory. After daemon restart, thread follow-ups
-  start fresh managed tasks with the same Slack context.
+- Managed child processes cannot be reattached after daemon restart. Follow-up
+  replies resume the persisted task/session state, while Slackgentic relaunches
+  the provider process.
 - PR review execution passes the PR URL to Codex/Claude; it does not cache
   GitHub diffs itself.
 
