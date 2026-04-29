@@ -2,10 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_harness.assignment import assign_channel_work_request
 from agent_harness.models import AgentTaskKind, Provider
-from agent_harness.store import Store
+from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team
+from agent_harness.team.assignment import assign_channel_work_request
 
 
 class AssignmentTests(unittest.TestCase):

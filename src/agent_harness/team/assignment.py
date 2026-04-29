@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from agent_harness.models import AgentTask, AssignmentMode, TeamAgent, WorkRequest
-from agent_harness.routing import parse_work_request
-from agent_harness.store import Store
+from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent
+from agent_harness.team.routing import canonicalize_agent_mentions, parse_work_request
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,8 @@ def assign_channel_work_request(
     requested_by_slack_user: str | None = None,
 ) -> AssignmentResult | None:
     active_agents = store.list_team_agents()
-    request = parse_work_request(text, [agent.handle for agent in active_agents])
+    canonical_text = canonicalize_agent_mentions(text, active_agents)
+    request = parse_work_request(canonical_text, [agent.handle for agent in active_agents])
     if request is None:
         return None
 

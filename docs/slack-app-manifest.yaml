@@ -12,7 +12,7 @@ features:
   slash_commands:
     - command: /slackgentic-local
       description: Set up and manage your local agent team.
-      usage_hint: setup | status | hire 2 claude agents | fire @riley | show roster
+      usage_hint: setup | status | show roster | repo root ~/code | hire 2 claude agents
       should_escape: true
 oauth_config:
   scopes:
@@ -25,6 +25,7 @@ oauth_config:
       - chat:write
       - chat:write.customize
       - commands
+      - pins:write
       - groups:history
       - groups:read
       - groups:write

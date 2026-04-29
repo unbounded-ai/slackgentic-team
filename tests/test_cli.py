@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 from agent_harness.cli import main
 from agent_harness.service import UnsafeServiceRestartError
-from agent_harness.slack_app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
-from agent_harness.store import Store
+from agent_harness.slack.app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
+from agent_harness.storage.store import Store
 
 
 class CliTests(unittest.TestCase):
@@ -75,7 +75,7 @@ class CliTests(unittest.TestCase):
 
             output = io.StringIO()
             with (
-                patch("agent_harness.slack_client.SlackGateway") as gateway,
+                patch("agent_harness.slack.client.SlackGateway") as gateway,
                 redirect_stdout(output),
             ):
                 code = main(
@@ -118,7 +118,7 @@ class CliTests(unittest.TestCase):
 
             output = io.StringIO()
             with (
-                patch("agent_harness.slack_client.SlackGateway", FakeSlackGateway),
+                patch("agent_harness.slack.client.SlackGateway", FakeSlackGateway),
                 redirect_stdout(output),
             ):
                 code = main(

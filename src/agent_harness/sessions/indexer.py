@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 
-from agent_harness.async_store import AsyncStore
 from agent_harness.config import AppConfig, load_config_from_env
 from agent_harness.providers import ClaudeProvider, CodexProvider
-from agent_harness.watcher import TranscriptWatcher
+from agent_harness.sessions.watcher import TranscriptWatcher
+from agent_harness.storage.async_store import AsyncStore
 
 
 class AgentDaemon:

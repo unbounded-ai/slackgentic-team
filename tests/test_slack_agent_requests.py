@@ -5,9 +5,9 @@ from pathlib import Path
 
 from agent_harness.models import SlackThreadRef
 from agent_harness.slack import decode_action_value
-from agent_harness.slack_agent_requests import SlackAgentRequestHandler
-from agent_harness.slack_client import PostedMessage
-from agent_harness.store import Store
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.slack.client import PostedMessage
+from agent_harness.storage.store import Store
 
 
 class FakeGateway:

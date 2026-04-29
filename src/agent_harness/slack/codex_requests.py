@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent_harness.slack_agent_requests import (
+from agent_harness.slack.agent_requests import (
     LEGACY_CODEX_REQUEST_ACTION,
     PendingAgentRequest,
     SlackAgentRequestHandler,

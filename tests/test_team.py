@@ -4,9 +4,12 @@ from pathlib import Path
 
 from agent_harness.models import AgentTaskKind, AssignmentMode, Provider, WorkRequest
 from agent_harness.team import (
+    AGENT_LIMIT_MESSAGE,
     AVATAR_IDENTITY_BANK,
     DEFAULT_AVATAR_BANK_SIZE,
+    DEFAULT_TEAM_SIZE,
     build_initial_model_team,
+    build_initial_team,
     build_initialization_messages,
     choose_reaction,
     hire_team_agents,
@@ -16,6 +19,14 @@ from agent_harness.team import (
 
 
 class TeamTests(unittest.TestCase):
+    def test_default_initial_team_is_one_agent_per_provider(self):
+        agents = build_initial_model_team()
+        self.assertEqual(len(agents), DEFAULT_TEAM_SIZE)
+        self.assertEqual(
+            [agent.provider_preference for agent in agents],
+            [Provider.CODEX, Provider.CLAUDE],
+        )
+
     def test_initial_model_team_has_persistent_provider_mapping(self):
         agents = build_initial_model_team(codex_count=2, claude_count=1)
         self.assertEqual(
@@ -25,12 +36,21 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(len({agent.handle for agent in agents}), 3)
         self.assertEqual([agent.handle for agent in agents], ["avery", "jordan", "morgan"])
         self.assertEqual([agent.avatar_slug for agent in agents], ["1", "2", "3"])
-        self.assertIn("generalist engineer", agents[0].metadata["backstory"])
+        self.assertEqual(len(agents[0].metadata["outside_interests"]), 3)
+        self.assertEqual(agents[0].metadata["backstory"], agents[0].metadata["personal_context"])
         self.assertIn("avatar", agents[0].metadata["avatar_prompt"].lower())
         self.assertIn("cartoon", agents[0].metadata["avatar_prompt"].lower())
         self.assertEqual(
             agents[0].metadata["avatar_path"],
             f"docs/assets/avatars/{agents[0].avatar_slug}.png",
+        )
+
+    def test_default_legacy_initial_team_size_is_two(self):
+        agents = build_initial_team()
+        self.assertEqual(len(agents), 2)
+        self.assertEqual(
+            [agent.provider_preference for agent in agents],
+            [Provider.CODEX, Provider.CLAUDE],
         )
 
     def test_avatar_identity_bank_has_500_unique_full_names(self):
@@ -51,6 +71,12 @@ class TeamTests(unittest.TestCase):
             {agent.avatar_slug for agent in agents},
             {str(index) for index in range(1, DEFAULT_AVATAR_BANK_SIZE + 1)},
         )
+
+    def test_team_size_cannot_exceed_avatar_bank_limit(self):
+        with self.assertRaisesRegex(ValueError, AGENT_LIMIT_MESSAGE):
+            build_initial_model_team(codex_count=251, claude_count=250)
+        with self.assertRaisesRegex(ValueError, AGENT_LIMIT_MESSAGE):
+            build_initial_team(501)
 
     def test_avatar_assets_exist_for_identity_bank(self):
         assets_dir = Path(__file__).resolve().parents[1] / "docs" / "assets" / "avatars"
@@ -109,6 +135,22 @@ class TeamTests(unittest.TestCase):
         self.assertTrue(existing_avatars.isdisjoint({agent.avatar_slug for agent in hired}))
         self.assertEqual(len({agent.full_name for agent in hired}), 3)
         self.assertEqual(len({agent.avatar_slug for agent in hired}), 3)
+
+    def test_randomized_hire_can_reuse_fired_avatar_capacity(self):
+        all_agents = build_initial_model_team(codex_count=250, claude_count=250)
+
+        hired = hire_team_agents(
+            all_agents,
+            1,
+            Provider.CODEX,
+            start_sort_order=500,
+            avatar_agents=[],
+            randomize_identities=True,
+            rng=random.Random(11),
+        )
+
+        self.assertEqual(len(hired), 1)
+        self.assertNotIn(hired[0].handle, {agent.handle for agent in all_agents})
 
     def test_initialization_messages_include_intros_and_welcomes(self):
         agents = build_initial_model_team(codex_count=2, claude_count=1)

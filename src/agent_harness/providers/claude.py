@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_harness.jsonl import iter_jsonl, last_jsonl_records
 from agent_harness.models import (
     AgentEvent,
     AgentSession,
@@ -16,6 +15,7 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
+from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_records
 
 
 class ClaudeProvider:
@@ -138,9 +138,9 @@ class ClaudeProvider:
 
 def claude_usage_from_record(record: dict[str, Any]) -> TokenUsage | None:
     message = record.get("message")
-    if not isinstance(message, dict):
-        return None
-    usage = message.get("usage")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        usage = record.get("usage")
     if not isinstance(usage, dict):
         return None
     input_tokens = int(usage.get("input_tokens") or 0)

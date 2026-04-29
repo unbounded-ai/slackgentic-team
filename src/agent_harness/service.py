@@ -469,10 +469,12 @@ def _service_names(
 def _codex_first_specs(specs: list[ServiceSpec]) -> list[ServiceSpec]:
     return sorted(
         specs,
-        key=lambda spec: 0
-        if spec.label == MACOS_CODEX_APP_SERVER_LABEL
-        or spec.name.endswith(f"-{CODEX_APP_SERVER_SERVICE_SUFFIX}")
-        else 1,
+        key=lambda spec: (
+            0
+            if spec.label == MACOS_CODEX_APP_SERVER_LABEL
+            or spec.name.endswith(f"-{CODEX_APP_SERVER_SERVICE_SUFFIX}")
+            else 1
+        ),
     )
 
 

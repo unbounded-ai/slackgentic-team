@@ -42,6 +42,12 @@ class AgentTaskKind(StrEnum):
     REVIEW = "review"
 
 
+class PendingWorkRequestStatus(StrEnum):
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+    CANCELLED = "cancelled"
+
+
 class AssignmentMode(StrEnum):
     ANYONE = "anyone"
     SPECIFIC = "specific"
@@ -118,18 +124,6 @@ class UsageSnapshot:
 
 
 @dataclass(frozen=True)
-class Persona:
-    provider: Provider
-    session_id: str
-    full_name: str
-    username: str
-    initials: str
-    color_hex: str
-    avatar_slug: str
-    icon_emoji: str
-
-
-@dataclass(frozen=True)
 class TeamAgent:
     agent_id: str
     handle: str
@@ -185,6 +179,22 @@ class SlackThreadRef:
     thread_ts: str
     message_ts: str | None = None
     permalink: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingWorkRequest:
+    pending_id: str
+    channel_id: str
+    thread_ts: str
+    request: WorkRequest
+    requested_by_slack_user: str | None
+    status: PendingWorkRequestStatus
+    created_at: datetime
+    updated_at: datetime
+    message_ts: str | None = None
+    author_agent_id: str | None = None
+    extra_metadata: dict[str, Any] = field(default_factory=dict)
+    exclude_agent_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

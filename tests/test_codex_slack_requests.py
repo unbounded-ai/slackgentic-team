@@ -1,10 +1,10 @@
 import threading
 import unittest
 
-from agent_harness.codex_slack_requests import SlackCodexRequestHandler
 from agent_harness.models import SlackThreadRef
 from agent_harness.slack import decode_action_value
-from agent_harness.slack_client import PostedMessage
+from agent_harness.slack.client import PostedMessage
+from agent_harness.slack.codex_requests import SlackCodexRequestHandler
 
 
 class FakeGateway:

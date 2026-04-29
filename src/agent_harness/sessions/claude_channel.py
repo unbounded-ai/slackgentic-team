@@ -11,8 +11,8 @@ from typing import Any
 
 from agent_harness.config import load_config_from_env
 from agent_harness.models import SlackThreadRef
-from agent_harness.slack_agent_requests import SlackAgentRequestHandler
-from agent_harness.store import Store
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.storage.store import Store
 
 CHANNEL_NAME = "slackgentic"
 CHANNEL_VERSION = "0.1.0"
@@ -218,7 +218,7 @@ def run_channel_server(db_path: Path | None = None) -> int:
         store.init_schema()
         request_handler = None
         if config.slack.bot_token:
-            from agent_harness.slack_client import SlackGateway
+            from agent_harness.slack.client import SlackGateway
 
             request_handler = SlackAgentRequestHandler(
                 SlackGateway(config.slack.bot_token),

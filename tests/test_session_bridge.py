@@ -7,15 +7,15 @@ from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentSession, Provider, SessionStatus, SlackThreadRef
-from agent_harness.session_bridge import (
+from agent_harness.sessions.bridge import (
     ExternalSessionBridge,
     _codex_remote_enabled,
     _slackgentic_channel_enabled,
     build_external_session_prompt,
     is_session_exit_request,
 )
-from agent_harness.session_terminal import TerminalTarget
-from agent_harness.store import Store
+from agent_harness.sessions.terminal import TerminalTarget
+from agent_harness.storage.store import Store
 
 
 class FakeGateway:

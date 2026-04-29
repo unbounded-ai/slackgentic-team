@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from agent_harness.models import AgentTaskStatus, Provider, SessionDependency, SlackThreadRef
-from agent_harness.store import Store
+from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 
 

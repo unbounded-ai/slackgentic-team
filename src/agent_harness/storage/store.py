@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 
 from agent_harness.models import (
@@ -10,14 +11,17 @@ from agent_harness.models import (
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
+    AssignmentMode,
     ControlMode,
-    Persona,
+    PendingWorkRequest,
+    PendingWorkRequestStatus,
     Provider,
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
     TeamAgent,
     TeamAgentStatus,
+    WorkRequest,
     parse_timestamp,
     utc_now,
 )
@@ -38,18 +42,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   git_branch TEXT,
   permission_mode TEXT,
   metadata_json TEXT NOT NULL DEFAULT '{}',
-  PRIMARY KEY (provider, session_id)
-);
-
-CREATE TABLE IF NOT EXISTS personas (
-  provider TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  full_name TEXT NOT NULL,
-  username TEXT NOT NULL,
-  initials TEXT NOT NULL,
-  color_hex TEXT NOT NULL,
-  avatar_slug TEXT NOT NULL,
-  icon_emoji TEXT NOT NULL,
   PRIMARY KEY (provider, session_id)
 );
 
@@ -97,6 +89,29 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
 
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent_status
   ON agent_tasks(agent_id, status);
+
+CREATE TABLE IF NOT EXISTS pending_work_requests (
+  pending_id TEXT NOT NULL PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  message_ts TEXT,
+  prompt TEXT NOT NULL,
+  assignment_mode TEXT NOT NULL,
+  requested_handle TEXT,
+  task_kind TEXT NOT NULL,
+  author_handle TEXT,
+  pr_url TEXT,
+  requested_by_slack_user TEXT,
+  author_agent_id TEXT,
+  extra_metadata_json TEXT NOT NULL DEFAULT '{}',
+  exclude_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_work_requests_status_created
+  ON pending_work_requests(status, created_at);
 
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT NOT NULL PRIMARY KEY,
@@ -241,34 +256,6 @@ class Store:
         )
         self.conn.commit()
 
-    def upsert_persona(self, persona: Persona) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO personas (
-              provider, session_id, full_name, username, initials, color_hex,
-              avatar_slug, icon_emoji
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider, session_id) DO UPDATE SET
-              full_name = excluded.full_name,
-              username = excluded.username,
-              initials = excluded.initials,
-              color_hex = excluded.color_hex,
-              avatar_slug = excluded.avatar_slug,
-              icon_emoji = excluded.icon_emoji
-            """,
-            (
-                persona.provider.value,
-                persona.session_id,
-                persona.full_name,
-                persona.username,
-                persona.initials,
-                persona.color_hex,
-                persona.avatar_slug,
-                persona.icon_emoji,
-            ),
-        )
-        self.conn.commit()
-
     def set_setting(self, key: str, value: str) -> None:
         self.conn.execute(
             """
@@ -289,6 +276,16 @@ class Store:
     def delete_setting(self, key: str) -> None:
         self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         self.conn.commit()
+
+    def list_settings(self, prefix: str | None = None) -> dict[str, str]:
+        if prefix is None:
+            rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT key, value FROM settings WHERE key LIKE ?",
+                (f"{prefix}%",),
+            ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
 
     def upsert_team_agent(self, agent: TeamAgent) -> None:
         self.conn.execute(
@@ -458,6 +455,82 @@ class Store:
             )
             self.conn.commit()
 
+    def create_pending_work_request(
+        self,
+        thread: SlackThreadRef,
+        request: WorkRequest,
+        requested_by_slack_user: str | None = None,
+        author_agent: TeamAgent | None = None,
+        extra_metadata: dict[str, object] | None = None,
+        exclude_agent_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+    ) -> PendingWorkRequest:
+        now = utc_now()
+        pending = PendingWorkRequest(
+            pending_id=f"pending_{uuid.uuid4().hex[:12]}",
+            channel_id=thread.channel_id,
+            thread_ts=thread.thread_ts,
+            message_ts=thread.message_ts,
+            request=request,
+            requested_by_slack_user=requested_by_slack_user,
+            author_agent_id=author_agent.agent_id if author_agent else None,
+            extra_metadata=dict(extra_metadata or {}),
+            exclude_agent_ids=tuple(sorted(exclude_agent_ids or ())),
+            status=PendingWorkRequestStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
+        self.conn.execute(
+            """
+            INSERT INTO pending_work_requests (
+              pending_id, channel_id, thread_ts, message_ts, prompt, assignment_mode,
+              requested_handle, task_kind, author_handle, pr_url, requested_by_slack_user,
+              author_agent_id, extra_metadata_json, exclude_agent_ids_json, status,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            _pending_work_request_values(pending),
+        )
+        self.conn.commit()
+        return pending
+
+    def list_pending_work_requests(
+        self,
+        channel_id: str | None = None,
+        limit: int = 50,
+    ) -> list[PendingWorkRequest]:
+        where = "WHERE status = ?"
+        params: list[object] = [PendingWorkRequestStatus.PENDING.value]
+        if channel_id:
+            where += " AND channel_id = ?"
+            params.append(channel_id)
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM pending_work_requests
+            {where}
+            ORDER BY created_at, pending_id
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_pending_work_request_from_row(row) for row in rows]
+
+    def update_pending_work_request_status(
+        self,
+        pending_id: str,
+        status: PendingWorkRequestStatus,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE pending_work_requests
+            SET status = ?, updated_at = ?
+            WHERE pending_id = ?
+            """,
+            (status.value, utc_now().isoformat(), pending_id),
+        )
+        self.conn.commit()
+
     def get_agent_task(self, task_id: str) -> AgentTask | None:
         with self._lock:
             row = self.conn.execute(
@@ -506,6 +579,19 @@ class Store:
             (channel_id, thread_ts),
         ).fetchone()
         return _agent_task_from_row(row) if row else None
+
+    def has_agent_task_session(self, provider: Provider, session_id: str) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT 1
+            FROM agent_tasks
+            WHERE session_provider = ?
+              AND session_id = ?
+            LIMIT 1
+            """,
+            (provider.value, session_id),
+        ).fetchone()
+        return row is not None
 
     def get_original_agent_task_by_thread(
         self, channel_id: str, thread_ts: str
@@ -598,6 +684,51 @@ class Store:
             ),
         )
         self.conn.commit()
+
+    def clear_external_session_tracking(
+        self,
+        provider: Provider,
+        session_id: str,
+        *,
+        team_id: str | None = None,
+        channel_id: str | None = None,
+    ) -> bool:
+        changed = False
+        for prefix in (
+            "external_session_agent.",
+            "external_session_pending.",
+            "external_session_summary.",
+            "session_channel_notice.",
+        ):
+            cursor = self.conn.execute(
+                "DELETE FROM settings WHERE key = ?",
+                (f"{prefix}{provider.value}.{session_id}",),
+            )
+            changed = changed or cursor.rowcount > 0
+        thread_where = "provider = ? AND session_id = ?"
+        thread_params: list[object] = [provider.value, session_id]
+        if team_id is not None:
+            thread_where += " AND team_id = ?"
+            thread_params.append(team_id)
+        if channel_id is not None:
+            thread_where += " AND channel_id = ?"
+            thread_params.append(channel_id)
+        cursor = self.conn.execute(
+            f"DELETE FROM slack_threads WHERE {thread_where}",
+            tuple(thread_params),
+        )
+        changed = changed or cursor.rowcount > 0
+        cursor = self.conn.execute(
+            """
+            DELETE FROM session_mirror_cursors
+            WHERE provider = ?
+              AND session_id = ?
+            """,
+            (provider.value, session_id),
+        )
+        changed = changed or cursor.rowcount > 0
+        self.conn.commit()
+        return changed
 
     def add_session_bridge_prompt(
         self,
@@ -1070,4 +1201,51 @@ def _agent_task_from_row(row: sqlite3.Row) -> AgentTask:
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
         metadata=json.loads(row["metadata_json"] or "{}"),
+    )
+
+
+def _pending_work_request_values(pending: PendingWorkRequest) -> tuple[object, ...]:
+    request = pending.request
+    return (
+        pending.pending_id,
+        pending.channel_id,
+        pending.thread_ts,
+        pending.message_ts,
+        request.prompt,
+        request.assignment_mode.value,
+        request.requested_handle,
+        request.task_kind.value,
+        request.author_handle,
+        request.pr_url,
+        pending.requested_by_slack_user,
+        pending.author_agent_id,
+        json.dumps(pending.extra_metadata, sort_keys=True),
+        json.dumps(list(pending.exclude_agent_ids), sort_keys=True),
+        pending.status.value,
+        pending.created_at.isoformat(),
+        pending.updated_at.isoformat(),
+    )
+
+
+def _pending_work_request_from_row(row: sqlite3.Row) -> PendingWorkRequest:
+    return PendingWorkRequest(
+        pending_id=row["pending_id"],
+        channel_id=row["channel_id"],
+        thread_ts=row["thread_ts"],
+        message_ts=row["message_ts"],
+        request=WorkRequest(
+            prompt=row["prompt"],
+            assignment_mode=AssignmentMode(row["assignment_mode"]),
+            requested_handle=row["requested_handle"],
+            task_kind=AgentTaskKind(row["task_kind"]),
+            author_handle=row["author_handle"],
+            pr_url=row["pr_url"],
+        ),
+        requested_by_slack_user=row["requested_by_slack_user"],
+        author_agent_id=row["author_agent_id"],
+        extra_metadata=json.loads(row["extra_metadata_json"] or "{}"),
+        exclude_agent_ids=tuple(json.loads(row["exclude_agent_ids_json"] or "[]")),
+        status=PendingWorkRequestStatus(row["status"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
     )

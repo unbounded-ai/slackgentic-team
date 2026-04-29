@@ -15,18 +15,18 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
-from agent_harness.codex_app_server import (
-    CodexAppServerClient,
-)
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentSession, Provider, SessionStatus, SlackThreadRef, utc_now
-from agent_harness.runner import _codex_trust_override
-from agent_harness.session_terminal import SessionTerminalNotifier, TerminalTarget
+from agent_harness.runtime.codex_app_server import (
+    CodexAppServerClient,
+)
+from agent_harness.runtime.runner import _codex_trust_override
+from agent_harness.runtime.tasks import _process_output_chunks
+from agent_harness.sessions.terminal import SessionTerminalNotifier, TerminalTarget
 from agent_harness.slack import dangerous_flag
-from agent_harness.slack_agent_requests import SlackAgentRequestHandler
-from agent_harness.slack_client import SlackGateway
-from agent_harness.store import Store
-from agent_harness.task_runtime import _process_output_chunks
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.slack.client import SlackGateway
+from agent_harness.storage.store import Store
 
 LOGGER = logging.getLogger(__name__)
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]

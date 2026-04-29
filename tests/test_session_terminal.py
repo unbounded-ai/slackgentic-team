@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness.models import AgentSession, Provider
-from agent_harness.session_terminal import SessionTerminalNotifier
+from agent_harness.sessions.terminal import SessionTerminalNotifier
 
 
 class SessionTerminalNotifierTests(unittest.TestCase):

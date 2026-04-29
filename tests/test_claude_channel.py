@@ -7,16 +7,16 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.claude_channel import (
+from agent_harness.models import SlackThreadRef
+from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
     ClaudeChannelServer,
     install_claude_mcp_server,
     mcp_config,
 )
-from agent_harness.models import SlackThreadRef
-from agent_harness.slack_agent_requests import SlackAgentRequestHandler
-from agent_harness.slack_client import PostedMessage
-from agent_harness.store import Store
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.slack.client import PostedMessage
+from agent_harness.storage.store import Store
 
 
 class FakeGateway:
@@ -192,7 +192,7 @@ class ClaudeChannelTests(unittest.TestCase):
             calls.append((args, check))
 
         with (
-            patch("agent_harness.claude_channel.shutil.which", return_value=None),
+            patch("agent_harness.sessions.claude_channel.shutil.which", return_value=None),
             patch.object(sys, "argv", ["/repo/src/agent_harness/__main__.py"]),
             patch("subprocess.run", fake_run),
         ):

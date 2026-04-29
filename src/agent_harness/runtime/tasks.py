@@ -6,20 +6,22 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentTask, AgentTaskStatus, Provider, SlackThreadRef, TeamAgent
-from agent_harness.runner import LaunchRequest, ManagedAgentProcess
-from agent_harness.slack_client import SlackGateway
-from agent_harness.store import Store
+from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
+from agent_harness.slack.client import SlackGateway
+from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
 
 LOGGER = logging.getLogger(__name__)
+SETTING_REPO_ROOT = "slack.repo_root"
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
+AgentIconUrlCallback = Callable[[TeamAgent], str | None]
 
 
 @dataclass
@@ -30,7 +32,9 @@ class RunningTask:
     thread: SlackThreadRef
     worker: threading.Thread
     output_buffer: str = ""
+    session_buffer: str = ""
     observed_agent_messages: set[str] | None = None
+    visible_message_count: int = 0
 
 
 class ManagedTaskRuntime:
@@ -43,6 +47,7 @@ class ManagedTaskRuntime:
         poll_seconds: float = 1.0,
         on_task_done: TaskDoneCallback | None = None,
         on_agent_message: AgentMessageCallback | None = None,
+        agent_icon_url: AgentIconUrlCallback | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -51,17 +56,24 @@ class ManagedTaskRuntime:
         self.poll_seconds = poll_seconds
         self.on_task_done = on_task_done
         self.on_agent_message = on_agent_message
+        self.agent_icon_url = agent_icon_url
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
 
     def start_task(self, task: AgentTask, agent: TeamAgent, thread: SlackThreadRef) -> bool:
         provider = agent.provider_preference or Provider.CODEX
-        cwd = _task_cwd(task, self.commands.default_cwd)
+        cwd = _task_cwd(task, self._default_cwd())
         request = LaunchRequest(
             provider=provider,
             prompt=build_task_prompt(agent, task),
             cwd=cwd,
             dangerous=self.commands.dangerous_by_default,
+            resume_session_id=(
+                task.session_id
+                if task.session_id
+                and (task.session_provider is None or task.session_provider == provider)
+                else None
+            ),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
@@ -73,6 +85,7 @@ class ManagedTaskRuntime:
                 thread,
                 f"Failed to start {provider.value}: {exc}",
                 persona=agent,
+                icon_url=self._agent_icon_url(agent),
             )
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
             return False
@@ -95,9 +108,13 @@ class ManagedTaskRuntime:
         running = self._get_running(task_id)
         if running is None:
             return False
-        if _provider_for_running(running) == Provider.CODEX:
+        if _provider_for_running(running) in {Provider.CODEX, Provider.CLAUDE}:
             return False
-        running.process.send(message)
+        try:
+            running.process.send(message)
+        except Exception:
+            LOGGER.debug("failed to send message to running managed task", exc_info=True)
+            return False
         return True
 
     def stop_task(self, task_id: str, status: AgentTaskStatus = AgentTaskStatus.CANCELLED) -> bool:
@@ -121,12 +138,25 @@ class ManagedTaskRuntime:
                     return running
         return None
 
+    def has_running_tasks(self) -> bool:
+        with self._lock:
+            return bool(self._running)
+
+    def _default_cwd(self) -> Path:
+        configured = self.store.get_setting(SETTING_REPO_ROOT)
+        if configured:
+            path = Path(configured).expanduser()
+            if path.exists():
+                return path
+        return self.commands.default_cwd
+
     def _stream_task(self, task_id: str) -> None:
         while True:
             running = self._get_running(task_id)
             if running is None:
                 return
             output = running.process.read_available()
+            self._capture_session_id(running, output)
             chunks, running.output_buffer = _process_output_chunks(
                 _provider_for_running(running),
                 output,
@@ -137,6 +167,7 @@ class ManagedTaskRuntime:
             if not running.process.is_alive():
                 time.sleep(0.05)
                 tail = running.process.read_available(max_reads=100, timeout=0.05)
+                self._capture_session_id(running, tail, final=True)
                 chunks, running.output_buffer = _process_output_chunks(
                     _provider_for_running(running),
                     tail,
@@ -145,9 +176,21 @@ class ManagedTaskRuntime:
                 )
                 for chunk in chunks:
                     self._post_agent_chunk(running, chunk)
-                self.store.update_agent_task_status(task_id, AgentTaskStatus.DONE)
                 with self._lock:
                     self._running.pop(task_id, None)
+                if running.visible_message_count == 0:
+                    self.gateway.post_thread_reply(
+                        running.thread,
+                        (
+                            f"{running.agent.full_name} finished without a "
+                            "Slack-visible response. I cancelled this run so the "
+                            "silent exit is visible instead of looking stuck."
+                        ),
+                        persona=running.agent,
+                        icon_url=self._agent_icon_url(running.agent),
+                    )
+                    self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+                    return
                 completed_task = self.store.get_agent_task(task_id) or running.task
                 if self.on_task_done:
                     self.on_task_done(completed_task, running.agent, running.thread)
@@ -155,7 +198,13 @@ class ManagedTaskRuntime:
             time.sleep(self.poll_seconds)
 
     def _post_agent_chunk(self, running: RunningTask, chunk: str) -> None:
-        self.gateway.post_thread_reply(running.thread, chunk, persona=running.agent)
+        self.gateway.post_thread_reply(
+            running.thread,
+            chunk,
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
+        running.visible_message_count += 1
         if self.on_agent_message is None:
             return
         normalized = chunk.strip()
@@ -170,6 +219,38 @@ class ManagedTaskRuntime:
             self.on_agent_message(running.task, running.agent, running.thread, normalized)
         except Exception:
             LOGGER.exception("failed to handle agent-authored Slack message")
+
+    def _agent_icon_url(self, agent: TeamAgent) -> str | None:
+        if self.agent_icon_url is None:
+            return None
+        try:
+            return self.agent_icon_url(agent)
+        except Exception:
+            LOGGER.debug("failed to resolve agent icon URL", exc_info=True)
+            return None
+
+    def _capture_session_id(
+        self,
+        running: RunningTask,
+        output: str,
+        *,
+        final: bool = False,
+    ) -> None:
+        session_id, running.session_buffer = _session_id_from_output(
+            _provider_for_running(running),
+            output,
+            running.session_buffer,
+            final=final,
+        )
+        if not session_id or running.task.session_id == session_id:
+            return
+        provider = _provider_for_running(running)
+        self.store.update_agent_task_session(running.task.task_id, provider, session_id)
+        running.task = replace(
+            running.task,
+            session_provider=provider,
+            session_id=session_id,
+        )
 
     def _get_running(self, task_id: str) -> RunningTask | None:
         with self._lock:
@@ -191,6 +272,10 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "separate Slack-visible message beginning exactly `somebody review ...` "
             "with the concrete item to review. After that message, stop and wait; "
             "Slackgentic will route the review and resume you with the review context."
+        ),
+        (
+            "When you hand work to a specific agent, use that agent's exact Slackgentic "
+            "`@handle` from the thread or roster."
         ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",
@@ -223,12 +308,17 @@ def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:
 
 
 def _requested_repo_cwd(prompt: str, default_cwd: Path) -> Path:
-    root = default_cwd.parent
-    repo_names = {
-        path.name.lower(): path
-        for path in root.iterdir()
-        if path.is_dir() and not path.name.startswith(".")
-    }
+    root = default_cwd
+    if not root.exists() or not root.is_dir():
+        return default_cwd
+    try:
+        repo_names = {
+            path.name.lower(): path
+            for path in root.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        }
+    except OSError:
+        return default_cwd
     patterns = [
         r"\b(?:in|inside|for)\s+(?:repo\s+|repository\s+)?(?P<repo>[A-Za-z0-9_.-]+)\b",
         r"\b(?:repo|repository)\s+(?P<repo>[A-Za-z0-9_.-]+)\b",
@@ -261,6 +351,46 @@ def _process_output_chunks(
     if provider == Provider.CODEX:
         return _codex_exec_chunks(text, buffer, final=final)
     return _claude_json_chunks(text, buffer, final=final)
+
+
+def _session_id_from_output(
+    provider: Provider,
+    text: str,
+    buffer: str = "",
+    final: bool = False,
+) -> tuple[str | None, str]:
+    combined = buffer + text
+    if not combined:
+        return None, buffer
+    lines = combined.splitlines(keepends=True)
+    next_buffer = ""
+    if lines and not _line_has_ending(lines[-1]) and not final:
+        next_buffer = lines.pop()
+
+    session_id = None
+    for line in lines:
+        candidate = _session_id_from_line(provider, line.strip())
+        if candidate:
+            session_id = candidate
+    return session_id, next_buffer
+
+
+def _session_id_from_line(provider: Provider, line: str) -> str | None:
+    if not line:
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    if provider == Provider.CODEX and event.get("type") == "thread.started":
+        value = event.get("thread_id")
+        return str(value) if value else None
+    if provider == Provider.CLAUDE:
+        value = event.get("session_id") or event.get("sessionId")
+        return str(value) if value else None
+    return None
 
 
 def _codex_exec_chunks(
@@ -302,6 +432,15 @@ def _render_codex_exec_line(line: str) -> str | None:
     if event_type == "item.completed":
         item = event.get("item")
         return _render_codex_item(item if isinstance(item, dict) else {})
+    if event_type == "event_msg":
+        payload = event.get("payload")
+        return _render_codex_event_payload(payload if isinstance(payload, dict) else {})
+    if event_type == "agent_message":
+        message = event.get("message") or event.get("text")
+        return _clean_terminal_output(str(message)) if message else None
+    if event_type == "response_item":
+        payload = event.get("payload")
+        return _render_codex_response_item(payload if isinstance(payload, dict) else {})
     if event_type == "error":
         message = event.get("message") or event.get("error")
         return f"Codex error: {message}" if message else "Codex error."
@@ -314,6 +453,31 @@ def _render_codex_item(item: dict) -> str | None:
         text = item.get("text")
         return _clean_terminal_output(str(text)) if text else None
     return None
+
+
+def _render_codex_event_payload(payload: dict) -> str | None:
+    payload_type = payload.get("type")
+    if payload_type == "agent_message":
+        message = payload.get("message") or payload.get("text")
+        return _clean_terminal_output(str(message)) if message else None
+    return None
+
+
+def _render_codex_response_item(payload: dict) -> str | None:
+    if payload.get("type") != "message" or payload.get("role") != "assistant":
+        return None
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"output_text", "text"} and isinstance(item.get("text"), str):
+            cleaned = _clean_terminal_output(item["text"])
+            if cleaned:
+                parts.append(cleaned)
+    return "\n\n".join(parts) if parts else None
 
 
 def _claude_json_chunks(

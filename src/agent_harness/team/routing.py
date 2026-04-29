@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 
-from agent_harness.models import AgentTaskKind, AssignmentMode, WorkRequest
+from agent_harness.models import AgentTaskKind, AssignmentMode, TeamAgent, WorkRequest
 from agent_harness.team import normalize_handle
 
 ANYONE_WORDS = ("somebody", "someone", "anyone", "any agent", "whoever")
 TASK_VERBS = ("do", "handle", "take", "work on", "start", "pick up", "review")
 BOT_MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*")
+AGENT_MENTION_RE = re.compile(r"(?<![\w.-])@([a-zA-Z][a-zA-Z0-9_-]{1,31})\b")
 PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
 
 
@@ -23,39 +24,131 @@ def parse_work_request(text: str, known_handles: list[str] | tuple[str, ...]) ->
 
 def parse_lightweight_handles(text: str) -> list[str]:
     handles: list[str] = []
-    for match in re.finditer(r"(?<![\w.-])@([a-zA-Z][a-zA-Z0-9_-]{1,31})\b", text):
+    for match in AGENT_MENTION_RE.finditer(text):
         handle = normalize_handle(match.group(1))
         if handle not in handles:
             handles.append(handle)
     return handles
 
 
+def canonicalize_agent_mentions(text: str, agents: list[TeamAgent] | tuple[TeamAgent, ...]) -> str:
+    if not agents:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        typed = match.group(1)
+        canonical = canonical_agent_handle(typed, agents)
+        if not canonical or canonical == typed.lower():
+            return match.group(0)
+        return f"@{canonical}"
+
+    return AGENT_MENTION_RE.sub(replace, text)
+
+
+def canonical_agent_handle(
+    mention: str,
+    agents: list[TeamAgent] | tuple[TeamAgent, ...],
+) -> str | None:
+    normalized = normalize_handle(mention)
+    aliases = agent_handle_aliases(agents)
+    canonical = aliases.get(normalized)
+    if canonical:
+        return canonical
+    fuzzy_matches = [
+        normalize_handle(agent.handle)
+        for agent in agents
+        if _is_single_edit_typo(normalized, normalize_handle(agent.handle))
+    ]
+    distinct_matches = sorted(set(fuzzy_matches))
+    if len(distinct_matches) == 1:
+        return distinct_matches[0]
+    return None
+
+
+def agent_handle_aliases(
+    agents: list[TeamAgent] | tuple[TeamAgent, ...],
+) -> dict[str, str]:
+    exact_handles = {normalize_handle(agent.handle) for agent in agents}
+    aliases: dict[str, str] = {handle: handle for handle in exact_handles}
+    candidates: dict[str, set[str]] = {}
+    for agent in agents:
+        handle = normalize_handle(agent.handle)
+        for alias in _agent_alias_candidates(agent):
+            if alias == handle or alias in exact_handles:
+                continue
+            candidates.setdefault(alias, set()).add(handle)
+    for alias, handles in candidates.items():
+        if len(handles) == 1:
+            aliases[alias] = next(iter(handles))
+    return aliases
+
+
+def _agent_alias_candidates(agent: TeamAgent) -> set[str]:
+    candidates = {normalize_handle(agent.handle)}
+    name_parts = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", agent.full_name)
+    if name_parts:
+        first_name = name_parts[0].lower()
+        if len(first_name) >= 2:
+            candidates.add(first_name)
+    return {candidate for candidate in candidates if _is_valid_handle(candidate)}
+
+
+def _is_valid_handle(value: str) -> bool:
+    try:
+        normalize_handle(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_single_edit_typo(typed: str, handle: str) -> bool:
+    if typed == handle or min(len(typed), len(handle)) < 3:
+        return False
+    if abs(len(typed) - len(handle)) > 1:
+        return False
+    index = 0
+    other_index = 0
+    edits = 0
+    while index < len(typed) and other_index < len(handle):
+        if typed[index] == handle[other_index]:
+            index += 1
+            other_index += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(typed) == len(handle):
+            index += 1
+            other_index += 1
+        elif len(typed) < len(handle):
+            other_index += 1
+        else:
+            index += 1
+    if index < len(typed) or other_index < len(handle):
+        edits += 1
+    return edits == 1
+
+
 def _parse_anyone_request(
     text: str, known_handles: list[str] | tuple[str, ...]
 ) -> WorkRequest | None:
     anyone_pattern = "|".join(re.escape(word) for word in ANYONE_WORDS)
-    verb_pattern = "|".join(re.escape(verb) for verb in TASK_VERBS)
     patterns = [
         (
-            rf"^(?:please\s+)?(?:{anyone_pattern})\s+(?:please\s+)?"
-            rf"(?P<verb>{verb_pattern})\s+(?P<prompt>.+)$"
-        ),
-        (
             rf"^(?:please\s+)?(?:{anyone_pattern})\s+can\s+"
-            rf"(?P<verb>{verb_pattern})\s+(?P<prompt>.+)$"
+            rf"(?:please\s+)?(?P<prompt>.+)$"
         ),
-        rf"^(?:please\s+)?(?:{anyone_pattern})\s+(?P<prompt>.+)$",
+        rf"^(?:please\s+)?(?:{anyone_pattern})\s+(?:please\s+)?(?P<prompt>.+)$",
     ]
     for pattern in patterns:
         match = re.match(pattern, text, flags=re.IGNORECASE)
         if match:
-            verb = match.groupdict().get("verb") or ""
             prompt = _clean_prompt(match.group("prompt"))
             if prompt:
                 return _work_request(
-                    prompt=_command_prompt(verb, prompt),
+                    prompt=prompt,
                     assignment_mode=AssignmentMode.ANYONE,
-                    verb=verb or _infer_verb(prompt),
+                    verb=_infer_verb(prompt),
                     known_handles=known_handles,
                 )
     return None

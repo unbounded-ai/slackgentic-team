@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -26,6 +27,7 @@ BOT_SCOPES = [
     "chat:write",
     "chat:write.customize",
     "commands",
+    "pins:write",
     "groups:history",
     "groups:read",
     "groups:write",
@@ -91,7 +93,7 @@ def build_slack_manifest(
                     "command": slash_command,
                     "description": "Set up and manage your local agent team.",
                     "usage_hint": (
-                        "setup | status | hire 2 claude agents | fire @riley | show roster"
+                        "setup | status | show roster | repo root ~/code | hire 2 claude agents"
                     ),
                     "should_escape": True,
                 }
@@ -162,8 +164,11 @@ def run_interactive_setup(options: SlackSetupOptions | None = None) -> int:
         options.config_file,
     )
     print(f"Saved Slackgentic credentials to {saved_path}.")
-    print("External terminal prompts will be mirrored with this Slack app identity.")
-    print(f"Run `slackgentic slack serve`, then use `{slash_command} setup` in Slack.")
+    print("Sessions started outside Slack will be mirrored with this Slack app identity.")
+    command = _slackgentic_executable()
+    print("Next, install and start the background service:")
+    print(f"  {command} service install && {command} service status")
+    print(f"Then use `{slash_command} setup` in Slack.")
     return 0
 
 
@@ -308,8 +313,10 @@ def _app_token(created: CreatedSlackApp, options: SlackSetupOptions) -> str:
         return token
     _open_url(_app_basic_page(created.app_id), options.open_browser)
     print(
-        "Generate an App-Level Token with the connections:write scope, then click Copy. "
-        "I will read the xapp token from the clipboard."
+        "Under App-Level Tokens, click `Generate Token and Scopes`, name it "
+        "`slackgentic` (any name is fine), add the `connections:write` scope, "
+        "generate the token, then click Copy. I will read the xapp token from "
+        "the clipboard."
     )
     return _wait_for_clipboard_token(
         APP_TOKEN_RE,
@@ -477,6 +484,15 @@ def _open_url(url: str, open_browser: bool) -> None:
 
 def _has_existing_credentials(values: dict[str, Any]) -> bool:
     return bool(values.get("SLACK_BOT_TOKEN") and values.get("SLACK_APP_TOKEN"))
+
+
+def _slackgentic_executable() -> str:
+    if shutil.which("slackgentic"):
+        return "slackgentic"
+    executable = Path(sys.argv[0])
+    if executable.name == "slackgentic":
+        return str(executable)
+    return "slackgentic"
 
 
 def _nested_dict(value: dict[str, Any], key: str) -> dict[str, Any]:

@@ -1,6 +1,6 @@
 import unittest
 
-from agent_harness.slack_client import SlackGateway
+from agent_harness.slack.client import SlackGateway
 from agent_harness.team import build_initial_model_team, build_initialization_messages
 
 

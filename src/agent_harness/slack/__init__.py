@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from agent_harness.models import AgentTask, Provider, SlackThreadRef, TeamAgent
-from agent_harness.routing import parse_lightweight_handles
-from agent_harness.team import DEFAULT_CLAUDE_TEAM_SIZE, DEFAULT_CODEX_TEAM_SIZE
+from agent_harness.team import (
+    DEFAULT_CLAUDE_TEAM_SIZE,
+    DEFAULT_CODEX_TEAM_SIZE,
+    agent_identity_label,
+)
+from agent_harness.team.routing import parse_lightweight_handles
 
 SLACK_PERMALINK_RE = re.compile(
     r"https://(?P<workspace>[^/]+)/archives/(?P<channel>[A-Z0-9]+)/p(?P<packed_ts>\d{16})"
@@ -14,7 +20,21 @@ SLACK_PERMALINK_RE = re.compile(
 )
 
 
-def build_setup_modal(callback_id: str = "setup.initial") -> dict[str, Any]:
+@dataclass(frozen=True)
+class AgentRosterStatus:
+    label: str
+    detail: str | None = None
+    thread_url: str | None = None
+    task_id: str | None = None
+    session_provider: Provider | None = None
+    session_id: str | None = None
+
+
+def build_setup_modal(
+    callback_id: str = "setup.initial",
+    default_repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    repo_root = str(default_repo_root or _default_repo_root())
     return {
         "type": "modal",
         "callback_id": callback_id,
@@ -66,6 +86,21 @@ def build_setup_modal(callback_id: str = "setup.initial") -> dict[str, Any]:
                     "action_id": "value",
                     "initial_value": str(DEFAULT_CLAUDE_TEAM_SIZE),
                     "placeholder": {"type": "plain_text", "text": str(DEFAULT_CLAUDE_TEAM_SIZE)},
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "repo_root",
+                "label": {"type": "plain_text", "text": "Repos root"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": repo_root,
+                    "placeholder": {"type": "plain_text", "text": "~/code"},
+                },
+                "hint": {
+                    "type": "plain_text",
+                    "text": "Agents launch here by default. Named sibling repos can be selected from this root.",
                 },
             },
         ],
@@ -148,13 +183,19 @@ def build_start_session_modal(callback_id: str = "session.start") -> dict[str, A
     }
 
 
-def build_team_roster_blocks(agents: list[TeamAgent]) -> list[dict[str, Any]]:
+def build_team_roster_blocks(
+    agents: list[TeamAgent],
+    statuses: dict[str, AgentRosterStatus] | None = None,
+) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*Agent team*  {len(agents)} active lightweight handles",
+                "text": (
+                    f"*Agent team*  {len(agents)} active lightweight handles\n"
+                    f"{_provider_breakdown_text(agents)}"
+                ),
             },
         },
         {
@@ -181,27 +222,184 @@ def build_team_roster_blocks(agents: list[TeamAgent]) -> list[dict[str, Any]]:
         },
     ]
     for agent in agents:
-        provider = agent.provider_preference.value if agent.provider_preference else "unmapped"
+        status = statuses.get(agent.agent_id) if statuses else None
+        status_text = _agent_status_text(status)
+        elements = []
+        if status and status.task_id:
+            elements.append(
+                _button(
+                    "Free up",
+                    "task.done",
+                    encode_action_value("task.done", task_id=status.task_id),
+                    "primary",
+                )
+            )
+        elif status and status.session_provider and status.session_id:
+            elements.append(
+                _button(
+                    "Free up",
+                    "external.session.finish",
+                    encode_action_value(
+                        "external.session.finish",
+                        provider=status.session_provider.value,
+                        session_id=status.session_id,
+                    ),
+                    "primary",
+                )
+            )
+        if status and status.thread_url:
+            elements.append(
+                _button(
+                    "Open thread",
+                    "thread.open",
+                    encode_action_value("thread.open"),
+                    url=status.thread_url,
+                )
+            )
+        elements.append(
+            _button(
+                "Fire",
+                "team.fire",
+                encode_action_value("team.fire", agent_id=agent.agent_id, handle=agent.handle),
+                "danger",
+            )
+        )
         blocks.append(
             {
                 "type": "section",
                 "block_id": f"team.agent.{agent.agent_id}",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        f"*{agent.full_name}* `@{agent.handle}`\n"
-                        f"{agent.role} - {provider} - {agent.voice}"
-                    ),
+                    "text": f"*{agent_identity_label(agent)}*\n{status_text}",
                 },
-                "accessory": _button(
-                    "Fire",
-                    "team.fire",
-                    encode_action_value("team.fire", agent_id=agent.agent_id, handle=agent.handle),
-                    "danger",
-                ),
+            }
+        )
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"team.agent.actions.{agent.agent_id}",
+                "elements": elements,
             }
         )
     return blocks
+
+
+def _agent_status_text(status: AgentRosterStatus | None) -> str:
+    if status is None:
+        return "Available"
+    parts = [status.label]
+    if status.detail:
+        parts.append(status.detail)
+    return ": ".join(parts)
+
+
+def _provider_breakdown_text(agents: list[TeamAgent]) -> str:
+    counts = {Provider.CODEX: 0, Provider.CLAUDE: 0}
+    unmapped = 0
+    for agent in agents:
+        if agent.provider_preference in counts:
+            counts[agent.provider_preference] += 1
+        else:
+            unmapped += 1
+    parts = [
+        f"Codex {counts[Provider.CODEX]}",
+        f"Claude {counts[Provider.CLAUDE]}",
+    ]
+    if unmapped:
+        parts.append(f"Unmapped {unmapped}")
+    return " / ".join(parts)
+
+
+def build_channel_overview_blocks(
+    slash_command: str,
+    codex_command: str,
+    claude_command: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Slackgentic is ready.*\n"
+                    "Write anything in this channel to start a task, or write "
+                    "`@agentname ...` to ask a specific agent. The agent replies "
+                    "in your thread."
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Thread subtasks:*\n"
+                    "Reply with `somebody ...` in a task thread to bring in another "
+                    "agent for that subtask. The original agent picks the thread back "
+                    "up with the added context."
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Commands:* run them as `{slash_command} <command>`\n"
+                    f"`{slash_command} status`  usage and active sessions\n"
+                    f"`{slash_command} show roster`  current team\n"
+                    f"`{slash_command} hire 3 agents`  add capacity\n"
+                    f"`{slash_command} fire everyone`  clear the team"
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Sessions started outside Slack:*\n"
+                    f"*Codex:* `{codex_command}`\n"
+                    f"*Claude:* `{claude_command}`\n"
+                    "Each command creates a tracked Slack thread here."
+                ),
+            },
+        },
+    ]
+
+
+def build_external_session_capacity_blocks(
+    provider: Provider,
+    waiting_count: int = 1,
+) -> list[dict[str, Any]]:
+    label = provider.value.title()
+    plural = "session" if waiting_count == 1 else "sessions"
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*No {label} team seat is available.*\n"
+                    f"{waiting_count} {label} {plural} started outside Slack waiting. Hire one "
+                    "matching agent and Slackgentic will backfill visible transcript "
+                    "output into the tracked thread."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"external.capacity.{provider.value}",
+            "elements": [
+                _button(
+                    f"Hire 1 {label} agent",
+                    f"external.capacity.hire.{provider.value}",
+                    encode_action_value("team.hire", count=1, provider=provider.value),
+                    "primary",
+                )
+            ],
+        },
+    ]
 
 
 def build_task_thread_blocks(task: AgentTask, agent: TeamAgent) -> list[dict[str, Any]]:
@@ -222,25 +420,22 @@ def build_task_thread_blocks(task: AgentTask, agent: TeamAgent) -> list[dict[str
             "block_id": f"task.actions.{task.task_id}",
             "elements": [
                 _button(
-                    "Mark Done",
+                    "Finish and free up this agent",
                     "task.done",
                     encode_action_value("task.done", task_id=task.task_id),
                     "primary",
                 ),
-                _button(
-                    "Pause",
-                    "task.pause",
-                    encode_action_value("task.pause", task_id=task.task_id),
-                ),
-                _button(
-                    "Cancel",
-                    "task.cancel",
-                    encode_action_value("task.cancel", task_id=task.task_id),
-                    "danger",
-                ),
             ],
         },
     ]
+
+
+def normalize_slack_mrkdwn(text: str) -> str:
+    segments = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    return "".join(
+        segment if segment.startswith("```") else _normalize_bold_markers(segment)
+        for segment in segments
+    )
 
 
 def encode_action_value(action: str, **payload: Any) -> str:
@@ -333,11 +528,16 @@ def _query_value(query: str, name: str) -> str | None:
     return None
 
 
+def _normalize_bold_markers(text: str) -> str:
+    return re.sub(r"\*\*([^*\n][^*]*?)\*\*", r"*\1*", text)
+
+
 def _button(
     text: str,
     action_id: str,
     value: str,
     style: str | None = None,
+    url: str | None = None,
 ) -> dict[str, Any]:
     button: dict[str, Any] = {
         "type": "button",
@@ -347,7 +547,17 @@ def _button(
     }
     if style:
         button["style"] = style
+    if url:
+        button["url"] = url
     return button
+
+
+def _default_repo_root() -> Path:
+    cwd = Path.cwd()
+    try:
+        return cwd.parents[1]
+    except IndexError:
+        return cwd
 
 
 def _option(text: str, value: str, description: str | None = None) -> dict[str, Any]:

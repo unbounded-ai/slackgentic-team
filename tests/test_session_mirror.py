@@ -4,15 +4,26 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness.models import AgentEvent, AgentSession, Provider, SessionStatus, SlackThreadRef
-from agent_harness.session_mirror import SessionMirror, render_session_event
-from agent_harness.session_terminal import TerminalTarget
-from agent_harness.store import Store
+from agent_harness.sessions.mirror import SessionMirror, render_session_event
+from agent_harness.sessions.terminal import TerminalTarget
+from agent_harness.storage.store import Store
+from agent_harness.team import build_initial_model_team, create_agent_task
 
 
 class FakeGateway:
     def __init__(self):
         self.parents = []
         self.replies = []
+        self.posts = []
+        self.updates = []
+
+    def post_message(self, channel_id, text, blocks=None, thread_ts=None):
+        self.posts.append((channel_id, text, blocks, thread_ts))
+        ts = f"170.{len(self.posts):06d}"
+        return type("Posted", (), {"ts": ts})()
+
+    def update_message(self, channel_id, ts, text, blocks=None):
+        self.updates.append((channel_id, ts, text, blocks))
 
     def post_session_parent(self, channel_id, text, persona, icon_url=None, blocks=None):
         self.parents.append((channel_id, text, persona))
@@ -42,6 +53,8 @@ class FakeProvider:
         self.events = events
 
     def discover(self):
+        if isinstance(self.session, list):
+            return self.session
         return [self.session]
 
     def iter_events(self, transcript_path):
@@ -59,12 +72,18 @@ class FakeTerminalNotifier:
         return self.targets
 
 
+def _add_team(store, codex_count=1, claude_count=1):
+    for agent in build_initial_model_team(codex_count=codex_count, claude_count=claude_count):
+        store.upsert_team_agent(agent)
+
+
 class SessionMirrorTests(unittest.TestCase):
     def test_initial_sync_marks_existing_events_without_posting(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -98,11 +117,51 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_ignored_external_session_is_not_remirrored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                store.set_setting("external_session_ignored.codex.s1", "now")
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(store.get_setting("external_session_agent.codex.s1"), None)
+            finally:
+                store.close()
+
     def test_unthreaded_session_posts_parent_with_first_visible_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -140,6 +199,401 @@ class SessionMirrorTests(unittest.TestCase):
 
                 self.assertEqual(len(gateway.parents), 1)
                 self.assertEqual([reply[1] for reply in gateway.replies], ["visible"])
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn("Task: visible", gateway.updates[0][2])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 2)
+            finally:
+                store.close()
+
+    def test_external_session_parent_summary_prefers_user_task_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={
+                            "payload": {
+                                "type": "user_message",
+                                "message": "make the README punchier",
+                            }
+                        },
+                    ),
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=2,
+                        metadata={"payload": {"type": "agent_message", "message": "done"}},
+                    ),
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn("Task: make the README punchier", gateway.updates[0][2])
+                self.assertEqual(
+                    store.get_setting("external_session_summary.codex.s1"),
+                    "make the README punchier",
+                )
+            finally:
+                store.close()
+
+    def test_external_session_summary_is_not_overwritten_by_later_assistant_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                store.set_setting(
+                    "external_session_agent.codex.s1", store.list_team_agents()[0].agent_id
+                )
+                store.set_setting("external_session_summary.codex.s1", "make the README punchier")
+                store.set_session_mirror_cursor(Provider.CODEX, "s1", 1)
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=2,
+                        metadata={
+                            "payload": {
+                                "type": "agent_message",
+                                "message": "I inspected several files and found more details.",
+                            }
+                        },
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_setting("external_session_summary.codex.s1"),
+                    "make the README punchier",
+                )
+                self.assertEqual(gateway.updates, [])
+            finally:
+                store.close()
+
+    def test_unthreaded_session_without_team_posts_provider_capacity_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+                self.assertIn("Hire 1 Codex agent", str(gateway.posts[0][2]))
+            finally:
+                store.close()
+
+    def test_external_sessions_do_not_overfill_available_provider_team(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=1, claude_count=0)
+                first = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex-1.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                second = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s2",
+                    transcript_path=Path(tmp) / "codex-2.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([first, second], events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.parents), 1)
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+                self.assertIn("Hire 1 Codex agent", str(gateway.posts[0][2]))
+            finally:
+                store.close()
+
+    def test_external_session_does_not_take_agent_with_managed_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                store.upsert_agent_task(create_agent_task(agents[0], "busy task", "C1"))
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+            finally:
+                store.close()
+
+    def test_managed_task_session_is_not_mirrored_as_external_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                task = create_agent_task(agents[0], "managed task", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_session(task.task_id, Provider.CODEX, "s1")
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_pending.codex.s1", "now")
+                store.set_setting("external_session_summary.codex.s1", "stale")
+                store.set_setting("session_channel_notice.codex.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.codex", "170.000001")
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                store.set_session_mirror_cursor(Provider.CODEX, "s1", 3)
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=4,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_summary.codex.s1"))
+                self.assertIsNone(store.get_setting("session_channel_notice.codex.s1"))
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
+                )
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 0)
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn(
+                    "Codex capacity for sessions started outside Slack is available now.",
+                    gateway.updates[0][2],
+                )
+            finally:
+                store.close()
+
+    def test_external_session_requires_matching_provider_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=1, claude_count=0)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=1,
+                        metadata={"message": {"content": [{"type": "text", "text": "visible"}]}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Claude team seat is available", gateway.posts[0][1])
+                self.assertIn("Hire 1 Claude agent", str(gateway.posts[0][2]))
+            finally:
+                store.close()
+
+    def test_pending_external_session_backfills_after_matching_agent_is_hired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "first"}},
+                    ),
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=2,
+                        metadata={"payload": {"type": "agent_message", "message": "second"}},
+                    ),
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 0)
+
+                _add_team(store, codex_count=1, claude_count=0)
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.parents), 1)
+                self.assertEqual([reply[1] for reply in gateway.replies], ["first", "second"])
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 2)
             finally:
                 store.close()
@@ -149,6 +603,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -197,6 +652,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -236,6 +692,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -288,6 +745,7 @@ class SessionMirrorTests(unittest.TestCase):
                 store.init_schema()
                 store.set_setting("slack.human_display_name", "Local User")
                 store.set_setting("slack.human_image_url", "https://example.com/avatar.png")
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -329,6 +787,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -423,6 +882,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -475,6 +935,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -524,6 +985,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CLAUDE,
                     session_id="s1",
@@ -578,6 +1040,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CLAUDE,
                     session_id="s1",
@@ -629,6 +1092,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CLAUDE,
                     session_id="s1",
@@ -672,6 +1136,7 @@ class SessionMirrorTests(unittest.TestCase):
             store = Store(Path(tmp) / "state.sqlite")
             try:
                 store.init_schema()
+                _add_team(store)
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="s1",
@@ -709,6 +1174,46 @@ class SessionMirrorTests(unittest.TestCase):
                     "not started against Slackgentic's Codex app-server",
                     gateway.replies[0][1],
                 )
+            finally:
+                store.close()
+
+    def test_ended_external_session_frees_assigned_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                provider = FakeProvider([session], [])
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [provider],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+
+                provider.session = []
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
             finally:
                 store.close()
 

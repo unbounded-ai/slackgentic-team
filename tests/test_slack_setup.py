@@ -1,6 +1,6 @@
 import unittest
 
-from agent_harness.slack_setup import (
+from agent_harness.slack.setup import (
     APP_TOKEN_RE,
     BOT_SCOPES,
     BOT_TOKEN_RE,

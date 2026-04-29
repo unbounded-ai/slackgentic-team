@@ -10,8 +10,8 @@ from typing import Any
 
 from agent_harness.models import SlackThreadRef
 from agent_harness.slack import encode_action_value
-from agent_harness.slack_client import SlackGateway
-from agent_harness.store import Store
+from agent_harness.slack.client import SlackGateway
+from agent_harness.storage.store import Store
 
 AGENT_REQUEST_ACTION = "agent.request"
 LEGACY_CODEX_REQUEST_ACTION = "codex.request"

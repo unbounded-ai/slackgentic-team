@@ -5,7 +5,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from agent_harness.models import Persona, SlackThreadRef, TeamAgent
+from agent_harness.models import SlackThreadRef, TeamAgent
+from agent_harness.slack import normalize_slack_mrkdwn
 from agent_harness.team import TeamChatMessage
 
 
@@ -97,6 +98,13 @@ class SlackGateway:
     def user_display_name(self, user_id: str) -> str | None:
         return self.user_profile(user_id).display_name
 
+    def permalink(self, channel_id: str, message_ts: str) -> str | None:
+        response = self.client.chat_getPermalink(channel=channel_id, message_ts=message_ts)
+        return response.get("permalink")
+
+    def pin_message(self, channel_id: str, message_ts: str) -> None:
+        self.client.pins_add(channel=channel_id, timestamp=message_ts)
+
     def post_message(
         self,
         channel_id: str,
@@ -106,7 +114,7 @@ class SlackGateway:
     ) -> PostedMessage:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
-            "text": text,
+            "text": normalize_slack_mrkdwn(text),
         }
         if blocks:
             kwargs["blocks"] = blocks
@@ -119,13 +127,13 @@ class SlackGateway:
         self,
         channel_id: str,
         text: str,
-        persona: Persona | TeamAgent,
+        persona: TeamAgent,
         icon_url: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
     ) -> PostedMessage:
         response = self.client.chat_postMessage(
             channel=channel_id,
-            text=text,
+            text=normalize_slack_mrkdwn(text),
             blocks=blocks,
             username=_identity_name(persona),
             icon_url=icon_url,
@@ -191,7 +199,7 @@ class SlackGateway:
         self,
         thread: SlackThreadRef,
         text: str,
-        persona: Persona | TeamAgent | None = None,
+        persona: TeamAgent | None = None,
         username: str | None = None,
         icon_url: str | None = None,
         icon_emoji: str | None = None,
@@ -200,7 +208,7 @@ class SlackGateway:
         kwargs = {
             "channel": thread.channel_id,
             "thread_ts": thread.thread_ts,
-            "text": text,
+            "text": normalize_slack_mrkdwn(text),
         }
         if blocks:
             kwargs["blocks"] = blocks
@@ -246,7 +254,7 @@ class SlackGateway:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
             "ts": ts,
-            "text": text,
+            "text": normalize_slack_mrkdwn(text),
         }
         if blocks:
             kwargs["blocks"] = blocks
@@ -263,8 +271,19 @@ class SlackGateway:
             raise
         return True
 
+    def remove_reaction(self, channel_id: str, ts: str, reaction_name: str) -> bool:
+        from slack_sdk.errors import SlackApiError
 
-def _identity_name(identity: Persona | TeamAgent) -> str:
+        try:
+            self.client.reactions_remove(channel=channel_id, timestamp=ts, name=reaction_name)
+        except SlackApiError as exc:
+            if exc.response.get("error") in {"no_reaction", "not_reacted"}:
+                return False
+            raise
+        return True
+
+
+def _identity_name(identity: TeamAgent) -> str:
     name = getattr(identity, "username", identity.full_name)
     provider = getattr(identity, "provider_preference", None) or getattr(identity, "provider", None)
     if provider is None:
