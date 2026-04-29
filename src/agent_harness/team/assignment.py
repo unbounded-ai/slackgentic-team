@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from agent_harness.models import (
+    ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     AgentTask,
     AssignmentMode,
@@ -91,6 +92,7 @@ def assign_work_request(
         metadata["pr_url"] = request.pr_url
     if extra_metadata:
         metadata.update(extra_metadata)
+    metadata.setdefault(ASSIGNMENT_PROMPT_METADATA_KEY, request.prompt)
     if request.dangerous_mode:
         metadata[DANGEROUS_MODE_METADATA_KEY] = True
     if metadata:

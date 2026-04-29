@@ -13,6 +13,7 @@ from pathlib import Path
 
 from agent_harness.config import AppConfig, load_config_from_env
 from agent_harness.models import (
+    ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     AgentTask,
     AgentTaskStatus,
@@ -1733,6 +1734,7 @@ class SlackTeamController:
         ):
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
+        metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         if request_message_ts:
             metadata["request_message_ts"] = request_message_ts
         if request.dangerous_mode or _task_dangerous_mode(previous_task):
@@ -2098,7 +2100,11 @@ class SlackTeamController:
             self.gateway.update_message(
                 task.channel_id,
                 task.parent_message_ts,
-                format_agent_assignment(agent, task.prompt, task.requested_by_slack_user),
+                format_agent_assignment(
+                    agent,
+                    _task_assignment_prompt(task),
+                    task.requested_by_slack_user,
+                ),
                 blocks=build_task_thread_blocks(task, agent, include_actions=False),
             )
         except Exception:
@@ -2116,7 +2122,11 @@ class SlackTeamController:
             self.gateway.update_message(
                 task.channel_id,
                 task.parent_message_ts,
-                format_agent_assignment(agent, task.prompt, task.requested_by_slack_user),
+                format_agent_assignment(
+                    agent,
+                    _task_assignment_prompt(task),
+                    task.requested_by_slack_user,
+                ),
                 blocks=build_task_thread_blocks(task, agent, include_actions=True),
             )
         except Exception:
@@ -2699,6 +2709,11 @@ def _history_message_event(
 
 def _task_dangerous_mode(task: AgentTask) -> bool:
     return bool(task.metadata.get(DANGEROUS_MODE_METADATA_KEY))
+
+
+def _task_assignment_prompt(task: AgentTask) -> str:
+    prompt = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
+    return prompt if isinstance(prompt, str) and prompt.strip() else task.prompt
 
 
 def _parse_work_request_for_agents(

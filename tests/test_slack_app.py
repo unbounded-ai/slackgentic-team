@@ -3881,6 +3881,8 @@ class SlackAppTests(unittest.TestCase):
                 update = gateway.updates[0]
                 self.assertEqual(update["channel_id"], "C1")
                 self.assertEqual(update["ts"], parent_task.parent_message_ts)
+                self.assertIn("summarize pyproject", update["text"])
+                self.assertNotIn("let's do it", update["text"])
                 actions = [block for block in update["blocks"] if block.get("type") == "actions"]
                 self.assertEqual(len(actions), 1)
                 self.assertEqual(

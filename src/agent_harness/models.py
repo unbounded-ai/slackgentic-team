@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 DANGEROUS_MODE_METADATA_KEY = "dangerous_mode"
+ASSIGNMENT_PROMPT_METADATA_KEY = "assignment_prompt"
 
 
 class Provider(StrEnum):
