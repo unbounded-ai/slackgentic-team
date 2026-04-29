@@ -952,6 +952,7 @@ class SlackTeamController:
         thread_ts = task.thread_ts if task and task.thread_ts else message_ts
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=thread_ts or "")
         if action in {"task.done", "task.finish", "task.cancel", "task.pause"}:
+            completed_tasks: list[AgentTask] = []
             if task is not None and task.thread_ts:
                 for thread_task in self.store.list_agent_tasks(include_done=True):
                     if (
@@ -967,12 +968,15 @@ class SlackTeamController:
                                 thread_task.task_id,
                                 AgentTaskStatus.DONE,
                             )
+                        completed_tasks.append(thread_task)
             elif self.runtime:
                 self.runtime.stop_task(str(task_id), AgentTaskStatus.DONE)
             else:
                 self.store.update_agent_task_status(str(task_id), AgentTaskStatus.DONE)
-            if task is not None:
-                self._mark_task_complete(task, thread, include_thread=True)
+            if not completed_tasks and task is not None:
+                completed_tasks.append(task)
+            for completed_task in completed_tasks:
+                self._mark_task_complete(completed_task, thread, include_thread=True)
             if thread.thread_ts:
                 self.gateway.post_thread_reply(thread, "Finished and freed up this agent.")
             self._resume_pending_work_requests(channel_id)
@@ -1851,6 +1855,8 @@ class SlackTeamController:
         *,
         include_thread: bool = False,
     ) -> None:
+        task = self.store.get_agent_task(task.task_id) or task
+        self._remove_task_action_buttons_if_resolved(task)
         message_ts_values: list[str] = []
         if include_thread and task.thread_ts:
             message_ts_values.append(task.thread_ts)
@@ -1876,6 +1882,24 @@ class SlackTeamController:
             self.gateway.add_reaction(channel_id, message_ts, "white_check_mark")
         except Exception:
             LOGGER.debug("failed to add Slack completion reaction", exc_info=True)
+
+    def _remove_task_action_buttons_if_resolved(self, task: AgentTask) -> None:
+        if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return
+        if not task.parent_message_ts:
+            return
+        agent = self.store.get_team_agent(task.agent_id, include_fired=True)
+        if agent is None:
+            return
+        try:
+            self.gateway.update_message(
+                task.channel_id,
+                task.parent_message_ts,
+                format_agent_assignment(agent, task.prompt, task.requested_by_slack_user),
+                blocks=build_task_thread_blocks(task, agent, include_actions=False),
+            )
+        except Exception:
+            LOGGER.debug("failed to remove resolved task action buttons", exc_info=True)
 
     def _agent_icon_url(self, agent) -> str | None:
         base_url = (

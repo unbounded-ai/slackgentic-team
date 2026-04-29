@@ -3236,6 +3236,14 @@ class SlackAppTests(unittest.TestCase):
                 }
                 self.assertEqual(statuses[first.task_id], AgentTaskStatus.DONE)
                 self.assertEqual(statuses[second.task_id], AgentTaskStatus.DONE)
+                self.assertEqual(
+                    {update["ts"] for update in gateway.updates},
+                    {"171.000001", "171.000002"},
+                )
+                for update in gateway.updates:
+                    self.assertFalse(
+                        any(block.get("type") == "actions" for block in update["blocks"])
+                    )
                 self.assertIn(
                     "Finished and freed up this agent.", gateway.thread_replies[-1]["text"]
                 )
@@ -3304,6 +3312,14 @@ class SlackAppTests(unittest.TestCase):
                     (pending.pending_id,),
                 ).fetchone()
                 self.assertEqual(row["status"], "cancelled")
+                self.assertEqual(
+                    {update["ts"] for update in gateway.updates},
+                    {"171.parent", "171.bot2"},
+                )
+                for update in gateway.updates:
+                    self.assertFalse(
+                        any(block.get("type") == "actions" for block in update["blocks"])
+                    )
                 self.assertIn(("C1", "171.thread", "white_check_mark"), gateway.reactions)
                 self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
             finally:

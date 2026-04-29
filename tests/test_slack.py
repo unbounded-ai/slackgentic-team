@@ -148,6 +148,16 @@ class SlackTests(unittest.TestCase):
         )
         self.assertEqual([item["action_id"] for item in elements], ["task.done"])
 
+    def test_resolved_task_blocks_omit_finish_button(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = create_agent_task(agent, "do the thing", "C1")
+
+        blocks = build_task_thread_blocks(task, agent, include_actions=False)
+
+        self.assertFalse(any(block.get("type") == "actions" for block in blocks))
+
     def test_external_capacity_button_matches_provider(self):
         blocks = build_external_session_capacity_blocks(Provider.CLAUDE, waiting_count=2)
         action_block = next(block for block in blocks if block.get("type") == "actions")

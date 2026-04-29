@@ -404,9 +404,14 @@ def build_external_session_capacity_blocks(
     ]
 
 
-def build_task_thread_blocks(task: AgentTask, agent: TeamAgent) -> list[dict[str, Any]]:
+def build_task_thread_blocks(
+    task: AgentTask,
+    agent: TeamAgent,
+    *,
+    include_actions: bool = True,
+) -> list[dict[str, Any]]:
     task_label = "PR review" if task.kind.value == "review" else "task"
-    return [
+    blocks = [
         {
             "type": "section",
             "text": {
@@ -417,19 +422,23 @@ def build_task_thread_blocks(task: AgentTask, agent: TeamAgent) -> list[dict[str
                 ),
             },
         },
-        {
-            "type": "actions",
-            "block_id": f"task.actions.{task.task_id}",
-            "elements": [
-                _button(
-                    "Finish and free up this agent",
-                    "task.done",
-                    encode_action_value("task.done", task_id=task.task_id),
-                    "primary",
-                ),
-            ],
-        },
     ]
+    if include_actions:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"task.actions.{task.task_id}",
+                "elements": [
+                    _button(
+                        "Finish and free up this agent",
+                        "task.done",
+                        encode_action_value("task.done", task_id=task.task_id),
+                        "primary",
+                    ),
+                ],
+            }
+        )
+    return blocks
 
 
 def normalize_slack_mrkdwn(text: str) -> str:
