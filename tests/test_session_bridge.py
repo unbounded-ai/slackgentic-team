@@ -1,3 +1,4 @@
+import json
 import signal
 import tempfile
 import threading
@@ -54,6 +55,20 @@ class FakeCodexLiveClient:
         if isinstance(self.handled, Exception):
             raise self.handled
         return self.handled
+
+
+def _write_claude_slackgentic_mcp_marker(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "attachment": {
+                    "type": "deferred_tools_delta",
+                    "addedNames": ["mcp__slackgentic__request_approval"],
+                }
+            }
+        )
+        + "\n"
+    )
 
 
 class SessionBridgeTests(unittest.TestCase):
@@ -245,6 +260,7 @@ class SessionBridgeTests(unittest.TestCase):
                     started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
                     last_seen_at=datetime.now(UTC),
                 )
+                _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 store.upsert_session(session)
                 thread = threading.Thread(target=deliver_channel_message)
                 thread.start()
@@ -262,7 +278,7 @@ class SessionBridgeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_exit_request_uses_codex_remote_before_sigterm(self):
+    def test_exit_request_uses_codex_remote_then_terminates_matching_process(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             killed = []
@@ -307,11 +323,9 @@ class SessionBridgeTests(unittest.TestCase):
 
                 self.assertTrue(handled)
                 self.assertEqual(live.calls, [("codex-s1", "/exit", Path(tmp))])
-                self.assertEqual(killed, [])
-                self.assertEqual(
-                    gateway.replies[0][1],
-                    "Sent `/exit` to the live codex session.",
-                )
+                self.assertEqual(killed, [(123, signal.SIGTERM)])
+                self.assertIn("Sent `/exit` to the live codex session.", gateway.replies[0][1])
+                self.assertIn("Terminated the matching process", gateway.replies[0][1])
             finally:
                 store.close()
 
@@ -487,6 +501,7 @@ class SessionBridgeTests(unittest.TestCase):
                     started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
                     last_seen_at=datetime.now(UTC),
                 )
+                _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 store.upsert_session(session)
                 thread = threading.Thread(target=deliver_channel_message)
                 thread.start()
@@ -552,6 +567,7 @@ class SessionBridgeTests(unittest.TestCase):
                     started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
                     last_seen_at=datetime(2026, 4, 27, 12, 10, tzinfo=UTC),
                 )
+                _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 store.upsert_session(session)
                 thread = threading.Thread(target=deliver_channel_message)
                 thread.start()
@@ -664,6 +680,7 @@ class SessionBridgeTests(unittest.TestCase):
                     started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
                     last_seen_at=datetime.now(UTC),
                 )
+                _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 store.upsert_session(session)
 
                 self.assertTrue(
@@ -678,6 +695,64 @@ class SessionBridgeTests(unittest.TestCase):
                     "SELECT cancelled_at FROM claude_channel_messages"
                 ).fetchone()
                 self.assertIsNotNone(row["cancelled_at"])
+            finally:
+                store.close()
+
+    def test_claude_session_with_channel_flag_but_missing_mcp_uses_resume_not_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            calls = []
+            ran = threading.Event()
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command="claude --dangerously-load-development-channels server:slackgentic",
+                        started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+                    )
+                ]
+            )
+
+            def runner(args, **kwargs):
+                calls.append(args)
+                ran.set()
+                return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            try:
+                store.init_schema()
+                bridge = ExternalSessionBridge(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(claude_binary="claude-bin", default_cwd=Path(tmp)),
+                    command_runner=runner,
+                    terminal_notifier=terminal,
+                    channel_delivery_timeout=0.01,
+                )
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+                    last_seen_at=datetime.now(UTC),
+                )
+                store.upsert_session(session)
+
+                self.assertTrue(
+                    bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
+                )
+
+                self.assertTrue(ran.wait(timeout=1))
+                self.assertEqual(
+                    calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
+                )
+                row = store.conn.execute(
+                    "SELECT COUNT(*) AS count FROM claude_channel_messages"
+                ).fetchone()
+                self.assertEqual(row["count"], 0)
             finally:
                 store.close()
 

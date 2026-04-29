@@ -941,11 +941,13 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("or just `status`", text)
                 self.assertIn("Codex outside Slack", text)
                 self.assertIn("Claude outside Slack", text)
+                self.assertIn("slackgentic claude-channel --install", text)
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn("Write anything in this channel", blocks)
                 self.assertIn("type them directly in this channel", blocks)
                 self.assertIn("Thread subtasks", blocks)
                 self.assertIn("Sessions started outside Slack", blocks)
+                self.assertIn("slackgentic claude-channel --install", blocks)
                 self.assertIn(("C1", gateway.posts[-1]["ts"]), gateway.pins)
             finally:
                 store.close()

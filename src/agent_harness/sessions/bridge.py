@@ -22,6 +22,7 @@ from agent_harness.runtime.codex_app_server import (
 )
 from agent_harness.runtime.runner import _codex_trust_override
 from agent_harness.runtime.tasks import _process_output_chunks
+from agent_harness.sessions.claude_channel import claude_session_has_slackgentic_mcp
 from agent_harness.sessions.terminal import SessionTerminalNotifier, TerminalTarget
 from agent_harness.slack import dangerous_flag
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
@@ -252,6 +253,8 @@ class ExternalSessionBridge:
         target = targets[0]
         if not _slackgentic_channel_enabled(target.command):
             return None
+        if not claude_session_has_slackgentic_mcp(session):
+            return None
         if not _target_start_matches_session(session, target):
             return None
         return target
@@ -266,6 +269,13 @@ class ExternalSessionBridge:
         if session.provider == Provider.CODEX:
             if not self._send_to_codex_app_server(session, prompt, thread):
                 return False
+            self.store.add_session_bridge_prompt(session.provider, session.session_id, prompt)
+            detail = self._terminate_matching_process_after_live_exit(session)
+            message = f"Sent `{prompt}` to the live {session.provider.value} session."
+            if detail:
+                message = f"{message} {detail}"
+            self.gateway.post_thread_reply(thread, message)
+            return True
         elif session.provider == Provider.CLAUDE:
             if not self._send_to_claude_channel(session, prompt, thread, slack_user):
                 return False
@@ -277,6 +287,29 @@ class ExternalSessionBridge:
             f"Sent `{prompt}` to the live {session.provider.value} session.",
         )
         return True
+
+    def _terminate_matching_process_after_live_exit(self, session: AgentSession) -> str | None:
+        targets = [
+            target
+            for target in self.terminal_notifier.targets_for_session(session)
+            if _target_start_matches_session(session, target)
+        ]
+        if not targets:
+            return None
+        if len(targets) > 1:
+            return (
+                f"I found {len(targets)} matching {session.provider.value} processes and did not "
+                "terminate any of them."
+            )
+        target = targets[0]
+        try:
+            self.process_killer(target.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return "The matching process had already exited."
+        except Exception as exc:
+            LOGGER.exception("failed to terminate external %s session", session.provider)
+            return f"Failed to terminate the matching process: {exc}"
+        return "Terminated the matching process so the agent can be freed."
 
     def _terminate_live_session(self, session: AgentSession, thread: SlackThreadRef) -> bool:
         targets = [

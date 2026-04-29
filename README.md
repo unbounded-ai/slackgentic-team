@@ -153,6 +153,15 @@ slackgentic claude-channel --install
 claude --dangerously-load-development-channels server:slackgentic
 ```
 
+`slackgentic slack setup` tries to register the Claude channel automatically
+when `claude` is on `PATH`. Run `slackgentic claude-channel --install` manually
+if setup could not reach Claude, and restart any already-open Claude sessions
+after installing. The launch flag alone is not enough; Claude must also load the
+Slackgentic MCP server so Slack replies and approval requests can reach the live
+terminal. No extra MCP flag is needed after registration unless you start Claude
+with `--strict-mcp-config` or another custom MCP config that excludes user-level
+servers.
+
 Those commands create tracked Slack threads for sessions you started outside
 Slack. If all matching team seats are occupied, Slackgentic posts a
 provider-specific hire button and waits without advancing the transcript cursor,

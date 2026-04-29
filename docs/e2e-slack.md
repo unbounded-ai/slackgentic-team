@@ -74,6 +74,14 @@ When the repository is public, Slack fetches them from GitHub's raw asset URLs.
 Set `SLACKGENTIC_AGENT_AVATAR_BASE_URL` to a different public HTTPS directory,
 or set it to `off` to disable custom agent icons.
 
+`slackgentic slack setup` attempts to register Slackgentic's Claude channel MCP
+server automatically when `claude` is on `PATH`. If setup prints a warning,
+run `slackgentic claude-channel --install` after Claude is available, then
+restart any already-open Claude sessions before using
+`claude --dangerously-load-development-channels server:slackgentic`. No extra
+MCP flag is needed after registration unless you use `--strict-mcp-config` or a
+custom MCP config that excludes user-level servers.
+
 ## 4. Set up from Slack
 
 In any channel or DM where the app is available:

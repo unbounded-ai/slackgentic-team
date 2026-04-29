@@ -1,9 +1,18 @@
+import json
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from agent_harness.models import AgentEvent, AgentSession, Provider, SessionStatus, SlackThreadRef
+from agent_harness.models import (
+    AgentEvent,
+    AgentSession,
+    AgentTaskStatus,
+    Provider,
+    SessionStatus,
+    SlackThreadRef,
+)
+from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.mirror import SessionMirror, render_session_event
 from agent_harness.sessions.terminal import TerminalTarget
 from agent_harness.storage.store import Store
@@ -80,6 +89,20 @@ class FakeTerminalNotifier:
 def _add_team(store, codex_count=1, claude_count=1):
     for agent in build_initial_model_team(codex_count=codex_count, claude_count=claude_count):
         store.upsert_team_agent(agent)
+
+
+def _write_claude_slackgentic_mcp_marker(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "attachment": {
+                    "type": "deferred_tools_delta",
+                    "addedNames": ["mcp__slackgentic__request_user_input"],
+                }
+            }
+        )
+        + "\n"
+    )
 
 
 class SessionMirrorTests(unittest.TestCase):
@@ -442,6 +465,61 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_cleared_capacity_notice_is_retired_so_next_wait_gets_fresh_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                store.set_setting("external_session_capacity_notice_ts.codex", "170.000001")
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn(
+                    "Codex capacity for sessions started outside Slack is available now.",
+                    gateway.updates[0][2],
+                )
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
+
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+            finally:
+                store.close()
+
     def test_external_sessions_do_not_overfill_available_provider_team(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -574,6 +652,53 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_tracked_codex_session_is_freed_when_terminal_disappears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                active = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(active)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(active, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([]),
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertEqual(store.get_session(Provider.CODEX, "s1").status, SessionStatus.DONE)
+                self.assertEqual(
+                    [reply[1] for reply in gateway.replies], ["Session ended; freed up this agent."]
+                )
+                self.assertEqual(refreshed_channels, ["C1"])
+            finally:
+                store.close()
+
     def test_external_session_does_not_take_agent_with_managed_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -677,6 +802,75 @@ class SessionMirrorTests(unittest.TestCase):
                     "Codex capacity for sessions started outside Slack is available now.",
                     gateway.updates[0][2],
                 )
+            finally:
+                store.close()
+
+    def test_managed_claude_session_is_not_mirrored_before_runtime_captures_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "help", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                transcript = Path(tmp) / "claude.jsonl"
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "queue-operation",
+                            "operation": "enqueue",
+                            "content": build_task_prompt(agent, task),
+                        }
+                    )
+                    + "\n"
+                )
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="managed-s1",
+                    transcript_path=transcript,
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="managed-s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=1,
+                        metadata={
+                            "message": {"content": [{"type": "text", "text": "managed visible"}]}
+                        },
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(
+                        Provider.CLAUDE,
+                        "managed-s1",
+                        "T1",
+                        "C1",
+                    )
+                )
+                updated = store.get_agent_task(task.task_id)
+                assert updated is not None
+                self.assertEqual(updated.session_provider, Provider.CLAUDE)
+                self.assertEqual(updated.session_id, "managed-s1")
             finally:
                 store.close()
 
@@ -1182,6 +1376,7 @@ class SessionMirrorTests(unittest.TestCase):
                     cwd=Path(tmp),
                     status=SessionStatus.ACTIVE,
                 )
+                _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 events = [
                     AgentEvent(
                         provider=Provider.CLAUDE,
@@ -1237,6 +1432,7 @@ class SessionMirrorTests(unittest.TestCase):
                     cwd=Path(tmp),
                     status=SessionStatus.ACTIVE,
                 )
+                _write_claude_slackgentic_mcp_marker(session.transcript_path)
                 events = [
                     AgentEvent(
                         provider=Provider.CLAUDE,
@@ -1273,6 +1469,60 @@ class SessionMirrorTests(unittest.TestCase):
 
                 self.assertEqual(len(gateway.parents), 1)
                 self.assertNotIn("Restart it with", gateway.parents[0][1])
+            finally:
+                store.close()
+
+    def test_claude_parent_warns_when_channel_flag_lacks_loaded_mcp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=1,
+                        metadata={"message": {"content": [{"type": "text", "text": "visible"}]}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp),
+                                command=(
+                                    "claude --dangerously-load-development-channels "
+                                    "server:slackgentic"
+                                ),
+                            )
+                        ]
+                    ),
+                    home=Path(tmp),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.parents), 1)
+                self.assertIn("does not have the Slackgentic MCP server", gateway.parents[0][1])
+                self.assertIn("slackgentic claude-channel --install", gateway.parents[0][1])
             finally:
                 store.close()
 

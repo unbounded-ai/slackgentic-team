@@ -12,7 +12,9 @@ from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
     ClaudeChannelServer,
     install_claude_mcp_server,
+    is_slackgentic_mcp_server_configured,
     mcp_config,
+    session_transcript_has_slackgentic_mcp,
 )
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.client import PostedMessage
@@ -155,6 +157,32 @@ class ClaudeChannelTests(unittest.TestCase):
             config["mcpServers"]["slackgentic"],
             {"command": "/usr/bin/python3", "args": ["-m", "agent_harness", "claude-channel"]},
         )
+
+    def test_detects_configured_slackgentic_mcp_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".claude.json").write_text(
+                json.dumps({"mcpServers": {"slackgentic": {"command": "slackgentic"}}})
+            )
+
+            self.assertTrue(is_slackgentic_mcp_server_configured(home))
+
+    def test_detects_loaded_slackgentic_mcp_tools_in_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "claude.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "attachment": {
+                            "type": "deferred_tools_delta",
+                            "addedNames": ["mcp__slackgentic__request_user_input"],
+                        }
+                    }
+                )
+                + "\n"
+            )
+
+            self.assertTrue(session_transcript_has_slackgentic_mcp(transcript))
 
     def test_install_registers_user_scoped_claude_mcp_server(self):
         calls = []

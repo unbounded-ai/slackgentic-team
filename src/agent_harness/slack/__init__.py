@@ -362,8 +362,11 @@ def build_channel_overview_blocks(
                 "text": (
                     "*Sessions started outside Slack:*\n"
                     f"*Codex:* `{codex_command}`\n"
-                    f"*Claude:* `{claude_command}`\n"
-                    "Each command creates a tracked Slack thread here."
+                    "*Claude:* run `slackgentic claude-channel --install` once, then "
+                    f"`{claude_command}`\n"
+                    "Each command creates a tracked Slack thread here. Restart already-open "
+                    "Claude sessions after installing the channel; no extra MCP flag is needed "
+                    "unless you use `--strict-mcp-config`."
                 ),
             },
         },

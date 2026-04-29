@@ -23,8 +23,13 @@ CHANNEL_INSTRUCTIONS = (
     "or discuss the channel tags or metadata. Respond normally in the terminal; "
     "Slackgentic mirrors your visible assistant responses back to the Slack thread. "
     "When you need Slack approval or a Slack choice, use the Slackgentic MCP tools "
-    "instead of asking only in prose."
+    "`request_approval` or `request_user_input`; do not use Claude's built-in "
+    "`AskUserQuestion` for Slack-mediated approvals or choices."
 )
+SLACKGENTIC_MCP_TOOL_NAMES = {
+    f"mcp__{CHANNEL_NAME}__request_approval",
+    f"mcp__{CHANNEL_NAME}__request_user_input",
+}
 
 
 class ClaudeChannelServer:
@@ -263,6 +268,47 @@ def mcp_config(command: str = "slackgentic", args: list[str] | None = None) -> d
     }
 
 
+def is_slackgentic_mcp_server_configured(home: Path | None = None) -> bool:
+    home = home or Path.home()
+    for path in (
+        home / ".claude.json",
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+    ):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _contains_slackgentic_mcp_config(value):
+            return True
+    return False
+
+
+def session_transcript_has_slackgentic_mcp(
+    transcript_path: Path,
+    *,
+    max_records: int = 80,
+) -> bool:
+    from agent_harness.storage.jsonl import iter_jsonl
+
+    try:
+        for index, (_, record) in enumerate(iter_jsonl(transcript_path), start=1):
+            if _record_has_slackgentic_mcp(record):
+                return True
+            if index >= max_records:
+                break
+    except OSError:
+        return False
+    return False
+
+
+def claude_session_has_slackgentic_mcp(session: object) -> bool:
+    transcript_path = getattr(session, "transcript_path", None)
+    if isinstance(transcript_path, Path):
+        return session_transcript_has_slackgentic_mcp(transcript_path)
+    return False
+
+
 def _current_slackgentic_command() -> str:
     command, _ = _current_slackgentic_invocation()
     return command
@@ -295,6 +341,45 @@ def _is_identifier(value: str) -> bool:
         and (value[0].isalpha() or value[0] == "_")
         and all(char.isalnum() or char == "_" for char in value)
     )
+
+
+def _contains_slackgentic_mcp_config(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    servers = value.get("mcpServers")
+    if isinstance(servers, dict) and _valid_mcp_server_config(servers.get(CHANNEL_NAME)):
+        return True
+    return any(_contains_slackgentic_mcp_config(child) for child in value.values())
+
+
+def _valid_mcp_server_config(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    command = value.get("command")
+    args = value.get("args")
+    return bool((isinstance(command, str) and command.strip()) or isinstance(args, list))
+
+
+def _record_has_slackgentic_mcp(record: dict[str, Any]) -> bool:
+    candidates: list[object] = [record.get("attachment")]
+    attachments = record.get("attachments")
+    if isinstance(attachments, list):
+        candidates.extend(attachments)
+    return any(_attachment_has_slackgentic_mcp(candidate) for candidate in candidates)
+
+
+def _attachment_has_slackgentic_mcp(attachment: object) -> bool:
+    if not isinstance(attachment, dict):
+        return False
+    added_names = {
+        str(name) for name in attachment.get("addedNames") or [] if isinstance(name, str)
+    }
+    attachment_type = attachment.get("type")
+    if attachment_type == "mcp_instructions_delta":
+        return CHANNEL_NAME in added_names
+    if attachment_type == "deferred_tools_delta":
+        return bool(SLACKGENTIC_MCP_TOOL_NAMES.intersection(added_names))
+    return False
 
 
 def _tools() -> list[dict[str, Any]]:

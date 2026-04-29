@@ -712,8 +712,10 @@ class SlackTeamController:
                 ),
                 f"Codex outside Slack: `{codex_command}` creates a tracking thread here.",
                 (
-                    f"Claude outside Slack: `{CLAUDE_EXTERNAL_COMMAND}` creates a "
-                    "tracking thread here."
+                    "Claude outside Slack: run `slackgentic claude-channel --install` once, "
+                    f"then `{CLAUDE_EXTERNAL_COMMAND}` creates a tracking thread here. Restart "
+                    "already-open Claude sessions after installing; no extra MCP flag is needed "
+                    "unless you use `--strict-mcp-config`."
                 ),
             ]
         )
@@ -2001,6 +2003,7 @@ class SocketModeSlackApp:
             on_external_session_occupancy_change=(
                 self.controller.handle_external_session_occupancy_change
             ),
+            home=config.home,
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()

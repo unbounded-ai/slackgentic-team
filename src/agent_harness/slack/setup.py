@@ -182,12 +182,28 @@ def run_interactive_setup(options: SlackSetupOptions | None = None) -> int:
         options.config_file,
     )
     print(f"Saved Slackgentic credentials to {saved_path}.")
+    _install_claude_channel_if_available()
     print("Sessions started outside Slack will be mirrored with this Slack app identity.")
     command = _slackgentic_executable()
     print("Next, install and start the background service:")
     print(f"  {command} service install && {command} service status")
     print(f"Then use `{slash_command} setup` in Slack.")
     return 0
+
+
+def _install_claude_channel_if_available() -> None:
+    if shutil.which("claude") is None:
+        print("Claude CLI not found on PATH; skipping Claude Slack channel registration.")
+        return
+    try:
+        from agent_harness.sessions.claude_channel import install_claude_mcp_server
+
+        install_claude_mcp_server()
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Warning: failed to register Claude Slack channel: {exc}")
+        print("Run `slackgentic claude-channel --install` after Claude is available.")
+        return
+    print("Registered Claude Slack channel MCP server.")
 
 
 def update_slack_app_manifest(options: SlackManifestUpdateOptions | None = None) -> int:

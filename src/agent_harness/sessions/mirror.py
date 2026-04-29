@@ -13,6 +13,8 @@ from pathlib import Path
 from agent_harness.models import (
     AgentEvent,
     AgentSession,
+    AgentTask,
+    AgentTaskStatus,
     Provider,
     SessionStatus,
     SlackThreadRef,
@@ -21,7 +23,12 @@ from agent_harness.models import (
 )
 from agent_harness.providers.base import AgentProvider
 from agent_harness.runtime.codex_app_server import DEFAULT_CODEX_APP_SERVER_URL
+from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.bridge import _codex_remote_enabled, _slackgentic_channel_enabled
+from agent_harness.sessions.claude_channel import (
+    claude_session_has_slackgentic_mcp,
+    is_slackgentic_mcp_server_configured,
+)
 from agent_harness.sessions.terminal import SessionTerminalNotifier
 from agent_harness.slack import build_external_session_capacity_blocks
 from agent_harness.slack.client import SlackGateway
@@ -66,6 +73,7 @@ class SessionMirror:
         terminal_notifier: SessionTerminalNotifier | None = None,
         codex_app_server_url: str | None = DEFAULT_CODEX_APP_SERVER_URL,
         on_external_session_occupancy_change: Callable[[str], None] | None = None,
+        home: Path | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -76,6 +84,7 @@ class SessionMirror:
         self.terminal_notifier = terminal_notifier or SessionTerminalNotifier()
         self.codex_app_server_url = codex_app_server_url
         self.on_external_session_occupancy_change = on_external_session_occupancy_change
+        self.home = home or Path.home()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -144,6 +153,7 @@ class SessionMirror:
                 continue
             self._post_session_channel_notice_once(session, thread)
             self._mirror_new_events(provider, session, thread, agent)
+        self._sync_capacity_notices(channel_id)
 
     def _run(self) -> None:
         while not self._stop.wait(self.poll_seconds):
@@ -218,14 +228,28 @@ class SessionMirror:
                 "original Codex terminal."
             )
         if session.provider == Provider.CLAUDE:
-            if any(_slackgentic_channel_enabled(target.command) for target in targets):
+            if not any(_slackgentic_channel_enabled(target.command) for target in targets):
+                return (
+                    "I can mirror visible output from this Claude session, but it was not started "
+                    "with Slackgentic's Claude channel enabled, so Slack replies cannot be "
+                    "delivered into the live terminal session. Restart it with "
+                    "`claude --dangerously-load-development-channels server:slackgentic` if you "
+                    "want to chat with it from Slack."
+                )
+            if claude_session_has_slackgentic_mcp(session):
                 return None
+            if not is_slackgentic_mcp_server_configured(self.home):
+                return (
+                    "This Claude terminal has Slackgentic's channel flag, but Claude does not have "
+                    "the Slackgentic MCP server registered. Run "
+                    "`slackgentic claude-channel --install`, then restart Claude with "
+                    "`claude --dangerously-load-development-channels server:slackgentic`."
+                )
             return (
-                "I can mirror visible output from this Claude session, but it was not started with "
-                "Slackgentic's Claude channel enabled, so Slack replies cannot be delivered into "
-                "the live terminal session. Restart it with "
-                "`claude --dangerously-load-development-channels server:slackgentic` if you want "
-                "to chat with it from Slack."
+                "This Claude terminal has Slackgentic's channel flag, but this session did not "
+                "load Slackgentic's MCP server. Restart Claude after "
+                "`slackgentic claude-channel --install` so Slack replies and approvals can reach "
+                "the live terminal."
             )
         return None
 
@@ -373,7 +397,9 @@ class SessionMirror:
         return agent
 
     def _external_terminal_session_closed(self, session: AgentSession) -> bool:
-        if session.provider != Provider.CLAUDE or session.status != SessionStatus.ACTIVE:
+        if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
+            return False
+        if session.status != SessionStatus.ACTIVE:
             return False
         live_target_key = _external_session_live_target_key(session)
         assigned_key = _external_session_agent_setting_key(session)
@@ -458,6 +484,24 @@ class SessionMirror:
         return session.status == SessionStatus.ACTIVE
 
     def _skip_managed_task_session(self, session: AgentSession, channel_id: str) -> bool:
+        managed_task = self._managed_task_for_session(session)
+        if managed_task is not None:
+            if managed_task.session_id != session.session_id:
+                self.store.update_agent_task_session(
+                    managed_task.task_id,
+                    session.provider,
+                    session.session_id,
+                )
+            changed = self.store.clear_external_session_tracking(
+                session.provider,
+                session.session_id,
+                team_id=self.team_id,
+                channel_id=channel_id,
+            )
+            if changed:
+                self._notify_external_session_occupancy_changed(channel_id)
+                self._update_capacity_notice_if_clear(channel_id, session.provider)
+            return True
         if not self.store.has_agent_task_session(session.provider, session.session_id):
             return False
         changed = self.store.clear_external_session_tracking(
@@ -470,6 +514,25 @@ class SessionMirror:
             self._notify_external_session_occupancy_changed(channel_id)
             self._update_capacity_notice_if_clear(channel_id, session.provider)
         return True
+
+    def _managed_task_for_session(self, session: AgentSession) -> AgentTask | None:
+        prompt = _managed_prompt_from_session_transcript(session)
+        if not prompt:
+            return None
+        for task in self.store.list_agent_tasks():
+            if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+                continue
+            agent = self.store.get_team_agent(task.agent_id)
+            if agent is None:
+                continue
+            provider = agent.provider_preference or Provider.CODEX
+            if provider != session.provider:
+                continue
+            if task.session_id and task.session_id != session.session_id:
+                continue
+            if build_task_prompt(agent, task) == prompt:
+                return task
+        return None
 
     def _notify_external_session_occupancy_changed(self, channel_id: str) -> None:
         if self.on_external_session_occupancy_change is None:
@@ -517,6 +580,14 @@ class SessionMirror:
             )
         except Exception:
             LOGGER.debug("failed to clear external capacity notice", exc_info=True)
+        self.store.delete_setting(setting_key)
+
+    def _sync_capacity_notices(self, channel_id: str) -> None:
+        for provider in Provider:
+            if self.store.get_setting(_capacity_notice_ts_key(provider)) is None:
+                continue
+            if self._pending_count(provider) == 0:
+                self._update_capacity_notice_if_clear(channel_id, provider)
 
     def _pending_count(self, provider: Provider) -> int:
         prefix = f"{PENDING_EXTERNAL_SESSION_PREFIX}{provider.value}."
@@ -663,6 +734,45 @@ def _capacity_message(provider: Provider, waiting_count: int) -> str:
         f"{waiting_count} {label} {plural} waiting. "
         "Hire one matching agent and Slackgentic will backfill the transcript."
     )
+
+
+def _managed_prompt_from_session_transcript(
+    session: AgentSession,
+    *,
+    max_records: int = 12,
+) -> str | None:
+    from agent_harness.storage.jsonl import iter_jsonl
+
+    try:
+        for index, (_, record) in enumerate(iter_jsonl(session.transcript_path), start=1):
+            prompt = _managed_prompt_from_record(session.provider, record)
+            if prompt:
+                return prompt
+            if index >= max_records:
+                break
+    except OSError:
+        return None
+    return None
+
+
+def _managed_prompt_from_record(provider: Provider, record: dict[str, object]) -> str | None:
+    if provider == Provider.CLAUDE:
+        if record.get("type") == "queue-operation" and record.get("operation") == "enqueue":
+            content = record.get("content")
+            return content if isinstance(content, str) else None
+        if record.get("type") == "user" and record.get("entrypoint") == "sdk-cli":
+            message = record.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                return content if isinstance(content, str) else None
+    if provider == Provider.CODEX:
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") == "user_message":
+            message = payload.get("message")
+            return message if isinstance(message, str) else None
+    return None
 
 
 def _session_channel_notice_key(session: AgentSession) -> str:

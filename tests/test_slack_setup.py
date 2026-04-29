@@ -10,6 +10,7 @@ from agent_harness.slack.setup import (
     SlackSetupOptions,
     _configured_slash_command,
     _create_slack_app_with_retry,
+    _install_claude_channel_if_available,
     build_socket_mode_manifest,
     extract_token,
     recursive_token_search,
@@ -109,6 +110,24 @@ class SlackSetupTests(unittest.TestCase):
             )
 
         refresh.assert_not_called()
+
+    def test_initial_setup_installs_claude_channel_when_claude_is_available(self):
+        with (
+            patch("agent_harness.slack.setup.shutil.which", return_value="/usr/bin/claude"),
+            patch("agent_harness.sessions.claude_channel.install_claude_mcp_server") as install,
+        ):
+            _install_claude_channel_if_available()
+
+        install.assert_called_once_with()
+
+    def test_initial_setup_skips_claude_channel_when_claude_is_missing(self):
+        with (
+            patch("agent_harness.slack.setup.shutil.which", return_value=None),
+            patch("agent_harness.sessions.claude_channel.install_claude_mcp_server") as install,
+        ):
+            _install_claude_channel_if_available()
+
+        install.assert_not_called()
 
 
 if __name__ == "__main__":
