@@ -16,6 +16,7 @@ from agent_harness.slack import (
     pack_slack_ts,
     parse_agent_handles,
     parse_thread_ref,
+    slack_blocks_for_markdown_table,
     unpack_slack_permalink_ts,
 )
 from agent_harness.team import build_initial_model_team
@@ -173,6 +174,55 @@ class SlackTests(unittest.TestCase):
         self.assertEqual(
             normalize_slack_mrkdwn("**Bold** and ```**literal**```"),
             "*Bold* and ```**literal**```",
+        )
+
+    def test_normalize_slack_mrkdwn_wraps_markdown_tables(self):
+        text = (
+            "**Modes**\n\n"
+            "| Switch | Off | On |\n"
+            "|---|---|---|\n"
+            "| `tablet.tablet_mode` | dense | hybrid |\n\n"
+            "Done"
+        )
+
+        rendered = normalize_slack_mrkdwn(text)
+
+        self.assertIn("*Modes*", rendered)
+        self.assertIn("```\n| Switch | Off | On |\n|---|---|---|", rendered)
+        self.assertIn("| `tablet.tablet_mode` | dense | hybrid |\n```", rendered)
+        self.assertIn("\nDone", rendered)
+
+    def test_slack_blocks_for_markdown_table_renders_native_table_block(self):
+        text = (
+            "**Modes**\n\n"
+            "| Switch | Off | On |\n"
+            "|---|---|---|\n"
+            "| `tablet.tablet_mode` | dense | hybrid |\n\n"
+            "Done"
+        )
+
+        blocks = slack_blocks_for_markdown_table(text)
+
+        self.assertIsNotNone(blocks)
+        assert blocks is not None
+        self.assertEqual([block["type"] for block in blocks], ["section", "table", "section"])
+        self.assertEqual(blocks[1]["rows"][0][0]["type"], "rich_text")
+        self.assertEqual(
+            blocks[1]["column_settings"],
+            [
+                {"is_wrapped": True},
+                {"is_wrapped": True},
+                {"is_wrapped": True},
+            ],
+        )
+        first_data_cell = blocks[1]["rows"][1][0]["elements"][0]["elements"][0]
+        self.assertEqual(
+            first_data_cell,
+            {
+                "type": "text",
+                "text": "tablet.tablet_mode",
+                "style": {"code": True},
+            },
         )
 
     def test_parse_agent_handles(self):

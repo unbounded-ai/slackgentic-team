@@ -11,7 +11,9 @@ from unittest.mock import patch
 from agent_harness.models import SlackThreadRef
 from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
+    SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
+    ensure_claude_mcp_permissions,
     install_claude_mcp_server,
     is_slackgentic_mcp_server_configured,
     mcp_config,
@@ -359,11 +361,14 @@ class ClaudeChannelTests(unittest.TestCase):
     def test_install_registers_user_scoped_claude_mcp_server(self):
         calls = []
 
-        def fake_run(args, check):
-            calls.append((args, check))
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return type(
+                "Completed", (), {"returncode": 0, "stdout": "", "stderr": "", "args": args}
+            )()
 
-        with patch("subprocess.run", fake_run):
-            install_claude_mcp_server("/opt/slackgentic")
+        with tempfile.TemporaryDirectory() as tmp, patch("subprocess.run", fake_run):
+            install_claude_mcp_server("/opt/slackgentic", home=Path(tmp))
 
         self.assertEqual(
             calls,
@@ -380,7 +385,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         "/opt/slackgentic",
                         "claude-channel",
                     ],
-                    True,
+                    {"check": False, "capture_output": True, "text": True},
                 )
             ],
         )
@@ -388,15 +393,19 @@ class ClaudeChannelTests(unittest.TestCase):
     def test_install_registers_python_module_when_slackgentic_script_is_unavailable(self):
         calls = []
 
-        def fake_run(args, check):
-            calls.append((args, check))
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return type(
+                "Completed", (), {"returncode": 0, "stdout": "", "stderr": "", "args": args}
+            )()
 
         with (
             patch("agent_harness.sessions.claude_channel.shutil.which", return_value=None),
             patch.object(sys, "argv", ["/repo/src/agent_harness/__main__.py"]),
             patch("subprocess.run", fake_run),
+            tempfile.TemporaryDirectory() as tmp,
         ):
-            install_claude_mcp_server()
+            install_claude_mcp_server(home=Path(tmp))
 
         self.assertEqual(
             calls,
@@ -415,10 +424,53 @@ class ClaudeChannelTests(unittest.TestCase):
                         "agent_harness",
                         "claude-channel",
                     ],
-                    True,
+                    {"check": False, "capture_output": True, "text": True},
                 )
             ],
         )
+
+    def test_install_still_allows_permissions_when_mcp_server_already_exists(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return type(
+                "Completed",
+                (),
+                {
+                    "returncode": 1,
+                    "stdout": "MCP server slackgentic already exists in user config",
+                    "stderr": "",
+                    "args": args,
+                },
+            )()
+
+        with tempfile.TemporaryDirectory() as tmp, patch("subprocess.run", fake_run):
+            install_claude_mcp_server("/opt/slackgentic", home=Path(tmp))
+            settings = Path(tmp) / ".claude" / "settings.local.json"
+            config = json.loads(settings.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(calls), 1)
+        for permission in SLACKGENTIC_MCP_PERMISSION_ALLOW:
+            self.assertIn(permission, config["permissions"]["allow"])
+
+    def test_install_allows_slackgentic_mcp_tools_in_claude_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.local.json"
+            settings.parent.mkdir()
+            settings.write_text(
+                json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}),
+                encoding="utf-8",
+            )
+
+            written = ensure_claude_mcp_permissions(home)
+
+            self.assertEqual(written, settings)
+            config = json.loads(settings.read_text(encoding="utf-8"))
+            for permission in SLACKGENTIC_MCP_PERMISSION_ALLOW:
+                self.assertIn(permission, config["permissions"]["allow"])
+            self.assertIn("Bash(ls:*)", config["permissions"]["allow"])
 
 
 def _wait_for(predicate, attempts=100):

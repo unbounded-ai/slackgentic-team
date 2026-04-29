@@ -617,6 +617,49 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_session_thread_creation_refreshes_occupancy_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(refreshed_channels, ["C1", "C1"])
+                self.assertIsNotNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
+                )
+            finally:
+                store.close()
+
     def test_inactive_external_session_cleanup_updates_status_and_refreshes_occupancy(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

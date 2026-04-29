@@ -633,6 +633,98 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_shows_idle_tracked_external_session_occupancy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(0, 1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.IDLE,
+                    )
+                )
+                store.set_setting("external_session_agent.claude.s1", agents[0].agent_id)
+                store.set_setting("external_session_summary.claude.s1", "waiting on approval")
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "local",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("claude session outside Slack: waiting on approval", blocks)
+                action_blocks = [
+                    block
+                    for block in gateway.posts[-1]["blocks"]
+                    if block.get("block_id") == f"team.agent.actions.{agents[0].agent_id}"
+                ]
+                self.assertEqual(len(action_blocks), 1)
+                actions = action_blocks[0]["elements"]
+                self.assertEqual(
+                    [action["text"]["text"] for action in actions],
+                    [
+                        "Free up",
+                        "Open thread",
+                        "Fire",
+                    ],
+                )
+                self.assertEqual(actions[0]["action_id"], "external.session.finish")
+                self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
+            finally:
+                store.close()
+
+    def test_roster_shows_external_session_free_up_without_thread_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(0, 1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_agent.claude.s1", agents[0].agent_id)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                action_blocks = [
+                    block
+                    for block in gateway.posts[-1]["blocks"]
+                    if block.get("block_id") == f"team.agent.actions.{agents[0].agent_id}"
+                ]
+                self.assertEqual(len(action_blocks), 1)
+                actions = action_blocks[0]["elements"]
+                self.assertEqual(
+                    [action["text"]["text"] for action in actions],
+                    [
+                        "Free up",
+                        "Fire",
+                    ],
+                )
+                self.assertEqual(actions[0]["action_id"], "external.session.finish")
+            finally:
+                store.close()
+
     def test_external_session_free_up_button_ignores_session_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -738,6 +830,49 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(runtime.started[0][1].agent_id, agent.agent_id)
                 self.assertIn("Capacity is available now", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_channel_request_does_not_assign_idle_tracked_external_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.IDLE,
+                    )
+                )
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "tablet service should be multi-tablet",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(store.list_agent_tasks(), [])
+                self.assertEqual(runtime.started, [])
+                self.assertIn("No agents are available", gateway.thread_replies[-1]["text"])
             finally:
                 store.close()
 
@@ -2552,9 +2687,13 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 tasks = store.list_agent_tasks(include_done=True)
-                self.assertEqual(len(tasks), 3)
-                self.assertEqual(tasks[-1].agent_id, parent_task.agent_id)
-                self.assertIn("review feedback", tasks[-1].metadata["thread_context"])
+                self.assertEqual(len(tasks), 2)
+                continued = store.get_agent_task(parent_task.task_id)
+                self.assertIsNotNone(continued)
+                self.assertEqual(continued.agent_id, parent_task.agent_id)
+                self.assertEqual(continued.status, AgentTaskStatus.ACTIVE)
+                self.assertEqual(continued.prompt, "apply that review feedback")
+                self.assertIn("review feedback", continued.metadata["thread_context"])
             finally:
                 store.close()
 
@@ -3457,7 +3596,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_plain_thread_reply_after_completion_starts_followup_with_original_agent(self):
+    def test_plain_thread_reply_after_completion_continues_original_agent_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -3485,6 +3624,11 @@ class SlackAppTests(unittest.TestCase):
                 )
                 parent_task = store.list_agent_tasks(include_done=True)[0]
                 store.update_agent_task_status(parent_task.task_id, AgentTaskStatus.DONE)
+                resolved_task = store.get_agent_task(parent_task.task_id)
+                self.assertIsNotNone(resolved_task)
+                controller._remove_task_action_buttons_if_resolved(resolved_task)
+                gateway.updates.clear()
+                gateway.thread_replies.clear()
 
                 controller.handle_event(
                     {
@@ -3492,7 +3636,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "also include the package version",
+                            "text": "let's do it!",
                             "ts": "171.000002",
                             "thread_ts": parent_task.thread_ts,
                         }
@@ -3500,10 +3644,28 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 tasks = store.list_agent_tasks(include_done=True)
-                self.assertEqual(len(tasks), 2)
-                self.assertEqual(tasks[-1].agent_id, parent_task.agent_id)
-                self.assertEqual(tasks[-1].prompt, "also include the package version")
-                self.assertEqual(tasks[-1].thread_ts, parent_task.thread_ts)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].task_id, parent_task.task_id)
+                self.assertEqual(tasks[0].agent_id, parent_task.agent_id)
+                self.assertEqual(tasks[0].prompt, "let's do it!")
+                self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
+                self.assertEqual(tasks[0].thread_ts, parent_task.thread_ts)
+                self.assertEqual(len(runtime.started), 2)
+                self.assertEqual(runtime.started[-1][0].task_id, parent_task.task_id)
+                self.assertEqual(len(gateway.updates), 1)
+                update = gateway.updates[0]
+                self.assertEqual(update["channel_id"], "C1")
+                self.assertEqual(update["ts"], parent_task.parent_message_ts)
+                actions = [block for block in update["blocks"] if block.get("type") == "actions"]
+                self.assertEqual(len(actions), 1)
+                self.assertEqual(
+                    actions[0]["elements"][0]["text"]["text"],
+                    "Finish and free up this agent",
+                )
+                self.assertNotIn(
+                    "I'll take this",
+                    "\n".join(reply["text"] for reply in gateway.thread_replies),
+                )
             finally:
                 store.close()
 

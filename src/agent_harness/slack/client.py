@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_harness.models import SlackThreadRef, TeamAgent
-from agent_harness.slack import normalize_slack_mrkdwn
+from agent_harness.slack import normalize_slack_mrkdwn, slack_blocks_for_markdown_table
 from agent_harness.team import TeamChatMessage
 
 
@@ -116,8 +116,9 @@ class SlackGateway:
             "channel": channel_id,
             "text": normalize_slack_mrkdwn(text),
         }
-        if blocks:
-            kwargs["blocks"] = blocks
+        rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        if rendered_blocks:
+            kwargs["blocks"] = rendered_blocks
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
         response = self.client.chat_postMessage(**kwargs)
@@ -134,7 +135,7 @@ class SlackGateway:
         response = self.client.chat_postMessage(
             channel=channel_id,
             text=normalize_slack_mrkdwn(text),
-            blocks=blocks,
+            blocks=blocks if blocks is not None else slack_blocks_for_markdown_table(text),
             username=_identity_name(persona),
             icon_url=icon_url,
             icon_emoji=None if icon_url else persona.icon_emoji,
@@ -210,8 +211,9 @@ class SlackGateway:
             "thread_ts": thread.thread_ts,
             "text": normalize_slack_mrkdwn(text),
         }
-        if blocks:
-            kwargs["blocks"] = blocks
+        rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        if rendered_blocks:
+            kwargs["blocks"] = rendered_blocks
         if persona:
             kwargs["username"] = _identity_name(persona)
             if icon_url:
@@ -256,8 +258,9 @@ class SlackGateway:
             "ts": ts,
             "text": normalize_slack_mrkdwn(text),
         }
-        if blocks is not None:
-            kwargs["blocks"] = blocks
+        rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        if rendered_blocks is not None:
+            kwargs["blocks"] = rendered_blocks
         self.client.chat_update(**kwargs)
 
     def add_reaction(self, channel_id: str, ts: str, reaction_name: str) -> bool:
