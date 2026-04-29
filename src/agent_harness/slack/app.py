@@ -726,6 +726,7 @@ class SlackTeamController:
                 CLAUDE_EXTERNAL_COMMAND,
             ),
         )
+        self._pin_message(channel_id, posted.ts, "channel overview message")
         return posted.ts
 
     def post_roster(
@@ -781,10 +782,13 @@ class SlackTeamController:
         return self.resume_pending_work_requests(channel_id)
 
     def _pin_roster(self, channel_id: str, message_ts: str) -> None:
+        self._pin_message(channel_id, message_ts, "roster message")
+
+    def _pin_message(self, channel_id: str, message_ts: str, label: str) -> None:
         try:
             self.gateway.pin_message(channel_id, message_ts)
         except Exception:
-            LOGGER.debug("failed to pin roster message", exc_info=True)
+            LOGGER.debug("failed to pin Slack %s", label, exc_info=True)
 
     def post_initial_introductions(self, channel_id: str) -> None:
         agents = self.store.list_team_agents()

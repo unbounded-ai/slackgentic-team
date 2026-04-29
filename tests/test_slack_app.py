@@ -946,6 +946,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("type them directly in this channel", blocks)
                 self.assertIn("Thread subtasks", blocks)
                 self.assertIn("Sessions started outside Slack", blocks)
+                self.assertIn(("C1", gateway.posts[-1]["ts"]), gateway.pins)
             finally:
                 store.close()
 
