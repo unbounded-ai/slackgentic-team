@@ -349,6 +349,11 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "unless the user explicitly asks for it."
         ),
         (
+            "When a table is the clearest format, write one normal Markdown table in the "
+            "message. Slackgentic renders one Markdown table per message as a native Slack "
+            "table. If you need multiple tables, send separate messages."
+        ),
+        (
             "You may ask another agent for a review or second opinion by sending one "
             "separate Slack-visible message beginning exactly `somebody review ...` "
             "with the concrete item to review. After that message, stop and wait; "

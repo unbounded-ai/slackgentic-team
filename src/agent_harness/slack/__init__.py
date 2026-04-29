@@ -446,11 +446,181 @@ def build_task_thread_blocks(
 
 
 def normalize_slack_mrkdwn(text: str) -> str:
-    segments = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    segments = re.split(r"(```.*?```)", _wrap_markdown_tables(text), flags=re.DOTALL)
     return "".join(
         segment if segment.startswith("```") else _normalize_bold_markers(segment)
         for segment in segments
     )
+
+
+def slack_blocks_for_markdown_table(text: str) -> list[dict[str, Any]] | None:
+    parsed = _extract_single_markdown_table(text)
+    if parsed is None:
+        return None
+    before, rows, after = parsed
+    if len(rows) > 100 or not rows or len(rows[0]) > 20:
+        return None
+    width = len(rows[0])
+    if any(len(row) != width for row in rows):
+        return None
+    blocks: list[dict[str, Any]] = []
+    blocks.extend(_markdown_section_blocks(before))
+    blocks.append(
+        {
+            "type": "table",
+            "column_settings": [{"is_wrapped": True} for _ in range(width)],
+            "rows": [
+                [_table_cell(cell, bold=row_index == 0) for cell in row]
+                for row_index, row in enumerate(rows)
+            ],
+        }
+    )
+    blocks.extend(_markdown_section_blocks(after))
+    return blocks[:50]
+
+
+def _extract_single_markdown_table(text: str) -> tuple[str, list[list[str]], str] | None:
+    segments = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    match: tuple[str, list[list[str]], str] | None = None
+    before_segments: list[str] = []
+    for segment_index, segment in enumerate(segments):
+        if segment.startswith("```"):
+            before_segments.append(segment)
+            continue
+        parsed = _extract_markdown_table_from_segment(segment)
+        if parsed is None:
+            before_segments.append(segment)
+            continue
+        if match is not None:
+            return None
+        before, rows, after = parsed
+        remaining = "".join(segments[segment_index + 1 :])
+        match = ("".join(before_segments) + before, rows, after + remaining)
+        before_segments.append(segment)
+    return match
+
+
+def _extract_markdown_table_from_segment(
+    text: str,
+) -> tuple[str, list[list[str]], str] | None:
+    lines = text.splitlines(keepends=True)
+    for index in range(len(lines)):
+        if not _is_markdown_table_start(lines, index):
+            continue
+        table_lines = [lines[index], lines[index + 1]]
+        cursor = index + 2
+        while cursor < len(lines) and _is_markdown_table_row(lines[cursor]):
+            table_lines.append(lines[cursor])
+            cursor += 1
+        rows = [_split_markdown_table_row(line) for line in table_lines[:1] + table_lines[2:]]
+        return "".join(lines[:index]), rows, "".join(lines[cursor:])
+    return None
+
+
+def _markdown_section_blocks(text: str) -> list[dict[str, Any]]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": normalize_slack_mrkdwn(chunk)}}
+        for chunk in _slack_text_chunks(cleaned)
+    ]
+
+
+def _slack_text_chunks(text: str, limit: int = 2800) -> list[str]:
+    chunks: list[str] = []
+    while text:
+        chunks.append(text[:limit])
+        text = text[limit:]
+    return chunks
+
+
+def _table_cell(text: str, *, bold: bool = False) -> dict[str, Any]:
+    return {
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_section",
+                "elements": _rich_text_elements_from_table_cell(text, bold=bold),
+            }
+        ],
+    }
+
+
+def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> list[dict[str, Any]]:
+    elements: list[dict[str, Any]] = []
+    for part in re.split(r"(`[^`]*`)", text.strip()):
+        if not part:
+            continue
+        style: dict[str, bool] = {}
+        value = part
+        if part.startswith("`") and part.endswith("`"):
+            value = part[1:-1]
+            style["code"] = True
+        else:
+            value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
+        if bold:
+            style["bold"] = True
+        element: dict[str, Any] = {"type": "text", "text": value}
+        if style:
+            element["style"] = style
+        elements.append(element)
+    return elements or [{"type": "text", "text": ""}]
+
+
+def _wrap_markdown_tables(text: str) -> str:
+    segments = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    return "".join(
+        segment if segment.startswith("```") else _wrap_markdown_tables_in_segment(segment)
+        for segment in segments
+    )
+
+
+def _wrap_markdown_tables_in_segment(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        if _is_markdown_table_start(lines, index):
+            table_lines = [lines[index], lines[index + 1]]
+            index += 2
+            while index < len(lines) and _is_markdown_table_row(lines[index]):
+                table_lines.append(lines[index])
+                index += 1
+            prefix = "" if not output or output[-1].endswith("\n") else "\n"
+            suffix = "" if index >= len(lines) or lines[index].startswith("\n") else "\n"
+            output.append(f"{prefix}```\n{''.join(table_lines).rstrip()}\n```{suffix}")
+            continue
+        output.append(lines[index])
+        index += 1
+    return "".join(output)
+
+
+def _is_markdown_table_start(lines: list[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and _is_markdown_table_row(lines[index])
+        and _is_markdown_table_separator(lines[index + 1])
+    )
+
+
+def _is_markdown_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.count("|") >= 2 and not stripped.startswith(">")
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    stripped = line.strip()
+    if not _is_markdown_table_row(stripped):
+        return False
+    cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+    if len(cells) < 2:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
 def encode_action_value(action: str, **payload: Any) -> str:

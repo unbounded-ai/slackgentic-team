@@ -22,6 +22,9 @@ CHANNEL_INSTRUCTIONS = (
     "as the user's Slack message for this existing session. Never quote, repeat, "
     "or discuss the channel tags or metadata. Respond normally in the terminal; "
     "Slackgentic mirrors your visible assistant responses back to the Slack thread. "
+    "When a table is the clearest format, write one normal Markdown table in the "
+    "message; Slackgentic renders one Markdown table per message as a native Slack "
+    "table. If you need multiple tables, send separate messages. "
     "When you need Slack approval or a Slack choice, use the Slackgentic MCP tools "
     "`request_approval` or `request_user_input`; do not use Claude's built-in "
     "`AskUserQuestion` for Slack-mediated approvals or choices. Use "
@@ -34,6 +37,7 @@ SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__request_approval",
     f"mcp__{CHANNEL_NAME}__request_user_input",
 }
+SLACKGENTIC_MCP_PERMISSION_ALLOW = tuple(sorted(SLACKGENTIC_MCP_TOOL_NAMES))
 
 
 class ClaudeChannelServer:
@@ -296,12 +300,12 @@ def run_channel_server(db_path: Path | None = None) -> int:
         store.close()
 
 
-def install_claude_mcp_server(command: str | None = None) -> None:
+def install_claude_mcp_server(command: str | None = None, home: Path | None = None) -> None:
     if command is None:
         resolved, command_args = _current_slackgentic_invocation()
     else:
         resolved, command_args = command, []
-    subprocess.run(
+    completed = subprocess.run(
         [
             "claude",
             "mcp",
@@ -314,8 +318,48 @@ def install_claude_mcp_server(command: str | None = None) -> None:
             *command_args,
             "claude-channel",
         ],
-        check=True,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if completed.returncode != 0 and "already exists" not in output:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    ensure_claude_mcp_permissions(home)
+
+
+def ensure_claude_mcp_permissions(home: Path | None = None) -> Path:
+    home = home or Path.home()
+    path = home / ".claude" / "settings.local.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    permissions = value.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        value["permissions"] = permissions
+    allow = permissions.get("allow")
+    if not isinstance(allow, list):
+        allow = []
+        permissions["allow"] = allow
+    existing = {item for item in allow if isinstance(item, str)}
+    changed = False
+    for permission in SLACKGENTIC_MCP_PERMISSION_ALLOW:
+        if permission not in existing:
+            allow.append(permission)
+            changed = True
+    if changed or not path.exists():
+        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 def mcp_config(command: str = "slackgentic", args: list[str] | None = None) -> dict[str, Any]:

@@ -655,9 +655,16 @@ class SlackTeamController:
         sessions_by_agent = {}
         for key, agent_id in self.store.list_settings(EXTERNAL_SESSION_AGENT_PREFIX).items():
             session = self._session_for_external_agent_setting(key)
-            if session is None or session.status != SessionStatus.ACTIVE:
+            if session is None or session.status not in {
+                SessionStatus.ACTIVE,
+                SessionStatus.IDLE,
+            }:
                 continue
-            sessions_by_agent[agent_id] = session
+            existing = sessions_by_agent.get(agent_id)
+            if existing is None or (
+                existing.status != SessionStatus.ACTIVE and session.status == SessionStatus.ACTIVE
+            ):
+                sessions_by_agent[agent_id] = session
         return sessions_by_agent
 
     def _session_for_external_agent_setting(self, key: str):
@@ -1590,13 +1597,17 @@ class SlackTeamController:
             )
         ):
             return True
-        extra_metadata: dict[str, object] = {}
         if previous_task:
-            extra_metadata = self._thread_task_metadata(
+            return self._continue_same_thread_agent_task(
+                request,
                 previous_task,
-                thread.channel_id,
-                thread.thread_ts,
+                agent,
+                thread,
+                requested_by_slack_user=requested_by_slack_user,
+                request_message_ts=request_message_ts,
+                try_live_send=False,
             )
+        extra_metadata: dict[str, object] = {}
         if request_message_ts:
             extra_metadata["request_message_ts"] = request_message_ts
         result = assign_work_request(
@@ -1703,6 +1714,7 @@ class SlackTeamController:
             metadata=metadata,
         )
         self.store.upsert_agent_task(task)
+        self._restore_task_action_buttons_if_active(task)
         if not self.runtime:
             return True
         return self.runtime.start_task(task, agent, thread)
@@ -1894,41 +1906,15 @@ class SlackTeamController:
         request = parse_work_request(f"@{agent.handle} {text}", [agent.handle])
         if request is None:
             return False
-        if parent_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
-            return self._continue_same_thread_agent_task(
-                request,
-                parent_task,
-                agent,
-                SlackThreadRef(channel_id, thread_ts),
-                requested_by_slack_user=event.get("user"),
-                request_message_ts=event.get("ts"),
-                try_live_send=False,
-            )
-        extra_metadata = self._thread_task_metadata(parent_task, channel_id, thread_ts)
-        extra_metadata["request_message_ts"] = event.get("ts")
-        result = assign_work_request(
-            self.store,
+        return self._continue_same_thread_agent_task(
             request,
-            channel_id,
-            requested_by_slack_user=event.get("user"),
-            extra_metadata=extra_metadata,
-            force_agent=agent,
-        )
-        if result is None:
-            return False
-        task = self._task_with_prior_session(result.task, parent_task)
-        self.store.upsert_agent_task(task)
-        posted = self.gateway.post_thread_reply(
+            parent_task,
+            agent,
             SlackThreadRef(channel_id, thread_ts),
-            format_agent_assignment(agent, result.request.prompt, event.get("user")),
-            persona=agent,
-            icon_url=self._agent_icon_url(agent),
+            requested_by_slack_user=event.get("user"),
+            request_message_ts=event.get("ts"),
+            try_live_send=False,
         )
-        self.store.update_agent_task_thread(task.task_id, thread_ts, posted.ts)
-        task = self.store.get_agent_task(task.task_id) or task
-        if self.runtime:
-            self.runtime.start_task(task, agent, SlackThreadRef(channel_id, thread_ts))
-        return True
 
     def _thread_task_metadata(
         self,
@@ -2084,6 +2070,24 @@ class SlackTeamController:
             )
         except Exception:
             LOGGER.debug("failed to remove resolved task action buttons", exc_info=True)
+
+    def _restore_task_action_buttons_if_active(self, task: AgentTask) -> None:
+        if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+            return
+        if not task.parent_message_ts:
+            return
+        agent = self.store.get_team_agent(task.agent_id, include_fired=True)
+        if agent is None:
+            return
+        try:
+            self.gateway.update_message(
+                task.channel_id,
+                task.parent_message_ts,
+                format_agent_assignment(agent, task.prompt, task.requested_by_slack_user),
+                blocks=build_task_thread_blocks(task, agent, include_actions=True),
+            )
+        except Exception:
+            LOGGER.debug("failed to restore active task action buttons", exc_info=True)
 
     def _agent_icon_url(self, agent) -> str | None:
         base_url = (

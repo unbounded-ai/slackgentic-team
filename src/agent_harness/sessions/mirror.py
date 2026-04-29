@@ -210,6 +210,7 @@ class SessionMirror:
             self.team_id,
             thread,
         )
+        self._notify_external_session_occupancy_changed(channel_id)
         if channel_notice:
             self._mark_session_channel_notice_posted(session)
         return thread

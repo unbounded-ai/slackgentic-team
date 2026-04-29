@@ -80,6 +80,21 @@ class SlackGatewayTests(unittest.TestCase):
 
         self.assertEqual(gateway.client.messages[0]["username"], "localuser")
 
+    def test_post_thread_reply_renders_markdown_table_as_block(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        from agent_harness.models import SlackThreadRef
+
+        gateway.post_thread_reply(
+            SlackThreadRef("C1", "171.000001"),
+            "| Name | State |\n|---|---|\n| `silas` | busy |",
+        )
+
+        blocks = gateway.client.messages[0]["blocks"]
+        self.assertEqual([block["type"] for block in blocks], ["table"])
+        self.assertEqual(blocks[0]["rows"][1][0]["elements"][0]["elements"][0]["text"], "silas")
+
     def test_archive_channel_calls_slack_api(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = FakeSlackClient()
@@ -95,6 +110,14 @@ class SlackGatewayTests(unittest.TestCase):
         gateway.update_message("C1", "171.000001", "done", blocks=[])
 
         self.assertEqual(gateway.client.updates[0]["blocks"], [])
+
+    def test_update_message_renders_markdown_table_as_block(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        gateway.update_message("C1", "171.000001", "| Name | State |\n|---|---|\n| Nell | free |")
+
+        self.assertEqual(gateway.client.updates[0]["blocks"][0]["type"], "table")
 
 
 if __name__ == "__main__":
