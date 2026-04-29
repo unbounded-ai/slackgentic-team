@@ -6,6 +6,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+DANGEROUS_MODE_METADATA_KEY = "dangerous_mode"
+
 
 class Provider(StrEnum):
     CODEX = "codex"
@@ -171,6 +173,7 @@ class WorkRequest:
     task_kind: AgentTaskKind = AgentTaskKind.WORK
     author_handle: str | None = None
     pr_url: str | None = None
+    dangerous_mode: bool = False
 
 
 @dataclass(frozen=True)

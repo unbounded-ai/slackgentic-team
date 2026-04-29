@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from agent_harness.models import AgentTask, AssignmentMode, TeamAgent, WorkRequest
+from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
+    AgentTask,
+    AssignmentMode,
+    TeamAgent,
+    WorkRequest,
+)
 from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent
 from agent_harness.team.routing import canonicalize_agent_mentions, parse_work_request
@@ -85,6 +91,8 @@ def assign_work_request(
         metadata["pr_url"] = request.pr_url
     if extra_metadata:
         metadata.update(extra_metadata)
+    if request.dangerous_mode:
+        metadata[DANGEROUS_MODE_METADATA_KEY] = True
     if metadata:
         task = replace(task, metadata=metadata)
 

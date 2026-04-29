@@ -345,6 +345,18 @@ def build_channel_overview_blocks(
             "text": {
                 "type": "mrkdwn",
                 "text": (
+                    "*Dangerous mode:*\n"
+                    "Add `#dangerous-mode` to a task to launch that agent with Codex "
+                    "no-sandbox/no-approval mode or Claude skip-permissions. Active "
+                    "dangerous-mode tasks are marked on the roster."
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
                     "*Commands:* type them directly in this channel, "
                     f"or run them as `{slash_command} <command>`\n"
                     f"`{slash_command} status`  usage and active sessions\n"

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
     AgentTask,
     AgentTaskStatus,
     Provider,
@@ -82,7 +83,7 @@ class ManagedTaskRuntime:
             provider=provider,
             prompt=build_task_prompt(agent, task),
             cwd=cwd,
-            dangerous=self.commands.dangerous_by_default,
+            dangerous=self.commands.dangerous_by_default or _task_dangerous_mode(task),
             resume_session_id=(
                 task.session_id
                 if task.session_id
@@ -396,6 +397,10 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+def _task_dangerous_mode(task: AgentTask) -> bool:
+    return bool(task.metadata.get(DANGEROUS_MODE_METADATA_KEY))
 
 
 def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:

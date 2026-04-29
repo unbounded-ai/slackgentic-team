@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from agent_harness.models import AgentTaskKind, AssignmentMode, TeamAgent, WorkRequest
 from agent_harness.team import normalize_handle
@@ -10,16 +11,28 @@ TASK_VERBS = ("do", "handle", "take", "work on", "start", "pick up", "review")
 BOT_MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*")
 AGENT_MENTION_RE = re.compile(r"(?<![\w.-])@([a-zA-Z][a-zA-Z0-9_-]{1,31})\b")
 PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
+DANGEROUS_MODE_TAG_RE = re.compile(r"(?<![\w.-])#dangerous-mode\b", re.IGNORECASE)
 
 
 def parse_work_request(text: str, known_handles: list[str] | tuple[str, ...]) -> WorkRequest | None:
-    cleaned = BOT_MENTION_RE.sub("", _collapse_spaces(text))
+    stripped_text, dangerous_mode = strip_dangerous_mode_tag(text)
+    cleaned = BOT_MENTION_RE.sub("", _collapse_spaces(stripped_text))
     if not cleaned:
         return None
     anyone = _parse_anyone_request(cleaned, known_handles)
     if anyone:
-        return anyone
-    return _parse_specific_request(cleaned, known_handles)
+        return _with_dangerous_mode(anyone, dangerous_mode)
+    return _with_dangerous_mode(_parse_specific_request(cleaned, known_handles), dangerous_mode)
+
+
+def strip_dangerous_mode_tag(text: str) -> tuple[str, bool]:
+    if not DANGEROUS_MODE_TAG_RE.search(text):
+        return text, False
+    stripped = DANGEROUS_MODE_TAG_RE.sub("", text)
+    stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+    stripped = re.sub(r"[ \t]+\n", "\n", stripped)
+    stripped = re.sub(r"\n[ \t]+", "\n", stripped)
+    return stripped.strip(), True
 
 
 def parse_lightweight_handles(text: str) -> list[str]:
@@ -211,6 +224,15 @@ def _work_request(
         author_handle=_extract_author_handle(prompt, known_handles),
         pr_url=pr_url,
     )
+
+
+def _with_dangerous_mode(
+    request: WorkRequest | None,
+    dangerous_mode: bool,
+) -> WorkRequest | None:
+    if request is None or not dangerous_mode:
+        return request
+    return replace(request, dangerous_mode=True)
 
 
 def _task_kind_for(verb: str, prompt: str, pr_url: str | None) -> AgentTaskKind:

@@ -62,6 +62,23 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(request.requested_handle, "riley")
         self.assertEqual(request.prompt, "update the failing test")
 
+    def test_parse_dangerous_mode_tag_strips_from_prompt(self):
+        request = parse_work_request("Somebody #dangerous-mode update the README", ["riley"])
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.assignment_mode, AssignmentMode.ANYONE)
+        self.assertEqual(request.prompt, "update the README")
+        self.assertTrue(request.dangerous_mode)
+
+    def test_parse_dangerous_mode_tag_before_specific_handle(self):
+        request = parse_work_request("#dangerous-mode @riley update the README", ["riley"])
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.assignment_mode, AssignmentMode.SPECIFIC)
+        self.assertEqual(request.requested_handle, "riley")
+        self.assertEqual(request.prompt, "update the README")
+        self.assertTrue(request.dangerous_mode)
+
     def test_parse_specific_handle_request_with_dash_separator(self):
         for separator in ("-", "\u2014"):
             with self.subTest(separator=separator):
