@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -279,6 +280,7 @@ def _install_launchd(spec: ServiceSpec) -> Path:
     path.write_bytes(content)
     _bootout_launchd(spec.label)
     _bootstrap_launchd(spec.label)
+    _settle_launchd_services([spec])
     return path
 
 
@@ -294,8 +296,10 @@ def _install_launchd_services(specs: list[ServiceSpec]) -> list[Path]:
 
     for spec in specs:
         _bootout_launchd(spec.label)
-    for spec in _codex_first_specs(specs):
+    ordered_specs = _codex_first_specs(specs)
+    for spec in ordered_specs:
         _bootstrap_launchd(spec.label)
+    _settle_launchd_services(ordered_specs)
     return paths
 
 
@@ -407,16 +411,53 @@ def _bootstrap_launchd(label: str, *, ignore_already_loaded: bool = False) -> No
     completed = subprocess.run(
         ["launchctl", "bootstrap", _launchd_domain(), str(_launchd_path(label))],
         check=False,
-        capture_output=ignore_already_loaded,
-        text=ignore_already_loaded,
+        capture_output=True,
+        text=True,
     )
+    if _launchd_bootstrap_succeeded(label, completed, ignore_already_loaded):
+        return
+
+    retry = _retry_bootstrap_launchd(label)
+    if _launchd_bootstrap_succeeded(label, retry, ignore_already_loaded=True):
+        return
+
+    raise RuntimeError(_launchctl_failure_message("bootstrap", retry or completed))
+
+
+def _retry_bootstrap_launchd(label: str) -> subprocess.CompletedProcess[str] | None:
+    time.sleep(0.25)
+    _bootout_launchd(label)
+    completed = subprocess.run(
+        ["launchctl", "bootstrap", _launchd_domain(), str(_launchd_path(label))],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed
+
+
+def _launchd_bootstrap_succeeded(
+    label: str,
+    completed: subprocess.CompletedProcess[str] | None,
+    ignore_already_loaded: bool,
+) -> bool:
+    if completed is None:
+        return False
     if completed.returncode == 0:
-        return
+        return True
     if ignore_already_loaded and _launchd_service_already_loaded(completed):
-        return
-    if ignore_already_loaded:
-        raise RuntimeError(_launchctl_failure_message("bootstrap", completed))
-    completed.check_returncode()
+        return True
+    return _launchd_service_is_loaded(label)
+
+
+def _settle_launchd_services(specs: list[ServiceSpec]) -> None:
+    time.sleep(0.25)
+    for spec in specs:
+        _start_launchd(spec.label)
+    time.sleep(0.25)
+    missing = [spec.label for spec in specs if not _launchd_service_is_loaded(spec.label)]
+    if missing:
+        raise RuntimeError(f"launchd services did not stay loaded: {', '.join(missing)}")
 
 
 def _launchd_domain() -> str:
@@ -593,6 +634,16 @@ def _launchd_service_already_loaded(completed: subprocess.CompletedProcess[str])
         or "already bootstrapped" in output
         or "service is already loaded" in output
     )
+
+
+def _launchd_service_is_loaded(label: str) -> bool:
+    completed = subprocess.run(
+        ["launchctl", "print", _launchd_target(label)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0
 
 
 def _launchctl_failure_message(

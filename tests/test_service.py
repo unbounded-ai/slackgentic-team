@@ -203,16 +203,109 @@ class ServiceTests(unittest.TestCase):
                 call(
                     ["launchctl", "bootstrap", "gui/501", str(paths[1])],
                     check=False,
-                    capture_output=False,
-                    text=False,
+                    capture_output=True,
+                    text=True,
                 ),
                 call(
                     ["launchctl", "bootstrap", "gui/501", str(paths[0])],
                     check=False,
-                    capture_output=False,
-                    text=False,
+                    capture_output=True,
+                    text=True,
                 ),
             ]
+        )
+
+    def test_install_services_on_macos_retries_transient_bootstrap_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            codex = build_codex_app_server_service_spec(
+                executable=Path(tmp) / "codex",
+                working_directory=Path(tmp),
+            )
+
+            def fake_run(command, **kwargs):
+                if command[:2] == ["launchctl", "bootstrap"]:
+                    bootstrap_calls.append(command)
+                    if len(bootstrap_calls) == 1:
+                        return subprocess.CompletedProcess(
+                            command,
+                            5,
+                            "",
+                            "Bootstrap failed: 5: Input/output error",
+                        )
+                if command[:2] == ["launchctl", "print"]:
+                    if len(bootstrap_calls) >= 2:
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    return subprocess.CompletedProcess(command, 3, "", "not loaded")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            bootstrap_calls = []
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service.os.getuid", return_value=501),
+                patch("agent_harness.service.time.sleep"),
+                patch(
+                    "agent_harness.service._launchd_path",
+                    side_effect=lambda label: Path(tmp) / f"{label}.plist",
+                ),
+                patch("agent_harness.service.subprocess.run", side_effect=fake_run),
+            ):
+                paths = install_services([daemon, codex])
+
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(bootstrap_calls), 5)
+
+    def test_install_services_on_macos_reconciles_missing_label_after_bootstrap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            codex = build_codex_app_server_service_spec(
+                executable=Path(tmp) / "codex",
+                working_directory=Path(tmp),
+            )
+
+            kickstart_calls = []
+
+            def fake_run(command, **kwargs):
+                if command[:2] == ["launchctl", "kickstart"]:
+                    kickstart_calls.append(command)
+                if command[:2] == ["launchctl", "print"]:
+                    if command[-1].endswith("codex-app-server") and not kickstart_calls:
+                        return subprocess.CompletedProcess(command, 3, "", "not loaded")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service.os.getuid", return_value=501),
+                patch("agent_harness.service.time.sleep"),
+                patch(
+                    "agent_harness.service._launchd_path",
+                    side_effect=lambda label: Path(tmp) / f"{label}.plist",
+                ),
+                patch("agent_harness.service.subprocess.run", side_effect=fake_run),
+            ):
+                paths = install_services([daemon, codex])
+
+        self.assertEqual(len(paths), 2)
+        self.assertIn(
+            [
+                "launchctl",
+                "kickstart",
+                "gui/501/com.slackgentic-team.codex-app-server",
+            ],
+            kickstart_calls,
         )
 
     def test_restart_service_on_macos_refuses_unsafe_launchd_unit(self):
