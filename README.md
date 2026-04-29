@@ -35,11 +35,13 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -e . && slackg
 slackgentic service install && slackgentic service status
 ```
 
-Then open Slack and run:
+Then the CLI will ask you to message yourself in Slack something like:
 
 ```text
 /slackgentic-<you> setup
 ```
+
+Proceed with the rest of the CLI instructions.
 
 Requirements: Python 3.11+, permission to create a Slack app, and `codex` or
 `claude` on `PATH`.
