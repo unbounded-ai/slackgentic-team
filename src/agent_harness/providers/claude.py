@@ -219,12 +219,29 @@ def _session_ended_by_exit(path: Path) -> bool:
 def _is_normal_conversation_record_after_exit(record: dict[str, Any], text: str) -> bool:
     record_type = record.get("type")
     if record_type == "assistant":
-        return True
+        return not _is_synthetic_no_response_record(record)
     if record_type != "user":
         return False
     if record.get("isMeta") is True:
         return False
     return not _is_local_command_text(text)
+
+
+def _is_synthetic_no_response_record(record: dict[str, Any]) -> bool:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    if message.get("model") == "<synthetic>":
+        return True
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("type") == "text"
+        and str(item.get("text") or "").strip() == "No response requested."
+        for item in content
+    )
 
 
 def _is_local_command_text(text: str) -> bool:

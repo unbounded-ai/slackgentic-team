@@ -6,10 +6,12 @@ from pathlib import Path
 from agent_harness.models import (
     AgentSession,
     AgentTaskStatus,
+    AssignmentMode,
     ControlMode,
     Provider,
     SessionStatus,
     SlackThreadRef,
+    WorkRequest,
 )
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
@@ -644,6 +646,112 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(runtime.started[0][1].agent_id, agent.agent_id)
                 self.assertIn("Capacity is available now", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_external_session_free_up_button_resumes_pending_specific_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "local",
+                    SlackThreadRef("C1", "171.000010", "171.000010"),
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"@{agent.handle} hi",
+                            "ts": "171.000002",
+                            "thread_ts": "171.000001",
+                        }
+                    }
+                )
+                pending = store.list_pending_work_requests(channel_id="C1")
+                self.assertEqual(len(pending), 1)
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.000003"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "external.session.finish",
+                                    provider=Provider.CLAUDE.value,
+                                    session_id="s1",
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                row = store.conn.execute(
+                    "SELECT status FROM pending_work_requests WHERE pending_id = ?",
+                    (pending[0].pending_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "assigned")
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(runtime.started[0][1].agent_id, agent.agent_id)
+            finally:
+                store.close()
+
+    def test_resume_pending_work_uses_stored_channel_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting("slack.channel_id", "C1")
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id=None,
+                    runtime=runtime,
+                )
+                store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.000001"),
+                    WorkRequest(
+                        prompt="hi",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                )
+
+                resumed = controller.resume_pending_work_requests_for_configured_channel()
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
             finally:
                 store.close()
 

@@ -763,6 +763,18 @@ class SlackTeamController:
         self._resume_pending_work_requests(channel_id)
         self.refresh_or_post_roster(channel_id)
 
+    def resume_pending_work_requests(self, channel_id: str) -> int:
+        resumed = self._resume_pending_work_requests(channel_id)
+        if resumed:
+            self.refresh_or_post_roster(channel_id)
+        return resumed
+
+    def resume_pending_work_requests_for_configured_channel(self) -> int:
+        channel_id = self._configured_agent_channel_id()
+        if not channel_id:
+            return 0
+        return self.resume_pending_work_requests(channel_id)
+
     def _pin_roster(self, channel_id: str, message_ts: str) -> None:
         try:
             self.gateway.pin_message(channel_id, message_ts)
@@ -981,7 +993,7 @@ class SlackTeamController:
         )
         if thread is not None:
             self.gateway.post_thread_reply(thread, "Finished and freed up this agent.")
-        self.refresh_or_post_roster(channel_id)
+        self.handle_external_session_occupancy_change(channel_id)
 
     def _handle_task_thread_reply(self, event: dict, channel_id: str, text: str) -> bool:
         thread_ts = event.get("thread_ts")
@@ -1911,6 +1923,7 @@ class SocketModeSlackApp:
             ),
         )
         self.session_mirror.start()
+        self.controller.resume_pending_work_requests_for_configured_channel()
         self.awake_keeper = ActiveSessionAwakeKeeper(
             lambda: self.runtime.has_running_tasks() or self.session_mirror.has_active_sessions()
         )
