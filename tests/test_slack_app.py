@@ -227,6 +227,28 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_refresh_roster_tolerates_slack_update_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+
+            def fail_update(channel_id, ts, text, blocks=None):
+                raise RuntimeError("rate limited")
+
+            gateway.update_message = fail_update
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 1):
+                    store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                roster_ts = controller.refresh_or_post_roster("C1")
+
+                self.assertEqual(roster_ts, "171.000001")
+            finally:
+                store.close()
+
     def test_fire_button_marks_agent_inactive_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

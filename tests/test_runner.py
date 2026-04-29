@@ -80,8 +80,9 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(command, "claude")
         self.assertIn("--print", args)
+        self.assertIn("--verbose", args)
         self.assertIn("--output-format", args)
-        self.assertIn("json", args)
+        self.assertIn("stream-json", args)
         self.assertNotIn("--no-session-persistence", args)
         self.assertIn("--dangerously-skip-permissions", args)
         self.assertIn("--worktree", args)
@@ -98,9 +99,20 @@ class RunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(command, "claude")
-        self.assertIn("--dangerously-load-development-channels", args)
-        channel_index = args.index("--dangerously-load-development-channels")
-        self.assertEqual(args[channel_index + 1], "server:slackgentic")
+        self.assertIn("--dangerously-load-development-channels=server:slackgentic", args)
+
+    def test_claude_command_can_allow_exact_tool(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="fix it",
+                cwd=Path("/tmp/repo"),
+                allowed_tools=("Bash(gh auth status)",),
+            )
+        )
+
+        self.assertEqual(command, "claude")
+        self.assertIn("--allowedTools=Bash(gh auth status)", args)
 
     def test_codex_resume_command_uses_existing_session(self):
         command, args = build_command(

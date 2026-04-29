@@ -824,13 +824,16 @@ class SlackTeamController:
         if roster_ts:
             agents = self.store.list_team_agents()
             statuses = self._roster_statuses(agents)
-            self.gateway.update_message(
-                channel_id,
-                roster_ts,
-                _roster_text(agents, statuses),
-                blocks=build_team_roster_blocks(agents, statuses),
-            )
-            self._pin_roster(channel_id, roster_ts)
+            try:
+                self.gateway.update_message(
+                    channel_id,
+                    roster_ts,
+                    _roster_text(agents, statuses),
+                    blocks=build_team_roster_blocks(agents, statuses),
+                )
+                self._pin_roster(channel_id, roster_ts)
+            except Exception:
+                LOGGER.debug("failed to update Slack roster message", exc_info=True)
             return roster_ts
         return self.post_roster(channel_id)
 

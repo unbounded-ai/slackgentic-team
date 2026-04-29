@@ -21,6 +21,7 @@ class LaunchRequest:
     claude_channel: bool = False
     slack_channel_id: str | None = None
     slack_thread_ts: str | None = None
+    allowed_tools: tuple[str, ...] = ()
     codex_binary: str = "codex"
     claude_binary: str = "claude"
 
@@ -48,11 +49,14 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
     if request.provider == Provider.CLAUDE:
         args = [
             "--print",
+            "--verbose",
             "--output-format",
-            "json",
+            "stream-json",
         ]
+        for allowed_tool in request.allowed_tools:
+            args.append(f"--allowedTools={allowed_tool}")
         if request.claude_channel:
-            args.extend(["--dangerously-load-development-channels", "server:slackgentic"])
+            args.append("--dangerously-load-development-channels=server:slackgentic")
         if request.resume_session_id:
             args.extend(["--resume", request.resume_session_id])
         if request.dangerous:

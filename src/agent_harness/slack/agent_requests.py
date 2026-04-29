@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import shlex
 import threading
 import time
@@ -17,6 +18,7 @@ from agent_harness.storage.store import Store
 AGENT_REQUEST_ACTION = "agent.request"
 LEGACY_CODEX_REQUEST_ACTION = "codex.request"
 AGENT_REQUEST_ACTIONS = {AGENT_REQUEST_ACTION, LEGACY_CODEX_REQUEST_ACTION}
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -242,12 +244,15 @@ class SlackAgentRequestHandler:
         ts = message_ts or pending.message_ts
         if not ts:
             return
-        self.gateway.update_message(
-            pending.thread.channel_id,
-            ts,
-            text[:2800],
-            blocks=blocks,
-        )
+        try:
+            self.gateway.update_message(
+                pending.thread.channel_id,
+                ts,
+                text[:2800],
+                blocks=blocks,
+            )
+        except Exception:
+            LOGGER.debug("failed to update Slack agent request message", exc_info=True)
 
 
 def render_persistent_agent_request(
