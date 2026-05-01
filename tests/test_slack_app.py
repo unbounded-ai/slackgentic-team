@@ -227,6 +227,28 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_refresh_roster_tolerates_slack_update_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+
+            def fail_update(channel_id, ts, text, blocks=None):
+                raise RuntimeError("rate limited")
+
+            gateway.update_message = fail_update
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 1):
+                    store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                roster_ts = controller.refresh_or_post_roster("C1")
+
+                self.assertEqual(roster_ts, "171.000001")
+            finally:
+                store.close()
+
     def test_fire_button_marks_agent_inactive_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -3875,12 +3897,18 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
                 self.assertEqual(tasks[0].thread_ts, parent_task.thread_ts)
                 self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertIn(
+                    "Original task: summarize pyproject",
+                    tasks[0].metadata["thread_context"],
+                )
                 self.assertEqual(len(runtime.started), 2)
                 self.assertEqual(runtime.started[-1][0].task_id, parent_task.task_id)
                 self.assertEqual(len(gateway.updates), 1)
                 update = gateway.updates[0]
                 self.assertEqual(update["channel_id"], "C1")
                 self.assertEqual(update["ts"], parent_task.parent_message_ts)
+                self.assertIn("summarize pyproject", update["text"])
+                self.assertNotIn("let's do it", update["text"])
                 actions = [block for block in update["blocks"] if block.get("type") == "actions"]
                 self.assertEqual(len(actions), 1)
                 self.assertEqual(
@@ -3891,6 +3919,37 @@ class SlackAppTests(unittest.TestCase):
                     "I'll take this",
                     "\n".join(reply["text"] for reply in gateway.thread_replies),
                 )
+
+                store.update_agent_task_status(parent_task.task_id, AgentTaskStatus.DONE)
+                continued_task = store.get_agent_task(parent_task.task_id)
+                self.assertIsNotNone(continued_task)
+                gateway.updates.clear()
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "try again",
+                            "ts": "171.000003",
+                            "thread_ts": parent_task.thread_ts,
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].task_id, parent_task.task_id)
+                self.assertEqual(tasks[0].prompt, "try again")
+                self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
+                thread_context = tasks[0].metadata["thread_context"]
+                self.assertIn("Original task: summarize pyproject", thread_context)
+                self.assertNotIn("Original task: let's do it!", thread_context)
+                self.assertEqual(len(runtime.started), 3)
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn("summarize pyproject", gateway.updates[0]["text"])
+                self.assertNotIn("try again", gateway.updates[0]["text"])
             finally:
                 store.close()
 

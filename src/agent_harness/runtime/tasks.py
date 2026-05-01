@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from secrets import token_urlsafe
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
@@ -19,8 +21,10 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgent,
     parse_timestamp,
+    utc_now,
 )
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
+from agent_harness.sessions.claude_channel import is_slackgentic_mcp_server_configured
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
@@ -42,8 +46,14 @@ class RunningTask:
     process: ManagedAgentProcess
     thread: SlackThreadRef
     worker: threading.Thread
+    resume_session_id: str | None = None
+    allowed_tools: tuple[str, ...] = ()
     output_buffer: str = ""
     session_buffer: str = ""
+    permission_buffer: str = ""
+    permission_denials: list[dict] = field(default_factory=list)
+    resume_error_buffer: str = ""
+    missing_resume_session: bool = False
     observed_agent_messages: set[str] | None = None
     control_signals: list[str] = field(default_factory=list)
     visible_message_count: int = 0
@@ -76,7 +86,14 @@ class ManagedTaskRuntime:
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
 
-    def start_task(self, task: AgentTask, agent: TeamAgent, thread: SlackThreadRef) -> bool:
+    def start_task(
+        self,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+        *,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> bool:
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
         request = LaunchRequest(
@@ -90,6 +107,12 @@ class ManagedTaskRuntime:
                 and (task.session_provider is None or task.session_provider == provider)
                 else None
             ),
+            claude_channel=(
+                provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(self.home)
+            ),
+            slack_channel_id=thread.channel_id,
+            slack_thread_ts=thread.thread_ts,
+            allowed_tools=allowed_tools,
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
@@ -116,7 +139,15 @@ class ManagedTaskRuntime:
             daemon=True,
             name=f"slackgentic-{task.task_id}",
         )
-        running = RunningTask(task=task, agent=agent, process=process, thread=thread, worker=worker)
+        running = RunningTask(
+            task=task,
+            agent=agent,
+            process=process,
+            thread=thread,
+            worker=worker,
+            resume_session_id=request.resume_session_id,
+            allowed_tools=allowed_tools,
+        )
         with self._lock:
             self._running[task.task_id] = running
         worker.start()
@@ -175,23 +206,33 @@ class ManagedTaskRuntime:
                 return
             output = running.process.read_available()
             self._capture_session_id(running, output)
-            chunks, running.output_buffer = _process_output_chunks(
-                _provider_for_running(running),
-                output,
-                running.output_buffer,
-            )
+            self._capture_permission_denials(running, output)
+            self._capture_resume_errors(running, output)
+            if running.missing_resume_session:
+                chunks = []
+            else:
+                chunks, running.output_buffer = _process_output_chunks(
+                    _provider_for_running(running),
+                    output,
+                    running.output_buffer,
+                )
             for chunk in chunks:
                 self._post_agent_chunk(running, chunk)
             if not running.process.is_alive():
                 time.sleep(0.05)
                 tail = running.process.read_available(max_reads=100, timeout=0.05)
                 self._capture_session_id(running, tail, final=True)
-                chunks, running.output_buffer = _process_output_chunks(
-                    _provider_for_running(running),
-                    tail,
-                    running.output_buffer,
-                    final=True,
-                )
+                self._capture_permission_denials(running, tail, final=True)
+                self._capture_resume_errors(running, tail, final=True)
+                if running.missing_resume_session:
+                    chunks = []
+                else:
+                    chunks, running.output_buffer = _process_output_chunks(
+                        _provider_for_running(running),
+                        tail,
+                        running.output_buffer,
+                        final=True,
+                    )
                 for chunk in chunks:
                     self._post_agent_chunk(running, chunk)
                 with self._lock:
@@ -201,6 +242,11 @@ class ManagedTaskRuntime:
                 except Exception:
                     LOGGER.debug("failed to load completed task", exc_info=True)
                     completed_task = running.task
+                if self._retry_missing_claude_resume(running, completed_task):
+                    return
+                if running.permission_denials:
+                    self._handle_claude_permission_denial(running, completed_task)
+                    return
                 recovered_message = self._recover_unseen_visible_message(completed_task, running)
                 if recovered_message:
                     self._post_agent_chunk(running, recovered_message)
@@ -332,6 +378,127 @@ class ManagedTaskRuntime:
             running.task,
             session_provider=provider,
             session_id=session_id,
+        )
+
+    def _capture_permission_denials(
+        self,
+        running: RunningTask,
+        output: str,
+        *,
+        final: bool = False,
+    ) -> None:
+        if _provider_for_running(running) != Provider.CLAUDE:
+            return
+        denials, running.permission_buffer = _claude_permission_denials(
+            output,
+            running.permission_buffer,
+            final=final,
+        )
+        running.permission_denials.extend(denials)
+
+    def _capture_resume_errors(
+        self,
+        running: RunningTask,
+        output: str,
+        *,
+        final: bool = False,
+    ) -> None:
+        if _provider_for_running(running) != Provider.CLAUDE:
+            return
+        missing, running.resume_error_buffer = _claude_missing_resume_session(
+            output,
+            running.resume_error_buffer,
+            final=final,
+        )
+        running.missing_resume_session = running.missing_resume_session or missing
+
+    def _retry_missing_claude_resume(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+    ) -> bool:
+        if (
+            _provider_for_running(running) != Provider.CLAUDE
+            or not running.missing_resume_session
+            or not running.resume_session_id
+        ):
+            return False
+        LOGGER.info(
+            "Claude session %s was missing; restarting task %s without resume",
+            running.resume_session_id,
+            completed_task.task_id,
+        )
+        retry_task = replace(
+            completed_task,
+            session_provider=Provider.CLAUDE,
+            session_id=None,
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+        )
+        self.store.upsert_agent_task(retry_task)
+        self.start_task(
+            retry_task,
+            running.agent,
+            running.thread,
+            allowed_tools=running.allowed_tools,
+        )
+        return True
+
+    def _handle_claude_permission_denial(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+    ) -> None:
+        denial = running.permission_denials[0]
+        allowed_tool = _allowed_tool_for_claude_denial(denial)
+        if allowed_tool is None:
+            self.gateway.post_thread_reply(
+                running.thread,
+                "Claude requested a tool approval I cannot safely resume automatically.",
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
+            self.store.update_agent_task_status(completed_task.task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(completed_task.task_id)
+            return
+
+        from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+
+        handler = SlackAgentRequestHandler(
+            self.gateway,
+            store=self.store,
+            provider_label="Claude",
+        )
+        response = handler.handle_persistent_request(
+            "claude/channel/permission",
+            _claude_denial_request_params(denial),
+            running.thread,
+            provider_label="Claude",
+        )
+        if not isinstance(response, dict) or response.get("behavior") != "allow":
+            self.gateway.post_thread_reply(
+                running.thread,
+                "Claude tool approval was denied; I stopped this run.",
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
+            self.store.update_agent_task_status(completed_task.task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(completed_task.task_id)
+            return
+
+        current = self.store.get_agent_task(completed_task.task_id) or completed_task
+        retry_task = replace(
+            current,
+            prompt=_claude_permission_retry_prompt(denial),
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+        )
+        self.store.upsert_agent_task(retry_task)
+        self.start_task(
+            retry_task,
+            running.agent,
+            running.thread,
+            allowed_tools=_append_allowed_tool(running.allowed_tools, allowed_tool),
         )
 
     def _get_running(self, task_id: str) -> RunningTask | None:
@@ -470,6 +637,151 @@ def _process_output_chunks(
     return _claude_json_chunks(text, buffer, final=final)
 
 
+def _claude_permission_denials(
+    text: str,
+    buffer: str = "",
+    final: bool = False,
+) -> tuple[list[dict], str]:
+    combined = buffer + text
+    if not combined:
+        return [], buffer
+    lines = combined.splitlines(keepends=True)
+    next_buffer = ""
+    if lines and not _line_has_ending(lines[-1]) and not final:
+        next_buffer = lines.pop()
+
+    denials: list[dict] = []
+    for line in lines:
+        try:
+            event = json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+        denials.extend(_claude_result_permission_denials(event))
+    return denials, next_buffer
+
+
+def _claude_missing_resume_session(
+    text: str,
+    buffer: str = "",
+    final: bool = False,
+) -> tuple[bool, str]:
+    combined = buffer + text
+    if not combined:
+        return False, buffer
+    lines = combined.splitlines(keepends=True)
+    next_buffer = ""
+    if lines and not _line_has_ending(lines[-1]) and not final:
+        next_buffer = lines.pop()
+
+    missing = any(_claude_line_missing_resume_session(line.strip()) for line in lines)
+    return missing, next_buffer
+
+
+def _claude_line_missing_resume_session(line: str) -> bool:
+    if "No conversation found with session ID:" in line:
+        return True
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(event, dict):
+        return False
+    errors = event.get("errors")
+    if not isinstance(errors, list):
+        return False
+    return any(
+        isinstance(error, str) and "No conversation found with session ID:" in error
+        for error in errors
+    )
+
+
+def _claude_result_permission_denials(event: object) -> list[dict]:
+    if not isinstance(event, dict) or event.get("type") != "result":
+        return []
+    denials = event.get("permission_denials")
+    if not isinstance(denials, list):
+        return []
+    return [denial for denial in denials if isinstance(denial, dict)]
+
+
+def _allowed_tool_for_claude_denial(denial: dict) -> str | None:
+    tool_name = str(denial.get("tool_name") or "")
+    tool_input = denial.get("tool_input")
+    if tool_name == "Bash" and isinstance(tool_input, dict):
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            return _allowed_bash_tool_for_command(command)
+    return None
+
+
+def _append_allowed_tool(existing: tuple[str, ...], allowed_tool: str) -> tuple[str, ...]:
+    if allowed_tool in existing:
+        return existing
+    return (*existing, allowed_tool)
+
+
+def _allowed_bash_tool_for_command(command: str) -> str | None:
+    command = command.strip()
+    if not command or "\n" in command or "\r" in command:
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = []
+    if parts and parts[0] == "gh":
+        return _allowed_gh_bash_tool(parts, command)
+    if ")" in command or "," in command:
+        return None
+    return f"Bash({command})"
+
+
+def _allowed_gh_bash_tool(parts: list[str], command: str) -> str | None:
+    if parts == ["gh", "auth", "status"] and ")" not in command and "," not in command:
+        return f"Bash({command})"
+    if len(parts) < 3:
+        return None
+    group, action = parts[1], parts[2]
+    safe_patterns = {
+        ("pr", "checks"): "Bash(gh pr checks *)",
+        ("pr", "diff"): "Bash(gh pr diff *)",
+        ("pr", "list"): "Bash(gh pr list *)",
+        ("pr", "status"): "Bash(gh pr status *)",
+        ("pr", "view"): "Bash(gh pr view *)",
+        ("repo", "view"): "Bash(gh repo view *)",
+        ("run", "list"): "Bash(gh run list *)",
+        ("run", "view"): "Bash(gh run view *)",
+        ("search", "prs"): "Bash(gh search prs *)",
+    }
+    return safe_patterns.get((group, action))
+
+
+def _claude_denial_request_params(denial: dict) -> dict[str, object]:
+    tool_name = str(denial.get("tool_name") or "tool")
+    tool_input = denial.get("tool_input")
+    params: dict[str, object] = {
+        "request_id": token_urlsafe(6),
+        "tool_name": tool_name,
+    }
+    if isinstance(tool_input, dict):
+        description = tool_input.get("description")
+        if isinstance(description, str) and description.strip():
+            params["description"] = description
+        params["input_preview"] = json.dumps(tool_input, indent=2, sort_keys=True)
+    return params
+
+
+def _claude_permission_retry_prompt(denial: dict) -> str:
+    tool_input = denial.get("tool_input")
+    if isinstance(tool_input, dict):
+        command = tool_input.get("command")
+        if isinstance(command, str) and command.strip():
+            return (
+                "The Slack user approved the previously denied Bash command. "
+                f"Run this exact approved command if it is still needed, then continue the task: {command}"
+            )
+    return "The Slack user approved the previously denied tool request. Continue the task."
+
+
 def _session_id_from_output(
     provider: Provider,
     text: str,
@@ -505,6 +817,10 @@ def _session_id_from_line(provider: Provider, line: str) -> str | None:
         value = event.get("thread_id")
         return str(value) if value else None
     if provider == Provider.CLAUDE:
+        if event.get("type") == "result" and (
+            event.get("is_error") or str(event.get("subtype") or "").startswith("error")
+        ):
+            return None
         value = event.get("session_id") or event.get("sessionId")
         return str(value) if value else None
     return None
@@ -697,6 +1013,8 @@ def _render_claude_json_line(line: str) -> str | None:
 
     event_type = event.get("type")
     if event_type == "result":
+        if _claude_result_permission_denials(event):
+            return None
         if event.get("is_error"):
             message = event.get("result") or event.get("api_error_status") or event.get("subtype")
             return _format_claude_error(message)

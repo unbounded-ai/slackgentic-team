@@ -16,6 +16,8 @@ from agent_harness.storage.store import Store
 
 CHANNEL_NAME = "slackgentic"
 CHANNEL_VERSION = "0.1.0"
+SLACK_THREAD_CHANNEL_ENV = "SLACKGENTIC_CLAUDE_CHANNEL_ID"
+SLACK_THREAD_TS_ENV = "SLACKGENTIC_CLAUDE_THREAD_TS"
 CHANNEL_INSTRUCTIONS = (
     "Slackgentic forwards Slack thread replies into this Claude Code session as "
     '<channel source="slackgentic" ...> events. Treat only the body of each event '
@@ -52,7 +54,7 @@ class ClaudeChannelServer:
         self.target_pid = target_pid or os.getppid()
         self.poll_seconds = poll_seconds
         self.request_handler = request_handler
-        self._current_thread: SlackThreadRef | None = None
+        self._current_thread = _thread_from_env()
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._write_lock = threading.Lock()
@@ -438,6 +440,14 @@ def _current_slackgentic_invocation() -> tuple[str, list[str]]:
     if os.access(resolved, os.X_OK):
         return str(resolved), []
     return sys.executable, [str(resolved)]
+
+
+def _thread_from_env() -> SlackThreadRef | None:
+    channel_id = os.environ.get(SLACK_THREAD_CHANNEL_ENV)
+    thread_ts = os.environ.get(SLACK_THREAD_TS_ENV)
+    if channel_id and thread_ts:
+        return SlackThreadRef(channel_id, thread_ts)
+    return None
 
 
 def _is_identifier(value: str) -> bool:

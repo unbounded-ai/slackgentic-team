@@ -11,6 +11,8 @@ from unittest.mock import patch
 from agent_harness.models import SlackThreadRef
 from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
+    SLACK_THREAD_CHANNEL_ENV,
+    SLACK_THREAD_TS_ENV,
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
     ensure_claude_mcp_permissions,
@@ -120,6 +122,24 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertIn("request_approval", tools)
                 self.assertIn("multiple options", tools["request_user_input"]["description"])
                 self.assertIn("one concrete action", tools["request_approval"]["description"])
+            finally:
+                store.close()
+
+    def test_current_thread_can_be_seeded_from_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                with patch.dict(
+                    "os.environ",
+                    {
+                        SLACK_THREAD_CHANNEL_ENV: "C1",
+                        SLACK_THREAD_TS_ENV: "171.000001",
+                    },
+                ):
+                    server = ClaudeChannelServer(store, target_pid=123)
+
+                self.assertEqual(server._current_thread, SlackThreadRef("C1", "171.000001"))
             finally:
                 store.close()
 

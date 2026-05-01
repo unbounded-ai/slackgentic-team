@@ -18,6 +18,10 @@ class LaunchRequest:
     model: str | None = None
     worktree: str | None = None
     resume_session_id: str | None = None
+    claude_channel: bool = False
+    slack_channel_id: str | None = None
+    slack_thread_ts: str | None = None
+    allowed_tools: tuple[str, ...] = ()
     codex_binary: str = "codex"
     claude_binary: str = "claude"
 
@@ -45,9 +49,14 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
     if request.provider == Provider.CLAUDE:
         args = [
             "--print",
+            "--verbose",
             "--output-format",
-            "json",
+            "stream-json",
         ]
+        for allowed_tool in request.allowed_tools:
+            args.append(f"--allowedTools={allowed_tool}")
+        if request.claude_channel:
+            args.append("--dangerously-load-development-channels=server:slackgentic")
         if request.resume_session_id:
             args.extend(["--resume", request.resume_session_id])
         if request.dangerous:
@@ -78,6 +87,18 @@ class ManagedAgentProcess:
         child_env = os.environ.copy()
         if self.env:
             child_env.update(self.env)
+        if (
+            self.request.provider == Provider.CLAUDE
+            and self.request.slack_channel_id
+            and self.request.slack_thread_ts
+        ):
+            from agent_harness.sessions.claude_channel import (
+                SLACK_THREAD_CHANNEL_ENV,
+                SLACK_THREAD_TS_ENV,
+            )
+
+            child_env[SLACK_THREAD_CHANNEL_ENV] = self.request.slack_channel_id
+            child_env[SLACK_THREAD_TS_ENV] = self.request.slack_thread_ts
         self.child = pexpect.spawn(
             command,
             args,
