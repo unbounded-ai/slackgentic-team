@@ -359,6 +359,77 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_session_summary_is_not_overwritten_by_claude_meta_user_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                store.set_setting(
+                    "external_session_summary.claude.s1",
+                    "what's left on this PR?",
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="user",
+                        line_number=2,
+                        metadata={
+                            "isMeta": True,
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "# Schedule Remote Agents\n\ninternal prompt",
+                                    }
+                                ]
+                            },
+                        },
+                    ),
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=3,
+                        metadata={
+                            "message": {"content": [{"type": "text", "text": "visible follow-up"}]}
+                        },
+                    ),
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual([reply[1] for reply in gateway.replies], ["visible follow-up"])
+                self.assertEqual(
+                    store.get_setting("external_session_summary.claude.s1"),
+                    "what's left on this PR?",
+                )
+                self.assertEqual(gateway.updates, [])
+            finally:
+                store.close()
+
     def test_new_external_session_is_mirrored_before_existing_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1570,6 +1641,20 @@ class SessionMirrorTests(unittest.TestCase):
                         "</channel>"
                     )
                 }
+            },
+        )
+
+        self.assertIsNone(render_session_event(event))
+
+    def test_render_claude_event_hides_meta_user_record(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="user",
+            metadata={
+                "isMeta": True,
+                "message": {"content": [{"type": "text", "text": "# Schedule Remote Agents"}]},
             },
         )
 
