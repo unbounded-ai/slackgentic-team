@@ -563,9 +563,7 @@ class TaskRuntimeTests(unittest.TestCase):
     def test_claude_permission_denial_allows_git_log_after_cd(self):
         denial = {
             "tool_name": "Bash",
-            "tool_input": {
-                "command": "cd /workspace/repos/sample-app && git log --oneline -30"
-            },
+            "tool_input": {"command": "cd /workspace/repos/sample-app && git log --oneline -30"},
         }
 
         self.assertEqual(
@@ -578,9 +576,7 @@ class TaskRuntimeTests(unittest.TestCase):
         denial = {
             "tool_name": "Bash",
             "tool_input": {
-                "command": (
-                    "git -C /workspace/repos/slackgentic-team log --oneline -1"
-                )
+                "command": ("git -C /workspace/repos/slackgentic-team log --oneline -1")
             },
         }
 
@@ -634,9 +630,7 @@ class TaskRuntimeTests(unittest.TestCase):
     def test_claude_session_permission_allows_bash_command_family(self):
         denial = {
             "tool_name": "Bash",
-            "tool_input": {
-                "command": "git -C /workspace/repos/sample-app push -u origin feature"
-            },
+            "tool_input": {"command": "git -C /workspace/repos/sample-app push -u origin feature"},
         }
 
         self.assertEqual(

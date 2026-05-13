@@ -262,7 +262,9 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                     thread,
                 )
 
-                self.assertEqual(gateway.replies[0]["text"], "Claude requests command approval: git")
+                self.assertEqual(
+                    gateway.replies[0]["text"], "Claude requests command approval: git"
+                )
                 self.assertIn(
                     "Command: `git`",
                     gateway.replies[0]["blocks"][0]["text"]["text"],
