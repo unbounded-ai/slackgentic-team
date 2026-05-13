@@ -110,6 +110,24 @@ class SlackAgentRequestHandler:
     ) -> Any:
         if self.store is None:
             return self.handle_request(method, params, thread, provider_label=provider_label)
+        pending = self.create_persistent_request(
+            method,
+            params,
+            thread,
+            provider_label=provider_label,
+        )
+        return self.wait_for_persistent_request(pending.token)
+
+    def create_persistent_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        thread: SlackThreadRef,
+        *,
+        provider_label: str | None = None,
+    ) -> PendingAgentRequest:
+        if self.store is None:
+            raise RuntimeError("persistent Slack agent requests require a store")
         pending = PendingAgentRequest(
             token=token_urlsafe(12),
             request_id=None,
@@ -130,14 +148,33 @@ class SlackAgentRequestHandler:
         posted = self.gateway.post_thread_reply(thread, text, blocks=blocks)
         pending.message_ts = posted.ts
         self.store.update_slack_agent_request_message_ts(pending.token, posted.ts)
-        deadline = time.monotonic() + self.timeout_seconds
+        return pending
+
+    def wait_for_persistent_request(
+        self,
+        token: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        if self.store is None:
+            return None
+        deadline = time.monotonic() + (
+            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
         while time.monotonic() < deadline:
-            resolved, response = self.store.get_slack_agent_request_response(pending.token)
+            resolved, response = self.store.get_slack_agent_request_response(token)
             if resolved:
                 return response
             time.sleep(self.poll_seconds)
-        response = _timeout_response(method)
-        self.store.resolve_slack_agent_request(pending.token, response)
+        resolved, response = self.store.get_slack_agent_request_response(token)
+        if resolved:
+            return response
+        row = self.store.get_slack_agent_request(token)
+        if row is None:
+            return None
+        pending = _pending_from_row(row, fallback_channel_id=row["thread_channel_id"])
+        response = _timeout_response(pending.method)
+        self.store.resolve_slack_agent_request(token, response)
         self._update_request_message(pending, f"{pending.provider_label} request timed out.")
         return response
 
@@ -418,8 +455,9 @@ def _approval_action_blocks(pending: PendingAgentRequest) -> list[dict[str, Any]
     elif method == "claude/channel/permission":
         labels = [
             ("Allow", "approve", "primary"),
-            ("Deny", "deny", "danger"),
+            ("Allow Session", "approve_session", None),
         ]
+        labels.append(("Deny", "deny", "danger"))
     elif method == "item/permissions/requestApproval":
         labels = [
             ("Approve Turn", "approve", "primary"),
@@ -521,7 +559,12 @@ def _decision_response(method: str, decision: str, params: dict[str, Any]) -> An
             }
         return {"permissions": {}, "scope": "turn"}
     if method == "claude/channel/permission":
-        return {"behavior": "allow" if decision == "approve" else "deny"}
+        if decision in {"approve", "approve_session"}:
+            response = {"behavior": "allow"}
+            if decision == "approve_session":
+                response["scope"] = "session"
+            return response
+        return {"behavior": "deny"}
     return None
 
 
@@ -570,6 +613,7 @@ def _resolved_text(method: str, decision: str, provider_label: str) -> str:
     if method == "claude/channel/permission":
         return {
             "approve": f"Allowed {provider_label} tool request.",
+            "approve_session": f"Allowed {provider_label} tool request for this session.",
             "deny": f"Denied {provider_label} tool request.",
             "cancel": f"Denied {provider_label} tool request.",
         }.get(decision, f"Handled {provider_label} tool request.")

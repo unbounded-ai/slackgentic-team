@@ -183,6 +183,89 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_claude_permission_can_be_allowed_for_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                thread = SlackThreadRef("C1", "171.000001")
+                pending = requester.create_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": "req-1",
+                        "tool_name": "Bash",
+                        "description": "List files",
+                        "input_preview": "ls ~/code",
+                        "can_allow_session": True,
+                    },
+                    thread,
+                )
+
+                actions = _first_actions_block(gateway.replies[0]["blocks"])["elements"]
+                self.assertEqual(
+                    [action["text"]["text"] for action in actions],
+                    ["Allow", "Allow Session", "Deny"],
+                )
+
+                handled = requester.handle_block_action(
+                    decode_action_value(actions[1]["value"]),
+                    "C1",
+                    gateway.replies[0]["ts"],
+                )
+
+                resolved, response = store.get_slack_agent_request_response(pending.token)
+                self.assertTrue(handled)
+                self.assertTrue(resolved)
+                self.assertEqual(response, {"behavior": "allow", "scope": "session"})
+                self.assertEqual(
+                    gateway.updates[-1]["text"],
+                    "Allowed Claude tool request for this session.",
+                )
+            finally:
+                store.close()
+
+    def test_claude_edit_permission_can_be_allowed_for_session_without_runtime_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=0.01,
+                    store=store,
+                    provider_label="Claude",
+                )
+
+                requester.create_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": "req-1",
+                        "tool_name": "Edit",
+                        "description": "A tool for editing files",
+                        "input_preview": (
+                            '{"file_path":"/tmp/README.md","old_string":"before",'
+                            '"new_string":"after"}'
+                        ),
+                    },
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                actions = _first_actions_block(gateway.replies[0]["blocks"])["elements"]
+                self.assertEqual(
+                    [action["text"]["text"] for action in actions],
+                    ["Allow", "Allow Session", "Deny"],
+                )
+            finally:
+                store.close()
+
     def test_claude_edit_permission_preview_is_shown_as_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
