@@ -203,6 +203,13 @@ class ManagedTaskRuntime:
         return self.commands.default_cwd
 
     def _stream_task(self, task_id: str) -> None:
+        try:
+            self._stream_task_loop(task_id)
+        except Exception:
+            LOGGER.exception("managed task worker failed for %s", task_id)
+            self._handle_task_worker_failure(task_id)
+
+    def _stream_task_loop(self, task_id: str) -> None:
         while True:
             running = self._get_running(task_id)
             if running is None:
@@ -288,6 +295,36 @@ class ManagedTaskRuntime:
                     self.on_task_done(completed_task, running.agent, running.thread)
                 return
             time.sleep(self.poll_seconds)
+
+    def _handle_task_worker_failure(self, task_id: str) -> None:
+        running = self._get_running(task_id)
+        with self._lock:
+            self._running.pop(task_id, None)
+        try:
+            current = self.store.get_agent_task(task_id)
+        except Exception:
+            LOGGER.debug("failed to load crashed task", exc_info=True)
+            current = None
+        if current is not None and current.status in {
+            AgentTaskStatus.QUEUED,
+            AgentTaskStatus.ACTIVE,
+        }:
+            self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(task_id)
+        if running is None:
+            return
+        try:
+            self.gateway.post_thread_reply(
+                running.thread,
+                (
+                    f"{running.agent.full_name} hit an internal Slackgentic error and "
+                    "this run was stopped instead of being left active."
+                ),
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
+        except Exception:
+            LOGGER.debug("failed to post managed task worker failure", exc_info=True)
 
     def _post_agent_chunk(self, running: RunningTask, chunk: str) -> None:
         visible_text, control_signals = _extract_agent_control_signals(chunk)
@@ -1194,6 +1231,8 @@ def _render_codex_exec_line(line: str) -> str | None:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
+        if line.lstrip().startswith("{"):
+            return None
         return _clean_terminal_output(line) or None
     if not isinstance(event, dict):
         return None

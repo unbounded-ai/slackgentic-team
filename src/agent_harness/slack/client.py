@@ -9,6 +9,8 @@ from agent_harness.models import SlackThreadRef, TeamAgent
 from agent_harness.slack import normalize_slack_mrkdwn, slack_blocks_for_markdown_table
 from agent_harness.team import TeamChatMessage
 
+SLACK_API_RETRY_LIMIT = 3
+
 
 @dataclass(frozen=True)
 class PostedMessage:
@@ -117,11 +119,12 @@ class SlackGateway:
             "text": normalize_slack_mrkdwn(text),
         }
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks:
             kwargs["blocks"] = rendered_blocks
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
-        response = self.client.chat_postMessage(**kwargs)
+        response = self._chat_post_message(kwargs, auto_rendered_blocks=auto_rendered_blocks)
         return PostedMessage(channel_id=channel_id, ts=response["ts"], thread_ts=thread_ts)
 
     def post_session_parent(
@@ -132,13 +135,19 @@ class SlackGateway:
         icon_url: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
     ) -> PostedMessage:
-        response = self.client.chat_postMessage(
-            channel=channel_id,
-            text=normalize_slack_mrkdwn(text),
-            blocks=blocks if blocks is not None else slack_blocks_for_markdown_table(text),
-            username=_identity_name(persona),
-            icon_url=icon_url,
-            icon_emoji=None if icon_url else persona.icon_emoji,
+        rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        kwargs: dict[str, Any] = {
+            "channel": channel_id,
+            "text": normalize_slack_mrkdwn(text),
+            "username": _identity_name(persona),
+            "icon_url": icon_url,
+            "icon_emoji": None if icon_url else persona.icon_emoji,
+        }
+        if rendered_blocks is not None:
+            kwargs["blocks"] = rendered_blocks
+        response = self._chat_post_message(
+            kwargs,
+            auto_rendered_blocks=blocks is None and rendered_blocks is not None,
         )
         return PostedMessage(channel_id=channel_id, ts=response["ts"])
 
@@ -212,6 +221,7 @@ class SlackGateway:
             "text": normalize_slack_mrkdwn(text),
         }
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks:
             kwargs["blocks"] = rendered_blocks
         if persona:
@@ -226,7 +236,7 @@ class SlackGateway:
                 kwargs["icon_url"] = icon_url
             else:
                 kwargs["icon_emoji"] = icon_emoji or ":bust_in_silhouette:"
-        response = self.client.chat_postMessage(**kwargs)
+        response = self._chat_post_message(kwargs, auto_rendered_blocks=auto_rendered_blocks)
         return PostedMessage(
             channel_id=thread.channel_id,
             ts=response["ts"],
@@ -306,9 +316,65 @@ class SlackGateway:
             "text": normalize_slack_mrkdwn(text),
         }
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
+        auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks is not None:
             kwargs["blocks"] = rendered_blocks
-        self.client.chat_update(**kwargs)
+        self._chat_update(kwargs, auto_rendered_blocks=auto_rendered_blocks)
+
+    def _chat_post_message(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        auto_rendered_blocks: bool,
+    ):
+        return self._call_slack_with_retries(
+            self.client.chat_postMessage,
+            kwargs,
+            auto_rendered_blocks=auto_rendered_blocks,
+        )
+
+    def _chat_update(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        auto_rendered_blocks: bool,
+    ):
+        return self._call_slack_with_retries(
+            self.client.chat_update,
+            kwargs,
+            auto_rendered_blocks=auto_rendered_blocks,
+        )
+
+    def _call_slack_with_retries(
+        self,
+        call,
+        kwargs: dict[str, Any],
+        *,
+        auto_rendered_blocks: bool,
+    ):
+        from slack_sdk.errors import SlackApiError
+
+        attempts = 0
+        current_kwargs = dict(kwargs)
+        used_plain_text_fallback = False
+        while True:
+            try:
+                return call(**current_kwargs)
+            except SlackApiError as exc:
+                error = exc.response.get("error")
+                if (
+                    error == "invalid_blocks"
+                    and auto_rendered_blocks
+                    and not used_plain_text_fallback
+                ):
+                    current_kwargs.pop("blocks", None)
+                    used_plain_text_fallback = True
+                    continue
+                if error == "ratelimited" and attempts < SLACK_API_RETRY_LIMIT:
+                    attempts += 1
+                    time.sleep(_retry_after_seconds(exc))
+                    continue
+                raise
 
     def add_reaction(self, channel_id: str, ts: str, reaction_name: str) -> bool:
         from slack_sdk.errors import SlackApiError
@@ -339,3 +405,17 @@ def _identity_name(identity: TeamAgent) -> str:
     if provider is None:
         return name
     return f"{name} [{provider.value}]"
+
+
+def _retry_after_seconds(exc) -> float:
+    headers = getattr(exc.response, "headers", None)
+    if headers is None and isinstance(exc.response, dict):
+        headers = exc.response.get("headers")
+    raw_value = None
+    if hasattr(headers, "get"):
+        raw_value = headers.get("Retry-After") or headers.get("retry-after")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(0.0, min(value, 30.0))
