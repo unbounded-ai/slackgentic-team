@@ -899,6 +899,8 @@ def _render_codex_event(event: AgentEvent) -> RenderedSessionEvent | None:
 def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
     if event.event_type not in {"assistant", "user"}:
         return None
+    if event.metadata.get("isMeta") is True:
+        return None
     message = event.metadata.get("message")
     if not isinstance(message, dict):
         return None
