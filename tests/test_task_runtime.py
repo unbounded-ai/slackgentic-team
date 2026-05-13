@@ -1,4 +1,5 @@
 import json
+import logging
 import tempfile
 import threading
 import time
@@ -53,6 +54,11 @@ class FakeGateway:
 
     def update_message(self, channel_id, ts, text, blocks=None):
         self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
+
+
+class FailingGateway(FakeGateway):
+    def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
+        raise RuntimeError("Slack post failed")
 
 
 class OneShotProcess:
@@ -445,6 +451,16 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(chunks, ["Done"])
         self.assertEqual(buffer, "")
 
+    def test_codex_exec_json_output_hides_malformed_json_records(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            '{"type":"item.completed","item":{"type":"command_execution","output":"unterminated\n',
+            final=True,
+        )
+
+        self.assertEqual(chunks, [])
+        self.assertEqual(buffer, "")
+
     def test_codex_exec_json_output_buffers_partial_lines(self):
         chunks, buffer = _process_output_chunks(
             Provider.CODEX,
@@ -733,6 +749,42 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+    def test_runtime_worker_failure_cancels_task_instead_of_leaving_it_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "post will fail", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FailingGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+
+                logging.disable(logging.CRITICAL)
+                try:
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                    for _ in range(50):
+                        current = store.get_agent_task(task.task_id)
+                        if current and current.status == AgentTaskStatus.CANCELLED:
+                            break
+                        time.sleep(0.01)
+                finally:
+                    logging.disable(logging.NOTSET)
+
+                current = store.get_agent_task(task.task_id)
+                self.assertIsNotNone(current)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.CANCELLED)
+                self.assertIsNone(store.get_managed_thread_task("C1", "171.000001", agent.agent_id))
             finally:
                 store.close()
 

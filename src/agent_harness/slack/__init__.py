@@ -583,6 +583,8 @@ def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> lis
             style["code"] = True
         else:
             value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
+        if not value:
+            value = " "
         if bold:
             style["bold"] = True
         element: dict[str, Any] = {"type": "text", "text": value}

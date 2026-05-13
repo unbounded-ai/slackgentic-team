@@ -1,5 +1,7 @@
 import unittest
 
+from slack_sdk.errors import SlackApiError
+
 from agent_harness.slack.client import SlackGateway
 from agent_harness.team import build_initial_model_team, build_initialization_messages
 
@@ -39,6 +41,45 @@ class FakeSlackClient:
     def conversations_archive(self, channel):
         self.archived_channels.append(channel)
         return {"ok": True}
+
+
+class FakeSlackResponse(dict):
+    def __init__(self, *args, headers=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.headers = headers or {}
+
+
+class InvalidBlocksOnceClient(FakeSlackClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def chat_postMessage(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1 and "blocks" in kwargs:
+            raise SlackApiError(
+                "invalid blocks",
+                FakeSlackResponse({"ok": False, "error": "invalid_blocks"}),
+            )
+        return super().chat_postMessage(**kwargs)
+
+
+class RateLimitedOnceClient(FakeSlackClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def chat_postMessage(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise SlackApiError(
+                "rate limited",
+                FakeSlackResponse(
+                    {"ok": False, "error": "ratelimited"},
+                    headers={"Retry-After": "0"},
+                ),
+            )
+        return super().chat_postMessage(**kwargs)
 
 
 class SlackGatewayTests(unittest.TestCase):
@@ -94,6 +135,32 @@ class SlackGatewayTests(unittest.TestCase):
         blocks = gateway.client.messages[0]["blocks"]
         self.assertEqual([block["type"] for block in blocks], ["table"])
         self.assertEqual(blocks[0]["rows"][1][0]["elements"][0]["elements"][0]["text"], "silas")
+
+    def test_post_thread_reply_falls_back_when_auto_table_blocks_are_invalid(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = InvalidBlocksOnceClient()
+
+        from agent_harness.models import SlackThreadRef
+
+        gateway.post_thread_reply(
+            SlackThreadRef("C1", "171.000001"),
+            "| Name | State |\n|---|---|\n| `silas` | busy |",
+        )
+
+        self.assertIn("blocks", gateway.client.calls[0])
+        self.assertNotIn("blocks", gateway.client.calls[1])
+        self.assertNotIn("blocks", gateway.client.messages[0])
+
+    def test_post_thread_reply_retries_after_rate_limit(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = RateLimitedOnceClient()
+
+        from agent_harness.models import SlackThreadRef
+
+        gateway.post_thread_reply(SlackThreadRef("C1", "171.000001"), "hello")
+
+        self.assertEqual(gateway.client.calls, 2)
+        self.assertEqual(gateway.client.messages[0]["text"], "hello")
 
     def test_archive_channel_calls_slack_api(self):
         gateway = object.__new__(SlackGateway)
