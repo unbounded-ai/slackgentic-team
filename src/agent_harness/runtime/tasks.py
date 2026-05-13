@@ -209,8 +209,13 @@ class ManagedTaskRuntime:
                 return
             output = running.process.read_available()
             self._capture_session_id(running, output)
-            self._capture_permission_denials(running, output)
+            permission_denied = self._capture_permission_denials(running, output)
             self._capture_resume_errors(running, output)
+            if permission_denied and running.process.is_alive():
+                try:
+                    running.process.terminate()
+                except Exception:
+                    LOGGER.debug("failed to stop Claude after permission denial", exc_info=True)
             if running.missing_resume_session:
                 chunks = []
             else:
@@ -389,15 +394,16 @@ class ManagedTaskRuntime:
         output: str,
         *,
         final: bool = False,
-    ) -> None:
+    ) -> bool:
         if _provider_for_running(running) != Provider.CLAUDE:
-            return
+            return False
         denials, running.permission_buffer = _claude_permission_denials(
             output,
             running.permission_buffer,
             final=final,
             tool_uses=running.permission_tool_uses,
         )
+        new_denial = False
         for denial in denials:
             key = _claude_denial_key(denial)
             if key in running.permission_denial_keys:
@@ -405,6 +411,9 @@ class ManagedTaskRuntime:
             running.permission_denial_keys.add(key)
             running.permission_denials.append(denial)
             self._ensure_claude_permission_request(running, denial)
+            new_denial = True
+            break
+        return new_denial
 
     def _capture_resume_errors(
         self,

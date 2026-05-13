@@ -167,6 +167,57 @@ class ClaudeStreamPermissionDeniedProcess(OneShotProcess):
         return ""
 
 
+class ClaudeLivePermissionDeniedProcess(ClaudeStreamPermissionDeniedProcess):
+    session_id = "claude-live-denied-session"
+
+    def __init__(self, request):
+        super().__init__(request)
+        self.terminated = False
+
+    def is_alive(self):
+        return not self.terminated
+
+    def terminate(self):
+        self.terminated = True
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.terminated:
+            return ""
+        if self.reads == 0:
+            return super().read_available(max_reads=max_reads, timeout=timeout)
+        self.reads += 1
+        assistant = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_second",
+                        "name": "Bash",
+                        "input": {
+                            "command": "codex --help",
+                            "description": "Try a different command",
+                        },
+                    }
+                ]
+            },
+        }
+        denial = {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_second",
+                        "content": "This command requires approval",
+                        "is_error": True,
+                    }
+                ]
+            },
+        }
+        return json.dumps(assistant) + "\n" + json.dumps(denial) + "\n"
+
+
 class ClaudeSecondPermissionDeniedProcess(ClaudePermissionDeniedProcess):
     command = 'gh search prs --author "@me" --state open --json number,title --limit 50'
     description = "Search open PRs"
@@ -986,6 +1037,67 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-stream-denied-session")
+                self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
+            finally:
+                store.close()
+
+    def test_runtime_stops_live_claude_after_streamed_permission_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            denied_processes = []
+            approved = threading.Event()
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    process = ClaudeLivePermissionDeniedProcess(request)
+                    denied_processes.append(process)
+                    return process
+                return ClaudeOneShotProcess(request)
+
+            def approve_request():
+                for _ in range(100):
+                    rows = store.list_pending_slack_agent_requests("claude/channel/permission")
+                    if rows:
+                        store.resolve_slack_agent_request(rows[0]["token"], {"behavior": "allow"})
+                        approved.set()
+                        return
+                    time.sleep(0.01)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "show recent talos commits", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                approver = threading.Thread(target=approve_request)
+                approver.start()
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+                approver.join(timeout=1)
+
+                self.assertTrue(approved.is_set())
+                self.assertTrue(denied_processes[0].terminated)
+                self.assertEqual(
+                    gateway.replies.count("Claude requests tool approval: Bash"),
+                    1,
+                )
+                self.assertIn("Done", gateway.replies)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[1].resume_session_id, "claude-live-denied-session")
                 self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
             finally:
                 store.close()
