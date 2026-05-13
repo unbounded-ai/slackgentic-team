@@ -908,17 +908,53 @@ def _allowed_gh_bash_tools(parts: list[str]) -> tuple[str, ...]:
 
 
 def _allowed_git_bash_tools(parts: list[str]) -> tuple[str, ...]:
-    if len(parts) < 2:
+    git_command = _git_read_only_command(parts)
+    if git_command is None:
         return ()
-    action = parts[1]
+    action, prefix = git_command
     safe_patterns = {
         "branch": ("Bash(git branch:*)", "Bash(git branch *)"),
         "diff": ("Bash(git diff:*)", "Bash(git diff *)"),
         "log": ("Bash(git log:*)", "Bash(git log *)"),
         "show": ("Bash(git show:*)", "Bash(git show *)"),
-        "status": ("Bash(git status)",),
+        "status": ("Bash(git status)", "Bash(git status:*)", "Bash(git status *)"),
     }
-    return safe_patterns.get(action, ())
+    patterns = list(safe_patterns.get(action, ()))
+    default_prefix = f"git {action}"
+    if prefix != default_prefix and ")" not in prefix and "," not in prefix:
+        patterns.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
+    return tuple(dict.fromkeys(patterns))
+
+
+def _git_read_only_command(parts: list[str]) -> tuple[str, str] | None:
+    if len(parts) < 2 or parts[0] != "git":
+        return None
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part == "-C":
+            if index + 1 >= len(parts):
+                return None
+            index += 2
+            continue
+        if part.startswith("-C") and len(part) > 2:
+            index += 1
+            continue
+        if part in {"--no-pager", "--paginate", "--no-optional-locks"}:
+            index += 1
+            continue
+        if part in {"-c", "--git-dir", "--work-tree", "--namespace"}:
+            if index + 1 >= len(parts):
+                return None
+            index += 2
+            continue
+        if part.startswith(("-c", "--git-dir=", "--work-tree=", "--namespace=")):
+            index += 1
+            continue
+        if part.startswith("-"):
+            return None
+        return part, shlex.join(parts[: index + 1])
+    return None
 
 
 def _claude_denial_request_params(denial: dict) -> dict[str, object]:
@@ -927,6 +963,7 @@ def _claude_denial_request_params(denial: dict) -> dict[str, object]:
     params: dict[str, object] = {
         "request_id": token_urlsafe(6),
         "tool_name": tool_name,
+        "can_allow_session": True,
     }
     if isinstance(tool_input, dict):
         description = tool_input.get("description")

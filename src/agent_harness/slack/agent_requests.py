@@ -455,8 +455,10 @@ def _approval_action_blocks(pending: PendingAgentRequest) -> list[dict[str, Any]
     elif method == "claude/channel/permission":
         labels = [
             ("Allow", "approve", "primary"),
-            ("Deny", "deny", "danger"),
         ]
+        if pending.params.get("can_allow_session"):
+            labels.append(("Allow Session", "approve_session", None))
+        labels.append(("Deny", "deny", "danger"))
     elif method == "item/permissions/requestApproval":
         labels = [
             ("Approve Turn", "approve", "primary"),
@@ -558,7 +560,12 @@ def _decision_response(method: str, decision: str, params: dict[str, Any]) -> An
             }
         return {"permissions": {}, "scope": "turn"}
     if method == "claude/channel/permission":
-        return {"behavior": "allow" if decision == "approve" else "deny"}
+        if decision in {"approve", "approve_session"}:
+            response = {"behavior": "allow"}
+            if decision == "approve_session":
+                response["scope"] = "session"
+            return response
+        return {"behavior": "deny"}
     return None
 
 
@@ -607,6 +614,7 @@ def _resolved_text(method: str, decision: str, provider_label: str) -> str:
     if method == "claude/channel/permission":
         return {
             "approve": f"Allowed {provider_label} tool request.",
+            "approve_session": f"Allowed {provider_label} tool request for this session.",
             "deny": f"Denied {provider_label} tool request.",
             "cancel": f"Denied {provider_label} tool request.",
         }.get(decision, f"Handled {provider_label} tool request.")

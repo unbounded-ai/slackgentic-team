@@ -511,6 +511,28 @@ class TaskRuntimeTests(unittest.TestCase):
         )
         self.assertIn("Bash(git log:*)", _allowed_tools_for_claude_denial(denial))
 
+    def test_claude_permission_denial_allows_git_log_after_dash_c(self):
+        denial = {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": (
+                    "git -C /Users/ilshat/code/unbounded-ai/slackgentic-team log --oneline -1"
+                )
+            },
+        }
+
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+
+        self.assertEqual(
+            _allowed_tool_for_claude_denial(denial),
+            ("Bash(git -C /Users/ilshat/code/unbounded-ai/slackgentic-team log --oneline -1)"),
+        )
+        self.assertIn(
+            "Bash(git -C /Users/ilshat/code/unbounded-ai/slackgentic-team log:*)",
+            allowed_tools,
+        )
+        self.assertIn("Bash(git log:*)", allowed_tools)
+
     def test_claude_permission_denial_allows_file_edit_tools(self):
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Edit"}), "Edit")
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Write"}), "Write")
