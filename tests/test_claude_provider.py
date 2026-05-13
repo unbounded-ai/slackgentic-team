@@ -49,6 +49,47 @@ class ClaudeProviderTests(unittest.TestCase):
             )
             self.assertEqual(sessions[0].cwd, project)
 
+    def test_discover_keeps_primary_transcript_when_subagent_reuses_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / ".claude" / "projects" / "-tmp-repo"
+            subagents = project / "session-1" / "subagents"
+            subagents.mkdir(parents=True)
+            path = project / "session-1.jsonl"
+            subagent_path = subagents / "agent-a1.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "cwd": str(project),
+                        "sessionId": "session-1",
+                    }
+                )
+                + "\n"
+            )
+            subagent_path.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-04-27T12:00:01.000Z",
+                        "cwd": str(project),
+                        "sessionId": "session-1",
+                    }
+                )
+                + "\n"
+            )
+            primary_mtime = datetime(2026, 4, 27, 12, 5, tzinfo=UTC).timestamp()
+            subagent_mtime = datetime(2026, 4, 27, 12, 10, tzinfo=UTC).timestamp()
+            os.utime(path, (primary_mtime, primary_mtime))
+            os.utime(subagent_path, (subagent_mtime, subagent_mtime))
+
+            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].session_id, "session-1")
+            self.assertEqual(sessions[0].transcript_path, path)
+
     def test_exit_command_marks_recent_session_done(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

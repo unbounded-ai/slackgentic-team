@@ -37,13 +37,16 @@ class ClaudeProvider:
     def discover(self) -> list[AgentSession]:
         if not self.projects_root.exists():
             return []
-        sessions: list[AgentSession] = []
+        sessions_by_id: dict[str, AgentSession] = {}
         for path in sorted(self.projects_root.rglob("*.jsonl")):
             session = self._session_from_path(path)
-            if session:
-                sessions.append(session)
+            if not session:
+                continue
+            existing = sessions_by_id.get(session.session_id)
+            if existing is None or _prefer_session_discovery(session, existing):
+                sessions_by_id[session.session_id] = session
         return sorted(
-            sessions,
+            sessions_by_id.values(),
             key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
@@ -169,6 +172,15 @@ def _first_timestamp(path: Path) -> datetime | None:
         if timestamp is not None:
             return timestamp
     return None
+
+
+def _prefer_session_discovery(candidate: AgentSession, existing: AgentSession) -> bool:
+    candidate_primary = candidate.transcript_path.stem == candidate.session_id
+    existing_primary = existing.transcript_path.stem == existing.session_id
+    if candidate_primary != existing_primary:
+        return candidate_primary
+    oldest = datetime.min.replace(tzinfo=UTC)
+    return (candidate.last_seen_at or oldest) > (existing.last_seen_at or oldest)
 
 
 def _usage_dedupe_id(record: dict[str, Any]) -> str:
