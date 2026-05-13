@@ -2266,6 +2266,85 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_background_resumed_claude_session_does_not_reclaim_live_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=0, claude_count=2)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 5, 13, 5, 0, tzinfo=UTC)
+                live_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="live",
+                    transcript_path=Path(tmp) / "live.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=started + timedelta(minutes=20),
+                    metadata={"entrypoint": "cli"},
+                )
+                resumed_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="resumed",
+                    transcript_path=Path(tmp) / "resumed.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=started + timedelta(minutes=30),
+                    metadata={"entrypoint": "sdk-cli"},
+                )
+                store.upsert_session(live_session)
+                store.upsert_session(resumed_session)
+                store.set_setting("external_session_agent.claude.live", agents[0].agent_id)
+                store.set_setting("external_session_agent.claude.resumed", agents[1].agent_id)
+                store.set_setting("external_session_live_target.claude.resumed", "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "resumed",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                notifier = FakeTerminalNotifier(
+                    [
+                        TerminalTarget(
+                            pid=123,
+                            tty="ttys001",
+                            cwd=Path(tmp),
+                            command=(
+                                "claude --dangerously-load-development-channels server:slackgentic"
+                            ),
+                            started_at=started,
+                        )
+                    ]
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider([resumed_session, live_session], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=notifier,
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertIsNone(
+                    store.get_setting("external_session_live_target.claude.resumed")
+                )
+                self.assertIsNone(
+                    store.get_setting("external_session_missing_target.claude.resumed")
+                )
+                self.assertEqual(
+                    store.get_setting("external_session_live_target.claude.live"),
+                    "123",
+                )
+                self.assertIsNone(store.get_setting("external_session_ignored.claude.resumed"))
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

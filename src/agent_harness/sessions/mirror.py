@@ -27,6 +27,7 @@ from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.bridge import (
     _codex_remote_enabled,
     _is_latest_live_session_for_cwd,
+    _session_can_use_live_target,
     _session_could_belong_to_live_target,
     _slackgentic_channel_enabled,
 )
@@ -491,6 +492,8 @@ class SessionMirror:
     def _live_target_matches_session(self, session: AgentSession, target) -> bool:
         if session.provider != Provider.CLAUDE:
             return True
+        if not _session_can_use_live_target(session):
+            return False
         if not _session_could_belong_to_live_target(session, target):
             return False
         return _is_latest_live_session_for_cwd(self.store, session, target)

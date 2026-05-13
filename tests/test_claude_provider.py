@@ -90,6 +90,34 @@ class ClaudeProviderTests(unittest.TestCase):
             self.assertEqual(sessions[0].session_id, "session-1")
             self.assertEqual(sessions[0].transcript_path, path)
 
+    def test_session_metadata_tracks_latest_entrypoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / ".claude" / "projects" / "-tmp-repo"
+            project.mkdir(parents=True)
+            path = project / "session-1.jsonl"
+            records = [
+                {
+                    "type": "user",
+                    "timestamp": "2026-04-27T12:00:00.000Z",
+                    "cwd": str(project),
+                    "sessionId": "session-1",
+                    "entrypoint": "cli",
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-04-27T12:00:01.000Z",
+                    "cwd": str(project),
+                    "sessionId": "session-1",
+                    "entrypoint": "sdk-cli",
+                },
+            ]
+            path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+
+            self.assertEqual(sessions[0].metadata["entrypoint"], "sdk-cli")
+
     def test_exit_command_marks_recent_session_done(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

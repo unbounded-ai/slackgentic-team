@@ -65,6 +65,7 @@ class ClaudeProvider:
         model: str | None = None
         git_branch: str | None = None
         permission_mode: str | None = None
+        entrypoint: str | None = None
         for _, record in last_jsonl_records(path, limit=50):
             session_id = str(record.get("sessionId") or session_id)
             if isinstance(record.get("cwd"), str):
@@ -73,6 +74,8 @@ class ClaudeProvider:
                 git_branch = record["gitBranch"]
             if isinstance(record.get("permissionMode"), str):
                 permission_mode = record["permissionMode"]
+            if isinstance(record.get("entrypoint"), str):
+                entrypoint = record["entrypoint"]
             message = record.get("message")
             if isinstance(message, dict) and isinstance(message.get("model"), str):
                 model = message["model"]
@@ -92,7 +95,7 @@ class ClaudeProvider:
             model=model,
             git_branch=git_branch,
             permission_mode=permission_mode,
-            metadata=metadata,
+            metadata={**metadata, **({"entrypoint": entrypoint} if entrypoint else {})},
         )
 
     def iter_events(self, transcript_path: Path) -> Iterator[AgentEvent]:

@@ -244,6 +244,8 @@ class ExternalSessionBridge:
         return False
 
     def _channel_target_for_session(self, session: AgentSession) -> TerminalTarget | None:
+        if not _session_can_use_live_target(session):
+            return None
         if session.started_at is None and not _is_latest_active_session_for_cwd(
             self.store,
             session,
@@ -479,10 +481,14 @@ def _render_resume_output(provider: Provider, stdout: str) -> str | None:
 def _is_latest_active_session_for_cwd(store: Store, session: AgentSession) -> bool:
     if session.cwd is None:
         return False
+    if not _session_can_use_live_target(session):
+        return False
     cutoff_seconds = 30 * 60
     now = utc_now()
     matches: list[AgentSession] = []
     for candidate in store.list_sessions(session.provider):
+        if not _session_can_use_live_target(candidate):
+            continue
         if candidate.status != SessionStatus.ACTIVE:
             continue
         if candidate.cwd is None or not _same_path(candidate.cwd, session.cwd):
@@ -505,6 +511,8 @@ def _is_latest_live_session_for_cwd(
 ) -> bool:
     if session.cwd is None:
         return False
+    if not _session_can_use_live_target(session):
+        return False
     target_started_at = target.started_at.astimezone() if target.started_at else None
     matches: list[AgentSession] = []
     seen_session_ids: set[str] = set()
@@ -512,6 +520,8 @@ def _is_latest_live_session_for_cwd(
         if candidate.session_id in seen_session_ids:
             continue
         seen_session_ids.add(candidate.session_id)
+        if not _session_can_use_live_target(candidate):
+            continue
         if candidate.status == SessionStatus.DONE:
             continue
         if candidate.cwd is None or not _same_path(candidate.cwd, session.cwd):
@@ -540,6 +550,15 @@ def _session_could_belong_to_live_target(
     if target.started_at is None:
         return False
     return session.started_at.astimezone() >= target.started_at.astimezone() - timedelta(minutes=15)
+
+
+def _session_can_use_live_target(session: AgentSession) -> bool:
+    if session.provider != Provider.CLAUDE:
+        return True
+    entrypoint = session.metadata.get("entrypoint")
+    if entrypoint is None:
+        return True
+    return entrypoint == "cli"
 
 
 def _same_path(left: Path, right: Path) -> bool:
