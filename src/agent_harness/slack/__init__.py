@@ -577,7 +577,7 @@ def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> lis
         if style:
             element["style"] = style
         elements.append(element)
-    return elements or [{"type": "text", "text": ""}]
+    return elements or [{"type": "text", "text": " "}]
 
 
 def _wrap_markdown_tables(text: str) -> str:
