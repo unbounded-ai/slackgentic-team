@@ -1224,7 +1224,7 @@ class SlackAppTests(unittest.TestCase):
                     store,
                     gateway,
                     default_channel_id="C1",
-                    slash_command="/slackgentic-ilshat",
+                    slash_command="/slackgentic-dev",
                 )
 
                 controller.post_channel_overview("C1")
@@ -1232,8 +1232,8 @@ class SlackAppTests(unittest.TestCase):
                 text = gateway.posts[-1]["text"]
                 self.assertIn("@agentname", text)
                 self.assertIn("somebody ...", text)
-                self.assertIn("/slackgentic-ilshat <command>", text)
-                self.assertIn("/slackgentic-ilshat hire 3 agents", text)
+                self.assertIn("/slackgentic-dev <command>", text)
+                self.assertIn("/slackgentic-dev hire 3 agents", text)
                 self.assertIn("or just `status`", text)
                 self.assertIn("#dangerous-mode", text)
                 self.assertIn("Codex outside Slack", text)
@@ -1630,6 +1630,14 @@ class SlackAppTests(unittest.TestCase):
                 started_task, _, _ = runtime.started[0]
                 self.assertTrue(started_task.metadata[DANGEROUS_MODE_METADATA_KEY])
                 self.assertNotIn("#dangerous-mode", gateway.thread_replies[0]["text"])
+                self.assertIn(
+                    "*Dangerous mode:* enabled for this task.",
+                    gateway.thread_replies[0]["text"],
+                )
+                self.assertIn(
+                    "*Dangerous mode:* enabled for this task.",
+                    gateway.thread_replies[0]["blocks"][0]["text"]["text"],
+                )
             finally:
                 store.close()
 

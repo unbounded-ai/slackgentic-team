@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -227,6 +228,66 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 self.assertEqual(
                     gateway.updates[-1]["text"],
                     "Allowed Claude tool request for this session.",
+                )
+            finally:
+                store.close()
+
+    def test_claude_bash_permission_displays_shell_command_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                thread = SlackThreadRef("C1", "171.000001")
+                pending = requester.create_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": "req-1",
+                        "tool_name": "Bash",
+                        "description": "Check worktree",
+                        "input_preview": json.dumps(
+                            {
+                                "command": "git -C /workspace/repos/sample-app status",
+                                "description": "Check worktree",
+                            }
+                        ),
+                        "can_allow_session": True,
+                    },
+                    thread,
+                )
+
+                self.assertEqual(
+                    gateway.replies[0]["text"], "Claude requests command approval: git"
+                )
+                self.assertIn(
+                    "Command: `git`",
+                    gateway.replies[0]["blocks"][0]["text"]["text"],
+                )
+                self.assertNotIn(
+                    "Tool: `Bash`",
+                    gateway.replies[0]["blocks"][0]["text"]["text"],
+                )
+
+                actions = _first_actions_block(gateway.replies[0]["blocks"])["elements"]
+                handled = requester.handle_block_action(
+                    decode_action_value(actions[1]["value"]),
+                    "C1",
+                    gateway.replies[0]["ts"],
+                )
+
+                resolved, response = store.get_slack_agent_request_response(pending.token)
+                self.assertTrue(handled)
+                self.assertTrue(resolved)
+                self.assertEqual(response, {"behavior": "allow", "scope": "session"})
+                self.assertEqual(
+                    gateway.updates[-1]["text"],
+                    "Allowed Claude command request for this session.",
                 )
             finally:
                 store.close()

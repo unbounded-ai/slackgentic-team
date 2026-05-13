@@ -582,26 +582,27 @@ class SessionMirror:
         )
 
     def _skip_managed_task_session(self, session: AgentSession, channel_id: str) -> bool:
-        managed_task = self._managed_task_for_session(session)
-        if managed_task is not None:
-            if managed_task.session_id != session.session_id:
-                self.store.update_agent_task_session(
-                    managed_task.task_id,
-                    session.provider,
-                    session.session_id,
-                )
-            changed = self.store.clear_external_session_tracking(
-                session.provider,
-                session.session_id,
-                team_id=self.team_id,
-                channel_id=channel_id,
-            )
-            if changed:
-                self._notify_external_session_occupancy_changed(channel_id)
-                self._update_capacity_notice_if_clear(channel_id, session.provider)
-            return True
+        managed_prompt = _managed_prompt_from_session_transcript(session)
+        if managed_prompt:
+            managed_task = self._managed_task_for_session_prompt(session, managed_prompt)
+            if managed_task is not None:
+                if managed_task.session_id != session.session_id:
+                    self.store.update_agent_task_session(
+                        managed_task.task_id,
+                        session.provider,
+                        session.session_id,
+                    )
+                self._clear_external_tracking(session, channel_id)
+                return True
+            if _looks_like_slackgentic_managed_prompt(managed_prompt):
+                self._clear_external_tracking(session, channel_id)
+                return True
         if not self.store.has_agent_task_session(session.provider, session.session_id):
             return False
+        self._clear_external_tracking(session, channel_id)
+        return True
+
+    def _clear_external_tracking(self, session: AgentSession, channel_id: str) -> None:
         changed = self.store.clear_external_session_tracking(
             session.provider,
             session.session_id,
@@ -611,12 +612,18 @@ class SessionMirror:
         if changed:
             self._notify_external_session_occupancy_changed(channel_id)
             self._update_capacity_notice_if_clear(channel_id, session.provider)
-        return True
 
     def _managed_task_for_session(self, session: AgentSession) -> AgentTask | None:
         prompt = _managed_prompt_from_session_transcript(session)
         if not prompt:
             return None
+        return self._managed_task_for_session_prompt(session, prompt)
+
+    def _managed_task_for_session_prompt(
+        self,
+        session: AgentSession,
+        prompt: str,
+    ) -> AgentTask | None:
         for task in self.store.list_agent_tasks():
             if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
                 continue
@@ -880,6 +887,14 @@ def _managed_prompt_from_record(provider: Provider, record: dict[str, object]) -
             message = payload.get("message")
             return message if isinstance(message, str) else None
     return None
+
+
+def _looks_like_slackgentic_managed_prompt(prompt: str) -> bool:
+    return (
+        "known in Slack as @" in prompt
+        and "You are working from Slack." in prompt
+        and "Task kind:" in prompt
+    )
 
 
 def _session_channel_notice_key(session: AgentSession) -> str:

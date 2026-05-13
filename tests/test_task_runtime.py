@@ -18,6 +18,7 @@ from agent_harness.models import (
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
     ManagedTaskRuntime,
+    _allowed_session_tools_for_claude_denial,
     _allowed_tool_for_claude_denial,
     _allowed_tools_for_claude_denial,
     _append_allowed_tool,
@@ -118,7 +119,7 @@ class ClaudePermissionDeniedProcess(OneShotProcess):
 
 class ClaudeStreamPermissionDeniedProcess(OneShotProcess):
     session_id = "claude-stream-denied-session"
-    command = "cd /Users/ilshat/code/unbounded-ai/talos && git log --oneline -30"
+    command = "cd /workspace/repos/sample-app && git log --oneline -30"
     description = "Show recent commits"
 
     def read_available(self, max_reads=20, timeout=0.05):
@@ -221,6 +222,17 @@ class ClaudeLivePermissionDeniedProcess(ClaudeStreamPermissionDeniedProcess):
 class ClaudeSecondPermissionDeniedProcess(ClaudePermissionDeniedProcess):
     command = 'gh search prs --author "@me" --state open --json number,title --limit 50'
     description = "Search open PRs"
+
+
+class ClaudeMultilineCommitPermissionDeniedProcess(ClaudePermissionDeniedProcess):
+    session_id = "claude-multiline-commit-session"
+    command = """git -C /workspace/repos/sample-app commit -m "$(cat <<'EOF'
+[sample-app] Add parity adapter and rollout bridge
+
+Parity for Codex.
+EOF
+)" """
+    description = "Commit codex parity"
 
 
 class ClaudeMissingResumeProcess(OneShotProcess):
@@ -352,17 +364,17 @@ class TaskRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             default = root
-            talos = root / "talos"
-            talos.mkdir()
+            sample_app = root / "sample-app"
+            sample_app.mkdir()
 
-            cwd = _requested_repo_cwd("in talos summarize the test command", default)
+            cwd = _requested_repo_cwd("in sample-app summarize the test command", default)
 
-            self.assertEqual(cwd, talos)
+            self.assertEqual(cwd, sample_app)
 
     def test_requested_repo_cwd_ignores_missing_root(self):
         missing = Path("/tmp/slackgentic-missing-root-for-test")
 
-        self.assertEqual(_requested_repo_cwd("in talos summarize tests", missing), missing)
+        self.assertEqual(_requested_repo_cwd("in sample-app summarize tests", missing), missing)
 
     def test_command_config_accepts_env_aliases(self):
         config = AgentCommandConfig.model_validate(
@@ -551,14 +563,12 @@ class TaskRuntimeTests(unittest.TestCase):
     def test_claude_permission_denial_allows_git_log_after_cd(self):
         denial = {
             "tool_name": "Bash",
-            "tool_input": {
-                "command": "cd /Users/ilshat/code/unbounded-ai/talos && git log --oneline -30"
-            },
+            "tool_input": {"command": "cd /workspace/repos/sample-app && git log --oneline -30"},
         }
 
         self.assertEqual(
             _allowed_tool_for_claude_denial(denial),
-            "Bash(cd /Users/ilshat/code/unbounded-ai/talos && git log --oneline -30)",
+            "Bash(cd /workspace/repos/sample-app && git log --oneline -30)",
         )
         self.assertIn("Bash(git log:*)", _allowed_tools_for_claude_denial(denial))
 
@@ -566,9 +576,7 @@ class TaskRuntimeTests(unittest.TestCase):
         denial = {
             "tool_name": "Bash",
             "tool_input": {
-                "command": (
-                    "git -C /Users/ilshat/code/unbounded-ai/slackgentic-team log --oneline -1"
-                )
+                "command": ("git -C /workspace/repos/slackgentic-team log --oneline -1")
             },
         }
 
@@ -576,10 +584,10 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(
             _allowed_tool_for_claude_denial(denial),
-            ("Bash(git -C /Users/ilshat/code/unbounded-ai/slackgentic-team log --oneline -1)"),
+            ("Bash(git -C /workspace/repos/slackgentic-team log --oneline -1)"),
         )
         self.assertIn(
-            "Bash(git -C /Users/ilshat/code/unbounded-ai/slackgentic-team log:*)",
+            "Bash(git -C /workspace/repos/slackgentic-team log:*)",
             allowed_tools,
         )
         self.assertIn("Bash(git log:*)", allowed_tools)
@@ -588,13 +596,47 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Edit"}), "Edit")
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Write"}), "Write")
 
-    def test_claude_permission_denial_rejects_gh_write_pattern(self):
+    def test_claude_permission_denial_allows_approved_gh_write_exactly(self):
         denial = {
             "tool_name": "Bash",
             "tool_input": {"command": "gh pr merge 6 --squash"},
         }
 
-        self.assertIsNone(_allowed_tool_for_claude_denial(denial))
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+
+        self.assertEqual(_allowed_tool_for_claude_denial(denial), "Bash(gh pr merge 6 --squash)")
+        self.assertNotIn("Bash(gh pr merge:*)", allowed_tools)
+
+    def test_claude_permission_denial_allows_multiline_git_commit_by_prefix(self):
+        denial = {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": ClaudeMultilineCommitPermissionDeniedProcess.command,
+                "description": ClaudeMultilineCommitPermissionDeniedProcess.description,
+            },
+        }
+
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+
+        self.assertNotIn(
+            f"Bash({ClaudeMultilineCommitPermissionDeniedProcess.command.strip()})",
+            allowed_tools,
+        )
+        self.assertIn(
+            "Bash(git -C /workspace/repos/sample-app commit:*)",
+            allowed_tools,
+        )
+
+    def test_claude_session_permission_allows_bash_command_family(self):
+        denial = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "git -C /workspace/repos/sample-app push -u origin feature"},
+        }
+
+        self.assertEqual(
+            _allowed_session_tools_for_claude_denial(denial),
+            ("Bash(git:*)", "Bash(git *)"),
+        )
 
     def test_append_allowed_tool_preserves_prior_approvals(self):
         allowed = _append_allowed_tool(("Bash(gh pr list:*)",), "Bash(gh pr view:*)")
@@ -973,7 +1015,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     "I'm blocked on approval before I can continue: view PR metadata",
                     gateway.replies[0],
                 )
-                self.assertIn("Claude requests tool approval: Bash", gateway.replies)
+                self.assertIn("Claude requests command approval: gh", gateway.replies)
                 self.assertIn("Done", gateway.replies)
                 self.assertNotIn("The command requires approval.", gateway.replies)
                 self.assertEqual(len(requests), 2)
@@ -982,6 +1024,62 @@ class TaskRuntimeTests(unittest.TestCase):
                     requests[1].allowed_tools,
                     ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
                 )
+            finally:
+                store.close()
+
+    def test_runtime_broadens_claude_bash_allowlist_for_session_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            approved = threading.Event()
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudePermissionDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            def approve_request():
+                for _ in range(100):
+                    rows = store.list_pending_slack_agent_requests("claude/channel/permission")
+                    if rows:
+                        store.resolve_slack_agent_request(
+                            rows[0]["token"],
+                            {"behavior": "allow", "scope": "session"},
+                        )
+                        approved.set()
+                        return
+                    time.sleep(0.01)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check gh auth", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                approver = threading.Thread(target=approve_request)
+                approver.start()
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+                approver.join(timeout=1)
+
+                self.assertTrue(approved.is_set())
+                self.assertEqual(len(requests), 2)
+                self.assertIn("Bash(gh pr view:*)", requests[1].allowed_tools)
+                self.assertIn("Bash(gh:*)", requests[1].allowed_tools)
+                self.assertIn("Bash(gh *)", requests[1].allowed_tools)
             finally:
                 store.close()
 
@@ -1013,7 +1111,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 store.init_schema()
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
-                task = create_agent_task(agent, "show recent talos commits", "C1")
+                task = create_agent_task(agent, "show recent sample-app commits", "C1")
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -1039,13 +1137,81 @@ class TaskRuntimeTests(unittest.TestCase):
                     gateway.replies[0],
                 )
                 self.assertEqual(
-                    gateway.replies.count("Claude requests tool approval: Bash"),
+                    gateway.replies.count("Claude requests command approval: git"),
                     1,
                 )
                 self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-stream-denied-session")
                 self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
+            finally:
+                store.close()
+
+    def test_runtime_handles_multiline_claude_bash_permission_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            approved = threading.Event()
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudeMultilineCommitPermissionDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            def approve_request():
+                for _ in range(100):
+                    rows = store.list_pending_slack_agent_requests("claude/channel/permission")
+                    if rows:
+                        params = json.loads(rows[0]["params_json"])
+                        self.assertEqual(params["tool_name"], "Bash")
+                        self.assertIn("Commit codex parity", params["input_preview"])
+                        store.resolve_slack_agent_request(rows[0]["token"], {"behavior": "allow"})
+                        approved.set()
+                        return
+                    time.sleep(0.01)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "commit staged changes", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                approver = threading.Thread(target=approve_request)
+                approver.start()
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+                approver.join(timeout=1)
+
+                self.assertTrue(approved.is_set())
+                self.assertIn(
+                    "I'm blocked on approval before I can continue: commit codex parity",
+                    gateway.replies[0],
+                )
+                self.assertIn("Claude requests command approval: git", gateway.replies)
+                self.assertNotIn(
+                    "Claude requested a tool approval I cannot safely resume automatically.",
+                    gateway.replies,
+                )
+                self.assertIn("Done", gateway.replies)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[1].resume_session_id, "claude-multiline-commit-session")
+                self.assertIn(
+                    "Bash(git -C /workspace/repos/sample-app commit:*)",
+                    requests[1].allowed_tools,
+                )
             finally:
                 store.close()
 
@@ -1077,7 +1243,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 store.init_schema()
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
-                task = create_agent_task(agent, "show recent talos commits", "C1")
+                task = create_agent_task(agent, "show recent sample-app commits", "C1")
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -1100,7 +1266,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertTrue(approved.is_set())
                 self.assertTrue(denied_processes[0].terminated)
                 self.assertEqual(
-                    gateway.replies.count("Claude requests tool approval: Bash"),
+                    gateway.replies.count("Claude requests command approval: git"),
                     1,
                 )
                 self.assertIn("Done", gateway.replies)

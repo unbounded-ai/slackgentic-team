@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1301,6 +1302,79 @@ class SessionMirrorTests(unittest.TestCase):
                 assert updated is not None
                 self.assertEqual(updated.session_provider, Provider.CLAUDE)
                 self.assertEqual(updated.session_id, "managed-s1")
+            finally:
+                store.close()
+
+    def test_stale_managed_claude_session_prompt_is_not_mirrored_as_external(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "old managed task", "C1")
+                prompt = build_task_prompt(agent, task)
+                task = replace(task, status=AgentTaskStatus.DONE)
+                store.upsert_agent_task(task)
+                transcript = Path(tmp) / "claude.jsonl"
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "queue-operation",
+                            "operation": "enqueue",
+                            "content": prompt,
+                        }
+                    )
+                    + "\n"
+                )
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="stale-managed-s1",
+                    transcript_path=transcript,
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="stale-managed-s1",
+                        timestamp=None,
+                        event_type="user",
+                        line_number=1,
+                        metadata={"message": {"content": prompt}},
+                    ),
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="stale-managed-s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=2,
+                        metadata={
+                            "message": {"content": [{"type": "text", "text": "managed visible"}]}
+                        },
+                    ),
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(
+                        Provider.CLAUDE,
+                        "stale-managed-s1",
+                        "T1",
+                        "C1",
+                    )
+                )
             finally:
                 store.close()
 

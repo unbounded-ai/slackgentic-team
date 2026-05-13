@@ -403,7 +403,12 @@ class SlackTeamController:
         )
         posted = self.gateway.post_thread_reply(
             thread,
-            format_agent_assignment(result.agent, result.request.prompt, event.get("user")),
+            format_agent_assignment(
+                result.agent,
+                result.request.prompt,
+                event.get("user"),
+                dangerous_mode=_task_dangerous_mode(result.task),
+            ),
             persona=result.agent,
             blocks=blocks,
             icon_url=self._agent_icon_url(result.agent),
@@ -568,10 +573,13 @@ class SlackTeamController:
             pending.thread_ts,
             pending.message_ts,
         )
-        text = (
-            "Capacity is available now.\n\n"
-            f"{format_agent_assignment(result.agent, result.request.prompt, pending.requested_by_slack_user)}"
+        assignment_text = format_agent_assignment(
+            result.agent,
+            result.request.prompt,
+            pending.requested_by_slack_user,
+            dangerous_mode=_task_dangerous_mode(result.task),
         )
+        text = f"Capacity is available now.\n\n{assignment_text}"
         blocks = build_task_thread_blocks(result.task, result.agent)
         posted = self.gateway.post_thread_reply(
             thread,
@@ -1239,7 +1247,12 @@ class SlackTeamController:
             return True
         posted = self.gateway.post_thread_reply(
             SlackThreadRef(channel_id, thread_ts),
-            format_agent_assignment(result.agent, result.request.prompt, event.get("user")),
+            format_agent_assignment(
+                result.agent,
+                result.request.prompt,
+                event.get("user"),
+                dangerous_mode=_task_dangerous_mode(result.task),
+            ),
             persona=result.agent,
             icon_url=self._agent_icon_url(result.agent),
         )
@@ -1321,7 +1334,12 @@ class SlackTeamController:
             return True
         posted = self.gateway.post_thread_reply(
             SlackThreadRef(channel_id, thread_ts),
-            format_agent_assignment(result.agent, result.request.prompt, event.get("user")),
+            format_agent_assignment(
+                result.agent,
+                result.request.prompt,
+                event.get("user"),
+                dangerous_mode=_task_dangerous_mode(result.task),
+            ),
             persona=result.agent,
             icon_url=self._agent_icon_url(result.agent),
         )
@@ -1557,7 +1575,10 @@ class SlackTeamController:
             posted = self.gateway.post_thread_reply(
                 thread,
                 format_agent_assignment(
-                    result.agent, result.request.prompt, requested_by_slack_user
+                    result.agent,
+                    result.request.prompt,
+                    requested_by_slack_user,
+                    dangerous_mode=_task_dangerous_mode(result.task),
                 ),
                 persona=result.agent,
                 blocks=blocks,
@@ -1659,9 +1680,19 @@ class SlackTeamController:
         task = self._task_with_prior_session(result.task, previous_task)
         self.store.upsert_agent_task(task)
         if sender_agent is not None:
-            text = format_agent_handoff_assignment(agent, sender_agent, result.request.prompt)
+            text = format_agent_handoff_assignment(
+                agent,
+                sender_agent,
+                result.request.prompt,
+                dangerous_mode=_task_dangerous_mode(task),
+            )
         else:
-            text = format_agent_assignment(agent, result.request.prompt, requested_by_slack_user)
+            text = format_agent_assignment(
+                agent,
+                result.request.prompt,
+                requested_by_slack_user,
+                dangerous_mode=_task_dangerous_mode(task),
+            )
         posted = self.gateway.post_thread_reply(
             thread,
             text,
@@ -2107,6 +2138,7 @@ class SlackTeamController:
                     agent,
                     _task_assignment_prompt(task),
                     task.requested_by_slack_user,
+                    dangerous_mode=_task_dangerous_mode(task),
                 ),
                 blocks=build_task_thread_blocks(task, agent, include_actions=False),
             )
@@ -2129,6 +2161,7 @@ class SlackTeamController:
                     agent,
                     _task_assignment_prompt(task),
                     task.requested_by_slack_user,
+                    dangerous_mode=_task_dangerous_mode(task),
                 ),
                 blocks=build_task_thread_blocks(task, agent, include_actions=True),
             )

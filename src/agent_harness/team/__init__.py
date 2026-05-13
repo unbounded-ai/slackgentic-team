@@ -781,18 +781,34 @@ def format_agent_introduction(agent: TeamAgent) -> str:
     return f"Hi, I'm @{agent.handle}. Outside work: {agent_personal_context(agent)}."
 
 
-def format_agent_assignment(agent: TeamAgent, prompt: str, requester: str | None = None) -> str:
+def format_agent_assignment(
+    agent: TeamAgent,
+    prompt: str,
+    requester: str | None = None,
+    *,
+    dangerous_mode: bool = False,
+) -> str:
     requester_text = f" for <@{requester}>" if requester else ""
     opener = _assignment_opener(agent)
-    return f"{opener}{requester_text}.\n\n*Task:* {prompt.strip()}"
+    lines = [f"{opener}{requester_text}."]
+    if dangerous_mode:
+        lines.append("*Dangerous mode:* enabled for this task.")
+    lines.append(f"*Task:* {prompt.strip()}")
+    return "\n\n".join(lines)
 
 
 def format_agent_handoff_assignment(
     agent: TeamAgent,
     sender: TeamAgent,
     prompt: str,
+    *,
+    dangerous_mode: bool = False,
 ) -> str:
-    return f"Got it, @{sender.handle}. I'll handle it.\n\n*Task:* {prompt.strip()}"
+    lines = [f"Got it, @{sender.handle}. I'll handle it."]
+    if dangerous_mode:
+        lines.append("*Dangerous mode:* enabled for this task.")
+    lines.append(f"*Task:* {prompt.strip()}")
+    return "\n\n".join(lines)
 
 
 def format_agent_handoff_request(
