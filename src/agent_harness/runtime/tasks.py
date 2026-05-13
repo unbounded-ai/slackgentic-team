@@ -52,6 +52,9 @@ class RunningTask:
     session_buffer: str = ""
     permission_buffer: str = ""
     permission_denials: list[dict] = field(default_factory=list)
+    permission_denial_keys: set[str] = field(default_factory=set)
+    permission_tool_uses: dict[str, dict] = field(default_factory=dict)
+    permission_request_tokens: dict[str, str] = field(default_factory=dict)
     resume_error_buffer: str = ""
     missing_resume_session: bool = False
     observed_agent_messages: set[str] | None = None
@@ -393,8 +396,15 @@ class ManagedTaskRuntime:
             output,
             running.permission_buffer,
             final=final,
+            tool_uses=running.permission_tool_uses,
         )
-        running.permission_denials.extend(denials)
+        for denial in denials:
+            key = _claude_denial_key(denial)
+            if key in running.permission_denial_keys:
+                continue
+            running.permission_denial_keys.add(key)
+            running.permission_denials.append(denial)
+            self._ensure_claude_permission_request(running, denial)
 
     def _capture_resume_errors(
         self,
@@ -450,8 +460,8 @@ class ManagedTaskRuntime:
         completed_task: AgentTask,
     ) -> None:
         denial = running.permission_denials[0]
-        allowed_tool = _allowed_tool_for_claude_denial(denial)
-        if allowed_tool is None:
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+        if not allowed_tools:
             self.gateway.post_thread_reply(
                 running.thread,
                 "Claude requested a tool approval I cannot safely resume automatically.",
@@ -462,19 +472,17 @@ class ManagedTaskRuntime:
             self.store.delete_managed_thread_task(completed_task.task_id)
             return
 
-        from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+        token = self._ensure_claude_permission_request(running, denial)
+        response = None
+        if token:
+            from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 
-        handler = SlackAgentRequestHandler(
-            self.gateway,
-            store=self.store,
-            provider_label="Claude",
-        )
-        response = handler.handle_persistent_request(
-            "claude/channel/permission",
-            _claude_denial_request_params(denial),
-            running.thread,
-            provider_label="Claude",
-        )
+            handler = SlackAgentRequestHandler(
+                self.gateway,
+                store=self.store,
+                provider_label="Claude",
+            )
+            response = handler.wait_for_persistent_request(token)
         if not isinstance(response, dict) or response.get("behavior") != "allow":
             self.gateway.post_thread_reply(
                 running.thread,
@@ -498,8 +506,35 @@ class ManagedTaskRuntime:
             retry_task,
             running.agent,
             running.thread,
-            allowed_tools=_append_allowed_tool(running.allowed_tools, allowed_tool),
+            allowed_tools=_append_allowed_tools(running.allowed_tools, allowed_tools),
         )
+
+    def _ensure_claude_permission_request(
+        self,
+        running: RunningTask,
+        denial: dict,
+    ) -> str | None:
+        if not _allowed_tools_for_claude_denial(denial):
+            return None
+        key = _claude_denial_key(denial)
+        existing = running.permission_request_tokens.get(key)
+        if existing:
+            return existing
+        from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+
+        handler = SlackAgentRequestHandler(
+            self.gateway,
+            store=self.store,
+            provider_label="Claude",
+        )
+        pending = handler.create_persistent_request(
+            "claude/channel/permission",
+            _claude_denial_request_params(denial),
+            running.thread,
+            provider_label="Claude",
+        )
+        running.permission_request_tokens[key] = pending.token
+        return pending.token
 
     def _get_running(self, task_id: str) -> RunningTask | None:
         with self._lock:
@@ -641,6 +676,7 @@ def _claude_permission_denials(
     text: str,
     buffer: str = "",
     final: bool = False,
+    tool_uses: dict[str, dict] | None = None,
 ) -> tuple[list[dict], str]:
     combined = buffer + text
     if not combined:
@@ -656,7 +692,11 @@ def _claude_permission_denials(
             event = json.loads(line.strip())
         except json.JSONDecodeError:
             continue
+        if tool_uses is not None:
+            _remember_claude_tool_uses(event, tool_uses)
         denials.extend(_claude_result_permission_denials(event))
+        if tool_uses is not None:
+            denials.extend(_claude_stream_permission_denials(event, tool_uses))
     return denials, next_buffer
 
 
@@ -704,14 +744,94 @@ def _claude_result_permission_denials(event: object) -> list[dict]:
     return [denial for denial in denials if isinstance(denial, dict)]
 
 
+def _remember_claude_tool_uses(event: dict, tool_uses: dict[str, dict]) -> None:
+    if event.get("type") != "assistant":
+        return
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        tool_use_id = item.get("id")
+        tool_name = item.get("name")
+        if not isinstance(tool_use_id, str) or not isinstance(tool_name, str):
+            continue
+        tool_input = item.get("input")
+        tool_uses[tool_use_id] = {
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "tool_input": tool_input if isinstance(tool_input, dict) else {},
+        }
+
+
+def _claude_stream_permission_denials(event: dict, tool_uses: dict[str, dict]) -> list[dict]:
+    if event.get("type") != "user":
+        return []
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    denials: list[dict] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_result":
+            continue
+        if not item.get("is_error"):
+            continue
+        tool_use_id = item.get("tool_use_id")
+        if not isinstance(tool_use_id, str):
+            continue
+        if not _claude_tool_result_is_permission_denial(item):
+            continue
+        tool_use = tool_uses.get(tool_use_id)
+        if tool_use:
+            denials.append(dict(tool_use))
+    return denials
+
+
+def _claude_tool_result_is_permission_denial(item: dict) -> bool:
+    values = [item.get("content"), item.get("toolUseResult")]
+    text = "\n".join(str(value) for value in values if value)
+    text = text.lower()
+    return (
+        "requires approval" in text
+        or "approve before running" in text
+        or "requested permissions" in text
+        or "haven't granted it yet" in text
+    )
+
+
+def _claude_denial_key(denial: dict) -> str:
+    tool_name = str(denial.get("tool_name") or "")
+    tool_input = denial.get("tool_input")
+    normalized_input = tool_input if isinstance(tool_input, dict) else {}
+    return json.dumps(
+        {"tool_name": tool_name, "tool_input": normalized_input},
+        sort_keys=True,
+        default=str,
+    )
+
+
 def _allowed_tool_for_claude_denial(denial: dict) -> str | None:
+    allowed_tools = _allowed_tools_for_claude_denial(denial)
+    return allowed_tools[0] if allowed_tools else None
+
+
+def _allowed_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     tool_name = str(denial.get("tool_name") or "")
     tool_input = denial.get("tool_input")
     if tool_name == "Bash" and isinstance(tool_input, dict):
         command = tool_input.get("command")
         if isinstance(command, str):
-            return _allowed_bash_tool_for_command(command)
-    return None
+            return _allowed_bash_tools_for_command(command)
+    if tool_name in {"Edit", "MultiEdit", "Write"}:
+        return (tool_name,)
+    return ()
 
 
 def _append_allowed_tool(existing: tuple[str, ...], allowed_tool: str) -> tuple[str, ...]:
@@ -720,39 +840,85 @@ def _append_allowed_tool(existing: tuple[str, ...], allowed_tool: str) -> tuple[
     return (*existing, allowed_tool)
 
 
-def _allowed_bash_tool_for_command(command: str) -> str | None:
+def _append_allowed_tools(
+    existing: tuple[str, ...],
+    allowed_tools: tuple[str, ...],
+) -> tuple[str, ...]:
+    next_tools = existing
+    for allowed_tool in allowed_tools:
+        next_tools = _append_allowed_tool(next_tools, allowed_tool)
+    return next_tools
+
+
+def _allowed_bash_tools_for_command(command: str) -> tuple[str, ...]:
     command = command.strip()
     if not command or "\n" in command or "\r" in command:
-        return None
+        return ()
     try:
         parts = shlex.split(command)
     except ValueError:
         parts = []
-    if parts and parts[0] == "gh":
-        return _allowed_gh_bash_tool(parts, command)
-    if ")" in command or "," in command:
-        return None
-    return f"Bash({command})"
+    effective_parts = _strip_cd_prefix(parts)
+    tools: list[str] = []
+    if effective_parts and effective_parts[0] == "gh":
+        safe_tools = _allowed_gh_bash_tools(effective_parts)
+    elif effective_parts and effective_parts[0] == "git":
+        safe_tools = _allowed_git_bash_tools(effective_parts)
+    else:
+        safe_tools = ()
+    if safe_tools:
+        if ")" not in command and "," not in command:
+            tools.append(f"Bash({command})")
+        tools.extend(safe_tools)
+    elif not effective_parts or effective_parts[0] not in {"gh", "git"}:
+        if ")" not in command and "," not in command:
+            tools.append(f"Bash({command})")
+    return tuple(dict.fromkeys(tools))
 
 
-def _allowed_gh_bash_tool(parts: list[str], command: str) -> str | None:
-    if parts == ["gh", "auth", "status"] and ")" not in command and "," not in command:
-        return f"Bash({command})"
+def _strip_cd_prefix(parts: list[str]) -> list[str]:
+    if len(parts) >= 4 and parts[0] == "cd" and parts[2] == "&&":
+        return parts[3:]
+    return parts
+
+
+def _allowed_bash_tool_for_command(command: str) -> str | None:
+    allowed_tools = _allowed_bash_tools_for_command(command)
+    return allowed_tools[0] if allowed_tools else None
+
+
+def _allowed_gh_bash_tools(parts: list[str]) -> tuple[str, ...]:
+    if parts == ["gh", "auth", "status"]:
+        return ("Bash(gh auth status)",)
     if len(parts) < 3:
-        return None
+        return ()
     group, action = parts[1], parts[2]
     safe_patterns = {
-        ("pr", "checks"): "Bash(gh pr checks *)",
-        ("pr", "diff"): "Bash(gh pr diff *)",
-        ("pr", "list"): "Bash(gh pr list *)",
-        ("pr", "status"): "Bash(gh pr status *)",
-        ("pr", "view"): "Bash(gh pr view *)",
-        ("repo", "view"): "Bash(gh repo view *)",
-        ("run", "list"): "Bash(gh run list *)",
-        ("run", "view"): "Bash(gh run view *)",
-        ("search", "prs"): "Bash(gh search prs *)",
+        ("pr", "checks"): ("Bash(gh pr checks:*)", "Bash(gh pr checks *)"),
+        ("pr", "diff"): ("Bash(gh pr diff:*)", "Bash(gh pr diff *)"),
+        ("pr", "list"): ("Bash(gh pr list:*)", "Bash(gh pr list *)"),
+        ("pr", "status"): ("Bash(gh pr status:*)", "Bash(gh pr status *)"),
+        ("pr", "view"): ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
+        ("repo", "view"): ("Bash(gh repo view:*)", "Bash(gh repo view *)"),
+        ("run", "list"): ("Bash(gh run list:*)", "Bash(gh run list *)"),
+        ("run", "view"): ("Bash(gh run view:*)", "Bash(gh run view *)"),
+        ("search", "prs"): ("Bash(gh search prs:*)", "Bash(gh search prs *)"),
     }
-    return safe_patterns.get((group, action))
+    return safe_patterns.get((group, action), ())
+
+
+def _allowed_git_bash_tools(parts: list[str]) -> tuple[str, ...]:
+    if len(parts) < 2:
+        return ()
+    action = parts[1]
+    safe_patterns = {
+        "branch": ("Bash(git branch:*)", "Bash(git branch *)"),
+        "diff": ("Bash(git diff:*)", "Bash(git diff *)"),
+        "log": ("Bash(git log:*)", "Bash(git log *)"),
+        "show": ("Bash(git show:*)", "Bash(git show *)"),
+        "status": ("Bash(git status)",),
+    }
+    return safe_patterns.get(action, ())
 
 
 def _claude_denial_request_params(denial: dict) -> dict[str, object]:

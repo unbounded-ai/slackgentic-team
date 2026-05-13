@@ -19,6 +19,7 @@ from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
     ManagedTaskRuntime,
     _allowed_tool_for_claude_denial,
+    _allowed_tools_for_claude_denial,
     _append_allowed_tool,
     _claude_missing_resume_session,
     _claude_permission_denials,
@@ -110,6 +111,57 @@ class ClaudePermissionDeniedProcess(OneShotProcess):
                         "session_id": self.session_id,
                     }
                 )
+                + "\n"
+            )
+        return ""
+
+
+class ClaudeStreamPermissionDeniedProcess(OneShotProcess):
+    session_id = "claude-stream-denied-session"
+    command = "cd /Users/ilshat/code/unbounded-ai/talos && git log --oneline -30"
+    description = "Show recent commits"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            assistant = {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_stream",
+                            "name": "Bash",
+                            "input": {
+                                "command": self.command,
+                                "description": self.description,
+                            },
+                        }
+                    ]
+                },
+            }
+            denial = {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_stream",
+                            "content": (
+                                "This command changes directory before running git, "
+                                "which can execute untrusted hooks from the target "
+                                "directory. Approve before running."
+                            ),
+                            "is_error": True,
+                        }
+                    ]
+                },
+            }
+            return (
+                f'{{"type":"system","session_id":"{self.session_id}"}}\n'
+                + json.dumps(assistant)
+                + "\n"
+                + json.dumps(denial)
                 + "\n"
             )
         return ""
@@ -443,7 +495,25 @@ class TaskRuntimeTests(unittest.TestCase):
             },
         }
 
-        self.assertEqual(_allowed_tool_for_claude_denial(denial), "Bash(gh pr view *)")
+        self.assertEqual(_allowed_tool_for_claude_denial(denial), "Bash(gh pr view:*)")
+
+    def test_claude_permission_denial_allows_git_log_after_cd(self):
+        denial = {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "cd /Users/ilshat/code/unbounded-ai/talos && git log --oneline -30"
+            },
+        }
+
+        self.assertEqual(
+            _allowed_tool_for_claude_denial(denial),
+            "Bash(cd /Users/ilshat/code/unbounded-ai/talos && git log --oneline -30)",
+        )
+        self.assertIn("Bash(git log:*)", _allowed_tools_for_claude_denial(denial))
+
+    def test_claude_permission_denial_allows_file_edit_tools(self):
+        self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Edit"}), "Edit")
+        self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Write"}), "Write")
 
     def test_claude_permission_denial_rejects_gh_write_pattern(self):
         denial = {
@@ -454,10 +524,10 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIsNone(_allowed_tool_for_claude_denial(denial))
 
     def test_append_allowed_tool_preserves_prior_approvals(self):
-        allowed = _append_allowed_tool(("Bash(gh pr list *)",), "Bash(gh pr view *)")
+        allowed = _append_allowed_tool(("Bash(gh pr list:*)",), "Bash(gh pr view:*)")
 
-        self.assertEqual(allowed, ("Bash(gh pr list *)", "Bash(gh pr view *)"))
-        self.assertEqual(_append_allowed_tool(allowed, "Bash(gh pr view *)"), allowed)
+        self.assertEqual(allowed, ("Bash(gh pr list:*)", "Bash(gh pr view:*)"))
+        self.assertEqual(_append_allowed_tool(allowed, "Bash(gh pr view:*)"), allowed)
 
     def test_claude_missing_resume_error_is_detected(self):
         result = json.dumps(
@@ -831,7 +901,70 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertNotIn("The command requires approval.", gateway.replies)
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-denied-session")
-                self.assertEqual(requests[1].allowed_tools, ("Bash(gh pr view *)",))
+                self.assertEqual(
+                    requests[1].allowed_tools,
+                    ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
+                )
+            finally:
+                store.close()
+
+    def test_runtime_posts_streamed_claude_permission_denial_without_waiting_for_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            approved = threading.Event()
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudeStreamPermissionDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            def approve_request():
+                for _ in range(100):
+                    rows = store.list_pending_slack_agent_requests("claude/channel/permission")
+                    if rows:
+                        params = json.loads(rows[0]["params_json"])
+                        self.assertEqual(params["tool_name"], "Bash")
+                        self.assertIn("git log --oneline -30", params["input_preview"])
+                        store.resolve_slack_agent_request(rows[0]["token"], {"behavior": "allow"})
+                        approved.set()
+                        return
+                    time.sleep(0.01)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "show recent talos commits", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                approver = threading.Thread(target=approve_request)
+                approver.start()
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+                approver.join(timeout=1)
+
+                self.assertTrue(approved.is_set())
+                self.assertEqual(
+                    gateway.replies.count("Claude requests tool approval: Bash"),
+                    1,
+                )
+                self.assertIn("Done", gateway.replies)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[1].resume_session_id, "claude-stream-denied-session")
+                self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
             finally:
                 store.close()
 
@@ -888,10 +1021,18 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(approved_tokens), 2)
                 self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 3)
-                self.assertEqual(requests[1].allowed_tools, ("Bash(gh pr view *)",))
+                self.assertEqual(
+                    requests[1].allowed_tools,
+                    ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
+                )
                 self.assertEqual(
                     requests[2].allowed_tools,
-                    ("Bash(gh pr view *)", "Bash(gh search prs *)"),
+                    (
+                        "Bash(gh pr view:*)",
+                        "Bash(gh pr view *)",
+                        "Bash(gh search prs:*)",
+                        "Bash(gh search prs *)",
+                    ),
                 )
             finally:
                 store.close()
