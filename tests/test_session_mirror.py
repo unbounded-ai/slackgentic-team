@@ -2186,6 +2186,86 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_older_claude_session_does_not_reclaim_newer_live_target_same_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=0, claude_count=2)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 5, 13, 5, 0, tzinfo=UTC)
+                old_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="old",
+                    transcript_path=Path(tmp) / "old.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started + timedelta(minutes=10),
+                )
+                new_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="new",
+                    transcript_path=Path(tmp) / "new.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started + timedelta(minutes=20),
+                    last_seen_at=started + timedelta(minutes=30),
+                )
+                store.upsert_session(old_session)
+                store.upsert_session(new_session)
+                store.set_setting("external_session_agent.claude.old", agents[0].agent_id)
+                store.set_setting("external_session_live_target.claude.old", "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "old",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                notifier = FakeTerminalNotifier(
+                    [
+                        TerminalTarget(
+                            pid=123,
+                            tty="ttys001",
+                            cwd=Path(tmp),
+                            command=(
+                                "claude --dangerously-load-development-channels server:slackgentic"
+                            ),
+                            started_at=started,
+                        )
+                    ]
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider([old_session, new_session], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=notifier,
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertIsNone(
+                    store.get_setting("external_session_live_target.claude.old")
+                )
+                self.assertIsNone(
+                    store.get_setting("external_session_missing_target.claude.old")
+                )
+                self.assertIsNone(store.get_setting("external_session_ignored.claude.old"))
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.old"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(
+                    store.get_setting("external_session_live_target.claude.new"),
+                    "123",
+                )
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
