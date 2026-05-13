@@ -455,9 +455,8 @@ def _approval_action_blocks(pending: PendingAgentRequest) -> list[dict[str, Any]
     elif method == "claude/channel/permission":
         labels = [
             ("Allow", "approve", "primary"),
+            ("Allow Session", "approve_session", None),
         ]
-        if pending.params.get("can_allow_session"):
-            labels.append(("Allow Session", "approve_session", None))
         labels.append(("Deny", "deny", "danger"))
     elif method == "item/permissions/requestApproval":
         labels = [

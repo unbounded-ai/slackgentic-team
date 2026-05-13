@@ -231,6 +231,41 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_claude_edit_permission_can_be_allowed_for_session_without_runtime_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=0.01,
+                    store=store,
+                    provider_label="Claude",
+                )
+
+                requester.create_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": "req-1",
+                        "tool_name": "Edit",
+                        "description": "A tool for editing files",
+                        "input_preview": (
+                            '{"file_path":"/tmp/README.md","old_string":"before",'
+                            '"new_string":"after"}'
+                        ),
+                    },
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                actions = _first_actions_block(gateway.replies[0]["blocks"])["elements"]
+                self.assertEqual(
+                    [action["text"]["text"] for action in actions],
+                    ["Allow", "Allow Session", "Deny"],
+                )
+            finally:
+                store.close()
+
     def test_claude_edit_permission_preview_is_shown_as_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
