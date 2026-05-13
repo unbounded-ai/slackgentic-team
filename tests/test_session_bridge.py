@@ -589,7 +589,7 @@ class SessionBridgeTests(unittest.TestCase):
                     transcript_path=Path(tmp) / "claude.jsonl",
                     cwd=Path(tmp),
                     status=SessionStatus.ACTIVE,
-                    started_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+                    started_at=datetime(2026, 4, 27, 12, 30, tzinfo=UTC),
                     last_seen_at=datetime.now(UTC),
                 )
                 _write_claude_slackgentic_mcp_marker(session.transcript_path)
@@ -669,6 +669,82 @@ class SessionBridgeTests(unittest.TestCase):
                 self.assertTrue(handled)
                 self.assertTrue(delivered.is_set())
                 self.assertEqual(calls, [])
+            finally:
+                store.close()
+
+    def test_older_claude_session_same_live_process_uses_resume_not_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            calls = []
+            ran = threading.Event()
+            target_started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command="claude --dangerously-load-development-channels server:slackgentic",
+                        started_at=target_started,
+                    )
+                ]
+            )
+
+            def runner(args, **kwargs):
+                calls.append(args)
+                ran.set()
+                return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            try:
+                store.init_schema()
+                bridge = ExternalSessionBridge(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(claude_binary="claude-bin", default_cwd=Path(tmp)),
+                    command_runner=runner,
+                    terminal_notifier=terminal,
+                    channel_delivery_timeout=0.01,
+                )
+                older_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="older",
+                    transcript_path=Path(tmp) / "older.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=target_started,
+                    last_seen_at=datetime(2026, 4, 27, 12, 10, tzinfo=UTC),
+                )
+                newer_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="newer",
+                    transcript_path=Path(tmp) / "newer.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=datetime(2026, 4, 27, 12, 30, tzinfo=UTC),
+                    last_seen_at=datetime(2026, 4, 27, 12, 35, tzinfo=UTC),
+                )
+                _write_claude_slackgentic_mcp_marker(older_session.transcript_path)
+                _write_claude_slackgentic_mcp_marker(newer_session.transcript_path)
+                store.upsert_session(older_session)
+                store.upsert_session(newer_session)
+
+                self.assertTrue(
+                    bridge.send_to_session(
+                        older_session,
+                        "continue the older thread",
+                        SlackThreadRef("C1", "171"),
+                    )
+                )
+
+                self.assertTrue(ran.wait(timeout=1))
+                self.assertEqual(
+                    calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
+                )
+                self.assertIn("older", calls[0])
+                row = store.conn.execute(
+                    "SELECT COUNT(*) AS count FROM claude_channel_messages"
+                ).fetchone()
+                self.assertEqual(row["count"], 0)
             finally:
                 store.close()
 
