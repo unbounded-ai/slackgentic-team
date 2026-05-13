@@ -502,6 +502,11 @@ class ManagedTaskRuntime:
             self.store.update_agent_task_status(completed_task.task_id, AgentTaskStatus.CANCELLED)
             self.store.delete_managed_thread_task(completed_task.task_id)
             return
+        if response.get("scope") == "session":
+            allowed_tools = _append_allowed_tools(
+                allowed_tools,
+                _allowed_session_tools_for_claude_denial(denial),
+            )
 
         current = self.store.get_agent_task(completed_task.task_id) or completed_task
         retry_task = replace(
@@ -851,6 +856,16 @@ def _allowed_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     return ()
 
 
+def _allowed_session_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
+    tool_name = str(denial.get("tool_name") or "")
+    tool_input = denial.get("tool_input")
+    if tool_name == "Bash" and isinstance(tool_input, dict):
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            return _allowed_bash_session_tools_for_command(command)
+    return ()
+
+
 def _append_allowed_tool(existing: tuple[str, ...], allowed_tool: str) -> tuple[str, ...]:
     if allowed_tool in existing:
         return existing
@@ -869,7 +884,7 @@ def _append_allowed_tools(
 
 def _allowed_bash_tools_for_command(command: str) -> tuple[str, ...]:
     command = command.strip()
-    if not command or "\n" in command or "\r" in command:
+    if not command or "\r" in command:
         return ()
     try:
         parts = shlex.split(command)
@@ -877,20 +892,61 @@ def _allowed_bash_tools_for_command(command: str) -> tuple[str, ...]:
         parts = []
     effective_parts = _strip_cd_prefix(parts)
     tools: list[str] = []
+    exact_allowed = _exact_bash_permission_allowed(command)
     if effective_parts and effective_parts[0] == "gh":
-        safe_tools = _allowed_gh_bash_tools(effective_parts)
+        prefix_tools = _allowed_gh_bash_tools(
+            effective_parts,
+            include_generic=not exact_allowed,
+        )
     elif effective_parts and effective_parts[0] == "git":
-        safe_tools = _allowed_git_bash_tools(effective_parts)
+        prefix_tools = _allowed_git_bash_tools(effective_parts)
     else:
-        safe_tools = ()
-    if safe_tools:
-        if ")" not in command and "," not in command:
-            tools.append(f"Bash({command})")
-        tools.extend(safe_tools)
-    elif not effective_parts or effective_parts[0] not in {"gh", "git"}:
-        if ")" not in command and "," not in command:
-            tools.append(f"Bash({command})")
+        prefix_tools = ()
+    if exact_allowed:
+        tools.append(f"Bash({command})")
+    if prefix_tools:
+        tools.extend(prefix_tools)
+    elif not exact_allowed:
+        tools.extend(_generic_bash_tools(command, effective_parts))
     return tuple(dict.fromkeys(tools))
+
+
+def _exact_bash_permission_allowed(command: str) -> bool:
+    return not any(value in command for value in (")", ",", "\n", "\r"))
+
+
+def _generic_bash_tools(command: str, parts: list[str]) -> tuple[str, ...]:
+    prefix = _generic_bash_prefix(command, parts)
+    if prefix is None:
+        return ()
+    return (f"Bash({prefix}:*)", f"Bash({prefix} *)")
+
+
+def _generic_bash_prefix(command: str, parts: list[str]) -> str | None:
+    for prefix_len in range(len(parts), 1, -1):
+        prefix = shlex.join(parts[:prefix_len])
+        if ")" in prefix or "," in prefix or "\n" in prefix or "\r" in prefix:
+            continue
+        if command.startswith(prefix):
+            return prefix
+    return None
+
+
+def _allowed_bash_session_tools_for_command(command: str) -> tuple[str, ...]:
+    command = command.strip()
+    if not command or "\r" in command:
+        return ()
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return ()
+    effective_parts = _strip_cd_prefix(parts)
+    if not effective_parts:
+        return ()
+    executable = shlex.join(effective_parts[:1])
+    if any(value in executable for value in (")", ",", "\n", "\r")):
+        return ()
+    return (f"Bash({executable}:*)", f"Bash({executable} *)")
 
 
 def _strip_cd_prefix(parts: list[str]) -> list[str]:
@@ -904,7 +960,11 @@ def _allowed_bash_tool_for_command(command: str) -> str | None:
     return allowed_tools[0] if allowed_tools else None
 
 
-def _allowed_gh_bash_tools(parts: list[str]) -> tuple[str, ...]:
+def _allowed_gh_bash_tools(
+    parts: list[str],
+    *,
+    include_generic: bool = True,
+) -> tuple[str, ...]:
     if parts == ["gh", "auth", "status"]:
         return ("Bash(gh auth status)",)
     if len(parts) < 3:
@@ -921,7 +981,11 @@ def _allowed_gh_bash_tools(parts: list[str]) -> tuple[str, ...]:
         ("run", "view"): ("Bash(gh run view:*)", "Bash(gh run view *)"),
         ("search", "prs"): ("Bash(gh search prs:*)", "Bash(gh search prs *)"),
     }
-    return safe_patterns.get((group, action), ())
+    patterns = list(safe_patterns.get((group, action), ()))
+    prefix = shlex.join(parts[:3])
+    if include_generic and ")" not in prefix and "," not in prefix:
+        patterns.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
+    return tuple(dict.fromkeys(patterns))
 
 
 def _allowed_git_bash_tools(parts: list[str]) -> tuple[str, ...]:
@@ -937,8 +1001,7 @@ def _allowed_git_bash_tools(parts: list[str]) -> tuple[str, ...]:
         "status": ("Bash(git status)", "Bash(git status:*)", "Bash(git status *)"),
     }
     patterns = list(safe_patterns.get(action, ()))
-    default_prefix = f"git {action}"
-    if prefix != default_prefix and ")" not in prefix and "," not in prefix:
+    if ")" not in prefix and "," not in prefix:
         patterns.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
     return tuple(dict.fromkeys(patterns))
 

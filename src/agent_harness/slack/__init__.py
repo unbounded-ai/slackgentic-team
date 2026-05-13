@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_harness.models import AgentTask, Provider, SlackThreadRef, TeamAgent
+from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
+    AgentTask,
+    Provider,
+    SlackThreadRef,
+    TeamAgent,
+)
 from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
@@ -427,6 +433,11 @@ def build_task_thread_blocks(
     include_actions: bool = True,
 ) -> list[dict[str, Any]]:
     task_label = "PR review" if task.kind.value == "review" else "task"
+    dangerous_line = (
+        "*Dangerous mode:* enabled for this task.\n"
+        if task.metadata.get(DANGEROUS_MODE_METADATA_KEY)
+        else ""
+    )
     blocks = [
         {
             "type": "section",
@@ -434,6 +445,7 @@ def build_task_thread_blocks(
                 "type": "mrkdwn",
                 "text": (
                     f"*{agent.full_name}* `@{agent.handle}` picked up a {task_label}.\n"
+                    f"{dangerous_line}"
                     f"*Task:* {task.prompt}"
                 ),
             },

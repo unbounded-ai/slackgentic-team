@@ -126,7 +126,7 @@ too. Replies from Slack are sent into that live session when possible, or resume
 against that exact session id.
 
 Setup asks for a repos root. Agents launch there by default, and phrases like
-`in talos ...` can select a sibling repo under that root.
+`in sample-app ...` can select a sibling repo under that root.
 
 Agents can also talk to each other. When one is unsure, it can ask another agent
 for a review in the same thread; the router prefers a different provider when a

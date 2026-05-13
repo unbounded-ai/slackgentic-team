@@ -212,7 +212,7 @@ class SlackAgentRequestHandler:
         pending.event.set()
         self._update_request_message(
             pending,
-            _resolved_text(pending.method, decision, pending.provider_label),
+            _resolved_text(pending.method, decision, pending.provider_label, pending.params),
             message_ts=message_ts,
         )
         return True
@@ -253,7 +253,7 @@ class SlackAgentRequestHandler:
             self.store.resolve_slack_agent_request(token, response)
         self._update_request_message(
             pending,
-            _resolved_text(pending.method, decision, pending.provider_label),
+            _resolved_text(pending.method, decision, pending.provider_label, pending.params),
             message_ts=message_ts,
         )
         return True
@@ -364,15 +364,34 @@ def _input_request_message(pending: PendingAgentRequest) -> tuple[str, list[dict
     return text, blocks[:50]
 
 
+def _claude_permission_summary(
+    provider_label: str,
+    params: dict[str, Any],
+) -> tuple[str, list[str]]:
+    command_name = _claude_bash_command_name(params)
+    if command_name:
+        return (
+            f"{provider_label} requests command approval: {command_name}",
+            [
+                f"*{provider_label} requests command approval.*",
+                f"Command: `{_truncate(command_name, 200)}`",
+            ],
+        )
+    tool_name = _plain(params.get("tool_name"), "tool")
+    lines = [f"*{provider_label} requests tool approval.*"]
+    if tool_name:
+        lines.append(f"Tool: `{_truncate(tool_name, 200)}`")
+    return f"{provider_label} requests tool approval: {tool_name}", lines
+
+
 def _claude_permission_request_message(
     pending: PendingAgentRequest,
 ) -> tuple[str, list[dict[str, Any]]]:
-    tool_name = _plain(pending.params.get("tool_name"), "tool")
+    fallback, summary_lines = _claude_permission_summary(
+        pending.provider_label,
+        pending.params,
+    )
     description = _plain(pending.params.get("description"), "")
-    fallback = f"{pending.provider_label} requests tool approval: {tool_name}"
-    summary_lines = [f"*{pending.provider_label} requests tool approval.*"]
-    if tool_name:
-        summary_lines.append(f"Tool: `{_truncate(tool_name, 200)}`")
     if description:
         summary_lines.append(_truncate(description, 500))
     blocks: list[dict[str, Any]] = [
@@ -519,12 +538,9 @@ def _approval_text(method: str, params: dict[str, Any], provider_label: str) -> 
             lines.append(_truncate(reason, 500))
         return "\n".join(lines)
     if method == "claude/channel/permission":
-        tool_name = _plain(params.get("tool_name"), "tool")
+        _, lines = _claude_permission_summary(provider_label, params)
         description = _plain(params.get("description"), "")
         input_preview = _plain(params.get("input_preview"), "")
-        lines = [f"*{provider_label} requests tool approval.*"]
-        if tool_name:
-            lines.append(f"Tool: `{_truncate(tool_name, 200)}`")
         if description:
             lines.append(_truncate(description, 500))
         if input_preview:
@@ -609,14 +625,22 @@ def _timeout_response(method: str) -> Any:
     return None
 
 
-def _resolved_text(method: str, decision: str, provider_label: str) -> str:
+def _resolved_text(
+    method: str,
+    decision: str,
+    provider_label: str,
+    params: dict[str, Any] | None = None,
+) -> str:
     if method == "claude/channel/permission":
+        request_label = "command" if params and _claude_bash_command_name(params) else "tool"
         return {
-            "approve": f"Allowed {provider_label} tool request.",
-            "approve_session": f"Allowed {provider_label} tool request for this session.",
-            "deny": f"Denied {provider_label} tool request.",
-            "cancel": f"Denied {provider_label} tool request.",
-        }.get(decision, f"Handled {provider_label} tool request.")
+            "approve": f"Allowed {provider_label} {request_label} request.",
+            "approve_session": (
+                f"Allowed {provider_label} {request_label} request for this session."
+            ),
+            "deny": f"Denied {provider_label} {request_label} request.",
+            "cancel": f"Denied {provider_label} {request_label} request.",
+        }.get(decision, f"Handled {provider_label} {request_label} request.")
     if method == "item/permissions/requestApproval":
         return {
             "approve": f"Approved {provider_label} permissions for this turn.",
@@ -871,6 +895,29 @@ def _permission_input_object(params: dict[str, Any]) -> object:
         except json.JSONDecodeError:
             return preview
     return None
+
+
+def _claude_bash_command_name(params: dict[str, Any]) -> str:
+    if _plain(params.get("tool_name"), "") != "Bash":
+        return ""
+    input_value = _permission_input_object(params)
+    if not isinstance(input_value, dict):
+        return ""
+    command = input_value.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    try:
+        parts = shlex.split(command.strip())
+    except ValueError:
+        return ""
+    parts = _strip_cd_prefix(parts)
+    return parts[0] if parts else ""
+
+
+def _strip_cd_prefix(parts: list[str]) -> list[str]:
+    if len(parts) >= 4 and parts[0] == "cd" and parts[2] == "&&":
+        return parts[3:]
+    return parts
 
 
 def _permission_input_text(params: dict[str, Any]) -> str:
