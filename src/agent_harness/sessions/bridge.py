@@ -11,7 +11,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -257,7 +257,9 @@ class ExternalSessionBridge:
             return None
         if not claude_session_has_slackgentic_mcp(session):
             return None
-        if not _target_start_matches_session(session, target):
+        if not _session_could_belong_to_live_target(session, target):
+            return None
+        if not _is_latest_live_session_for_cwd(self.store, session, target):
             return None
         return target
 
@@ -494,6 +496,50 @@ def _is_latest_active_session_for_cwd(store: Store, session: AgentSession) -> bo
         return False
     matches.sort(key=lambda item: item.last_seen_at or item.started_at or now, reverse=True)
     return matches[0].session_id == session.session_id
+
+
+def _is_latest_live_session_for_cwd(
+    store: Store,
+    session: AgentSession,
+    target: TerminalTarget,
+) -> bool:
+    if session.cwd is None:
+        return False
+    target_started_at = target.started_at.astimezone() if target.started_at else None
+    matches: list[AgentSession] = []
+    seen_session_ids: set[str] = set()
+    for candidate in [*store.list_sessions(session.provider), session]:
+        if candidate.session_id in seen_session_ids:
+            continue
+        seen_session_ids.add(candidate.session_id)
+        if candidate.status == SessionStatus.DONE:
+            continue
+        if candidate.cwd is None or not _same_path(candidate.cwd, session.cwd):
+            continue
+        if target_started_at and candidate.started_at:
+            candidate_started_at = candidate.started_at.astimezone()
+            if candidate_started_at < target_started_at - timedelta(minutes=15):
+                continue
+        matches.append(candidate)
+    if not matches:
+        return False
+    oldest = datetime.min.replace(tzinfo=UTC)
+    matches.sort(
+        key=lambda item: item.last_seen_at or item.started_at or oldest,
+        reverse=True,
+    )
+    return matches[0].session_id == session.session_id
+
+
+def _session_could_belong_to_live_target(
+    session: AgentSession,
+    target: TerminalTarget,
+) -> bool:
+    if session.started_at is None:
+        return True
+    if target.started_at is None:
+        return False
+    return session.started_at.astimezone() >= target.started_at.astimezone() - timedelta(minutes=15)
 
 
 def _same_path(left: Path, right: Path) -> bool:
