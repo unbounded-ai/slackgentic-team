@@ -748,6 +748,84 @@ class SessionBridgeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_background_resumed_claude_session_does_not_claim_live_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            calls = []
+            ran = threading.Event()
+            target_started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command="claude --dangerously-load-development-channels server:slackgentic",
+                        started_at=target_started,
+                    )
+                ]
+            )
+
+            def runner(args, **kwargs):
+                calls.append(args)
+                ran.set()
+                return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            try:
+                store.init_schema()
+                bridge = ExternalSessionBridge(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(claude_binary="claude-bin", default_cwd=Path(tmp)),
+                    command_runner=runner,
+                    terminal_notifier=terminal,
+                    channel_delivery_timeout=0.01,
+                )
+                live_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="live",
+                    transcript_path=Path(tmp) / "live.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=target_started,
+                    last_seen_at=datetime(2026, 4, 27, 12, 30, tzinfo=UTC),
+                    metadata={"entrypoint": "cli"},
+                )
+                resumed_session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="resumed",
+                    transcript_path=Path(tmp) / "resumed.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=target_started,
+                    last_seen_at=datetime(2026, 4, 27, 12, 40, tzinfo=UTC),
+                    metadata={"entrypoint": "sdk-cli"},
+                )
+                _write_claude_slackgentic_mcp_marker(live_session.transcript_path)
+                _write_claude_slackgentic_mcp_marker(resumed_session.transcript_path)
+                store.upsert_session(live_session)
+                store.upsert_session(resumed_session)
+
+                self.assertTrue(
+                    bridge.send_to_session(
+                        resumed_session,
+                        "continue the resumed thread",
+                        SlackThreadRef("C1", "171"),
+                    )
+                )
+
+                self.assertTrue(ran.wait(timeout=1))
+                self.assertEqual(
+                    calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
+                )
+                self.assertIn("resumed", calls[0])
+                row = store.conn.execute(
+                    "SELECT COUNT(*) AS count FROM claude_channel_messages"
+                ).fetchone()
+                self.assertEqual(row["count"], 0)
+            finally:
+                store.close()
+
     def test_stale_claude_session_does_not_channel_into_new_process_same_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

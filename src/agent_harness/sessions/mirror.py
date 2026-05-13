@@ -24,7 +24,13 @@ from agent_harness.models import (
 from agent_harness.providers.base import AgentProvider
 from agent_harness.runtime.codex_app_server import DEFAULT_CODEX_APP_SERVER_URL
 from agent_harness.runtime.tasks import build_task_prompt
-from agent_harness.sessions.bridge import _codex_remote_enabled, _slackgentic_channel_enabled
+from agent_harness.sessions.bridge import (
+    _codex_remote_enabled,
+    _is_latest_live_session_for_cwd,
+    _session_can_use_live_target,
+    _session_could_belong_to_live_target,
+    _slackgentic_channel_enabled,
+)
 from agent_harness.sessions.claude_channel import (
     claude_session_has_slackgentic_mcp,
     is_slackgentic_mcp_server_configured,
@@ -433,6 +439,10 @@ class SessionMirror:
             or self._time_matched_terminal_target(session)
         )
         if target is not None:
+            if not self._live_target_matches_session(session, target):
+                self.store.delete_setting(live_target_key)
+                self.store.delete_setting(_external_session_missing_target_key(session))
+                return False
             self.store.set_setting(live_target_key, str(target.pid))
             self.store.delete_setting(_external_session_missing_target_key(session))
             return False
@@ -478,6 +488,15 @@ class SessionMirror:
             return None
         matches.sort(key=lambda item: item[0])
         return matches[0][1]
+
+    def _live_target_matches_session(self, session: AgentSession, target) -> bool:
+        if session.provider != Provider.CLAUDE:
+            return True
+        if not _session_can_use_live_target(session):
+            return False
+        if not _session_could_belong_to_live_target(session, target):
+            return False
+        return _is_latest_live_session_for_cwd(self.store, session, target)
 
     def _active_external_agent_ids(
         self,

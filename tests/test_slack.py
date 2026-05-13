@@ -225,6 +225,14 @@ class SlackTests(unittest.TestCase):
             },
         )
 
+    def test_slack_blocks_for_markdown_table_renders_empty_cells_as_blank_text(self):
+        blocks = slack_blocks_for_markdown_table("| Name | State |\n|---|---|\n| Avery | |")
+
+        self.assertIsNotNone(blocks)
+        assert blocks is not None
+        empty_cell_text = blocks[0]["rows"][1][1]["elements"][0]["elements"][0]["text"]
+        self.assertEqual(empty_cell_text, " ")
+
     def test_parse_agent_handles(self):
         self.assertEqual(parse_agent_handles("please ask @Riley and @sage"), ["riley", "sage"])
 

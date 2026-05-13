@@ -37,13 +37,16 @@ class ClaudeProvider:
     def discover(self) -> list[AgentSession]:
         if not self.projects_root.exists():
             return []
-        sessions: list[AgentSession] = []
+        sessions_by_id: dict[str, AgentSession] = {}
         for path in sorted(self.projects_root.rglob("*.jsonl")):
             session = self._session_from_path(path)
-            if session:
-                sessions.append(session)
+            if not session:
+                continue
+            existing = sessions_by_id.get(session.session_id)
+            if existing is None or _prefer_session_discovery(session, existing):
+                sessions_by_id[session.session_id] = session
         return sorted(
-            sessions,
+            sessions_by_id.values(),
             key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
@@ -62,6 +65,7 @@ class ClaudeProvider:
         model: str | None = None
         git_branch: str | None = None
         permission_mode: str | None = None
+        entrypoint: str | None = None
         for _, record in last_jsonl_records(path, limit=50):
             session_id = str(record.get("sessionId") or session_id)
             if isinstance(record.get("cwd"), str):
@@ -70,6 +74,8 @@ class ClaudeProvider:
                 git_branch = record["gitBranch"]
             if isinstance(record.get("permissionMode"), str):
                 permission_mode = record["permissionMode"]
+            if isinstance(record.get("entrypoint"), str):
+                entrypoint = record["entrypoint"]
             message = record.get("message")
             if isinstance(message, dict) and isinstance(message.get("model"), str):
                 model = message["model"]
@@ -89,7 +95,7 @@ class ClaudeProvider:
             model=model,
             git_branch=git_branch,
             permission_mode=permission_mode,
-            metadata=metadata,
+            metadata={**metadata, **({"entrypoint": entrypoint} if entrypoint else {})},
         )
 
     def iter_events(self, transcript_path: Path) -> Iterator[AgentEvent]:
@@ -169,6 +175,15 @@ def _first_timestamp(path: Path) -> datetime | None:
         if timestamp is not None:
             return timestamp
     return None
+
+
+def _prefer_session_discovery(candidate: AgentSession, existing: AgentSession) -> bool:
+    candidate_primary = candidate.transcript_path.stem == candidate.session_id
+    existing_primary = existing.transcript_path.stem == existing.session_id
+    if candidate_primary != existing_primary:
+        return candidate_primary
+    oldest = datetime.min.replace(tzinfo=UTC)
+    return (candidate.last_seen_at or oldest) > (existing.last_seen_at or oldest)
 
 
 def _usage_dedupe_id(record: dict[str, Any]) -> str:
