@@ -969,6 +969,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.join(timeout=1)
 
                 self.assertTrue(approved.is_set())
+                self.assertIn(
+                    "I'm blocked on approval before I can continue: view PR metadata",
+                    gateway.replies[0],
+                )
                 self.assertIn("Claude requests tool approval: Bash", gateway.replies)
                 self.assertIn("Done", gateway.replies)
                 self.assertNotIn("The command requires approval.", gateway.replies)
@@ -1030,6 +1034,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.join(timeout=1)
 
                 self.assertTrue(approved.is_set())
+                self.assertIn(
+                    "I'm blocked on approval before I can continue: show recent commits",
+                    gateway.replies[0],
+                )
                 self.assertEqual(
                     gateway.replies.count("Claude requests tool approval: Bash"),
                     1,

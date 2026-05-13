@@ -536,6 +536,14 @@ class ManagedTaskRuntime:
             store=self.store,
             provider_label="Claude",
         )
+        status_text = _claude_permission_status_text(denial)
+        if status_text:
+            self.gateway.post_thread_reply(
+                running.thread,
+                status_text,
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
         pending = handler.create_persistent_request(
             "claude/channel/permission",
             _claude_denial_request_params(denial),
@@ -980,6 +988,60 @@ def _claude_denial_request_params(denial: dict) -> dict[str, object]:
             params["description"] = description
         params["input_preview"] = json.dumps(tool_input, indent=2, sort_keys=True)
     return params
+
+
+def _claude_permission_status_text(denial: dict) -> str | None:
+    tool_name = str(denial.get("tool_name") or "tool")
+    tool_input = denial.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return f"I'm blocked on approval before I can continue: use Claude `{tool_name}`."
+
+    description = tool_input.get("description")
+    description_text = description.strip() if isinstance(description, str) else ""
+    if tool_name == "Bash":
+        command = tool_input.get("command")
+        if isinstance(command, str) and command.strip():
+            if description_text:
+                return (
+                    "I'm blocked on approval before I can continue: "
+                    f"{_status_sentence(description_text)} "
+                    f"(`{_status_inline_code(command.strip(), 180)}`)."
+                )
+            return (
+                "I'm blocked on approval before I can continue: "
+                f"run `{_status_inline_code(command.strip(), 220)}`."
+            )
+    if tool_name in {"Edit", "MultiEdit", "Write"}:
+        file_path = tool_input.get("file_path")
+        if isinstance(file_path, str) and file_path.strip():
+            verb = {
+                "Edit": "edit",
+                "MultiEdit": "edit",
+                "Write": "write",
+            }.get(tool_name, "change")
+            return (
+                "I'm blocked on approval before I can continue: "
+                f"{verb} `{_status_inline_code(file_path.strip(), 220)}`."
+            )
+    if description_text:
+        return (
+            f"I'm blocked on approval before I can continue: {_status_sentence(description_text)}."
+        )
+    return f"I'm blocked on approval before I can continue: use Claude `{tool_name}`."
+
+
+def _status_sentence(value: str) -> str:
+    value = value.strip().rstrip(".")
+    if not value:
+        return value
+    return value[:1].lower() + value[1:]
+
+
+def _status_inline_code(value: str, limit: int) -> str:
+    compact = " ".join(value.replace("`", "'").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "..."
 
 
 def _claude_permission_retry_prompt(denial: dict) -> str:
