@@ -2248,12 +2248,8 @@ class SessionMirrorTests(unittest.TestCase):
                 mirror.sync_once(backfill_new_sessions=False)
                 mirror.sync_once(backfill_new_sessions=False)
 
-                self.assertIsNone(
-                    store.get_setting("external_session_live_target.claude.old")
-                )
-                self.assertIsNone(
-                    store.get_setting("external_session_missing_target.claude.old")
-                )
+                self.assertIsNone(store.get_setting("external_session_live_target.claude.old"))
+                self.assertIsNone(store.get_setting("external_session_missing_target.claude.old"))
                 self.assertIsNone(store.get_setting("external_session_ignored.claude.old"))
                 self.assertEqual(
                     store.get_setting("external_session_agent.claude.old"),
@@ -2331,9 +2327,7 @@ class SessionMirrorTests(unittest.TestCase):
                 mirror.sync_once(backfill_new_sessions=False)
                 mirror.sync_once(backfill_new_sessions=False)
 
-                self.assertIsNone(
-                    store.get_setting("external_session_live_target.claude.resumed")
-                )
+                self.assertIsNone(store.get_setting("external_session_live_target.claude.resumed"))
                 self.assertIsNone(
                     store.get_setting("external_session_missing_target.claude.resumed")
                 )
