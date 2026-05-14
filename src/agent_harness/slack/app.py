@@ -41,6 +41,7 @@ from agent_harness.runtime.codex_app_server import (
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
 )
 from agent_harness.runtime.tasks import (
@@ -927,7 +928,26 @@ class SlackTeamController:
         return True
 
     def cancel_orphaned_active_tasks(self) -> int:
-        return 0
+        if self.runtime is None:
+            return 0
+        resumed = 0
+        for task in self.store.list_agent_tasks():
+            if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+                continue
+            if not task.thread_ts:
+                continue
+            if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
+                continue
+            is_running = getattr(self.runtime, "is_task_running", None)
+            if callable(is_running) and is_running(task.task_id):
+                continue
+            agent = self.store.get_team_agent(task.agent_id)
+            if agent is None:
+                continue
+            thread = SlackThreadRef(task.channel_id, task.thread_ts, task.parent_message_ts)
+            if self.runtime.start_task(task, agent, thread):
+                resumed += 1
+        return resumed
 
     def _ensure_initial_team(self, codex_count: int, claude_count: int) -> None:
         if self.store.list_team_agents(include_fired=True):
