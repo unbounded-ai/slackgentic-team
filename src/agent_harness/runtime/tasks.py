@@ -878,6 +878,8 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
     visible_lines: list[str] = []
     signals: list[str] = []
     for line in text.splitlines():
+        if _is_agent_transport_leak(line):
+            continue
         normalized = re.sub(r"\s+", " ", line.strip()).upper()
         if normalized == AGENT_THREAD_DONE_SIGNAL:
             signals.append(AGENT_THREAD_DONE_SIGNAL)
@@ -1406,6 +1408,8 @@ def _render_codex_exec_line(line: str) -> str | None:
         return None
     if "failed to record rollout items" in line:
         return None
+    if _is_agent_transport_leak(line):
+        return None
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
@@ -1586,6 +1590,25 @@ def _format_claude_error(message: object) -> str:
 
 def _line_has_ending(line: str) -> bool:
     return line.endswith(("\n", "\r"))
+
+
+def _is_agent_transport_leak(text: str) -> bool:
+    cleaned = _clean_terminal_output(text)
+    normalized = " ".join(cleaned.split())
+    if not normalized:
+        return False
+    if "write_stdin failed: Unknown process id" in normalized:
+        return True
+    if "codex_core::tools::router" in normalized and (
+        "ERROR" in normalized or "error=" in normalized or "failed" in normalized
+    ):
+        return True
+    if re.search(r'"exit_code"\s*:\s*-?\d+', normalized) and re.search(
+        r'"status"\s*:\s*"(?:completed|failed|running)"',
+        normalized,
+    ):
+        return True
+    return bool(re.search(r'"recipient_name"\s*:\s*"functions\.', normalized))
 
 
 def _provider_for_running(running: RunningTask) -> Provider:
