@@ -3156,7 +3156,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(continued_task.prompt, "reply with DELEGATED_OK")
                 self.assertIn("DELEGATED_OK", continued_task.metadata["thread_context"])
                 self.assertIn(
-                    f"@{codex_agent.handle}, please reply with DELEGATED_OK",
+                    f"\n\n@{codex_agent.handle} please reply with DELEGATED_OK",
                     gateway.thread_replies[-1]["text"],
                 )
                 self.assertNotIn("for <@U1>", gateway.thread_replies[-1]["text"])
@@ -3238,7 +3238,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("NAMED_DELEGATION_OK", tasks[-1].metadata["thread_context"])
                 self.assertEqual(len(runtime.started), 3)
                 self.assertIn(
-                    f"@{target_agent.handle}, please take the task I assigned above.",
+                    f"\n\n@{target_agent.handle} please take the task I assigned above.",
                     gateway.thread_replies[-2]["text"],
                 )
             finally:
@@ -3958,6 +3958,35 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(gateway.updates), 1)
                 self.assertIn("summarize pyproject", gateway.updates[0]["text"])
                 self.assertNotIn("try again", gateway.updates[0]["text"])
+            finally:
+                store.close()
+
+    def test_thread_context_resolves_known_human_user_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller._remember_human_user(
+                    "U1",
+                    {
+                        "display_name": "Ilshat",
+                        "image_72": "https://example.com/avatar.png",
+                    },
+                )
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {
+                        "user": "U1",
+                        "text": "please check <@U1>",
+                        "ts": "171.000001",
+                    }
+                ]
+
+                context = controller._thread_context("C1", "171.thread")
+
+                self.assertEqual(context, "Ilshat: please check Ilshat")
+                self.assertNotIn("U1", context)
             finally:
                 store.close()
 

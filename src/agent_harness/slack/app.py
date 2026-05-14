@@ -108,6 +108,7 @@ SETTING_CHANNEL_ID = "slack.channel_id"
 SETTING_ROSTER_TS = "slack.roster_ts"
 SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
+SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
@@ -2030,13 +2031,43 @@ class SlackTeamController:
             return None
         lines: list[str] = []
         for message in messages[-12:]:
-            text = (message.get("text") or "").strip()
+            text = self._thread_context_text(message.get("text") or "").strip()
             if not text:
                 continue
-            author = message.get("username") or message.get("user") or "Slack"
+            author = self._thread_context_author(message)
             lines.append(f"{author}: {text}")
         context = "\n".join(lines)
         return context[-6000:] if context else None
+
+    def _thread_context_author(self, message: dict) -> str:
+        username = message.get("username")
+        if isinstance(username, str) and username.strip():
+            return username.strip()
+        profile_name = _profile_display_name(message.get("user_profile"))
+        if profile_name:
+            return profile_name
+        user_id = message.get("user")
+        if isinstance(user_id, str) and user_id.strip():
+            return self._display_name_for_slack_user(user_id) or "Slack user"
+        return "Slack"
+
+    def _thread_context_text(self, text: str) -> str:
+        return re.sub(
+            r"<@([A-Z0-9]+)>",
+            lambda match: self._display_name_for_slack_user(match.group(1)) or "Slack user",
+            text,
+        )
+
+    def _display_name_for_slack_user(self, user_id: str) -> str | None:
+        configured = self.store.get_setting(_human_user_display_name_key(user_id))
+        if configured and configured.strip():
+            return configured.strip()
+        remembered_id = self.store.get_setting(SETTING_HUMAN_USER_ID)
+        if remembered_id == user_id:
+            remembered_name = self.store.get_setting(HUMAN_DISPLAY_NAME_SETTING)
+            if remembered_name and remembered_name.strip():
+                return remembered_name.strip()
+        return None
 
     def _record_dependency_if_requested(
         self,
@@ -2199,6 +2230,7 @@ class SlackTeamController:
                 image_url = image_url or slack_profile.image_url
         if display_name:
             self.store.set_setting(HUMAN_DISPLAY_NAME_SETTING, display_name)
+            self.store.set_setting(_human_user_display_name_key(user_id), display_name)
         if image_url:
             self.store.set_setting(HUMAN_IMAGE_URL_SETTING, image_url)
 
@@ -2707,6 +2739,10 @@ def _shorten(value: str, limit: int) -> str:
 
 def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:
     return f"{SETTING_SLACK_MESSAGE_PROCESSED_PREFIX}{channel_id}.{message_ts}"
+
+
+def _human_user_display_name_key(user_id: str) -> str:
+    return f"{SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX}{user_id}"
 
 
 def _float_setting(value: str | None) -> float | None:

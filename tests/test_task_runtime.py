@@ -363,6 +363,7 @@ class TaskRuntimeTests(unittest.TestCase):
         prompt = build_task_prompt(agent, task)
 
         self.assertIn("separate final paragraph", prompt)
+        self.assertIn("start of its own final paragraph", prompt)
         self.assertIn("@nell pick one before I proceed", prompt)
         self.assertIn("Do not put that callback handle inline", prompt)
 
