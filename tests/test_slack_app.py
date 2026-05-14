@@ -14,7 +14,7 @@ from agent_harness.models import (
     SlackThreadRef,
     WorkRequest,
 )
-from agent_harness.runtime.tasks import AGENT_THREAD_DONE_SIGNAL
+from agent_harness.runtime.tasks import AGENT_THREAD_DONE_SIGNAL, MANAGED_RUN_STARTED_METADATA_KEY
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
@@ -4067,6 +4067,78 @@ class SlackAppTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+    def test_startup_reconcile_does_not_restart_idle_active_thread_without_run_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "summarize pyproject", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 0)
+                self.assertEqual(runtime.started, [])
+            finally:
+                store.close()
+
+    def test_startup_reconcile_restarts_interrupted_managed_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "continue after restart", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                    metadata={MANAGED_RUN_STARTED_METADATA_KEY: "2026-05-14T00:45:46+00:00"},
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+                restarted, restarted_agent, restarted_thread = runtime.started[0]
+                self.assertEqual(restarted.task_id, task.task_id)
+                self.assertEqual(restarted.session_id, "codex-thread-1")
+                self.assertEqual(restarted_agent.agent_id, agent.agent_id)
+                self.assertEqual(restarted_thread.thread_ts, "171.thread")
             finally:
                 store.close()
 
