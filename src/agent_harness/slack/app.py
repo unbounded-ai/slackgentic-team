@@ -2056,7 +2056,7 @@ class SlackTeamController:
         if _is_subtask(task) or _is_external_thread_helper_task(task):
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
-            self._mark_task_complete(task, thread)
+        self._mark_task_complete(task, thread)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
