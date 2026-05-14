@@ -192,6 +192,44 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         start.assert_called_once_with("slackgentic-team", include_codex_app_server=False)
 
+    def test_slack_serve_refuses_python_314_runtime(self):
+        output = io.StringIO()
+        with (
+            patch("sys.version_info", (3, 14, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
+            redirect_stdout(output),
+        ):
+            code = main(["slack", "serve"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("Python 3.14+ on macOS", output.getvalue())
+
+    def test_claude_channel_refuses_python_314_runtime(self):
+        output = io.StringIO()
+        with (
+            patch("sys.version_info", (3, 14, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
+            redirect_stdout(output),
+        ):
+            code = main(["claude-channel", "--print-mcp-config"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("TCC privacy prompts", output.getvalue())
+
+    def test_service_install_refuses_python_314_runtime(self):
+        output = io.StringIO()
+        with (
+            patch("sys.version_info", (3, 14, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
+            patch("agent_harness.service.install_services") as install,
+            redirect_stdout(output),
+        ):
+            code = main(["service", "install"])
+
+        self.assertEqual(code, 2)
+        install.assert_not_called()
+        self.assertIn("reinstall the service", output.getvalue())
+
     def test_service_install_installs_codex_app_server_and_daemon(self):
         output = io.StringIO()
         with (

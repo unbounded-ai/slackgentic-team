@@ -1,3 +1,4 @@
+import os
 import plistlib
 import subprocess
 import tempfile
@@ -9,7 +10,9 @@ from agent_harness.service import (
     MACOS_CODEX_APP_SERVER_LABEL,
     ServiceSpec,
     UnsafeServiceRestartError,
+    _stable_python_executable,
     build_codex_app_server_service_spec,
+    ensure_service_python_shims,
     install_services,
     render_launchd_plist,
     render_systemd_unit,
@@ -104,6 +107,47 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("/opt/homebrew/bin", path)
         self.assertNotIn(".codex/tmp", path)
         self.assertNotIn("cryptexd", path)
+
+    def test_service_environment_path_prefers_python_shim_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_dir = Path(tmp) / "bin"
+            with patch(
+                "agent_harness.service._stable_python_executable",
+                return_value=Path("/opt/homebrew/bin/python3.13"),
+            ):
+                path = service_environment_path("/opt/homebrew/bin", service_bin_dir=shim_dir)
+
+        self.assertEqual(path.split(os.pathsep)[0], str(shim_dir))
+
+    def test_ensure_service_python_shims_points_python_to_stable_python(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stable = Path(tmp) / "python3.13"
+            stable.write_text("#!/bin/sh\n")
+            spec = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "state" / "logs",
+            )
+
+            with patch("agent_harness.service._stable_python_executable", return_value=stable):
+                bin_dir = ensure_service_python_shims(spec)
+
+            assert bin_dir is not None
+            self.assertEqual((bin_dir / "python").resolve(), stable.resolve())
+            self.assertEqual((bin_dir / "python3").resolve(), stable.resolve())
+
+    def test_stable_python_falls_back_to_current_stable_interpreter(self):
+        with (
+            patch("agent_harness.service.shutil.which", return_value=None),
+            patch("agent_harness.service.sys.version_info", (3, 13, 0)),
+            patch("agent_harness.service.sys.executable", "/tmp/venv/bin/python"),
+        ):
+            self.assertEqual(
+                _stable_python_executable(),
+                Path("/tmp/venv/bin/python").resolve(),
+            )
 
     def test_restart_service_on_macos_uses_launchd_label_target(self):
         with (

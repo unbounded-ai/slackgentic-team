@@ -31,7 +31,7 @@ agent needs you.
 
 ```sh
 git clone https://github.com/unbounded-ai/slackgentic-team.git && cd slackgentic-team
-python3 -m venv .venv && source .venv/bin/activate && pip install -e . && slackgentic slack setup
+python3.13 -m venv .venv && source .venv/bin/activate && pip install -e . && slackgentic slack setup
 slackgentic service install && slackgentic service status
 ```
 
@@ -44,7 +44,9 @@ Then the CLI will ask you to message yourself in Slack something like:
 Proceed with the rest of the CLI instructions.
 
 Requirements: Python 3.11+, permission to create a Slack app, and `codex` or
-`claude` on `PATH`.
+`claude` on `PATH`. On macOS, install managed Slackgentic services from Python
+3.11-3.13 so Homebrew `python3` drift cannot put long-running agents behind a
+new TCC prompt identity.
 
 ## Setup Notes
 
@@ -245,11 +247,12 @@ variables override stored values.
 | `SLACKGENTIC_CODEX_AGENTS` | Default initial Codex count. |
 | `SLACKGENTIC_CLAUDE_AGENTS` | Default initial Claude count. |
 | `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS avatar directory, or `off`. |
+| `SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS` | Allow managed tasks to start in macOS privacy-protected locations after you have granted OS access. |
 
 ## Development
 
 ```sh
-python -m venv .venv && source .venv/bin/activate && pip install -e '.[dev]'
+python3.13 -m venv .venv && source .venv/bin/activate && pip install -e '.[dev]'
 ```
 
 Checks:

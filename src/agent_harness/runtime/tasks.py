@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import re
 import shlex
 import threading
@@ -41,6 +42,14 @@ MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
+MACOS_TCC_PROTECTED_HOME_DIRS = (
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+)
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str, str | None], bool]
@@ -111,6 +120,26 @@ class ManagedTaskRuntime:
     ) -> bool:
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
+        tcc_issue = _macos_tcc_protected_cwd_issue(
+            cwd,
+            home=self.home,
+            allow=self.commands.allow_macos_tcc_protected_paths,
+        )
+        if tcc_issue:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"I did not start {provider.value} because {tcc_issue}. "
+                    "Move the repo under an unprotected working directory such as ~/code, "
+                    "or set SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS=true after granting "
+                    "the chosen runtime the required macOS privacy access."
+                ),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(task.task_id)
+            return False
         claude_channel = provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(
             self.home
         )
@@ -240,6 +269,10 @@ class ManagedTaskRuntime:
     def has_running_tasks(self) -> bool:
         with self._lock:
             return bool(self._running)
+
+    def running_tasks(self) -> list[RunningTask]:
+        with self._lock:
+            return list(self._running.values())
 
     def _default_cwd(self) -> Path:
         configured = self.store.get_setting(SETTING_REPO_ROOT)
@@ -901,6 +934,44 @@ def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:
         if path.exists():
             return path
     return _requested_repo_cwd(task.prompt, default_cwd)
+
+
+def _macos_tcc_protected_cwd_issue(
+    cwd: Path,
+    *,
+    home: Path | None = None,
+    allow: bool = False,
+) -> str | None:
+    if allow or platform.system().lower() != "darwin":
+        return None
+    path = _resolved_path(cwd)
+    home_paths = [_resolved_path(home)] if home is not None else []
+    real_home = _resolved_path(Path.home())
+    if real_home not in home_paths:
+        home_paths.append(real_home)
+    for home_path in home_paths:
+        for dirname in MACOS_TCC_PROTECTED_HOME_DIRS:
+            protected_root = home_path / dirname
+            if _path_is_relative_to(path, protected_root):
+                return f"the working directory {path} is inside macOS-protected {dirname}"
+    if _path_is_relative_to(path, Path("/Volumes")):
+        return f"the working directory {path} is on a macOS-protected mounted volume"
+    return None
+
+
+def _resolved_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except OSError:
+        return path.expanduser().absolute()
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _requested_repo_cwd(prompt: str, default_cwd: Path) -> Path:

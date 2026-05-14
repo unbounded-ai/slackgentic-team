@@ -693,6 +693,21 @@ class SlackTeamController:
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
                 task_id=task.task_id,
             )
+        for running in self._running_managed_tasks():
+            agent = getattr(running, "agent", None)
+            task = getattr(running, "task", None)
+            thread = getattr(running, "thread", None)
+            if agent is None or task is None or thread is None:
+                continue
+            if agent.agent_id not in statuses:
+                continue
+            detail_prefix = "Dangerous mode: " if _task_dangerous_mode(task) else ""
+            statuses[agent.agent_id] = AgentRosterStatus(
+                "Occupied",
+                f"{detail_prefix}Slack task: {_shorten(task.prompt, 140)}",
+                thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
+                task_id=task.task_id,
+            )
         for agent_id, session in self._active_external_sessions_by_agent().items():
             if agent_id not in statuses:
                 continue
@@ -716,6 +731,18 @@ class SlackTeamController:
                 session_id=session.session_id,
             )
         return statuses
+
+    def _running_managed_tasks(self):
+        if self.runtime is None:
+            return []
+        running_tasks = getattr(self.runtime, "running_tasks", None)
+        if not callable(running_tasks):
+            return []
+        try:
+            return running_tasks()
+        except Exception:
+            LOGGER.debug("failed to read running managed tasks for roster", exc_info=True)
+            return []
 
     def _external_session_permalink(self, session) -> str | None:
         channel_id = self._configured_agent_channel_id()

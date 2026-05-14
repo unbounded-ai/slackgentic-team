@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import shutil
+import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,8 @@ from agent_harness.team import (
     runtime_personality_prompt,
 )
 from agent_harness.team.assignment import assign_channel_work_request
+
+SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -214,6 +218,10 @@ def main(argv: list[str] | None = None) -> int:
     slack_doctor.add_argument("--home", type=Path)
 
     args = parser.parse_args(argv)
+    runtime_python_issue = _managed_runtime_python_issue(args)
+    if runtime_python_issue:
+        print(runtime_python_issue)
+        return 2
     if args.command == "scan":
         return _scan(args)
     if args.command == "usage":
@@ -334,6 +342,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.slack_command == "setup" and args.serve:
             return run_slack_app(config)
     raise AssertionError(args.command)
+
+
+def _managed_runtime_python_issue(args: argparse.Namespace) -> str | None:
+    if not _command_starts_managed_runtime(args):
+        return None
+    version = tuple(sys.version_info[:2])
+    if platform.system().lower() != "darwin" or version < SUPPORTED_PYTHON_MAX_EXCLUSIVE:
+        return None
+    return (
+        "Refusing to run Slackgentic managed services under Python 3.14+ on macOS. "
+        "Homebrew framework Python 3.14 is shown in TCC privacy prompts as "
+        '"Python 3.14", which can block unattended Slackgentic agents. Recreate '
+        "the Slackgentic venv with Python 3.11-3.13, then reinstall the service "
+        "and Claude channel."
+    )
+
+
+def _command_starts_managed_runtime(args: argparse.Namespace) -> bool:
+    if args.command == "claude-channel":
+        return True
+    if args.command == "service":
+        return args.service_command in {"install", "print"}
+    if args.command != "slack":
+        return False
+    if args.slack_command == "serve":
+        return True
+    return args.slack_command == "setup" and bool(getattr(args, "serve", False))
 
 
 def _service(args: argparse.Namespace) -> int:

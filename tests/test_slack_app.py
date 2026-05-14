@@ -667,6 +667,51 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_shows_runtime_running_task_occupancy(self):
+        class RuntimeWithRunningTask(FakeRuntime):
+            def __init__(self, running):
+                super().__init__()
+                self._running = running
+
+            def running_tasks(self):
+                return self._running
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "drive PR 23", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                )
+                store.upsert_agent_task(task)
+                running = type(
+                    "Running",
+                    (),
+                    {
+                        "agent": agent,
+                        "task": task,
+                        "thread": SlackThreadRef("C1", "171.thread"),
+                    },
+                )()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=RuntimeWithRunningTask([running]),
+                )
+
+                controller.post_roster("C1")
+
+                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                self.assertIn("Occupied: Slack task: drive PR 23", str(gateway.posts[-1]["blocks"]))
+            finally:
+                store.close()
+
     def test_roster_marks_dangerous_mode_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
