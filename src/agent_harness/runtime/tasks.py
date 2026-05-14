@@ -630,7 +630,9 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         ),
         (
             "When you hand work to a specific agent, use that agent's exact Slackgentic "
-            "`@handle` from the thread or roster."
+            "`@handle` from the thread or roster. Put that `@handle` at the start of "
+            "its own final paragraph when it is meant to route work or get that agent "
+            "to look at something."
         ),
         (
             "When you need a named external/session agent in the Slack thread to choose, "
