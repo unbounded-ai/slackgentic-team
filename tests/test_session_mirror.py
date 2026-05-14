@@ -60,6 +60,20 @@ class FakeGateway:
         return type("Posted", (), {"ts": ts})()
 
 
+class FailingReplyGateway(FakeGateway):
+    def post_thread_reply(
+        self,
+        thread,
+        text,
+        persona=None,
+        username=None,
+        icon_url=None,
+        icon_emoji=None,
+        blocks=None,
+    ):
+        raise RuntimeError("Slack post failed")
+
+
 class FakeProvider:
     provider = Provider.CODEX
 
@@ -248,6 +262,94 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(len(gateway.updates), 1)
                 self.assertIn("Task: visible", gateway.updates[0][2])
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 2)
+            finally:
+                store.close()
+
+    def test_start_tolerates_initial_sync_post_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                mirror = SessionMirror(
+                    store,
+                    FailingReplyGateway(),
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    poll_seconds=60,
+                )
+
+                with self.assertLogs("agent_harness.sessions.mirror", level="ERROR"):
+                    mirror.start()
+                    mirror.stop()
+
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 0)
+            finally:
+                store.close()
+
+    def test_mirror_keeps_cursor_when_thread_reply_post_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                mirror = SessionMirror(
+                    store,
+                    FailingReplyGateway(),
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                with self.assertLogs("agent_harness.sessions.mirror", level="ERROR"):
+                    mirror.sync_once()
+
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 0)
             finally:
                 store.close()
 

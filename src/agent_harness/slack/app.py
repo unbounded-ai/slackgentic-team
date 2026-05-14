@@ -43,6 +43,8 @@ from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
+    managed_run_resume_attempts,
+    should_resume_managed_run,
 )
 from agent_harness.runtime.tasks import (
     SETTING_REPO_ROOT as TASK_RUNTIME_REPO_ROOT_SETTING,
@@ -931,6 +933,7 @@ class SlackTeamController:
         if self.runtime is None:
             return 0
         resumed = 0
+        now = utc_now()
         for task in self.store.list_agent_tasks():
             if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
                 continue
@@ -941,13 +944,43 @@ class SlackTeamController:
             is_running = getattr(self.runtime, "is_task_running", None)
             if callable(is_running) and is_running(task.task_id):
                 continue
+            if not should_resume_managed_run(task, now=now):
+                LOGGER.info(
+                    "skipping resume of orphaned task %s (age/attempt bounds exceeded: attempts=%d)",
+                    task.task_id,
+                    managed_run_resume_attempts(task),
+                )
+                self._abandon_orphaned_task(task)
+                continue
             agent = self.store.get_team_agent(task.agent_id)
             if agent is None:
                 continue
             thread = SlackThreadRef(task.channel_id, task.thread_ts, task.parent_message_ts)
-            if self.runtime.start_task(task, agent, thread):
+            resume = getattr(self.runtime, "resume_orphaned_task", None)
+            started = (
+                resume(task, agent, thread)
+                if callable(resume)
+                else self.runtime.start_task(task, agent, thread)
+            )
+            if started:
                 resumed += 1
         return resumed
+
+    def _abandon_orphaned_task(self, task: AgentTask) -> None:
+        metadata = dict(task.metadata)
+        metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+        metadata.pop("managed_run_resume_attempts", None)
+        cancelled = replace(
+            task,
+            status=AgentTaskStatus.CANCELLED,
+            metadata=metadata,
+            updated_at=utc_now(),
+        )
+        try:
+            self.store.upsert_agent_task(cancelled)
+            self.store.delete_managed_thread_task(task.task_id)
+        except Exception:
+            LOGGER.debug("failed to abandon stale orphaned task %s", task.task_id, exc_info=True)
 
     def _ensure_initial_team(self, codex_count: int, claude_count: int) -> None:
         if self.store.list_team_agents(include_fired=True):
@@ -2586,11 +2619,20 @@ class SocketModeSlackApp:
         self.claude_permission_auto_resolver.stop()
         self.slack_message_backfill.stop()
         self.session_mirror.stop()
+        if self.runtime is not None:
+            stop_all = getattr(self.runtime, "stop_all_running_tasks", None)
+            if callable(stop_all):
+                try:
+                    stop_all()
+                except Exception:
+                    LOGGER.exception("failed to stop running managed tasks during shutdown")
         if self.codex_app_server:
             self.codex_app_server.close()
         self.store.close()
 
     def run_forever(self) -> None:
+        import signal
+
         from slack_sdk.socket_mode import SocketModeClient
         from slack_sdk.socket_mode.response import SocketModeResponse
 
@@ -2620,11 +2662,37 @@ class SocketModeSlackApp:
 
         client.socket_mode_request_listeners.append(listener)
         client.connect()
+        shutdown = threading.Event()
+
+        def _request_shutdown(_signum=None, _frame=None) -> None:
+            shutdown.set()
+
+        previous_handlers: dict[int, object] = {}
+        for sig_name in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                previous_handlers[sig] = signal.signal(sig, _request_shutdown)
+            except (ValueError, OSError):
+                continue
         try:
-            while True:
-                time.sleep(1)
+            while not shutdown.is_set():
+                if shutdown.wait(timeout=1.0):
+                    break
         except KeyboardInterrupt:
-            client.close()
+            shutdown.set()
+        finally:
+            for sig, previous in previous_handlers.items():
+                try:
+                    signal.signal(sig, previous)
+                except (ValueError, OSError, TypeError):
+                    continue
+            try:
+                client.close()
+            except Exception:
+                LOGGER.debug("failed to close Slack socket client cleanly", exc_info=True)
+            self.close()
 
     def handle_request(self, request) -> dict | None:
         if request.type == "interactive":

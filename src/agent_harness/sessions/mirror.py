@@ -98,7 +98,10 @@ class SessionMirror:
     def start(self) -> None:
         if self._thread is not None:
             return
-        self.sync_once(backfill_new_sessions=False)
+        try:
+            self.sync_once(backfill_new_sessions=False)
+        except Exception:
+            LOGGER.exception("initial external session mirror sync failed")
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -164,7 +167,8 @@ class SessionMirror:
                     self._update_cursor_if_needed(session, max_line)
                     continue
                 thread = self._post_session_parent(session, channel_id, agent)
-                self._post_chunks(session, thread, chunks, agent)
+                if not self._post_chunks(session, thread, chunks, agent):
+                    continue
                 self._update_parent_summary(session, thread, chunks)
                 self._update_cursor_if_needed(session, max_line)
                 continue
@@ -295,7 +299,8 @@ class SessionMirror:
         agent: TeamAgent,
     ) -> None:
         chunks, max_line = self._new_chunks(provider, session)
-        self._post_chunks(session, thread, chunks, agent)
+        if not self._post_chunks(session, thread, chunks, agent):
+            return
         self._update_parent_summary(session, thread, chunks)
         self._update_cursor_if_needed(session, max_line)
 
@@ -336,23 +341,37 @@ class SessionMirror:
         thread: SlackThreadRef,
         chunks: list[RenderedSessionEvent],
         agent: TeamAgent,
-    ) -> None:
+    ) -> bool:
         icon_url = self._team_agent_icon_url(agent)
         for chunk in chunks:
-            if chunk.author == "user":
-                posted = self.gateway.post_thread_reply(
-                    thread,
-                    chunk.text,
-                    username=self._human_display_name(),
-                    icon_url=self._human_image_url(),
+            try:
+                if chunk.author == "user":
+                    posted = self.gateway.post_thread_reply(
+                        thread,
+                        chunk.text,
+                        username=self._human_display_name(),
+                        icon_url=self._human_image_url(),
+                    )
+                    self.store.mark_slack_message_mirrored(
+                        thread.channel_id,
+                        posted.ts,
+                        f"{session.provider.value}:{session.session_id}:user",
+                    )
+                else:
+                    self.gateway.post_thread_reply(
+                        thread,
+                        chunk.text,
+                        persona=agent,
+                        icon_url=icon_url,
+                    )
+            except Exception:
+                LOGGER.exception(
+                    "failed to mirror %s session %s into Slack",
+                    session.provider.value,
+                    session.session_id,
                 )
-                self.store.mark_slack_message_mirrored(
-                    thread.channel_id,
-                    posted.ts,
-                    f"{session.provider.value}:{session.session_id}:user",
-                )
-            else:
-                self.gateway.post_thread_reply(thread, chunk.text, persona=agent, icon_url=icon_url)
+                return False
+        return True
 
     def _update_parent_summary(
         self,

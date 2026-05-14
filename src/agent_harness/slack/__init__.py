@@ -572,6 +572,7 @@ def _table_cell(text: str, *, bold: bool = False) -> dict[str, Any]:
 
 
 def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> list[dict[str, Any]]:
+    blank_cell_text = "\u00a0"
     elements: list[dict[str, Any]] = []
     for part in re.split(r"(`[^`]*`)", text.strip()):
         if not part:
@@ -584,14 +585,14 @@ def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> lis
         else:
             value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
         if not value:
-            value = " "
+            value = blank_cell_text
         if bold:
             style["bold"] = True
         element: dict[str, Any] = {"type": "text", "text": value}
         if style:
             element["style"] = style
         elements.append(element)
-    return elements or [{"type": "text", "text": " "}]
+    return elements or [{"type": "text", "text": blank_cell_text}]
 
 
 def _wrap_markdown_tables(text: str) -> str:

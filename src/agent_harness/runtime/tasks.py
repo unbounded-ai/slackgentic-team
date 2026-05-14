@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from secrets import token_urlsafe
 
@@ -24,7 +24,10 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
-from agent_harness.sessions.claude_channel import is_slackgentic_mcp_server_configured
+from agent_harness.sessions.claude_channel import (
+    SLACKGENTIC_MCP_PERMISSION_ALLOW,
+    is_slackgentic_mcp_server_configured,
+)
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
@@ -33,6 +36,9 @@ LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
 AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
 MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
+MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
+MANAGED_RUN_MAX_RESUMES = 3
+MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
@@ -100,6 +106,14 @@ class ManagedTaskRuntime:
     ) -> bool:
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
+        claude_channel = provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(
+            self.home
+        )
+        launch_allowed_tools = _initial_allowed_tools(
+            provider,
+            allowed_tools,
+            claude_channel=claude_channel,
+        )
         request = LaunchRequest(
             provider=provider,
             prompt=build_task_prompt(agent, task),
@@ -111,12 +125,10 @@ class ManagedTaskRuntime:
                 and (task.session_provider is None or task.session_provider == provider)
                 else None
             ),
-            claude_channel=(
-                provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(self.home)
-            ),
+            claude_channel=claude_channel,
             slack_channel_id=thread.channel_id,
             slack_thread_ts=thread.thread_ts,
-            allowed_tools=allowed_tools,
+            allowed_tools=launch_allowed_tools,
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
@@ -151,7 +163,7 @@ class ManagedTaskRuntime:
             thread=thread,
             worker=worker,
             resume_session_id=request.resume_session_id,
-            allowed_tools=allowed_tools,
+            allowed_tools=launch_allowed_tools,
         )
         with self._lock:
             self._running[task.task_id] = running
@@ -186,6 +198,20 @@ class ManagedTaskRuntime:
 
     def is_task_running(self, task_id: str) -> bool:
         return self._get_running(task_id) is not None
+
+    def stop_all_running_tasks(self, status: AgentTaskStatus = AgentTaskStatus.CANCELLED) -> int:
+        with self._lock:
+            task_ids = list(self._running.keys())
+        stopped = 0
+        for task_id in task_ids:
+            try:
+                if self.stop_task(task_id, status):
+                    stopped += 1
+            except Exception:
+                LOGGER.debug(
+                    "failed to stop running task %s during shutdown", task_id, exc_info=True
+                )
+        return stopped
 
     def running_task_for_thread(self, channel_id: str, thread_ts: str) -> RunningTask | None:
         with self._lock:
@@ -445,6 +471,8 @@ class ManagedTaskRuntime:
     ) -> bool:
         if _provider_for_running(running) != Provider.CLAUDE:
             return False
+        if running.process.request.dangerous:
+            return False
         denials, running.permission_buffer = _claude_permission_denials(
             output,
             running.permission_buffer,
@@ -517,6 +545,15 @@ class ManagedTaskRuntime:
         completed_task: AgentTask,
     ) -> None:
         denial = running.permission_denials[0]
+        internal_tool = _slackgentic_mcp_tool_for_claude_denial(denial)
+        if internal_tool:
+            self._retry_claude_permission_denial(
+                running,
+                completed_task,
+                denial,
+                (internal_tool,),
+            )
+            return
         allowed_tools = _allowed_tools_for_claude_denial(denial)
         if not allowed_tools:
             self.gateway.post_thread_reply(
@@ -555,7 +592,15 @@ class ManagedTaskRuntime:
                 allowed_tools,
                 _allowed_session_tools_for_claude_denial(denial),
             )
+        self._retry_claude_permission_denial(running, completed_task, denial, allowed_tools)
 
+    def _retry_claude_permission_denial(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+        denial: dict,
+        allowed_tools: tuple[str, ...],
+    ) -> None:
         current = self.store.get_agent_task(completed_task.task_id) or completed_task
         retry_task = replace(
             current,
@@ -576,6 +621,8 @@ class ManagedTaskRuntime:
         running: RunningTask,
         denial: dict,
     ) -> str | None:
+        if _slackgentic_mcp_tool_for_claude_denial(denial):
+            return None
         if not _allowed_tools_for_claude_denial(denial):
             return None
         key = _claude_denial_key(denial)
@@ -623,10 +670,15 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.debug("failed to load task before clearing managed run marker", exc_info=True)
             return None
-        if current is None or MANAGED_RUN_STARTED_METADATA_KEY not in current.metadata:
+        if current is None:
+            return current
+        has_marker = MANAGED_RUN_STARTED_METADATA_KEY in current.metadata
+        has_attempts = MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY in current.metadata
+        if not has_marker and not has_attempts:
             return current
         metadata = dict(current.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY, None)
         updated = replace(current, metadata=metadata, updated_at=utc_now())
         try:
             self.store.upsert_agent_task(updated)
@@ -634,6 +686,82 @@ class ManagedTaskRuntime:
             LOGGER.debug("failed to clear managed run marker", exc_info=True)
             return current
         return updated
+
+    def resume_orphaned_task(
+        self,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+    ) -> bool:
+        try:
+            current = self.store.get_agent_task(task.task_id) or task
+        except Exception:
+            LOGGER.debug("failed to load task before resume bump", exc_info=True)
+            current = task
+        attempts = managed_run_resume_attempts(current) + 1
+        metadata = dict(current.metadata)
+        metadata[MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY] = attempts
+        bumped = replace(current, metadata=metadata, updated_at=utc_now())
+        try:
+            self.store.upsert_agent_task(bumped)
+        except Exception:
+            LOGGER.debug("failed to record managed run resume attempt", exc_info=True)
+            bumped = current
+        return self.start_task(bumped, agent, thread)
+
+
+def managed_run_resume_attempts(task: AgentTask) -> int:
+    value = task.metadata.get(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY)
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return max(0, int(value.strip()))
+    return 0
+
+
+def managed_run_started_age(
+    task: AgentTask,
+    *,
+    now: datetime | None = None,
+) -> timedelta | None:
+    marker = task.metadata.get(MANAGED_RUN_STARTED_METADATA_KEY)
+    if not isinstance(marker, str):
+        return None
+    started = parse_timestamp(marker)
+    if started is None:
+        return None
+    reference = now or utc_now()
+    return reference - started
+
+
+def should_resume_managed_run(
+    task: AgentTask,
+    *,
+    now: datetime | None = None,
+    max_age: timedelta = MANAGED_RUN_MAX_RESUME_AGE,
+    max_resumes: int = MANAGED_RUN_MAX_RESUMES,
+) -> bool:
+    if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
+        return False
+    if managed_run_resume_attempts(task) >= max_resumes:
+        return False
+    age = managed_run_started_age(task, now=now)
+    if age is None:
+        return False
+    return age <= max_age
+
+
+def _initial_allowed_tools(
+    provider: Provider,
+    allowed_tools: tuple[str, ...],
+    *,
+    claude_channel: bool,
+) -> tuple[str, ...]:
+    if provider == Provider.CLAUDE and claude_channel:
+        return _append_allowed_tools(allowed_tools, SLACKGENTIC_MCP_PERMISSION_ALLOW)
+    return allowed_tools
 
 
 def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
@@ -931,6 +1059,13 @@ def _allowed_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     return ()
 
 
+def _slackgentic_mcp_tool_for_claude_denial(denial: dict) -> str | None:
+    tool_name = str(denial.get("tool_name") or "")
+    if tool_name in SLACKGENTIC_MCP_PERMISSION_ALLOW:
+        return tool_name
+    return None
+
+
 def _allowed_session_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     tool_name = str(denial.get("tool_name") or "")
     tool_input = denial.get("tool_input")
@@ -1183,6 +1318,11 @@ def _status_inline_code(value: str, limit: int) -> str:
 
 
 def _claude_permission_retry_prompt(denial: dict) -> str:
+    if _slackgentic_mcp_tool_for_claude_denial(denial):
+        return (
+            "The internal Slackgentic Slack request tool is now allowed. "
+            "Retry the Slack request if it is still needed, then continue the task."
+        )
     tool_input = denial.get("tool_input")
     if isinstance(tool_input, dict):
         command = tool_input.get("command")

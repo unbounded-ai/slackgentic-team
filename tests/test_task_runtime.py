@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness.config import AgentCommandConfig
@@ -18,6 +18,9 @@ from agent_harness.models import (
 )
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_MAX_RESUME_AGE,
+    MANAGED_RUN_MAX_RESUMES,
+    MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     _allowed_session_tools_for_claude_denial,
@@ -33,7 +36,10 @@ from agent_harness.runtime.tasks import (
     _requested_repo_cwd,
     _session_id_from_output,
     build_task_prompt,
+    managed_run_resume_attempts,
+    should_resume_managed_run,
 )
+from agent_harness.sessions.claude_channel import SLACKGENTIC_MCP_PERMISSION_ALLOW
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
@@ -115,6 +121,76 @@ class ClaudePermissionDeniedProcess(OneShotProcess):
                         "subtype": "success",
                         "is_error": False,
                         "result": "The command requires approval.",
+                        "permission_denials": [denial],
+                        "session_id": self.session_id,
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
+class ClaudeDangerousPermissionDeniedThenFinalProcess(OneShotProcess):
+    session_id = "claude-dangerous-denied-session"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            denial = {
+                "tool_name": "Task",
+                "tool_use_id": "toolu_unsupported",
+                "tool_input": {"description": "delegate work"},
+            }
+            return (
+                f'{{"type":"system","session_id":"{self.session_id}"}}\n'
+                + json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": "The tool requires approval.",
+                        "permission_denials": [denial],
+                        "session_id": self.session_id,
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": "Done after dangerous-mode bypass.",
+                        "session_id": self.session_id,
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
+class ClaudeSlackgenticMcpPermissionDeniedProcess(OneShotProcess):
+    session_id = "claude-slackgentic-mcp-denied-session"
+    tool_name = "mcp__slackgentic__request_user_input"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            denial = {
+                "tool_name": self.tool_name,
+                "tool_use_id": "toolu_slackgentic",
+                "tool_input": {
+                    "question": "Pick a landing path",
+                    "options": [{"label": "Open PR"}],
+                },
+            }
+            return (
+                f'{{"type":"system","session_id":"{self.session_id}"}}\n'
+                + json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": "Slack request tool requires approval.",
                         "permission_denials": [denial],
                         "session_id": self.session_id,
                     }
@@ -778,6 +854,127 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_should_resume_managed_run_requires_marker(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "no marker", "C1")
+
+        self.assertFalse(should_resume_managed_run(task))
+
+    def test_should_resume_managed_run_rejects_stale_marker(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+        stale = now - MANAGED_RUN_MAX_RESUME_AGE - timedelta(seconds=30)
+        task = create_agent_task(agent, "stale marker", "C1")
+        task = replace(
+            task,
+            metadata={MANAGED_RUN_STARTED_METADATA_KEY: stale.isoformat()},
+        )
+
+        self.assertFalse(should_resume_managed_run(task, now=now))
+
+    def test_should_resume_managed_run_accepts_fresh_marker(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+        fresh = now - timedelta(seconds=30)
+        task = create_agent_task(agent, "fresh marker", "C1")
+        task = replace(
+            task,
+            metadata={MANAGED_RUN_STARTED_METADATA_KEY: fresh.isoformat()},
+        )
+
+        self.assertTrue(should_resume_managed_run(task, now=now))
+
+    def test_should_resume_managed_run_caps_attempts(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+        fresh = now - timedelta(seconds=10)
+        task = create_agent_task(agent, "too many attempts", "C1")
+        task = replace(
+            task,
+            metadata={
+                MANAGED_RUN_STARTED_METADATA_KEY: fresh.isoformat(),
+                MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY: MANAGED_RUN_MAX_RESUMES,
+            },
+        )
+
+        self.assertFalse(should_resume_managed_run(task, now=now))
+
+    def test_resume_orphaned_task_bumps_attempts_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "resume me", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    metadata={
+                        MANAGED_RUN_STARTED_METADATA_KEY: "2026-05-13T11:59:50+00:00",
+                    },
+                )
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.resume_orphaned_task(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(managed_run_resume_attempts(current), 1)
+                runtime.stop_task(task.task_id)
+                cleared = store.get_agent_task(task.task_id)
+                assert cleared is not None
+                self.assertEqual(managed_run_resume_attempts(cleared), 0)
+            finally:
+                store.close()
+
+    def test_runtime_stop_all_running_tasks_clears_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task_one = create_agent_task(agent, "stay alive", "C1")
+                task_two = replace(
+                    create_agent_task(agent, "also stay alive", "C1"),
+                    thread_ts="171.000002",
+                )
+                store.upsert_agent_task(task_one)
+                store.upsert_agent_task(task_two)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task_one, agent, SlackThreadRef("C1", "171.000001"))
+                runtime.start_task(task_two, agent, SlackThreadRef("C1", "171.000002"))
+
+                self.assertTrue(runtime.has_running_tasks())
+                self.assertEqual(runtime.stop_all_running_tasks(), 2)
+
+                self.assertFalse(runtime.has_running_tasks())
+                for task in (task_one, task_two):
+                    persisted = store.get_agent_task(task.task_id)
+                    assert persisted is not None
+                    self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+                    self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
     def test_runtime_marks_managed_run_while_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1032,6 +1229,46 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_ignores_claude_permission_denials_in_dangerous_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeDangerousPermissionDeniedThenFinalProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "finish without prompting", "C1")
+                task = replace(task, metadata={DANGEROUS_MODE_METADATA_KEY: True})
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done after dangerous-mode bypass." in gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertTrue(requests[0].dangerous)
+                self.assertEqual(gateway.replies, ["Done after dangerous-mode bypass."])
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("claude/channel/permission"),
+                    [],
+                )
+            finally:
+                store.close()
+
     def test_runtime_loads_claude_channel_for_slack_thread_when_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1067,10 +1304,57 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertTrue(requests[0].claude_channel)
                 self.assertEqual(requests[0].slack_channel_id, "C1")
                 self.assertEqual(requests[0].slack_thread_ts, "171.000001")
+                for allowed_tool in SLACKGENTIC_MCP_PERMISSION_ALLOW:
+                    self.assertIn(allowed_tool, requests[0].allowed_tools)
                 for _ in range(50):
                     if gateway.replies:
                         break
                     time.sleep(0.01)
+            finally:
+                store.close()
+
+    def test_runtime_retries_internal_slackgentic_mcp_permission_without_slack_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudeSlackgenticMcpPermissionDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "ask Slack to choose", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(len(requests), 2)
+                self.assertIn(
+                    ClaudeSlackgenticMcpPermissionDeniedProcess.tool_name,
+                    requests[1].allowed_tools,
+                )
+                self.assertEqual(gateway.replies, ["Done"])
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("claude/channel/permission"),
+                    [],
+                )
             finally:
                 store.close()
 
@@ -1133,7 +1417,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-denied-session")
                 self.assertEqual(
-                    requests[1].allowed_tools,
+                    requests[1].allowed_tools[-2:],
                     ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
                 )
             finally:
@@ -1442,11 +1726,11 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 3)
                 self.assertEqual(
-                    requests[1].allowed_tools,
+                    requests[1].allowed_tools[-2:],
                     ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
                 )
                 self.assertEqual(
-                    requests[2].allowed_tools,
+                    requests[2].allowed_tools[-4:],
                     (
                         "Bash(gh pr view:*)",
                         "Bash(gh pr view *)",

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 from agent_harness.models import (
@@ -13,8 +14,16 @@ from agent_harness.models import (
     SessionStatus,
     SlackThreadRef,
     WorkRequest,
+    utc_now,
 )
-from agent_harness.runtime.tasks import AGENT_THREAD_DONE_SIGNAL, MANAGED_RUN_STARTED_METADATA_KEY
+from agent_harness.runtime.tasks import (
+    AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_MAX_RESUME_AGE,
+    MANAGED_RUN_MAX_RESUMES,
+    MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
+    MANAGED_RUN_STARTED_METADATA_KEY,
+    managed_run_resume_attempts,
+)
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
@@ -159,6 +168,7 @@ class FakeRuntime:
         self.started = []
         self.sent = []
         self.stopped = []
+        self.resumed = []
 
     def start_task(self, task, agent, thread):
         self.started.append((task, agent, thread))
@@ -171,6 +181,14 @@ class FakeRuntime:
     def stop_task(self, task_id, status=AgentTaskStatus.CANCELLED):
         self.stopped.append((task_id, status))
         return True
+
+    def resume_orphaned_task(self, task, agent, thread):
+        attempts = managed_run_resume_attempts(task) + 1
+        metadata = dict(task.metadata)
+        metadata[MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY] = attempts
+        bumped = replace(task, metadata=metadata)
+        self.resumed.append((bumped, agent, thread))
+        return self.start_task(bumped, agent, thread)
 
 
 class FakeSessionBridge:
@@ -4119,7 +4137,7 @@ class SlackAppTests(unittest.TestCase):
                     parent_message_ts="171.parent",
                     session_provider=Provider.CODEX,
                     session_id="codex-thread-1",
-                    metadata={MANAGED_RUN_STARTED_METADATA_KEY: "2026-05-14T00:45:46+00:00"},
+                    metadata={MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat()},
                 )
                 store.upsert_agent_task(task)
                 store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
@@ -4139,6 +4157,88 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(restarted.session_id, "codex-thread-1")
                 self.assertEqual(restarted_agent.agent_id, agent.agent_id)
                 self.assertEqual(restarted_thread.thread_ts, "171.thread")
+                self.assertEqual(managed_run_resume_attempts(restarted), 1)
+            finally:
+                store.close()
+
+    def test_startup_reconcile_skips_stale_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                stale_marker = (
+                    utc_now() - MANAGED_RUN_MAX_RESUME_AGE - timedelta(seconds=30)
+                ).isoformat()
+                task = replace(
+                    create_agent_task(agent, "stale orphan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-stale",
+                    metadata={MANAGED_RUN_STARTED_METADATA_KEY: stale_marker},
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 0)
+                self.assertEqual(runtime.started, [])
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+            finally:
+                store.close()
+
+    def test_startup_reconcile_skips_when_resume_attempts_exhausted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "exhausted attempts", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-exhausted",
+                    metadata={
+                        MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat(),
+                        MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY: MANAGED_RUN_MAX_RESUMES,
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 0)
+                self.assertEqual(runtime.started, [])
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
             finally:
                 store.close()
 
