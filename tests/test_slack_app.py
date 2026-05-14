@@ -685,7 +685,7 @@ class SlackAppTests(unittest.TestCase):
                     gateway.removed_reactions,
                 )
                 self.assertIn(("C1", "171.000001", "eyes"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.000001", "white_check_mark"), gateway.reactions)
+                self.assertNotIn(("C1", "171.000001", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
@@ -727,11 +727,11 @@ class SlackAppTests(unittest.TestCase):
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
-    def test_runtime_subtask_exit_marks_request_message_complete(self):
+    def test_runtime_subtask_exit_clears_request_message_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -762,7 +762,8 @@ class SlackAppTests(unittest.TestCase):
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
+                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
                 self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
             finally:
                 store.close()
@@ -798,7 +799,8 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
                 self.assertIsNone(store.get_managed_thread_task("C1", "171.000001", agent.agent_id))
-                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
+                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
@@ -2241,6 +2243,7 @@ class SlackAppTests(unittest.TestCase):
                     dante,
                     SlackThreadRef("C1", "171.thread"),
                     "@cruz do this better",
+                    "171.agent",
                 )
 
                 self.assertTrue(handled)
@@ -2253,6 +2256,19 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(thread.thread_ts, "171.thread")
                 self.assertEqual(task.session_provider, Provider.CLAUDE)
                 self.assertEqual(task.session_id, "claude-session-1")
+                self.assertEqual(task.metadata["request_message_ts"], "171.agent")
+                self.assertIn(("C1", "171.agent", "eyes"), gateway.reactions)
+                self.assertIn(("C1", "171.agent", "hourglass_flowing_sand"), gateway.reactions)
+
+                controller.handle_runtime_task_done(task, agent, thread)
+
+                self.assertIn(("C1", "171.agent", "eyes"), gateway.removed_reactions)
+                self.assertIn(
+                    ("C1", "171.agent", "hourglass_flowing_sand"),
+                    gateway.removed_reactions,
+                )
+                self.assertIn(("C1", "171.agent", "white_check_mark"), gateway.removed_reactions)
+                self.assertNotIn(("C1", "171.agent", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
@@ -2845,6 +2861,25 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertEqual(runtime.sent, [(task.task_id, "also include install notes")])
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.metadata["request_message_ts"], "171.000002")
+                self.assertIn("171.000001", current.metadata["request_message_ts_history"])
+                agent = store.get_team_agent(task.agent_id)
+                assert agent is not None
+
+                controller.handle_runtime_task_done(
+                    current,
+                    agent,
+                    SlackThreadRef("C1", task.thread_ts),
+                )
+
+                self.assertIn(
+                    ("C1", "171.000002", "hourglass_flowing_sand"),
+                    gateway.removed_reactions,
+                )
+                self.assertIn(("C1", "171.000002", "eyes"), gateway.removed_reactions)
+                self.assertNotIn(("C1", "171.000002", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
@@ -4713,7 +4748,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_restarted_managed_run_exit_marks_request_message_complete(self):
+    def test_restarted_managed_run_exit_clears_request_message_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -4760,7 +4795,8 @@ class SlackAppTests(unittest.TestCase):
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
+                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
@@ -5126,7 +5162,8 @@ class SlackAppTests(unittest.TestCase):
                         any(block.get("type") == "actions" for block in update["blocks"])
                     )
                 self.assertIn(("C1", "171.thread", "white_check_mark"), gateway.reactions)
-                self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.removed_reactions)
+                self.assertNotIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
