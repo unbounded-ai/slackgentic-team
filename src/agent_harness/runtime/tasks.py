@@ -118,6 +118,13 @@ class ManagedTaskRuntime:
         *,
         allowed_tools: tuple[str, ...] = (),
     ) -> bool:
+        with self._lock:
+            if task.task_id in self._running:
+                LOGGER.debug(
+                    "refusing duplicate start for task %s; a worker is already running",
+                    task.task_id,
+                )
+                return False
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
         tcc_issue = _macos_tcc_protected_cwd_issue(
@@ -1004,9 +1011,22 @@ def _slack_chunks(text: str, limit: int = 2800) -> list[str]:
         return []
     chunks: list[str] = []
     while cleaned:
-        chunks.append(cleaned[:limit])
-        cleaned = cleaned[limit:]
-    return chunks
+        if len(cleaned) <= limit:
+            chunks.append(cleaned)
+            break
+        cut = _slack_chunk_break(cleaned, limit)
+        chunks.append(cleaned[:cut].rstrip())
+        cleaned = cleaned[cut:].lstrip()
+    return [chunk for chunk in chunks if chunk]
+
+
+def _slack_chunk_break(text: str, limit: int) -> int:
+    window = text[:limit]
+    for separator in ("\n\n", "\n", ". ", " "):
+        idx = window.rfind(separator)
+        if idx > 0:
+            return idx + len(separator)
+    return limit
 
 
 def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:

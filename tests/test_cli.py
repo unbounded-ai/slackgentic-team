@@ -233,6 +233,8 @@ class CliTests(unittest.TestCase):
     def test_service_install_installs_codex_app_server_and_daemon(self):
         output = io.StringIO()
         with (
+            patch("sys.version_info", (3, 13, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
             patch(
                 "agent_harness.service._current_slackgentic_executable",
                 return_value=Path("/tmp/slackgentic"),
@@ -256,6 +258,8 @@ class CliTests(unittest.TestCase):
     def test_service_install_can_skip_codex_app_server(self):
         output = io.StringIO()
         with (
+            patch("sys.version_info", (3, 13, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
             patch(
                 "agent_harness.service._current_slackgentic_executable",
                 return_value=Path("/tmp/slackgentic"),

@@ -2056,6 +2056,14 @@ class SlackTeamController:
         ):
             self._remember_request_message_for_task(previous_task, request_message_ts)
             return True
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if callable(is_running) and is_running(previous_task.task_id):
+            LOGGER.debug(
+                "skipping duplicate continuation for task %s; worker is still running",
+                previous_task.task_id,
+            )
+            self._remember_request_message_for_task(previous_task, request_message_ts)
+            return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         if request_message_ts:
@@ -2193,6 +2201,7 @@ class SlackTeamController:
             thread.channel_id,
             thread.thread_ts,
         )
+        handoff_request_posted = False
         if target_previous_task is not None:
             self.gateway.post_thread_reply(
                 thread,
@@ -2200,6 +2209,7 @@ class SlackTeamController:
                 persona=agent,
                 icon_url=self._agent_icon_url(agent),
             )
+            handoff_request_posted = True
             if self._continue_same_thread_agent_task(
                 request,
                 target_previous_task,
@@ -2220,12 +2230,13 @@ class SlackTeamController:
             return
         delegated_task = self._task_with_prior_session(result.task, target_previous_task)
         self.store.upsert_agent_task(delegated_task)
-        self.gateway.post_thread_reply(
-            thread,
-            format_agent_handoff_request(agent, target_agent, visible_prompt),
-            persona=agent,
-            icon_url=self._agent_icon_url(agent),
-        )
+        if not handoff_request_posted:
+            self.gateway.post_thread_reply(
+                thread,
+                format_agent_handoff_request(agent, target_agent, visible_prompt),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
         posted = self.gateway.post_thread_reply(
             thread,
             format_agent_handoff_assignment(target_agent, agent, result.request.prompt),

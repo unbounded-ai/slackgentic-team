@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
 from agent_harness.models import Provider
 from agent_harness.slack import dangerous_flag
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -155,8 +159,34 @@ class ManagedAgentProcess:
     def is_alive(self) -> bool:
         if self.child is None:
             return False
-        return bool(self.child.isalive())
+        isalive = getattr(self.child, "isalive", None)
+        if callable(isalive):
+            try:
+                return bool(isalive())
+            except Exception:
+                LOGGER.debug("failed to poll managed agent process", exc_info=True)
+                return False
+        proc = getattr(self.child, "proc", None)
+        poll = getattr(proc, "poll", None)
+        if callable(poll):
+            return poll() is None
+        return False
 
     def terminate(self) -> None:
-        if self.child is not None:
-            self.child.terminate(force=False)
+        if self.child is None:
+            return
+        terminate = getattr(self.child, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate(force=False)
+            except TypeError:
+                terminate()
+            return
+        proc = getattr(self.child, "proc", None)
+        proc_terminate = getattr(proc, "terminate", None)
+        if callable(proc_terminate):
+            proc_terminate()
+            return
+        kill = getattr(self.child, "kill", None)
+        if callable(kill):
+            kill(signal.SIGTERM)
