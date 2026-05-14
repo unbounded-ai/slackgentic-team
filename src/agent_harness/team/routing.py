@@ -17,6 +17,7 @@ DANGEROUS_MODE_TAG_RE = re.compile(r"(?<![\w.-])#dangerous-mode\b", re.IGNORECAS
 def parse_work_request(text: str, known_handles: list[str] | tuple[str, ...]) -> WorkRequest | None:
     stripped_text, dangerous_mode = strip_dangerous_mode_tag(text)
     cleaned = BOT_MENTION_RE.sub("", _collapse_spaces(stripped_text))
+    cleaned = _unwrap_leading_handle_code(cleaned, known_handles)
     if not cleaned:
         return None
     anyone = _parse_anyone_request(cleaned, known_handles)
@@ -278,3 +279,12 @@ def _infer_verb(prompt: str) -> str:
 
 def _collapse_spaces(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _unwrap_leading_handle_code(text: str, known_handles: list[str] | tuple[str, ...]) -> str:
+    handles = sorted((normalize_handle(handle) for handle in known_handles), key=len, reverse=True)
+    for handle in handles:
+        pattern = rf"^`@?{re.escape(handle)}`(?=$|\s|[:,\-\u2013\u2014])"
+        if re.match(pattern, text, flags=re.IGNORECASE):
+            return re.sub(pattern, f"@{handle}", text, count=1, flags=re.IGNORECASE)
+    return text

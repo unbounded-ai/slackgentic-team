@@ -326,7 +326,11 @@ class SlackTeamController:
         if not channel_id or not self._is_agent_channel(channel_id):
             return None, None
         message_ts = event.get("ts")
-        if not message_ts or self.store.is_mirrored_slack_message(channel_id, message_ts):
+        if not message_ts:
+            return None, None
+        if self.store.is_slack_agent_request_message(channel_id, message_ts):
+            return None, None
+        if self.store.is_mirrored_slack_message(channel_id, message_ts):
             return None, None
         return channel_id, message_ts
 
@@ -537,13 +541,19 @@ class SlackTeamController:
         extra_metadata: dict[str, object] | None = None,
         exclude_agent_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
     ) -> None:
+        metadata = dict(extra_metadata or {})
         if self._should_queue_unavailable_request(request, target):
+            request_message_ts = metadata.get("request_message_ts")
             self.store.create_pending_work_request(
-                SlackThreadRef(target.channel_id, target.thread_ts or ""),
+                SlackThreadRef(
+                    target.channel_id,
+                    target.thread_ts or "",
+                    request_message_ts if isinstance(request_message_ts, str) else None,
+                ),
                 request,
                 requested_by_slack_user=requested_by_slack_user,
                 author_agent=author_agent,
-                extra_metadata=extra_metadata,
+                extra_metadata=metadata,
                 exclude_agent_ids=exclude_agent_ids,
             )
         self._post_text(target, self._assignment_unavailable_text(request))
@@ -2399,6 +2409,12 @@ class SlackTeamController:
             request_message_ts = task.metadata.get("request_message_ts")
             if isinstance(request_message_ts, str) and request_message_ts == message_ts:
                 return True
+        for pending in self.store.list_pending_work_requests(limit=500):
+            if pending.message_ts == message_ts:
+                return True
+            request_message_ts = pending.extra_metadata.get("request_message_ts")
+            if isinstance(request_message_ts, str) and request_message_ts == message_ts:
+                return True
         return False
 
     def _clear_slack_message_processed(self, channel_id: str, message_ts: str | None) -> None:
@@ -3258,9 +3274,12 @@ def _render_delegate_template(text: str, sender, target) -> str:
 
 
 def _is_subtask(task: AgentTask) -> bool:
+    parent_task_id = task.metadata.get("parent_task_id")
+    if isinstance(parent_task_id, str) and parent_task_id != task.task_id:
+        return True
     return any(
         isinstance(task.metadata.get(key), str)
-        for key in ("parent_task_id", "delegated_from_task_id", "delegate_to_agent_id")
+        for key in ("delegated_from_task_id", "delegate_to_agent_id")
     )
 
 

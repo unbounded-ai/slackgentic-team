@@ -608,6 +608,44 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_self_parented_followup_stays_occupied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "follow up in same thread", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.000001",
+                    parent_message_ts="171.000001",
+                )
+                task = replace(
+                    task,
+                    metadata={
+                        "parent_task_id": task.task_id,
+                        "parent_agent_id": agent.agent_id,
+                        "request_message_ts": "171.user",
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.set_setting(SETTING_ROSTER_TS, "171.000099")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
+                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
+                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+            finally:
+                store.close()
+
     def test_runtime_subtask_exit_marks_request_message_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1659,6 +1697,112 @@ class SlackAppTests(unittest.TestCase):
                     "Update docs after interrupted restart",
                 )
                 self.assertEqual(len(runtime.started), 1)
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_skips_stored_agent_request_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                store.create_slack_agent_request(
+                    "approval-1",
+                    "Claude",
+                    "agent/requestApproval",
+                    {"title": "Somebody update docs"},
+                    SlackThreadRef("C1", "171.thread"),
+                    message_ts="171.000010",
+                )
+                gateway.history_messages.append(
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "USLACKGENTIC",
+                        "text": "Somebody update docs",
+                        "ts": "171.000010",
+                        "thread_ts": "171.thread",
+                    }
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000005")
+
+                self.assertEqual(recovered, 0)
+                self.assertEqual(store.list_agent_tasks(), [])
+                self.assertEqual(runtime.started, [])
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_skips_pending_work_request_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Update docs when someone is available",
+                            "ts": "171.000010",
+                        }
+                    }
+                )
+                pending = store.list_pending_work_requests(channel_id="C1")
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].extra_metadata["request_message_ts"], "171.000010")
+                gateway.history_messages.append(
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "Update docs when someone is available",
+                        "ts": "171.000010",
+                        "reactions": [{"name": "white_check_mark"}],
+                    }
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000005")
+
+                self.assertEqual(recovered, 0)
+                self.assertEqual(len(store.list_pending_work_requests(channel_id="C1")), 1)
+                self.assertEqual(store.list_agent_tasks(), [])
             finally:
                 store.close()
 

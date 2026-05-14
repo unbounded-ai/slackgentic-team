@@ -12,6 +12,7 @@ from agent_harness.team import (
     build_initial_team,
     build_initialization_messages,
     choose_reaction,
+    format_agent_handoff_request,
     hire_team_agents,
     least_represented_provider,
     pick_idle_agent,
@@ -195,6 +196,20 @@ class TeamTests(unittest.TestCase):
     def test_reaction_defaults_to_non_random_acknowledgement(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         self.assertEqual(choose_reaction(agent, "please look when you can"), "eyes")
+
+    def test_handoff_request_uses_plain_target_handle_on_new_paragraph(self):
+        sender, target = build_initial_model_team(codex_count=2, claude_count=0)
+
+        text = format_agent_handoff_request(sender, target, "continue using my review above.")
+
+        self.assertEqual(
+            text,
+            (
+                f"Passing this back from @{sender.handle}.\n\n"
+                f"@{target.handle} please continue using my review above."
+            ),
+        )
+        self.assertNotIn("`@", text)
 
 
 if __name__ == "__main__":

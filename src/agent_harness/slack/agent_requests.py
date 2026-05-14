@@ -145,7 +145,19 @@ class SlackAgentRequestHandler:
             pending.thread,
         )
         text, blocks = _request_message(pending)
-        posted = self.gateway.post_thread_reply(thread, text, blocks=blocks)
+        try:
+            posted = self.gateway.post_thread_reply(thread, text, blocks=blocks)
+        except Exception:
+            LOGGER.debug(
+                "failed to post full Slack agent request; retrying with compact request",
+                exc_info=True,
+            )
+            fallback_text, fallback_blocks = _compact_request_message(pending, text)
+            posted = self.gateway.post_thread_reply(
+                thread,
+                fallback_text,
+                blocks=fallback_blocks,
+            )
         pending.message_ts = posted.ts
         self.store.update_slack_agent_request_message_ts(pending.token, posted.ts)
         return pending
@@ -306,6 +318,16 @@ def _request_message(pending: PendingAgentRequest) -> tuple[str, list[dict[str, 
     text = _approval_text(pending.method, pending.params, pending.provider_label)
     return text, [
         {"type": "section", "text": {"type": "mrkdwn", "text": _mrkdwn(text)}},
+        *_approval_action_blocks(pending),
+    ]
+
+
+def _compact_request_message(
+    pending: PendingAgentRequest,
+    text: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    return text, [
+        {"type": "section", "text": {"type": "mrkdwn", "text": _mrkdwn(_truncate(text, 2500))}},
         *_approval_action_blocks(pending),
     ]
 

@@ -92,6 +92,15 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(request.requested_handle, "riley")
                 self.assertEqual(request.prompt, "pick one before proceeding")
 
+    def test_parse_specific_handle_request_unwraps_leading_code_handle(self):
+        request = parse_work_request("`@riley` please handle this before I continue", ["riley"])
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.assignment_mode, AssignmentMode.SPECIFIC)
+        self.assertEqual(request.requested_handle, "riley")
+        self.assertEqual(request.prompt, "this before I continue")
+
     def test_parse_review_request_with_author_and_pr_url(self):
         request = parse_work_request(
             "Somebody review @riley's PR https://github.com/acme/app/pull/42",

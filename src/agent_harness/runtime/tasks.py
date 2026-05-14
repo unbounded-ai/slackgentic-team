@@ -368,6 +368,13 @@ class ManagedTaskRuntime:
         running.control_signals.extend(control_signals)
         if not visible_text:
             return
+        normalized = visible_text.strip()
+        if not normalized:
+            return
+        if running.observed_agent_messages is None:
+            running.observed_agent_messages = set()
+        if normalized in running.observed_agent_messages:
+            return
         self.gateway.post_thread_reply(
             running.thread,
             visible_text,
@@ -375,18 +382,8 @@ class ManagedTaskRuntime:
             icon_url=self._agent_icon_url(running.agent),
         )
         running.visible_message_count += 1
-        normalized = visible_text.strip()
-        already_observed = False
-        if normalized:
-            if running.observed_agent_messages is None:
-                running.observed_agent_messages = set()
-            already_observed = normalized in running.observed_agent_messages
-            running.observed_agent_messages.add(normalized)
+        running.observed_agent_messages.add(normalized)
         if self.on_agent_message is None:
-            return
-        if not normalized:
-            return
-        if already_observed:
             return
         try:
             self.on_agent_message(running.task, running.agent, running.thread, normalized)
@@ -798,16 +795,18 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         ),
         (
             "When you hand work to a specific agent, use that agent's exact Slackgentic "
-            "`@handle` from the thread or roster. Put that `@handle` at the start of "
-            "its own final paragraph when it is meant to route work or get that agent "
-            "to look at something."
+            "@handle from the thread or roster. Write the handle as plain text with no "
+            "backticks or inline code formatting. Put that plain @handle at the start "
+            "of its own final paragraph when it is meant to route work or get that "
+            "agent to look at something."
         ),
         (
             "When you need a named external/session agent in the Slack thread to choose, "
             "continue, or respond, put your context and options first. Then end with a "
-            "separate final paragraph whose first token is that agent's `@handle`, for "
-            "example `@nell pick one before I proceed`. Do not put that callback handle "
-            "inline near the beginning or bury it before the options."
+            "separate final paragraph whose first token is that agent's plain @handle, "
+            "for example @nell pick one before I proceed. Do not put that callback "
+            "handle inline near the beginning, wrap it in backticks, or bury it before "
+            "the options."
         ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",
