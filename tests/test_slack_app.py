@@ -1556,6 +1556,54 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_slack_message_backfill_reprocesses_acknowledged_message_without_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller._mark_slack_message_processed("C1", "171.000010")
+                gateway.history_messages.append(
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "Update docs after interrupted restart",
+                        "ts": "171.000010",
+                        "reactions": [{"name": "white_check_mark"}],
+                    }
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000005")
+
+                self.assertEqual(recovered, 1)
+                self.assertEqual(len(store.list_agent_tasks()), 1)
+                self.assertEqual(
+                    store.list_agent_tasks()[0].prompt,
+                    "Update docs after interrupted restart",
+                )
+                self.assertEqual(len(runtime.started), 1)
+            finally:
+                store.close()
+
     def test_slack_message_backfill_processes_known_thread_replies(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
