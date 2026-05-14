@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from secrets import token_urlsafe
 
@@ -33,6 +33,9 @@ LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
 AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
 MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
+MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
+MANAGED_RUN_MAX_RESUMES = 3
+MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
@@ -186,6 +189,20 @@ class ManagedTaskRuntime:
 
     def is_task_running(self, task_id: str) -> bool:
         return self._get_running(task_id) is not None
+
+    def stop_all_running_tasks(self, status: AgentTaskStatus = AgentTaskStatus.CANCELLED) -> int:
+        with self._lock:
+            task_ids = list(self._running.keys())
+        stopped = 0
+        for task_id in task_ids:
+            try:
+                if self.stop_task(task_id, status):
+                    stopped += 1
+            except Exception:
+                LOGGER.debug(
+                    "failed to stop running task %s during shutdown", task_id, exc_info=True
+                )
+        return stopped
 
     def running_task_for_thread(self, channel_id: str, thread_ts: str) -> RunningTask | None:
         with self._lock:
@@ -623,10 +640,15 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.debug("failed to load task before clearing managed run marker", exc_info=True)
             return None
-        if current is None or MANAGED_RUN_STARTED_METADATA_KEY not in current.metadata:
+        if current is None:
+            return current
+        has_marker = MANAGED_RUN_STARTED_METADATA_KEY in current.metadata
+        has_attempts = MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY in current.metadata
+        if not has_marker and not has_attempts:
             return current
         metadata = dict(current.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY, None)
         updated = replace(current, metadata=metadata, updated_at=utc_now())
         try:
             self.store.upsert_agent_task(updated)
@@ -634,6 +656,71 @@ class ManagedTaskRuntime:
             LOGGER.debug("failed to clear managed run marker", exc_info=True)
             return current
         return updated
+
+    def resume_orphaned_task(
+        self,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+    ) -> bool:
+        try:
+            current = self.store.get_agent_task(task.task_id) or task
+        except Exception:
+            LOGGER.debug("failed to load task before resume bump", exc_info=True)
+            current = task
+        attempts = managed_run_resume_attempts(current) + 1
+        metadata = dict(current.metadata)
+        metadata[MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY] = attempts
+        bumped = replace(current, metadata=metadata, updated_at=utc_now())
+        try:
+            self.store.upsert_agent_task(bumped)
+        except Exception:
+            LOGGER.debug("failed to record managed run resume attempt", exc_info=True)
+            bumped = current
+        return self.start_task(bumped, agent, thread)
+
+
+def managed_run_resume_attempts(task: AgentTask) -> int:
+    value = task.metadata.get(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY)
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return max(0, int(value.strip()))
+    return 0
+
+
+def managed_run_started_age(
+    task: AgentTask,
+    *,
+    now: datetime | None = None,
+) -> timedelta | None:
+    marker = task.metadata.get(MANAGED_RUN_STARTED_METADATA_KEY)
+    if not isinstance(marker, str):
+        return None
+    started = parse_timestamp(marker)
+    if started is None:
+        return None
+    reference = now or utc_now()
+    return reference - started
+
+
+def should_resume_managed_run(
+    task: AgentTask,
+    *,
+    now: datetime | None = None,
+    max_age: timedelta = MANAGED_RUN_MAX_RESUME_AGE,
+    max_resumes: int = MANAGED_RUN_MAX_RESUMES,
+) -> bool:
+    if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
+        return False
+    if managed_run_resume_attempts(task) >= max_resumes:
+        return False
+    age = managed_run_started_age(task, now=now)
+    if age is None:
+        return False
+    return age <= max_age
 
 
 def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
