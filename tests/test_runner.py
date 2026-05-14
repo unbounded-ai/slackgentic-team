@@ -156,24 +156,32 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(process.read_available(), "firsttail")
 
-    def test_managed_process_sends_prompt_over_stdin(self):
+    def test_managed_process_sends_codex_prompt_over_pipe_stdin(self):
         child = FakeChild()
         calls = []
+        prompt = "hidden prompt " * 2000
 
-        def fake_spawn(command, args, **kwargs):
-            calls.append((command, args, kwargs))
+        def fake_popen_spawn(command, **kwargs):
+            calls.append((command, kwargs))
             return child
 
         process = ManagedAgentProcess(
-            LaunchRequest(provider=Provider.CODEX, prompt="hidden prompt", cwd=Path("/tmp/repo"))
+            LaunchRequest(provider=Provider.CODEX, prompt=prompt, cwd=Path("/tmp/repo"))
         )
 
-        with patch("pexpect.spawn", fake_spawn):
+        def fail_pty_spawn(*_args, **_kwargs):
+            raise AssertionError("codex stdin prompt should use pipe-backed spawn")
+
+        with (
+            patch("pexpect.spawn", fail_pty_spawn),
+            patch("pexpect.popen_spawn.PopenSpawn", fake_popen_spawn),
+        ):
             process.start()
 
-        self.assertEqual(calls[0][0], "codex")
-        self.assertNotIn("hidden prompt", calls[0][1])
-        self.assertEqual(child.sent, ["hidden prompt", "\n"])
+        self.assertEqual(calls[0][0][0], "codex")
+        self.assertIn("-", calls[0][0])
+        self.assertNotIn(prompt, calls[0][0])
+        self.assertEqual(child.sent, [prompt, "\n"])
         self.assertTrue(child.eof_sent)
 
     def test_managed_codex_resume_process_does_not_send_stdin(self):

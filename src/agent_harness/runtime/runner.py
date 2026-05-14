@@ -99,6 +99,22 @@ class ManagedAgentProcess:
 
             child_env[SLACK_THREAD_CHANNEL_ENV] = self.request.slack_channel_id
             child_env[SLACK_THREAD_TS_ENV] = self.request.slack_thread_ts
+        if self._reads_prompt_from_stdin():
+            from pexpect.popen_spawn import PopenSpawn
+
+            # Large Slack-derived prompts can exceed PTY line-buffer limits before Codex starts.
+            self.child = PopenSpawn(
+                [command, *args],
+                cwd=str(self.request.cwd),
+                env=child_env,
+                encoding="utf-8",
+                timeout=0.1,
+            )
+            self.child.send(self.request.prompt)
+            if not self.request.prompt.endswith("\n"):
+                self.child.send("\n")
+            self.child.sendeof()
+            return
         self.child = pexpect.spawn(
             command,
             args,
@@ -108,11 +124,9 @@ class ManagedAgentProcess:
             timeout=0.1,
             echo=False,
         )
-        if self.request.provider == Provider.CODEX and not self.request.resume_session_id:
-            self.child.send(self.request.prompt)
-            if not self.request.prompt.endswith("\n"):
-                self.child.send("\n")
-            self.child.sendeof()
+
+    def _reads_prompt_from_stdin(self) -> bool:
+        return self.request.provider == Provider.CODEX and not self.request.resume_session_id
 
     def send(self, message: str) -> None:
         if self.child is None:

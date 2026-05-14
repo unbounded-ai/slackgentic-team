@@ -498,6 +498,23 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("Do not put that callback handle inline", prompt)
         self.assertNotIn("`@handle`", prompt)
 
+    def test_build_task_prompt_sanitizes_stored_slack_user_ids(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = replace(
+            create_agent_task(agent, "continue", "C1"),
+            metadata={
+                "thread_context": (
+                    "U0ARHEAU9B3: please check <@U0ARHEAU9B3>\nReviewer: @U0ARHEAU9B3 once ready"
+                )
+            },
+        )
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("Slack user: please check Slack user", prompt)
+        self.assertIn("Reviewer: Slack user once ready", prompt)
+        self.assertNotIn("U0ARHEAU9B3", prompt)
+
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1102,6 +1119,40 @@ class TaskRuntimeTests(unittest.TestCase):
                 assert persisted is not None
                 self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
                 self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+            finally:
+                store.close()
+
+    def test_runtime_cancels_codex_run_that_never_starts_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "review a design", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                    codex_thread_start_timeout=timedelta(seconds=0),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if not runtime.has_running_tasks():
+                        break
+                    time.sleep(0.01)
+
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+                self.assertIsNone(store.get_managed_thread_task("C1", "171.000001"))
+                self.assertIn("did not finish starting Codex", gateway.replies[-1])
             finally:
                 store.close()
 

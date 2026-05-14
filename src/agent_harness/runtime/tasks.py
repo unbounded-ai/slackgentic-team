@@ -28,6 +28,7 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     is_slackgentic_mcp_server_configured,
 )
+from agent_harness.slack import replace_slack_user_ids
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
@@ -39,6 +40,7 @@ MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
+CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str, str | None], bool]
@@ -67,6 +69,7 @@ class RunningTask:
     observed_agent_messages: set[str] | None = None
     control_signals: list[str] = field(default_factory=list)
     visible_message_count: int = 0
+    started_monotonic: float = field(default_factory=time.monotonic)
 
 
 class ManagedTaskRuntime:
@@ -82,6 +85,7 @@ class ManagedTaskRuntime:
         on_agent_control: AgentControlCallback | None = None,
         agent_icon_url: AgentIconUrlCallback | None = None,
         home: Path | None = None,
+        codex_thread_start_timeout: timedelta = CODEX_THREAD_START_TIMEOUT,
     ):
         self.store = store
         self.gateway = gateway
@@ -93,6 +97,7 @@ class ManagedTaskRuntime:
         self.on_agent_control = on_agent_control
         self.agent_icon_url = agent_icon_url
         self.home = home or Path.home()
+        self.codex_thread_start_timeout = codex_thread_start_timeout
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
 
@@ -275,6 +280,9 @@ class ManagedTaskRuntime:
                 )
             for chunk in chunks:
                 self._post_agent_chunk(running, chunk)
+            if self._codex_thread_start_timed_out(running):
+                self._handle_codex_thread_start_timeout(running)
+                return
             if not running.process.is_alive():
                 time.sleep(0.05)
                 tail = running.process.read_available(max_reads=100, timeout=0.05)
@@ -340,6 +348,42 @@ class ManagedTaskRuntime:
                     self.on_task_done(completed_task, running.agent, running.thread)
                 return
             time.sleep(self.poll_seconds)
+
+    def _codex_thread_start_timed_out(self, running: RunningTask) -> bool:
+        if _provider_for_running(running) != Provider.CODEX:
+            return False
+        if running.task.session_id:
+            return False
+        if running.visible_message_count or running.control_signals:
+            return False
+        if not running.process.is_alive():
+            return False
+        timeout_seconds = self.codex_thread_start_timeout.total_seconds()
+        if timeout_seconds <= 0:
+            return True
+        return time.monotonic() - running.started_monotonic >= timeout_seconds
+
+    def _handle_codex_thread_start_timeout(self, running: RunningTask) -> None:
+        task_id = running.task.task_id
+        try:
+            running.process.terminate()
+        except Exception:
+            LOGGER.debug("failed to stop Codex after startup timeout", exc_info=True)
+        with self._lock:
+            self._running.pop(task_id, None)
+        self._clear_managed_run_started(task_id)
+        self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+        self.store.delete_managed_thread_task(task_id)
+        self.gateway.post_thread_reply(
+            running.thread,
+            (
+                f"{running.agent.full_name} did not finish starting Codex within "
+                f"{int(self.codex_thread_start_timeout.total_seconds())} seconds, "
+                "so I stopped this run instead of leaving it stuck."
+            ),
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
 
     def _handle_task_worker_failure(self, task_id: str) -> None:
         running = self._get_running(task_id)
@@ -823,6 +867,10 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "handle inline near the beginning, wrap it in backticks, or bury it before "
             "the options."
         ),
+        (
+            "Do not write raw Slack user IDs such as U12345 or @U12345 in visible replies. "
+            "Use the person's display name when known, or say the Slack user."
+        ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",
     ]
@@ -832,13 +880,14 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         lines.append("Review the PR and report findings with concrete file or diff references.")
     thread_context = task.metadata.get("thread_context")
     if isinstance(thread_context, str) and thread_context.strip():
+        sanitized_thread_context = replace_slack_user_ids(thread_context.strip())
         lines.extend(
             [
                 "",
                 "Private Slack thread context. Use this to understand prior messages, "
                 "handoffs, reviews, and user intent. Do not quote this heading or describe "
                 "it as hidden context in Slack-visible replies:",
-                thread_context.strip(),
+                sanitized_thread_context,
             ]
         )
     return "\n".join(lines)

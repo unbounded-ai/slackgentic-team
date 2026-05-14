@@ -24,6 +24,7 @@ from agent_harness.models import (
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
+    TeamAgentStatus,
     WorkRequest,
     utc_now,
 )
@@ -68,6 +69,7 @@ from agent_harness.slack import (
     decode_action_value,
     is_dependency_intent,
     parse_thread_ref,
+    replace_slack_user_ids,
 )
 from agent_harness.slack.agent_requests import (
     AGENT_REQUEST_ACTIONS,
@@ -794,10 +796,9 @@ class SlackTeamController:
     def hire_agents(self, count: int, provider: Provider | None = None):
         if not self._can_hire(count):
             raise ValueError(AGENT_LIMIT_MESSAGE)
-        all_agents = self.store.list_team_agents(include_fired=True)
         active_agents = self.store.list_team_agents()
         hired = hire_team_agents(
-            all_agents,
+            active_agents,
             count,
             provider,
             start_sort_order=self.store.next_team_sort_order(),
@@ -806,8 +807,21 @@ class SlackTeamController:
             randomize_identities=True,
         )
         for agent in hired:
+            self._release_inactive_handle(agent.handle)
             self.store.upsert_team_agent(agent)
         return hired
+
+    def _release_inactive_handle(self, handle: str) -> None:
+        existing = self.store.get_team_agent(handle, include_fired=True)
+        if existing is None or existing.status == TeamAgentStatus.ACTIVE:
+            return
+        used_handles = {
+            agent.handle
+            for agent in self.store.list_team_agents(include_fired=True)
+            if agent.agent_id != existing.agent_id
+        }
+        retired = _retired_inactive_handle(existing, used_handles)
+        self.store.upsert_team_agent(replace(existing, handle=retired))
 
     def _can_hire(self, count: int) -> bool:
         active_count = len(self.store.list_team_agents())
@@ -2110,10 +2124,11 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
     ) -> None:
-        if _is_subtask(task) or _is_external_thread_helper_task(task):
+        task_is_child = _is_subtask(task) or _is_external_thread_helper_task(task)
+        if task_is_child:
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
-        self._clear_task_request_status_reactions(task, thread)
+            self._clear_task_request_status_reactions(task, thread)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
@@ -2362,11 +2377,7 @@ class SlackTeamController:
         return "Slack"
 
     def _thread_context_text(self, text: str) -> str:
-        return re.sub(
-            r"<@([A-Z0-9]+)>",
-            lambda match: self._display_name_for_slack_user(match.group(1)) or "Slack user",
-            text,
-        )
+        return replace_slack_user_ids(text, self._display_name_for_slack_user)
 
     def _display_name_for_slack_user(self, user_id: str) -> str | None:
         configured = self.store.get_setting(_human_user_display_name_key(user_id))
@@ -3251,6 +3262,20 @@ def _pending_request_message_ts(pending: PendingWorkRequest) -> str | None:
     if isinstance(request_message_ts, str) and request_message_ts:
         return request_message_ts
     return pending.thread_ts or None
+
+
+def _retired_inactive_handle(agent, used_handles: set[str]) -> str:
+    suffix = re.sub(r"[^a-z0-9_-]", "", str(agent.agent_id).lower())[-12:] or "agent"
+    base = f"retired-{suffix}"[:32].rstrip("-_")
+    if len(base) < 2:
+        base = "retired-agent"
+    candidate = base
+    counter = 2
+    while candidate in used_handles:
+        tail = f"-{counter}"
+        candidate = f"{base[: 32 - len(tail)]}{tail}"
+        counter += 1
+    return candidate
 
 
 def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:

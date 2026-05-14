@@ -1,8 +1,15 @@
 import random
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
-from agent_harness.models import AgentTaskKind, AssignmentMode, Provider, WorkRequest
+from agent_harness.models import (
+    AgentTaskKind,
+    AssignmentMode,
+    Provider,
+    TeamAgentStatus,
+    WorkRequest,
+)
 from agent_harness.team import (
     AGENT_LIMIT_MESSAGE,
     AVATAR_IDENTITY_BANK,
@@ -13,6 +20,7 @@ from agent_harness.team import (
     build_initialization_messages,
     choose_reaction,
     format_agent_handoff_request,
+    generate_team_agent,
     hire_team_agents,
     least_represented_provider,
     pick_idle_agent,
@@ -152,6 +160,44 @@ class TeamTests(unittest.TestCase):
 
         self.assertEqual(len(hired), 1)
         self.assertNotIn(hired[0].handle, {agent.handle for agent in all_agents})
+
+    def test_handle_base_reuses_fired_agent_first_name(self):
+        vera_index = next(
+            identity.avatar_index
+            for identity in AVATAR_IDENTITY_BANK
+            if identity.full_name == "Vera Martinez"
+        )
+        fired_vera = replace(
+            generate_team_agent(0, avatar_index=vera_index),
+            handle="vera",
+            status=TeamAgentStatus.FIRED,
+        )
+
+        hired = hire_team_agents(
+            [fired_vera],
+            1,
+            Provider.CODEX,
+            start_sort_order=vera_index - 1,
+        )
+
+        self.assertEqual(hired[0].handle, "vera")
+
+    def test_handle_uses_last_initial_when_same_first_name_is_active(self):
+        vera_martinez_index = next(
+            identity.avatar_index
+            for identity in AVATAR_IDENTITY_BANK
+            if identity.full_name == "Vera Martinez"
+        )
+
+        agent = generate_team_agent(
+            0,
+            {"vera"},
+            Provider.CODEX,
+            avatar_index=vera_martinez_index,
+            active_first_names={"vera"},
+        )
+
+        self.assertEqual(agent.handle, "veram")
 
     def test_initialization_messages_include_intros_and_welcomes(self):
         agents = build_initial_model_team(codex_count=2, claude_count=1)
