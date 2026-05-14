@@ -850,6 +850,45 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_agent_message_clears_answered_request_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "answer follow-ups", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        "request_message_ts": "171.user2",
+                        "request_message_ts_history": ["171.user1"],
+                    },
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "Answered both questions.",
+                    "171.agent",
+                )
+
+                self.assertFalse(handled)
+                for message_ts in ("171.user1", "171.user2"):
+                    self.assertIn(
+                        ("C1", message_ts, "hourglass_flowing_sand"),
+                        gateway.removed_reactions,
+                    )
+                    self.assertIn(("C1", message_ts, "eyes"), gateway.removed_reactions)
+            finally:
+                store.close()
+
     def test_runtime_external_thread_helper_exit_marks_task_done(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

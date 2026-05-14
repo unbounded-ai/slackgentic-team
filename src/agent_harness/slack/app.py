@@ -1595,6 +1595,7 @@ class SlackTeamController:
         active_agents = self.store.list_team_agents()
         request = _agent_authored_review_request(text, active_agents)
         if request is None:
+            self._clear_task_request_status_reactions(task, thread)
             return False
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
         if message_ts:
