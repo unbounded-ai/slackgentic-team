@@ -1077,6 +1077,34 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_stop_all_running_tasks_can_preserve_restart_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "resume after restart", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertEqual(runtime.stop_all_running_tasks(status=None), 1)
+
+                self.assertFalse(runtime.has_running_tasks())
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+                self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+            finally:
+                store.close()
+
     def test_runtime_marks_managed_run_while_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1905,8 +1933,11 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentCommandConfig(),
                     process_factory=OneShotProcess,
                     poll_seconds=0.01,
-                    on_agent_message=lambda task, agent, thread, text: (
-                        seen.append((task.task_id, agent.agent_id, thread.thread_ts, text)) or True
+                    on_agent_message=lambda task, agent, thread, text, message_ts: (
+                        seen.append(
+                            (task.task_id, agent.agent_id, thread.thread_ts, text, message_ts)
+                        )
+                        or True
                     ),
                 )
 
@@ -1942,7 +1973,9 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentCommandConfig(),
                     process_factory=DuplicateCodexFinalProcess,
                     poll_seconds=0.01,
-                    on_agent_message=lambda task, agent, thread, text: seen.append(text),
+                    on_agent_message=lambda task, agent, thread, text, message_ts: seen.append(
+                        text
+                    ),
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
@@ -2084,7 +2117,9 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentCommandConfig(),
                     process_factory=ProgressOnlySessionProcess,
                     poll_seconds=0.01,
-                    on_agent_message=lambda task, agent, thread, text: seen.append(text) or True,
+                    on_agent_message=lambda task, agent, thread, text, message_ts: (
+                        seen.append(text) or True
+                    ),
                     on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
                     home=home,
                 )

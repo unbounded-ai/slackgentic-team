@@ -83,7 +83,6 @@ from agent_harness.team import (
     MAX_TEAM_AGENTS,
     agent_personal_context,
     build_initialization_messages,
-    choose_reaction,
     format_agent_assignment,
     format_agent_handoff_assignment,
     format_agent_handoff_request,
@@ -109,10 +108,27 @@ from agent_harness.team.routing import (
 LOGGER = logging.getLogger(__name__)
 SETTING_CHANNEL_ID = "slack.channel_id"
 SETTING_ROSTER_TS = "slack.roster_ts"
+SETTING_ROSTER_MESSAGE_PREFIX = "slack.roster_message."
+SETTING_ROSTER_DISCOVERY_PREFIX = "slack.roster_discovery."
 SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
 SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
+TASK_REACTION_ACKNOWLEDGED = "eyes"
+TASK_REACTION_IN_PROGRESS = "hourglass_flowing_sand"
+TASK_REACTION_DONE = "white_check_mark"
+TASK_STATUS_REACTIONS = (
+    TASK_REACTION_ACKNOWLEDGED,
+    TASK_REACTION_IN_PROGRESS,
+    TASK_REACTION_DONE,
+    "thumbsup",
+    "warning",
+    "test_tube",
+    "rocket",
+    "link",
+    "memo",
+    "thinking_face",
+)
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
 SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
@@ -367,7 +383,7 @@ class SlackTeamController:
                 thread_ts=event.get("thread_ts") or event.get("ts"),
                 message_ts=event.get("ts"),
             )
-            self._ack_thinking(channel_id, event.get("ts"))
+            self._mark_message_acknowledged(channel_id, event.get("ts"))
             self._start_specific_requests_in_thread(
                 multi_requests,
                 thread,
@@ -382,7 +398,7 @@ class SlackTeamController:
         request = _channel_work_request(text, active_agents)
         if request is None:
             return
-        self._ack_thinking(channel_id, event.get("ts"))
+        self._mark_message_acknowledged(channel_id, event.get("ts"))
         thread = SlackThreadRef(
             channel_id=channel_id,
             thread_ts=event.get("thread_ts") or event.get("ts"),
@@ -442,7 +458,7 @@ class SlackTeamController:
         task = self.store.get_agent_task(result.task.task_id) or result.task
         if self.runtime:
             self.runtime.start_task(task, result.agent, thread)
-        self._react(channel_id, event.get("ts"), result.agent, result.request.prompt)
+        self._mark_message_in_progress(channel_id, event.get("ts"))
 
     def handle_team_command(
         self,
@@ -633,6 +649,8 @@ class SlackTeamController:
         task = self.store.get_agent_task(result.task.task_id) or result.task
         if self.runtime:
             self.runtime.start_task(task, result.agent, thread)
+        if request_message_ts:
+            self._mark_message_in_progress(pending.channel_id, request_message_ts)
         return True
 
     def _post_text(self, target: SlackReplyTarget, text: str) -> None:
@@ -858,29 +876,76 @@ class SlackTeamController:
             thread_ts=thread_ts,
         )
         if remember:
-            self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
-            self.store.set_setting(SETTING_ROSTER_TS, posted.ts)
+            self._remember_roster_message(channel_id, posted.ts)
             if thread_ts is None:
                 self._pin_roster(channel_id, posted.ts)
         return posted.ts
 
     def refresh_or_post_roster(self, channel_id: str) -> str:
-        roster_ts = self.store.get_setting(SETTING_ROSTER_TS)
-        if roster_ts:
+        self._discover_recent_roster_messages(channel_id)
+        roster_ts_values = self._remembered_roster_ts_values(channel_id)
+        if roster_ts_values:
             agents = self.store.list_team_agents()
             statuses = self._roster_statuses(agents)
+            text = _roster_text(agents, statuses)
+            blocks = build_team_roster_blocks(agents, statuses)
+            latest_roster_ts = roster_ts_values[-1]
+            self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
+            self.store.set_setting(SETTING_ROSTER_TS, latest_roster_ts)
             try:
-                self.gateway.update_message(
-                    channel_id,
-                    roster_ts,
-                    _roster_text(agents, statuses),
-                    blocks=build_team_roster_blocks(agents, statuses),
-                )
-                self._pin_roster(channel_id, roster_ts)
+                self._pin_roster(channel_id, latest_roster_ts)
             except Exception:
-                LOGGER.debug("failed to update Slack roster message", exc_info=True)
-            return roster_ts
+                LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
+            for roster_ts in roster_ts_values:
+                try:
+                    self.gateway.update_message(
+                        channel_id,
+                        roster_ts,
+                        text,
+                        blocks=blocks,
+                    )
+                except Exception:
+                    LOGGER.debug(
+                        "failed to update Slack roster message %s",
+                        roster_ts,
+                        exc_info=True,
+                    )
+            return latest_roster_ts
         return self.post_roster(channel_id)
+
+    def _remember_roster_message(self, channel_id: str, message_ts: str) -> None:
+        self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
+        self.store.set_setting(SETTING_ROSTER_TS, message_ts)
+        self.store.set_setting(_roster_message_setting_key(channel_id, message_ts), message_ts)
+
+    def _remembered_roster_ts_values(self, channel_id: str) -> list[str]:
+        values: list[str] = []
+        legacy_ts = self.store.get_setting(SETTING_ROSTER_TS)
+        if legacy_ts:
+            values.append(legacy_ts)
+        prefix = _roster_message_channel_prefix(channel_id)
+        for value in self.store.list_settings(prefix).values():
+            if value:
+                values.append(value)
+        return sorted(dict.fromkeys(values), key=_slack_ts_sort_key)
+
+    def _discover_recent_roster_messages(self, channel_id: str) -> None:
+        discovery_key = _roster_discovery_setting_key(channel_id)
+        if self.store.get_setting(discovery_key):
+            return
+        try:
+            messages = self.gateway.channel_messages(channel_id, limit=200)
+        except Exception:
+            LOGGER.debug("failed to discover recent Slack roster messages", exc_info=True)
+            return
+        for message in messages:
+            message_ts = message.get("ts")
+            if not isinstance(message_ts, str) or not message_ts:
+                continue
+            if not _is_roster_message(message):
+                continue
+            self.store.set_setting(_roster_message_setting_key(channel_id, message_ts), message_ts)
+        self.store.set_setting(discovery_key, utc_now().isoformat())
 
     def handle_external_session_occupancy_change(self, channel_id: str) -> None:
         self._resume_pending_work_requests(channel_id)
@@ -1184,9 +1249,9 @@ class SlackTeamController:
         if task is None:
             return False
         agent = self.store.get_team_agent(task.agent_id)
-        self._ack_thinking(channel_id, message_ts)
-        if agent:
-            self._react(channel_id, message_ts, agent, text)
+        if agent is None and task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return True
+        self._mark_message_acknowledged(channel_id, message_ts)
         if self._handle_thread_work_request(task, event, text, agent):
             return True
         if self._record_dependency_if_requested(task.task_id, event, text, agent):
@@ -1194,9 +1259,14 @@ class SlackTeamController:
         active_task = self._active_thread_task_for_agent(task, channel_id, thread_ts)
         target_task = active_task or task
         if self.runtime and self.runtime.send_to_task(target_task.task_id, text):
+            self._remember_request_message_for_task(target_task, message_ts)
+            self._mark_message_in_progress(channel_id, message_ts)
             return True
         if agent:
-            return self._start_thread_followup(target_task, event, text, agent)
+            started = self._start_thread_followup(target_task, event, text, agent)
+            if started:
+                self._mark_message_in_progress(channel_id, message_ts)
+            return started
         if task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
             return True
         self.gateway.post_thread_reply(
@@ -1219,6 +1289,7 @@ class SlackTeamController:
         session = self.store.get_session_for_slack_thread(self.team_id, channel_id, thread_ts)
         if session is None:
             return False
+        self._mark_message_acknowledged(channel_id, message_ts)
         if self._handle_external_thread_work_request(session, event, text):
             return True
         if self.session_bridge is None:
@@ -1229,12 +1300,15 @@ class SlackTeamController:
             return True
         if not self._reserve_external_session_agent_for_reply(session, channel_id, thread_ts):
             return True
-        return self.session_bridge.send_to_session(
+        sent = self.session_bridge.send_to_session(
             session,
             text,
             SlackThreadRef(channel_id, thread_ts),
             slack_user=event.get("user"),
         )
+        if sent:
+            self._mark_message_in_progress(channel_id, message_ts)
+        return sent
 
     def _reserve_external_session_agent_for_reply(
         self,
@@ -1302,10 +1376,11 @@ class SlackTeamController:
             SlackThreadRef(channel_id, thread_ts),
             requested_by_slack_user=event.get("user"),
         ):
+            self._mark_message_in_progress(channel_id, event.get("ts"))
             return True
         same_thread_agent = self._same_thread_requested_agent(request, channel_id, thread_ts)
         if same_thread_agent is not None:
-            return self._start_same_thread_agent_followup(
+            started = self._start_same_thread_agent_followup(
                 request,
                 same_thread_agent,
                 SlackThreadRef(channel_id, thread_ts),
@@ -1313,6 +1388,9 @@ class SlackTeamController:
                 author_agent=author_agent,
                 request_message_ts=event.get("ts"),
             )
+            if started:
+                self._mark_message_in_progress(channel_id, event.get("ts"))
+            return started
         extra_metadata = self._external_thread_task_metadata(session, channel_id, thread_ts)
         extra_metadata["request_message_ts"] = event.get("ts")
         extra_metadata = self._with_linked_thread_context(
@@ -1357,6 +1435,7 @@ class SlackTeamController:
         task = self.store.get_agent_task(result.task.task_id) or result.task
         if self.runtime:
             self.runtime.start_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
+        self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
 
     def _handle_thread_work_request(
@@ -1398,7 +1477,7 @@ class SlackTeamController:
         )
         same_thread_agent = self._same_thread_requested_agent(request, channel_id, thread_ts)
         if same_thread_agent is not None:
-            return self._start_same_thread_agent_followup(
+            started = self._start_same_thread_agent_followup(
                 request,
                 same_thread_agent,
                 SlackThreadRef(channel_id, thread_ts),
@@ -1407,6 +1486,9 @@ class SlackTeamController:
                 context_task=parent_task,
                 request_message_ts=event.get("ts"),
             )
+            if started:
+                self._mark_message_in_progress(channel_id, event.get("ts"))
+            return started
         delegation = _thread_delegation_intent(request.prompt, parent_agent, active_agents)
         excluded_agent_ids: set[str] = set(self._external_busy_agent_ids())
         sticky_excluded_agent_ids: set[str] = set(
@@ -1454,6 +1536,7 @@ class SlackTeamController:
         task = self.store.get_agent_task(result.task.task_id) or result.task
         if self.runtime:
             self.runtime.start_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
+        self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
 
     def handle_runtime_agent_message(
@@ -1462,16 +1545,19 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
         text: str,
+        message_ts: str | None = None,
     ) -> bool:
         if not thread.thread_ts:
             return False
-        if self._handle_agent_authored_specific_request(task, agent, thread, text):
+        if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
         active_agents = self.store.list_team_agents()
         request = _agent_authored_review_request(text, active_agents)
         if request is None:
             return False
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
+        if message_ts:
+            metadata["request_message_ts"] = message_ts
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         if not isinstance(delegate_to_agent_id, str):
             delegate_to_agent_id = agent.agent_id
@@ -1512,6 +1598,8 @@ class SlackTeamController:
                 exclude_agent_ids=self._anyone_context_agent_ids(request, active_agents, agent),
             )
             return True
+        if message_ts:
+            self._mark_message_acknowledged(thread.channel_id, message_ts)
         posted = self.gateway.post_thread_reply(
             thread,
             format_agent_handoff_assignment(result.agent, agent, result.request.prompt),
@@ -1520,8 +1608,13 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
         reviewer_task = self.store.get_agent_task(result.task.task_id) or result.task
-        if self.runtime:
-            self.runtime.start_task(reviewer_task, result.agent, thread)
+        started = (
+            self.runtime.start_task(reviewer_task, result.agent, thread) if self.runtime else True
+        )
+        if started and message_ts:
+            self._mark_message_in_progress(thread.channel_id, message_ts)
+        elif message_ts:
+            self._clear_message_status_reactions(thread.channel_id, message_ts)
         return True
 
     def _handle_agent_authored_specific_request(
@@ -1530,6 +1623,7 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
         text: str,
+        message_ts: str | None = None,
     ) -> bool:
         active_agents = self.store.list_team_agents()
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
@@ -1542,13 +1636,21 @@ class SlackTeamController:
                     agent,
                     thread,
                     text,
+                    message_ts=message_ts,
                 ):
                     handled = True
             return handled
         request = _parse_work_request_for_agents(text, active_agents, split_newlines=True)
         if request is None or request.assignment_mode != AssignmentMode.SPECIFIC:
             return False
-        return self._start_agent_authored_specific_request(request, task, agent, thread, text)
+        return self._start_agent_authored_specific_request(
+            request,
+            task,
+            agent,
+            thread,
+            text,
+            message_ts=message_ts,
+        )
 
     def _start_agent_authored_specific_request(
         self,
@@ -1557,6 +1659,8 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
         text: str,
+        *,
+        message_ts: str | None = None,
     ) -> bool:
         target_agent = self.store.get_team_agent(request.requested_handle or "")
         if target_agent is None or target_agent.agent_id == agent.agent_id:
@@ -1571,20 +1675,30 @@ class SlackTeamController:
             return True
         if task.metadata.get("delegate_to_agent_id") == target_agent.agent_id:
             return False
+        if message_ts:
+            self._mark_message_acknowledged(thread.channel_id, message_ts)
         same_thread_task = self._latest_task_for_agent_thread(
             target_agent.agent_id,
             thread.channel_id,
             thread.thread_ts,
         )
         if same_thread_task is not None:
-            return self._continue_same_thread_agent_task(
+            handled = self._continue_same_thread_agent_task(
                 request,
                 same_thread_task,
                 target_agent,
                 thread,
                 requested_by_slack_user=task.requested_by_slack_user,
+                request_message_ts=message_ts,
             )
+            if handled and message_ts:
+                self._mark_message_in_progress(thread.channel_id, message_ts)
+            elif message_ts:
+                self._clear_message_status_reactions(thread.channel_id, message_ts)
+            return handled
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
+        if message_ts:
+            metadata["request_message_ts"] = message_ts
         metadata = self._with_linked_thread_context(
             metadata,
             request.prompt,
@@ -1618,8 +1732,13 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
         delegated_task = self.store.get_agent_task(result.task.task_id) or result.task
-        if self.runtime:
-            self.runtime.start_task(delegated_task, result.agent, thread)
+        started = (
+            self.runtime.start_task(delegated_task, result.agent, thread) if self.runtime else True
+        )
+        if started and message_ts:
+            self._mark_message_in_progress(thread.channel_id, message_ts)
+        elif message_ts:
+            self._clear_message_status_reactions(thread.channel_id, message_ts)
         return True
 
     def _start_specific_requests_in_thread(
@@ -1633,6 +1752,12 @@ class SlackTeamController:
         context_task: AgentTask | None = None,
     ) -> bool:
         handled = False
+        started = False
+        request_message_ts = thread.message_ts
+        if not request_message_ts and extra_metadata:
+            value = extra_metadata.get("request_message_ts")
+            if isinstance(value, str) and value:
+                request_message_ts = value
         for request in requests:
             target_agent = self.store.get_team_agent(request.requested_handle or "")
             if target_agent is None:
@@ -1644,6 +1769,7 @@ class SlackTeamController:
                 requested_by_slack_user=requested_by_slack_user,
             ):
                 handled = True
+                started = True
                 continue
             same_thread_agent = self._same_thread_requested_agent(
                 request,
@@ -1651,23 +1777,17 @@ class SlackTeamController:
                 thread.thread_ts,
             )
             if same_thread_agent is not None:
-                request_message_ts = None
-                if extra_metadata:
-                    value = extra_metadata.get("request_message_ts")
-                    if isinstance(value, str):
-                        request_message_ts = value
-                handled = (
-                    self._start_same_thread_agent_followup(
-                        request,
-                        same_thread_agent,
-                        thread,
-                        requested_by_slack_user=requested_by_slack_user,
-                        author_agent=author_agent,
-                        context_task=context_task,
-                        request_message_ts=request_message_ts,
-                    )
-                    or handled
+                same_thread_started = self._start_same_thread_agent_followup(
+                    request,
+                    same_thread_agent,
+                    thread,
+                    requested_by_slack_user=requested_by_slack_user,
+                    author_agent=author_agent,
+                    context_task=context_task,
+                    request_message_ts=request_message_ts,
                 )
+                started = started or same_thread_started
+                handled = same_thread_started or handled
                 continue
             result = assign_work_request(
                 self.store,
@@ -1705,7 +1825,10 @@ class SlackTeamController:
             task = self.store.get_agent_task(result.task.task_id) or result.task
             if self.runtime:
                 self.runtime.start_task(task, result.agent, thread)
+            started = True
             handled = True
+        if started and request_message_ts:
+            self._mark_message_in_progress(thread.channel_id, request_message_ts)
         return handled
 
     def _same_thread_requested_agent(
@@ -1769,6 +1892,7 @@ class SlackTeamController:
                 request.prompt,
             )
         ):
+            self._remember_request_message_for_task(previous_task, request_message_ts)
             return True
         if previous_task:
             return self._continue_same_thread_agent_task(
@@ -1888,6 +2012,7 @@ class SlackTeamController:
             and self.runtime
             and self.runtime.send_to_task(previous_task.task_id, request.prompt)
         ):
+            self._remember_request_message_for_task(previous_task, request_message_ts)
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
@@ -1961,6 +2086,24 @@ class SlackTeamController:
             session_id=previous_task.session_id,
         )
 
+    def _remember_request_message_for_task(
+        self,
+        task: AgentTask,
+        message_ts: str | None,
+    ) -> AgentTask:
+        if not message_ts:
+            return task
+        metadata = _metadata_with_request_message_ts(task.metadata, message_ts)
+        if metadata == task.metadata:
+            return task
+        updated = replace(task, metadata=metadata, updated_at=utc_now())
+        try:
+            self.store.upsert_agent_task(updated)
+        except Exception:
+            LOGGER.debug("failed to remember task request message", exc_info=True)
+            return task
+        return self.store.get_agent_task(task.task_id) or updated
+
     def handle_runtime_task_done(
         self,
         task: AgentTask,
@@ -1970,7 +2113,7 @@ class SlackTeamController:
         if _is_subtask(task) or _is_external_thread_helper_task(task):
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
-            self._mark_task_complete(task, thread)
+        self._clear_task_request_status_reactions(task, thread)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
@@ -2263,27 +2406,11 @@ class SlackTeamController:
         )
         return True
 
-    def _react(
-        self,
-        channel_id: str,
-        message_ts: str | None,
-        agent,
-        text: str,
-    ) -> None:
-        if not message_ts or not agent:
-            return
-        try:
-            self.gateway.add_reaction(channel_id, message_ts, choose_reaction(agent, text))
-        except Exception:
-            LOGGER.debug("failed to add Slack reaction", exc_info=True)
+    def _mark_message_acknowledged(self, channel_id: str, message_ts: str | None) -> None:
+        self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_ACKNOWLEDGED)
 
-    def _ack_thinking(self, channel_id: str, message_ts: str | None) -> None:
-        if not message_ts:
-            return
-        try:
-            self.gateway.add_reaction(channel_id, message_ts, "hourglass_flowing_sand")
-        except Exception:
-            LOGGER.debug("failed to add thinking reaction", exc_info=True)
+    def _mark_message_in_progress(self, channel_id: str, message_ts: str | None) -> None:
+        self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_IN_PROGRESS)
 
     def _mark_task_complete(
         self,
@@ -2294,31 +2421,61 @@ class SlackTeamController:
     ) -> None:
         task = self.store.get_agent_task(task.task_id) or task
         self._remove_task_action_buttons_if_resolved(task)
-        message_ts_values: list[str] = []
         if include_thread and task.thread_ts:
-            message_ts_values.append(task.thread_ts)
-        request_message_ts = task.metadata.get("request_message_ts")
-        if isinstance(request_message_ts, str) and request_message_ts:
-            message_ts_values.append(request_message_ts)
-        elif task.parent_message_ts:
-            message_ts_values.append(task.parent_message_ts)
-        for message_ts in dict.fromkeys(message_ts_values):
-            self._mark_message_complete(thread.channel_id, message_ts)
+            self._mark_message_complete(thread.channel_id, task.thread_ts)
+        for message_ts in _task_request_message_ts_values(task):
+            if include_thread and message_ts == task.thread_ts:
+                continue
+            self._clear_message_status_reactions(thread.channel_id, message_ts)
+
+    def _clear_task_request_status_reactions(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> None:
+        task = self.store.get_agent_task(task.task_id) or task
+        for message_ts in _task_request_message_ts_values(task):
+            self._clear_message_status_reactions(thread.channel_id, message_ts)
 
     def _mark_message_complete(self, channel_id: str, message_ts: str | None) -> None:
+        self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_DONE)
+
+    def _set_task_status_reaction(
+        self,
+        channel_id: str,
+        message_ts: str | None,
+        reaction_name: str,
+    ) -> None:
+        if not message_ts:
+            return
+        self._clear_message_status_reactions(
+            channel_id,
+            message_ts,
+            except_reaction=reaction_name,
+        )
+        try:
+            self.gateway.add_reaction(channel_id, message_ts, reaction_name)
+        except Exception:
+            LOGGER.debug("failed to add Slack task status reaction", exc_info=True)
+
+    def _clear_message_status_reactions(
+        self,
+        channel_id: str,
+        message_ts: str | None,
+        *,
+        except_reaction: str | None = None,
+    ) -> None:
         if not message_ts:
             return
         remove_reaction = getattr(self.gateway, "remove_reaction", None)
         if callable(remove_reaction):
-            for reaction in ("hourglass_flowing_sand", "eyes"):
+            for reaction in TASK_STATUS_REACTIONS:
+                if reaction == except_reaction:
+                    continue
                 try:
                     remove_reaction(channel_id, message_ts, reaction)
                 except Exception:
-                    LOGGER.debug("failed to remove Slack completion reaction", exc_info=True)
-        try:
-            self.gateway.add_reaction(channel_id, message_ts, "white_check_mark")
-        except Exception:
-            LOGGER.debug("failed to add Slack completion reaction", exc_info=True)
+                    LOGGER.debug("failed to remove stale Slack task reaction", exc_info=True)
 
     def _remove_task_action_buttons_if_resolved(self, task: AgentTask) -> None:
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
@@ -2781,7 +2938,9 @@ class SocketModeSlackApp:
             stop_all = getattr(self.runtime, "stop_all_running_tasks", None)
             if callable(stop_all):
                 try:
-                    stop_all()
+                    # Preserve task state and managed-run markers so launchd restarts
+                    # can resume interrupted work instead of freeing the agent.
+                    stop_all(status=None)
                 except Exception:
                     LOGGER.exception("failed to stop running managed tasks during shutdown")
         if self.codex_app_server:
@@ -2976,6 +3135,44 @@ def _roster_text(agents, statuses: dict[str, AgentRosterStatus] | None = None) -
     )
 
 
+def _roster_message_channel_prefix(channel_id: str) -> str:
+    return f"{SETTING_ROSTER_MESSAGE_PREFIX}{channel_id}."
+
+
+def _roster_message_setting_key(channel_id: str, message_ts: str) -> str:
+    return f"{_roster_message_channel_prefix(channel_id)}{message_ts}"
+
+
+def _roster_discovery_setting_key(channel_id: str) -> str:
+    return f"{SETTING_ROSTER_DISCOVERY_PREFIX}{channel_id}"
+
+
+def _is_roster_message(message: dict) -> bool:
+    text = message.get("text")
+    if isinstance(text, str) and text.startswith("Agent roster:"):
+        return True
+    blocks = message.get("blocks")
+    if not isinstance(blocks, list):
+        return False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        text_obj = block.get("text")
+        if not isinstance(text_obj, dict):
+            continue
+        value = text_obj.get("text")
+        if isinstance(value, str) and value.startswith("*Agent team*"):
+            return True
+    return False
+
+
+def _slack_ts_sort_key(value: str) -> tuple[float, str]:
+    try:
+        return (float(value), value)
+    except ValueError:
+        return (0.0, value)
+
+
 def _shorten(value: str, limit: int) -> str:
     cleaned = re.sub(r"\s+", " ", value).strip()
     if len(cleaned) <= limit:
@@ -2997,6 +3194,42 @@ def _event_has_slackgentic_progress_reaction(event: dict) -> bool:
         }:
             return True
     return False
+
+
+def _task_request_message_ts_values(task: AgentTask) -> list[str]:
+    values: list[str] = []
+    request_message_ts = task.metadata.get("request_message_ts")
+    if isinstance(request_message_ts, str) and request_message_ts:
+        values.append(request_message_ts)
+    history = task.metadata.get("request_message_ts_history")
+    if isinstance(history, list):
+        values.extend(item for item in history if isinstance(item, str) and item)
+    if not values and task.parent_message_ts:
+        values.append(task.parent_message_ts)
+    return list(dict.fromkeys(values))
+
+
+def _metadata_with_request_message_ts(
+    metadata: dict[str, object],
+    message_ts: str,
+) -> dict[str, object]:
+    updated = dict(metadata)
+    current = updated.get("request_message_ts")
+    history = updated.get("request_message_ts_history")
+    values: list[str] = []
+    if isinstance(current, str) and current:
+        values.append(current)
+    if isinstance(history, list):
+        values.extend(item for item in history if isinstance(item, str) and item)
+    values.append(message_ts)
+    deduped = list(dict.fromkeys(values))
+    updated["request_message_ts"] = message_ts
+    prior = [item for item in deduped if item != message_ts]
+    if prior:
+        updated["request_message_ts_history"] = prior[-20:]
+    else:
+        updated.pop("request_message_ts_history", None)
+    return updated
 
 
 def _metadata_has_message_ts(metadata: dict[str, object], message_ts: str) -> bool:

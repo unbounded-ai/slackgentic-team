@@ -41,7 +41,7 @@ MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
-AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
+AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str, str | None], bool]
 AgentControlCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
 AgentIconUrlCallback = Callable[[TeamAgent], str | None]
 
@@ -183,15 +183,21 @@ class ManagedTaskRuntime:
             return False
         return True
 
-    def stop_task(self, task_id: str, status: AgentTaskStatus = AgentTaskStatus.CANCELLED) -> bool:
+    def stop_task(
+        self,
+        task_id: str,
+        status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
+    ) -> bool:
         running = self._get_running(task_id)
         if running is None:
-            self._clear_managed_run_started(task_id)
-            self.store.update_agent_task_status(task_id, status)
+            if status is not None:
+                self._clear_managed_run_started(task_id)
+                self.store.update_agent_task_status(task_id, status)
             return False
         running.process.terminate()
-        self._clear_managed_run_started(task_id)
-        self.store.update_agent_task_status(task_id, status)
+        if status is not None:
+            self._clear_managed_run_started(task_id)
+            self.store.update_agent_task_status(task_id, status)
         with self._lock:
             self._running.pop(task_id, None)
         return True
@@ -199,7 +205,10 @@ class ManagedTaskRuntime:
     def is_task_running(self, task_id: str) -> bool:
         return self._get_running(task_id) is not None
 
-    def stop_all_running_tasks(self, status: AgentTaskStatus = AgentTaskStatus.CANCELLED) -> int:
+    def stop_all_running_tasks(
+        self,
+        status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
+    ) -> int:
         with self._lock:
             task_ids = list(self._running.keys())
         stopped = 0
@@ -375,7 +384,7 @@ class ManagedTaskRuntime:
             running.observed_agent_messages = set()
         if normalized in running.observed_agent_messages:
             return
-        self.gateway.post_thread_reply(
+        posted = self.gateway.post_thread_reply(
             running.thread,
             visible_text,
             persona=running.agent,
@@ -386,7 +395,13 @@ class ManagedTaskRuntime:
         if self.on_agent_message is None:
             return
         try:
-            self.on_agent_message(running.task, running.agent, running.thread, normalized)
+            self.on_agent_message(
+                running.task,
+                running.agent,
+                running.thread,
+                normalized,
+                posted.ts,
+            )
         except Exception:
             LOGGER.exception("failed to handle agent-authored Slack message")
 
