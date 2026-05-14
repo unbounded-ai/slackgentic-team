@@ -198,6 +198,9 @@ CREATE TABLE IF NOT EXISTS slack_agent_requests (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX IF NOT EXISTS idx_slack_agent_requests_message
+  ON slack_agent_requests(thread_channel_id, message_ts);
+
 CREATE TABLE IF NOT EXISTS mirrored_slack_messages (
   channel_id TEXT NOT NULL,
   message_ts TEXT NOT NULL,
@@ -984,80 +987,86 @@ class Store:
         message_ts: str | None = None,
         answers: dict[str, str] | None = None,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO slack_agent_requests (
-              token, provider_label, method, params_json, thread_channel_id,
-              thread_ts, message_ts, answers_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                token,
-                provider_label,
-                method,
-                json.dumps(params, sort_keys=True),
-                thread.channel_id,
-                thread.thread_ts,
-                message_ts,
-                json.dumps(answers or {}, sort_keys=True),
-                utc_now().isoformat(),
-            ),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO slack_agent_requests (
+                  token, provider_label, method, params_json, thread_channel_id,
+                  thread_ts, message_ts, answers_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    provider_label,
+                    method,
+                    json.dumps(params, sort_keys=True),
+                    thread.channel_id,
+                    thread.thread_ts,
+                    message_ts,
+                    json.dumps(answers or {}, sort_keys=True),
+                    utc_now().isoformat(),
+                ),
+            )
+            self.conn.commit()
 
     def update_slack_agent_request_message_ts(self, token: str, message_ts: str) -> None:
-        self.conn.execute(
-            """
-            UPDATE slack_agent_requests
-            SET message_ts = ?
-            WHERE token = ?
-            """,
-            (message_ts, token),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE slack_agent_requests
+                SET message_ts = ?
+                WHERE token = ?
+                """,
+                (message_ts, token),
+            )
+            self.conn.commit()
 
     def update_slack_agent_request_answers(self, token: str, answers: dict[str, str]) -> None:
-        self.conn.execute(
-            """
-            UPDATE slack_agent_requests
-            SET answers_json = ?
-            WHERE token = ? AND resolved_at IS NULL
-            """,
-            (json.dumps(answers, sort_keys=True), token),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE slack_agent_requests
+                SET answers_json = ?
+                WHERE token = ? AND resolved_at IS NULL
+                """,
+                (json.dumps(answers, sort_keys=True), token),
+            )
+            self.conn.commit()
 
     def resolve_slack_agent_request(self, token: str, response: object) -> None:
-        self.conn.execute(
-            """
-            UPDATE slack_agent_requests
-            SET response_json = ?, resolved_at = ?
-            WHERE token = ? AND resolved_at IS NULL
-            """,
-            (json.dumps(response, sort_keys=True), utc_now().isoformat(), token),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE slack_agent_requests
+                SET response_json = ?, resolved_at = ?
+                WHERE token = ? AND resolved_at IS NULL
+                """,
+                (json.dumps(response, sort_keys=True), utc_now().isoformat(), token),
+            )
+            self.conn.commit()
 
     def get_slack_agent_request(self, token: str) -> sqlite3.Row | None:
-        return self.conn.execute(
-            """
-            SELECT token, provider_label, method, params_json, thread_channel_id,
-                   thread_ts, message_ts, answers_json, response_json, resolved_at
-            FROM slack_agent_requests
-            WHERE token = ?
-            """,
-            (token,),
-        ).fetchone()
+        with self._lock:
+            return self.conn.execute(
+                """
+                SELECT token, provider_label, method, params_json, thread_channel_id,
+                       thread_ts, message_ts, answers_json, response_json, resolved_at
+                FROM slack_agent_requests
+                WHERE token = ?
+                """,
+                (token,),
+            ).fetchone()
 
     def get_slack_agent_request_response(self, token: str) -> tuple[bool, object]:
-        row = self.conn.execute(
-            """
-            SELECT response_json, resolved_at
-            FROM slack_agent_requests
-            WHERE token = ?
-            """,
-            (token,),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT response_json, resolved_at
+                FROM slack_agent_requests
+                WHERE token = ?
+                """,
+                (token,),
+            ).fetchone()
         if row is None or not row["resolved_at"]:
             return False, None
         try:
@@ -1065,8 +1074,36 @@ class Store:
         except (TypeError, json.JSONDecodeError):
             return True, None
 
+    def is_slack_agent_request_message(self, channel_id: str, message_ts: str | None) -> bool:
+        if not message_ts:
+            return False
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT 1
+                FROM slack_agent_requests
+                WHERE thread_channel_id = ? AND message_ts = ?
+                """,
+                (channel_id, message_ts),
+            ).fetchone()
+        return row is not None
+
     def list_pending_slack_agent_requests(self, method: str | None = None) -> list[sqlite3.Row]:
         if method is None:
+            with self._lock:
+                return list(
+                    self.conn.execute(
+                        """
+                        SELECT token, provider_label, method, params_json, thread_channel_id,
+                               thread_ts, message_ts, answers_json, response_json,
+                               resolved_at, created_at
+                        FROM slack_agent_requests
+                        WHERE resolved_at IS NULL
+                        ORDER BY created_at
+                        """
+                    )
+                )
+        with self._lock:
             return list(
                 self.conn.execute(
                     """
@@ -1074,24 +1111,12 @@ class Store:
                            thread_ts, message_ts, answers_json, response_json,
                            resolved_at, created_at
                     FROM slack_agent_requests
-                    WHERE resolved_at IS NULL
+                    WHERE resolved_at IS NULL AND method = ?
                     ORDER BY created_at
-                    """
+                    """,
+                    (method,),
                 )
             )
-        return list(
-            self.conn.execute(
-                """
-                SELECT token, provider_label, method, params_json, thread_channel_id,
-                       thread_ts, message_ts, answers_json, response_json,
-                       resolved_at, created_at
-                FROM slack_agent_requests
-                WHERE resolved_at IS NULL AND method = ?
-                ORDER BY created_at
-                """,
-                (method,),
-            )
-        )
 
     def mark_slack_message_mirrored(
         self,

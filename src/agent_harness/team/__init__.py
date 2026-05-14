@@ -816,7 +816,7 @@ def format_agent_handoff_request(
     target: TeamAgent,
     prompt: str,
 ) -> str:
-    return f"Passing this back from `@{sender.handle}`.\n\n@{target.handle} please {prompt.strip()}"
+    return f"Passing this back from @{sender.handle}.\n\n@{target.handle} please {prompt.strip()}"
 
 
 def build_initialization_messages(agents: list[TeamAgent]) -> list[TeamChatMessage]:

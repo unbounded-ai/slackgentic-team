@@ -89,6 +89,34 @@ class OneShotProcess:
         pass
 
 
+class DuplicateCodexFinalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            text = "Final answer"
+            return (
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "agent_message", "message": text},
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
 class ClaudeOneShotProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         if self.reads == 0:
@@ -465,8 +493,10 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertIn("separate final paragraph", prompt)
         self.assertIn("start of its own final paragraph", prompt)
+        self.assertIn("plain text with no backticks", prompt)
         self.assertIn("@nell pick one before I proceed", prompt)
         self.assertIn("Do not put that callback handle inline", prompt)
+        self.assertNotIn("`@handle`", prompt)
 
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1892,6 +1922,37 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+    def test_runtime_posts_duplicate_codex_final_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "finish once", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=DuplicateCodexFinalProcess,
+                    poll_seconds=0.01,
+                    on_agent_message=lambda task, agent, thread, text: seen.append(text),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if gateway.replies and not runtime.has_running_tasks():
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Final answer"])
+                self.assertEqual(seen, ["Final answer"])
             finally:
                 store.close()
 

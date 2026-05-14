@@ -25,6 +25,24 @@ class FakeGateway:
         self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
 
 
+class FailingFullRequestGateway(FakeGateway):
+    def __init__(self):
+        super().__init__()
+        self.failures = 0
+
+    def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
+        if self.failures == 0:
+            self.failures += 1
+            raise RuntimeError("invalid_blocks")
+        return super().post_thread_reply(
+            thread,
+            text,
+            persona=persona,
+            icon_url=icon_url,
+            blocks=blocks,
+        )
+
+
 class SlackAgentRequestHandlerTests(unittest.TestCase):
     def test_persistent_request_can_be_resolved_by_another_handler(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,6 +199,97 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 self.assertIn("Input preview", gateway.replies[0]["blocks"][1]["text"]["text"])
                 self.assertIn("```ls ~/code```", gateway.replies[0]["blocks"][1]["text"]["text"])
                 self.assertEqual(gateway.updates[-1]["text"], "Allowed Claude tool request.")
+            finally:
+                store.close()
+
+    def test_persistent_claude_permission_retries_compact_message_when_full_blocks_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FailingFullRequestGateway()
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                thread = SlackThreadRef("C1", "171.000001")
+
+                pending = requester.create_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": "req-1",
+                        "tool_name": "Bash",
+                        "description": "List files",
+                        "input_preview": "ls ~/code",
+                    },
+                    thread,
+                )
+
+                self.assertEqual(gateway.failures, 1)
+                self.assertEqual(len(gateway.replies), 1)
+                self.assertEqual(pending.message_ts, gateway.replies[0]["ts"])
+                row = store.get_slack_agent_request(pending.token)
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["message_ts"], gateway.replies[0]["ts"])
+                actions = _first_actions_block(gateway.replies[0]["blocks"])["elements"]
+                self.assertEqual(
+                    [action["text"]["text"] for action in actions],
+                    ["Allow", "Allow Session", "Deny"],
+                )
+            finally:
+                store.close()
+
+    def test_persistent_claude_permission_waiters_share_store_connection_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            start = threading.Event()
+            results = []
+            errors = []
+            try:
+                store.init_schema()
+                requester = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                pending = requester.create_persistent_request(
+                    "claude/channel/permission",
+                    {
+                        "request_id": "req-1",
+                        "tool_name": "Bash",
+                        "description": "List files",
+                        "input_preview": "ls ~/code",
+                    },
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                def wait_for_request():
+                    start.wait()
+                    try:
+                        results.append(
+                            requester.wait_for_persistent_request(
+                                pending.token,
+                                timeout_seconds=2,
+                            )
+                        )
+                    except Exception as exc:  # pragma: no cover - asserted through errors
+                        errors.append(exc)
+
+                workers = [threading.Thread(target=wait_for_request) for _ in range(8)]
+                for worker in workers:
+                    worker.start()
+                start.set()
+                store.resolve_slack_agent_request(pending.token, {"behavior": "allow"})
+                for worker in workers:
+                    worker.join(timeout=2)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(results, [{"behavior": "allow"}] * 8)
             finally:
                 store.close()
 
