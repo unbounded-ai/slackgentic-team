@@ -18,6 +18,11 @@ python -m ruff check src tests
 python -m ruff format --check src tests
 ```
 
+Before opening a pull request, always run the two Ruff commands above. Passing
+unit tests is not enough: CI has a separate formatting gate, and
+`python -m ruff format --check src tests` will fail the PR if the formatter
+would rewrite even one file.
+
 The test suite uses `unittest` and should not require network access.
 
 ## Development Notes
