@@ -170,6 +170,7 @@ class FakeRuntime:
         self.sent = []
         self.stopped = []
         self.resumed = []
+        self.running_task_ids: set[str] = set()
 
     def start_task(self, task, agent, thread):
         self.started.append((task, agent, thread))
@@ -178,6 +179,9 @@ class FakeRuntime:
     def send_to_task(self, task_id, message):
         self.sent.append((task_id, message))
         return True
+
+    def is_task_running(self, task_id: str) -> bool:
+        return task_id in self.running_task_ids
 
     def stop_task(self, task_id, status=AgentTaskStatus.CANCELLED):
         self.stopped.append((task_id, status))
@@ -3886,6 +3890,69 @@ class SlackAppTests(unittest.TestCase):
                     gateway.thread_replies[-1]["text"],
                 )
                 self.assertNotIn("for <@U1>", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_thread_reply_during_running_task_does_not_spawn_parallel_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(1, 1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                claude_agent = next(
+                    agent for agent in agents if agent.provider_preference == Provider.CLAUDE
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"@{claude_agent.handle} long-running work",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                parent_task = store.list_agent_tasks(include_done=True)[0]
+                runtime.running_task_ids.add(parent_task.task_id)
+                started_before = len(runtime.started)
+
+                for ping_ts in ("171.000002", "171.000003"):
+                    controller.handle_event(
+                        {
+                            "event": {
+                                "type": "message",
+                                "channel": "C1",
+                                "user": "U1",
+                                "text": "status?",
+                                "ts": ping_ts,
+                                "thread_ts": parent_task.thread_ts,
+                            }
+                        }
+                    )
+
+                self.assertEqual(
+                    len(runtime.started),
+                    started_before,
+                    "follow-up pings must not spawn parallel start_task calls "
+                    "while the previous run is still executing",
+                )
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertEqual(
+                    [task.task_id for task in tasks],
+                    [parent_task.task_id],
+                    "no new agent task rows should be created for in-flight pings",
+                )
             finally:
                 store.close()
 

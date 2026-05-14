@@ -118,6 +118,13 @@ class ManagedTaskRuntime:
         *,
         allowed_tools: tuple[str, ...] = (),
     ) -> bool:
+        with self._lock:
+            if task.task_id in self._running:
+                LOGGER.debug(
+                    "refusing duplicate start for task %s; a worker is already running",
+                    task.task_id,
+                )
+                return False
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
         tcc_issue = _macos_tcc_protected_cwd_issue(

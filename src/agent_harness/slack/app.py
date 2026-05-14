@@ -2056,6 +2056,14 @@ class SlackTeamController:
         ):
             self._remember_request_message_for_task(previous_task, request_message_ts)
             return True
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if callable(is_running) and is_running(previous_task.task_id):
+            LOGGER.debug(
+                "skipping duplicate continuation for task %s; worker is still running",
+                previous_task.task_id,
+            )
+            self._remember_request_message_for_task(previous_task, request_message_ts)
+            return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         if request_message_ts:
