@@ -1478,6 +1478,64 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_channel_work_request_includes_linked_slack_thread_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                linked_url = (
+                    "https://example.slack.com/archives/C2/"
+                    "p1712345680000002?thread_ts=1712345680.000001&cid=C2"
+                )
+                gateway.thread_history_messages[("C2", "1712345680.000001")] = [
+                    {
+                        "type": "message",
+                        "channel": "C2",
+                        "user": "U2",
+                        "text": "The issue: agent missed the linked PR request.",
+                        "ts": "1712345680.000001",
+                    },
+                    {
+                        "type": "message",
+                        "channel": "C2",
+                        "username": "agent",
+                        "text": "I only see naming artifacts, not code.",
+                        "ts": "1712345680.000002",
+                        "thread_ts": "1712345680.000001",
+                    },
+                ]
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"Fix this issue {linked_url}",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task = runtime.started[0][0]
+                thread_context = task.metadata["thread_context"]
+                self.assertIn("Linked Slack thread from task prompt", thread_context)
+                self.assertIn("The issue: agent missed the linked PR request.", thread_context)
+                self.assertIn("I only see naming artifacts, not code.", thread_context)
+            finally:
+                store.close()
+
     def test_repeated_slack_message_event_is_processed_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -2151,6 +2209,69 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].prompt, "review the repo")
                 rendered = gateway.thread_replies[0]["blocks"][0]["text"]["text"]
                 self.assertIn("*Task:* review the repo", rendered)
+            finally:
+                store.close()
+
+    def test_thread_work_request_includes_linked_slack_thread_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(2, 0):
+                    store.upsert_team_agent(agent)
+                linked_url = (
+                    "https://example.slack.com/archives/C2/"
+                    "p1712345680000002?thread_ts=1712345680.000001&cid=C2"
+                )
+                gateway.thread_history_messages[("C2", "1712345680.000001")] = [
+                    {
+                        "type": "message",
+                        "channel": "C2",
+                        "user": "U2",
+                        "text": "Linked issue root: preserve permalink context.",
+                        "ts": "1712345680.000001",
+                    }
+                ]
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody summarize pyproject",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                parent_task = runtime.started[0][0]
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"somebody fix this issue {linked_url}",
+                            "ts": "171.000002",
+                            "thread_ts": parent_task.thread_ts,
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 2)
+                followup = runtime.started[-1][0]
+                thread_context = followup.metadata["thread_context"]
+                self.assertIn("Original task: summarize pyproject", thread_context)
+                self.assertIn("Linked Slack thread from task prompt", thread_context)
+                self.assertIn("Linked issue root: preserve permalink context.", thread_context)
             finally:
                 store.close()
 

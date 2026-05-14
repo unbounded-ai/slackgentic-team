@@ -356,22 +356,37 @@ class SlackTeamController:
         active_agents = self.store.list_team_agents()
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
         if multi_requests:
+            thread = SlackThreadRef(
+                channel_id=channel_id,
+                thread_ts=event.get("thread_ts") or event.get("ts"),
+                message_ts=event.get("ts"),
+            )
             self._ack_thinking(channel_id, event.get("ts"))
             self._start_specific_requests_in_thread(
                 multi_requests,
-                SlackThreadRef(
-                    channel_id=channel_id,
-                    thread_ts=event.get("thread_ts") or event.get("ts"),
-                    message_ts=event.get("ts"),
-                ),
+                thread,
                 requested_by_slack_user=event.get("user"),
-                extra_metadata={"request_message_ts": event.get("ts")},
+                extra_metadata=self._with_linked_thread_context(
+                    {"request_message_ts": event.get("ts")},
+                    text,
+                    current_thread=thread,
+                ),
             )
             return
         request = _channel_work_request(text, active_agents)
         if request is None:
             return
         self._ack_thinking(channel_id, event.get("ts"))
+        thread = SlackThreadRef(
+            channel_id=channel_id,
+            thread_ts=event.get("thread_ts") or event.get("ts"),
+            message_ts=event.get("ts"),
+        )
+        extra_metadata = self._with_linked_thread_context(
+            {"request_message_ts": event.get("ts")},
+            text,
+            current_thread=thread,
+        )
         author_agent = (
             self.store.get_team_agent(request.author_handle) if request.author_handle else None
         )
@@ -384,7 +399,7 @@ class SlackTeamController:
             channel_id,
             requested_by_slack_user=event.get("user"),
             author_agent=author_agent,
-            extra_metadata={"request_message_ts": event.get("ts")},
+            extra_metadata=extra_metadata,
             exclude_agent_ids=excluded_agent_ids,
         )
         if result is None:
@@ -396,15 +411,11 @@ class SlackTeamController:
                 request,
                 requested_by_slack_user=event.get("user"),
                 author_agent=author_agent,
+                extra_metadata=extra_metadata,
                 exclude_agent_ids=sticky_excluded_agent_ids,
             )
             return
         blocks = build_task_thread_blocks(result.task, result.agent)
-        thread = SlackThreadRef(
-            channel_id=channel_id,
-            thread_ts=event.get("thread_ts") or event.get("ts"),
-            message_ts=event.get("ts"),
-        )
         posted = self.gateway.post_thread_reply(
             thread,
             format_agent_assignment(
@@ -1245,6 +1256,11 @@ class SlackTeamController:
         if multi_requests:
             extra_metadata = self._external_thread_task_metadata(session, channel_id, thread_ts)
             extra_metadata["request_message_ts"] = event.get("ts")
+            extra_metadata = self._with_linked_thread_context(
+                extra_metadata,
+                text,
+                current_thread=SlackThreadRef(channel_id, thread_ts),
+            )
             return self._start_specific_requests_in_thread(
                 multi_requests,
                 SlackThreadRef(channel_id, thread_ts),
@@ -1277,6 +1293,11 @@ class SlackTeamController:
             )
         extra_metadata = self._external_thread_task_metadata(session, channel_id, thread_ts)
         extra_metadata["request_message_ts"] = event.get("ts")
+        extra_metadata = self._with_linked_thread_context(
+            extra_metadata,
+            request.prompt,
+            current_thread=SlackThreadRef(channel_id, thread_ts),
+        )
         sticky_excluded_agent_ids = self._anyone_context_agent_ids(request, active_agents)
         excluded_agent_ids = set(self._external_busy_agent_ids())
         excluded_agent_ids.update(sticky_excluded_agent_ids)
@@ -1330,6 +1351,11 @@ class SlackTeamController:
         if multi_requests:
             extra_metadata = self._thread_task_metadata(parent_task, channel_id, thread_ts)
             extra_metadata["request_message_ts"] = event.get("ts")
+            extra_metadata = self._with_linked_thread_context(
+                extra_metadata,
+                text,
+                current_thread=SlackThreadRef(channel_id, thread_ts),
+            )
             return self._start_specific_requests_in_thread(
                 multi_requests,
                 SlackThreadRef(channel_id, thread_ts),
@@ -1343,6 +1369,11 @@ class SlackTeamController:
             return False
         extra_metadata = self._thread_task_metadata(parent_task, channel_id, thread_ts)
         extra_metadata["request_message_ts"] = event.get("ts")
+        extra_metadata = self._with_linked_thread_context(
+            extra_metadata,
+            request.prompt,
+            current_thread=SlackThreadRef(channel_id, thread_ts),
+        )
         same_thread_agent = self._same_thread_requested_agent(request, channel_id, thread_ts)
         if same_thread_agent is not None:
             return self._start_same_thread_agent_followup(
@@ -1423,6 +1454,11 @@ class SlackTeamController:
         if not isinstance(delegate_to_agent_id, str):
             delegate_to_agent_id = agent.agent_id
         metadata["delegate_to_agent_id"] = delegate_to_agent_id
+        metadata = self._with_linked_thread_context(
+            metadata,
+            request.prompt,
+            current_thread=thread,
+        )
         delegate_prompt = task.metadata.get("delegate_prompt")
         if not isinstance(delegate_prompt, str) or not delegate_prompt.strip():
             delegate_prompt = REVIEW_DELEGATE_PROMPT
@@ -1527,6 +1563,11 @@ class SlackTeamController:
                 requested_by_slack_user=task.requested_by_slack_user,
             )
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
+        metadata = self._with_linked_thread_context(
+            metadata,
+            request.prompt,
+            current_thread=thread,
+        )
         metadata["delegated_from_task_id"] = task.task_id
         metadata["delegated_from_agent_id"] = agent.agent_id
         result = assign_work_request(
@@ -1720,6 +1761,11 @@ class SlackTeamController:
         extra_metadata: dict[str, object] = {}
         if request_message_ts:
             extra_metadata["request_message_ts"] = request_message_ts
+        extra_metadata = self._with_linked_thread_context(
+            extra_metadata,
+            request.prompt,
+            current_thread=thread,
+        )
         result = assign_work_request(
             self.store,
             request,
@@ -1825,6 +1871,11 @@ class SlackTeamController:
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         if request_message_ts:
             metadata["request_message_ts"] = request_message_ts
+        metadata = self._with_linked_thread_context(
+            metadata,
+            request.prompt,
+            current_thread=thread,
+        )
         if request.dangerous_mode or _task_dangerous_mode(previous_task):
             metadata[DANGEROUS_MODE_METADATA_KEY] = True
         task = replace(
@@ -2075,6 +2126,47 @@ class SlackTeamController:
         if context:
             metadata["thread_context"] = context
         return metadata
+
+    def _with_linked_thread_context(
+        self,
+        metadata: dict[str, object],
+        text: str,
+        *,
+        current_thread: SlackThreadRef | None,
+    ) -> dict[str, object]:
+        linked_context = self._linked_thread_context(text, current_thread=current_thread)
+        if not linked_context:
+            return metadata
+        updated = dict(metadata)
+        existing = updated.get("thread_context")
+        if isinstance(existing, str) and existing.strip():
+            updated["thread_context"] = f"{existing.strip()}\n\n{linked_context}"
+        else:
+            updated["thread_context"] = linked_context
+        return updated
+
+    def _linked_thread_context(
+        self,
+        text: str,
+        *,
+        current_thread: SlackThreadRef | None,
+    ) -> str | None:
+        ref = parse_thread_ref(text)
+        if ref is None or not ref.thread_ts:
+            return None
+        if (
+            current_thread is not None
+            and ref.channel_id == current_thread.channel_id
+            and ref.thread_ts == current_thread.thread_ts
+        ):
+            return None
+        context = self._thread_context(ref.channel_id, ref.thread_ts)
+        if not context:
+            return None
+        label = "Linked Slack thread from task prompt"
+        if ref.permalink:
+            label = f"{label}: {ref.permalink}"
+        return f"{label}\n{context}"
 
     def _thread_context(self, channel_id: str, thread_ts: str) -> str | None:
         try:
