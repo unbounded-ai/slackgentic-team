@@ -307,31 +307,42 @@ def install_claude_mcp_server(command: str | None = None, home: Path | None = No
         resolved, command_args = _current_slackgentic_invocation()
     else:
         resolved, command_args = command, []
-    completed = subprocess.run(
-        [
-            "claude",
-            "mcp",
-            "add",
-            "--scope",
-            "user",
-            CHANNEL_NAME,
-            "--",
-            resolved,
-            *command_args,
-            "claude-channel",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    add_command = [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        CHANNEL_NAME,
+        "--",
+        resolved,
+        *command_args,
+        "claude-channel",
+    ]
+    completed = subprocess.run(add_command, check=False, capture_output=True, text=True)
     output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
-    if completed.returncode != 0 and "already exists" not in output:
-        raise subprocess.CalledProcessError(
-            completed.returncode,
-            completed.args,
-            output=completed.stdout,
-            stderr=completed.stderr,
+    if completed.returncode != 0:
+        if "already exists" not in output.lower():
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        subprocess.run(
+            ["claude", "mcp", "remove", "--scope", "user", CHANNEL_NAME],
+            check=False,
+            capture_output=True,
+            text=True,
         )
+        completed = subprocess.run(add_command, check=False, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
     ensure_claude_mcp_permissions(home)
 
 
