@@ -3889,6 +3889,97 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_delegate_to_original_posts_handoff_once_when_continuation_fails(self):
+        class UnresumableRuntime(DetachedRuntime):
+            def start_task(self, task, agent, thread):
+                self.started.append((task, agent, thread))
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = UnresumableRuntime()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(1, 1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                codex_agent = next(
+                    agent for agent in agents if agent.provider_preference == Provider.CODEX
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"@{codex_agent.handle} summarize pyproject",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                parent_task = store.list_agent_tasks(include_done=True)[0]
+                store.update_agent_task_status(parent_task.task_id, AgentTaskStatus.DONE)
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "somebody ask the original agent to reply with DELEGATED_OK",
+                            "ts": "171.000002",
+                            "thread_ts": parent_task.thread_ts,
+                        }
+                    }
+                )
+
+                delegated_by_reviewer = store.list_agent_tasks(include_done=True)[-1]
+                reviewer = store.get_team_agent(delegated_by_reviewer.agent_id)
+                self.assertEqual(
+                    delegated_by_reviewer.metadata["delegate_to_agent_id"],
+                    parent_task.agent_id,
+                )
+                gateway.post_thread_reply(
+                    runtime.started[-1][2],
+                    "I am asking the original agent to reply with DELEGATED_OK.",
+                    persona=reviewer,
+                )
+
+                replies_before = len(gateway.thread_replies)
+
+                controller.handle_runtime_task_done(
+                    delegated_by_reviewer,
+                    reviewer,
+                    SlackThreadRef("C1", parent_task.thread_ts),
+                )
+
+                new_replies = gateway.thread_replies[replies_before:]
+                handoff_request_marker = f"@{codex_agent.handle} please reply with DELEGATED_OK"
+                handoff_request_count = sum(
+                    1 for reply in new_replies if handoff_request_marker in reply["text"]
+                )
+                self.assertEqual(
+                    handoff_request_count,
+                    1,
+                    f"expected one handoff request, got {handoff_request_count}: "
+                    f"{[r['text'] for r in new_replies]}",
+                )
+                handoff_assignment_count = sum(
+                    1
+                    for reply in new_replies
+                    if reply["text"].startswith(f"Got it, @{reviewer.handle}.")
+                )
+                self.assertEqual(handoff_assignment_count, 1)
+            finally:
+                store.close()
+
     def test_thread_agent_can_delegate_task_to_explicit_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

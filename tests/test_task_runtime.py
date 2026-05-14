@@ -825,6 +825,24 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(chunks, ["Final"])
         self.assertEqual(buffer, "")
 
+    def test_codex_long_message_splits_at_paragraph_boundary(self):
+        first = "Short opener."
+        second = "Body paragraph." + (" filler" * 400)
+        message = f"{first}\n\n{second}"
+        line = json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": message},
+            }
+        )
+
+        chunks, buffer = _process_output_chunks(Provider.CODEX, f"{line}\n")
+
+        self.assertEqual(buffer, "")
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual(chunks[0], first)
+        self.assertTrue(chunks[1].startswith("Body paragraph."))
+
     def test_claude_json_output_buffers_partial_lines(self):
         chunks, buffer = _process_output_chunks(
             Provider.CLAUDE,

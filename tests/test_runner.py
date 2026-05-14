@@ -31,6 +31,30 @@ class FakeChild:
         self.eof_sent = True
 
 
+class FakeProc:
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+
+class FakePopenChild(FakeChild):
+    def __init__(self, returncode=None):
+        super().__init__()
+        self.proc = FakeProc(returncode)
+
+
+class BrokenIsAliveChild(FakeChild):
+    def isalive(self):
+        raise pexpect.ExceptionPexpect("no child processes")
+
+
 class RunnerTests(unittest.TestCase):
     def test_codex_command_uses_argv_not_shell(self):
         command, args = build_command(
@@ -183,6 +207,26 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn(prompt, calls[0][0])
         self.assertEqual(child.sent, [prompt, "\n"])
         self.assertTrue(child.eof_sent)
+
+    def test_managed_process_polls_pipe_backed_codex_child(self):
+        process = ManagedAgentProcess(
+            LaunchRequest(provider=Provider.CODEX, prompt="x", cwd=Path("/tmp/repo"))
+        )
+        process.child = FakePopenChild()
+
+        self.assertTrue(process.is_alive())
+        process.terminate()
+
+        self.assertTrue(process.child.proc.terminated)
+        self.assertFalse(process.is_alive())
+
+    def test_managed_process_treats_pexpect_poll_error_as_exited(self):
+        process = ManagedAgentProcess(
+            LaunchRequest(provider=Provider.CLAUDE, prompt="x", cwd=Path("/tmp/repo"))
+        )
+        process.child = BrokenIsAliveChild()
+
+        self.assertFalse(process.is_alive())
 
     def test_managed_codex_resume_process_does_not_send_stdin(self):
         child = FakeChild()
