@@ -1863,6 +1863,106 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_slack_message_backfill_skips_existing_task_thread_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "Good bye", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.000001",
+                    parent_message_ts="171.000002",
+                    metadata={
+                        "assignment_prompt": "Somebody summarize pyproject",
+                        "request_message_ts": "171.000010",
+                    },
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                gateway.history_messages.append(
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "Somebody summarize pyproject",
+                        "ts": "171.000001",
+                    }
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000000")
+
+                self.assertEqual(recovered, 0)
+                self.assertEqual(len(store.list_agent_tasks(include_done=True)), 1)
+                self.assertEqual(runtime.started, [])
+            finally:
+                store.close()
+
+    def test_pending_duplicate_thread_root_is_cancelled_when_capacity_returns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "Good bye", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.000001",
+                    parent_message_ts="171.000002",
+                    metadata={
+                        "assignment_prompt": "Somebody summarize pyproject",
+                        "request_message_ts": "171.000010",
+                    },
+                )
+                store.upsert_agent_task(task)
+                pending = store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.000001"),
+                    WorkRequest(
+                        prompt="Somebody summarize pyproject",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                self.assertEqual(resumed, 0)
+                self.assertEqual(runtime.started, [])
+                self.assertEqual(len(store.list_agent_tasks(include_done=True)), 1)
+                row = store.conn.execute(
+                    "SELECT status FROM pending_work_requests WHERE pending_id = ?",
+                    (pending.pending_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "cancelled")
+            finally:
+                store.close()
+
     def test_channel_work_request_accepts_dangerous_mode_tag(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

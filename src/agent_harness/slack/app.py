@@ -332,6 +332,8 @@ class SlackTeamController:
             return None, None
         if self.store.is_mirrored_slack_message(channel_id, message_ts):
             return None, None
+        if self._has_work_for_request_message(channel_id, message_ts):
+            return None, None
         return channel_id, message_ts
 
     def _handle_unprocessed_user_message_event(self, event: dict, channel_id: str) -> None:
@@ -575,6 +577,16 @@ class SlackTeamController:
         return resumed
 
     def _try_resume_pending_work_request(self, pending: PendingWorkRequest) -> bool:
+        request_message_ts = _pending_request_message_ts(pending)
+        if request_message_ts and self._has_task_for_request_message(
+            pending.channel_id,
+            request_message_ts,
+        ):
+            self.store.update_pending_work_request_status(
+                pending.pending_id,
+                PendingWorkRequestStatus.CANCELLED,
+            )
+            return False
         author_agent = None
         if pending.author_agent_id:
             author_agent = self.store.get_team_agent(pending.author_agent_id)
@@ -2395,25 +2407,39 @@ class SlackTeamController:
         return bool(self.store.get_setting(_slack_message_processed_key(channel_id, message_ts)))
 
     def _processed_slack_message_needs_backfill(self, event: dict) -> bool:
+        channel_id = event.get("channel")
+        if not isinstance(channel_id, str) or not channel_id:
+            return False
         message_ts = event.get("ts")
         if not isinstance(message_ts, str) or not message_ts:
             return False
         if not _event_has_slackgentic_progress_reaction(event):
             return False
-        return not self._has_task_for_request_message(message_ts)
+        return not self._has_work_for_request_message(channel_id, message_ts)
 
-    def _has_task_for_request_message(self, message_ts: str) -> bool:
+    def _has_task_for_request_message(self, channel_id: str, message_ts: str) -> bool:
         for task in self.store.list_agent_tasks(include_done=True):
+            if task.channel_id != channel_id:
+                continue
+            if task.thread_ts == message_ts:
+                return True
             if task.parent_message_ts == message_ts:
                 return True
-            request_message_ts = task.metadata.get("request_message_ts")
-            if isinstance(request_message_ts, str) and request_message_ts == message_ts:
+            if _metadata_has_message_ts(task.metadata, message_ts):
                 return True
+        return False
+
+    def _has_work_for_request_message(self, channel_id: str, message_ts: str) -> bool:
+        if self._has_task_for_request_message(channel_id, message_ts):
+            return True
         for pending in self.store.list_pending_work_requests(limit=500):
+            if pending.channel_id != channel_id:
+                continue
+            if pending.thread_ts == message_ts:
+                return True
             if pending.message_ts == message_ts:
                 return True
-            request_message_ts = pending.extra_metadata.get("request_message_ts")
-            if isinstance(request_message_ts, str) and request_message_ts == message_ts:
+            if _metadata_has_message_ts(pending.extra_metadata, message_ts):
                 return True
         return False
 
@@ -2971,6 +2997,27 @@ def _event_has_slackgentic_progress_reaction(event: dict) -> bool:
         }:
             return True
     return False
+
+
+def _metadata_has_message_ts(metadata: dict[str, object], message_ts: str) -> bool:
+    request_message_ts = metadata.get("request_message_ts")
+    if isinstance(request_message_ts, str) and request_message_ts == message_ts:
+        return True
+    request_message_ts_history = metadata.get("request_message_ts_history")
+    if isinstance(request_message_ts_history, list):
+        return any(
+            item == message_ts for item in request_message_ts_history if isinstance(item, str)
+        )
+    return False
+
+
+def _pending_request_message_ts(pending: PendingWorkRequest) -> str | None:
+    if pending.message_ts:
+        return pending.message_ts
+    request_message_ts = pending.extra_metadata.get("request_message_ts")
+    if isinstance(request_message_ts, str) and request_message_ts:
+        return request_message_ts
+    return pending.thread_ts or None
 
 
 def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:
