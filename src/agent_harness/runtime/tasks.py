@@ -463,13 +463,22 @@ class ManagedTaskRuntime:
         return handled
 
     def _recover_visible_message(self, task: AgentTask, running: RunningTask) -> str | None:
-        if _provider_for_running(running) != Provider.CODEX or not task.session_id:
+        provider = _provider_for_running(running)
+        if not task.session_id:
             return None
-        return _latest_codex_transcript_message(
-            task.session_id,
-            self.home,
-            since=task.created_at,
-        )
+        if provider == Provider.CODEX:
+            return _latest_codex_transcript_message(
+                task.session_id,
+                self.home,
+                since=task.created_at,
+            )
+        if provider == Provider.CLAUDE:
+            return _latest_claude_transcript_message(
+                task.session_id,
+                self.home,
+                since=task.created_at,
+            )
+        return None
 
     def _recover_unseen_visible_message(
         self,
@@ -1603,6 +1612,58 @@ def _codex_transcript_record_message(record: dict) -> str | None:
     return None
 
 
+def _latest_claude_transcript_message(
+    session_id: str,
+    home: Path,
+    *,
+    since: datetime | None = None,
+) -> str | None:
+    projects_root = home / ".claude" / "projects"
+    if not projects_root.exists():
+        return None
+    try:
+        paths = sorted(
+            projects_root.rglob(f"{session_id}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in paths:
+        message = _latest_claude_transcript_message_from_path(path, since=since)
+        if message:
+            return message
+    return None
+
+
+def _latest_claude_transcript_message_from_path(
+    path: Path,
+    *,
+    since: datetime | None = None,
+) -> str | None:
+    latest: str | None = None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("type") != "assistant":
+            continue
+        timestamp = parse_timestamp(record.get("timestamp"))
+        if since is not None and timestamp is not None and timestamp < since:
+            continue
+        message = _claude_assistant_message_text(record)
+        if message:
+            latest = message
+    return latest
+
+
 def _claude_json_chunks(
     text: str,
     buffer: str = "",
@@ -1652,6 +1713,33 @@ def _render_claude_json_line(line: str) -> str | None:
         message = event.get("message") or event.get("error")
         return _format_claude_error(message)
     return None
+
+
+def _claude_assistant_message_text(record: dict) -> str | None:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        cleaned = _clean_terminal_output(content)
+        return cleaned or None
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        cleaned = _clean_terminal_output(text)
+        if cleaned:
+            parts.append(cleaned)
+    if not parts:
+        return None
+    return "\n\n".join(parts)
 
 
 def _format_claude_error(message: object) -> str:
