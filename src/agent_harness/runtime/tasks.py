@@ -775,6 +775,10 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "unless the user explicitly asks for it."
         ),
         (
+            "For ongoing work, send a concise Slack-visible progress update at least every "
+            "5 minutes, and sooner for meaningful progress, blockers, or decisions."
+        ),
+        (
             "When a table is the clearest format, write one normal Markdown table in the "
             "message. Slackgentic renders one Markdown table per message as a native Slack "
             "table. If you need multiple tables, send separate messages."
@@ -1415,7 +1419,10 @@ def _render_codex_exec_line(line: str) -> str | None:
     except json.JSONDecodeError:
         if line.lstrip().startswith("{"):
             return None
-        return _clean_terminal_output(line) or None
+        cleaned = _clean_terminal_output(line)
+        if cleaned.lower().startswith(("error:", "codex error:")):
+            return cleaned
+        return None
     if not isinstance(event, dict):
         return None
 

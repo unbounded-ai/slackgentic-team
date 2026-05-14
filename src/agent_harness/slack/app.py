@@ -2292,6 +2292,28 @@ class SlackTeamController:
             return False
         return bool(self.store.get_setting(_slack_message_processed_key(channel_id, message_ts)))
 
+    def _processed_slack_message_needs_backfill(self, event: dict) -> bool:
+        message_ts = event.get("ts")
+        if not isinstance(message_ts, str) or not message_ts:
+            return False
+        if not _event_has_slackgentic_progress_reaction(event):
+            return False
+        return not self._has_task_for_request_message(message_ts)
+
+    def _has_task_for_request_message(self, message_ts: str) -> bool:
+        for task in self.store.list_agent_tasks(include_done=True):
+            if task.parent_message_ts == message_ts:
+                return True
+            request_message_ts = task.metadata.get("request_message_ts")
+            if isinstance(request_message_ts, str) and request_message_ts == message_ts:
+                return True
+        return False
+
+    def _clear_slack_message_processed(self, channel_id: str, message_ts: str | None) -> None:
+        if not message_ts:
+            return
+        self.store.delete_setting(_slack_message_processed_key(channel_id, message_ts))
+
     def _mark_slack_message_processed(self, channel_id: str, message_ts: str | None) -> None:
         if not message_ts:
             return
@@ -2443,7 +2465,9 @@ class SlackMessageBackfill:
             if event_channel_id is None or message_ts is None:
                 continue
             if self.controller._slack_message_processed(event_channel_id, message_ts):
-                continue
+                if not self.controller._processed_slack_message_needs_backfill(event):
+                    continue
+                self.controller._clear_slack_message_processed(event_channel_id, message_ts)
             try:
                 self.controller.handle_event({"event": event})
                 recovered += 1
@@ -2823,6 +2847,22 @@ def _shorten(value: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
+
+
+def _event_has_slackgentic_progress_reaction(event: dict) -> bool:
+    reactions = event.get("reactions")
+    if not isinstance(reactions, list):
+        return False
+    for reaction in reactions:
+        if not isinstance(reaction, dict):
+            continue
+        if reaction.get("name") in {
+            "hourglass_flowing_sand",
+            "eyes",
+            "white_check_mark",
+        }:
+            return True
+    return False
 
 
 def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:

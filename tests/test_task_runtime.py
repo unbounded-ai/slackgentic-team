@@ -439,6 +439,15 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("somebody review", prompt)
         self.assertIn("stop and wait", prompt)
 
+    def test_build_task_prompt_instructs_periodic_slack_updates(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "work carefully", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("at least every 5 minutes", prompt)
+        self.assertIn("Slack-visible progress update", prompt)
+
     def test_build_task_prompt_instructs_thread_done_signal(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         task = create_agent_task(agent, "work carefully", "C1")
@@ -570,6 +579,29 @@ class TaskRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(chunks, ["Done"])
+        self.assertEqual(buffer, "")
+
+    def test_codex_exec_json_output_hides_plain_non_json_noise(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            (
+                "def _shorten(value: str, limit: int) -> str:\n"
+                '    cleaned = " ".join(value.split())\n'
+                "    return cleaned\n"
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Done"])
+        self.assertEqual(buffer, "")
+
+    def test_codex_exec_json_output_renders_plain_error_lines(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            "Error: Codex failed to start\n",
+        )
+
+        self.assertEqual(chunks, ["Error: Codex failed to start"])
         self.assertEqual(buffer, "")
 
     def test_codex_exec_json_output_hides_malformed_json_records(self):
