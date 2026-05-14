@@ -13,6 +13,7 @@ from agent_harness.models import (
     AssignmentMode,
     Provider,
     TeamAgent,
+    TeamAgentStatus,
     WorkRequest,
     utc_now,
 )
@@ -598,6 +599,7 @@ def generate_team_agent(
     seed: str = DEFAULT_TEAM_SEED,
     avatar_index: int | None = None,
     outside_interests: Sequence[str] | None = None,
+    active_first_names: set[str] | frozenset[str] | None = None,
 ) -> TeamAgent:
     provider = (
         provider_preference
@@ -612,7 +614,13 @@ def generate_team_agent(
         if avatar_index is not None
         else avatar_identity_for_order(sort_order)
     )
-    handle = _unique_handle(identity.handle_base, identity.last_name, used_handles)
+    active_first_name_values = set(active_first_names or set())
+    handle = _unique_handle(
+        identity.handle_base,
+        identity.last_name,
+        used_handles,
+        use_last_initial=identity.first_name.lower() in active_first_name_values,
+    )
     color = _pick(COLORS, digest, 12)
     icon_emoji = _icon_emoji_for(profile)
     suffix = digest.hex()[:8]
@@ -662,7 +670,14 @@ def hire_team_agents(
 ) -> list[TeamAgent]:
     if count < 1:
         raise ValueError("hire count must be at least 1")
-    used_handles = {agent.handle for agent in existing_agents}
+    used_handles = {
+        agent.handle for agent in existing_agents if agent.status == TeamAgentStatus.ACTIVE
+    }
+    active_first_names = {
+        _agent_first_name(agent).lower()
+        for agent in existing_agents
+        if agent.status == TeamAgentStatus.ACTIVE and _agent_first_name(agent)
+    }
     next_order = (
         start_sort_order
         if start_sort_order is not None
@@ -693,8 +708,10 @@ def hire_team_agents(
             outside_interests=(
                 _random_outside_interests(chooser) if randomize_identities and chooser else None
             ),
+            active_first_names=active_first_names,
         )
         used_handles.add(agent.handle)
+        active_first_names.add(_agent_first_name(agent).lower())
         hired.append(agent)
     return hired
 
@@ -1000,13 +1017,22 @@ def _pick(items: list[str], digest: bytes, offset: int) -> str:
     return items[value % len(items)]
 
 
-def _unique_handle(base_name: str, last: str, used_handles: set[str]) -> str:
+def _unique_handle(
+    base_name: str,
+    last: str,
+    used_handles: set[str],
+    *,
+    use_last_initial: bool = False,
+) -> str:
     base = re.sub(r"[^a-z0-9_-]", "", base_name.lower())
-    candidates = [
-        base,
-        f"{base}{last[:1].lower()}",
-        f"{base}-{last.lower()}",
-    ]
+    candidates = [base]
+    if use_last_initial:
+        candidates.extend(
+            [
+                f"{base}{last[:1].lower()}",
+                f"{base}-{last.lower()}",
+            ]
+        )
     for candidate in candidates:
         if HANDLE_RE.match(candidate) and candidate not in used_handles:
             return candidate
@@ -1014,6 +1040,10 @@ def _unique_handle(base_name: str, last: str, used_handles: set[str]) -> str:
     while f"{base}{suffix}" in used_handles:
         suffix += 1
     return f"{base}{suffix}"
+
+
+def _agent_first_name(agent: TeamAgent) -> str:
+    return agent.full_name.split(maxsplit=1)[0] if agent.full_name.strip() else ""
 
 
 def _icon_emoji_for(profile: RoleProfile) -> str:

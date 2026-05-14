@@ -82,6 +82,21 @@ class RateLimitedOnceClient(FakeSlackClient):
         return super().chat_postMessage(**kwargs)
 
 
+class InvalidUpdateBlocksOnceClient(FakeSlackClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def chat_update(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1 and "blocks" in kwargs:
+            raise SlackApiError(
+                "invalid blocks",
+                FakeSlackResponse({"ok": False, "error": "invalid_blocks"}),
+            )
+        return super().chat_update(**kwargs)
+
+
 class SlackGatewayTests(unittest.TestCase):
     def test_post_team_initialization_uses_agent_identities_in_one_thread(self):
         gateway = object.__new__(SlackGateway)
@@ -151,6 +166,22 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertNotIn("blocks", gateway.client.calls[1])
         self.assertNotIn("blocks", gateway.client.messages[0])
 
+    def test_post_thread_reply_falls_back_when_explicit_blocks_are_invalid(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = InvalidBlocksOnceClient()
+
+        from agent_harness.models import SlackThreadRef
+
+        gateway.post_thread_reply(
+            SlackThreadRef("C1", "171.000001"),
+            "hello",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "hello"}}],
+        )
+
+        self.assertIn("blocks", gateway.client.calls[0])
+        self.assertNotIn("blocks", gateway.client.calls[1])
+        self.assertNotIn("blocks", gateway.client.messages[0])
+
     def test_post_thread_reply_retries_after_rate_limit(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = RateLimitedOnceClient()
@@ -185,6 +216,15 @@ class SlackGatewayTests(unittest.TestCase):
         gateway.update_message("C1", "171.000001", "| Name | State |\n|---|---|\n| Nell | free |")
 
         self.assertEqual(gateway.client.updates[0]["blocks"][0]["type"], "table")
+
+    def test_update_message_clears_blocks_when_rendered_blocks_are_invalid(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = InvalidUpdateBlocksOnceClient()
+
+        gateway.update_message("C1", "171.000001", "| Name | State |\n|---|---|\n| Nell | free |")
+
+        self.assertEqual(gateway.client.calls[1]["blocks"], [])
+        self.assertEqual(gateway.client.updates[0]["blocks"], [])
 
 
 if __name__ == "__main__":

@@ -46,6 +46,10 @@ class AgentCommandConfig(BaseModel):
     dangerous_by_default: bool = Field(
         default=False, validation_alias="SLACKGENTIC_DANGEROUS_BY_DEFAULT"
     )
+    allow_macos_tcc_protected_paths: bool = Field(
+        default=False,
+        validation_alias="SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS",
+    )
 
 
 class TeamConfig(BaseModel):

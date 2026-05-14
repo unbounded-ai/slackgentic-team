@@ -449,20 +449,26 @@ class ClaudeChannelTests(unittest.TestCase):
             ],
         )
 
-    def test_install_still_allows_permissions_when_mcp_server_already_exists(self):
+    def test_install_replaces_existing_mcp_server_and_allows_permissions(self):
         calls = []
 
         def fake_run(args, **kwargs):
             calls.append((args, kwargs))
+            if args[:3] == ["claude", "mcp", "add"] and len(calls) == 1:
+                return type(
+                    "Completed",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "MCP server slackgentic already exists in user config",
+                        "stderr": "",
+                        "args": args,
+                    },
+                )()
             return type(
                 "Completed",
                 (),
-                {
-                    "returncode": 1,
-                    "stdout": "MCP server slackgentic already exists in user config",
-                    "stderr": "",
-                    "args": args,
-                },
+                {"returncode": 0, "stdout": "", "stderr": "", "args": args},
             )()
 
         with tempfile.TemporaryDirectory() as tmp, patch("subprocess.run", fake_run):
@@ -470,7 +476,14 @@ class ClaudeChannelTests(unittest.TestCase):
             settings = Path(tmp) / ".claude" / "settings.local.json"
             config = json.loads(settings.read_text(encoding="utf-8"))
 
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [call[0][:3] for call in calls],
+            [
+                ["claude", "mcp", "add"],
+                ["claude", "mcp", "remove"],
+                ["claude", "mcp", "add"],
+            ],
+        )
         for permission in SLACKGENTIC_MCP_PERMISSION_ALLOW:
             self.assertIn(permission, config["permissions"]["allow"])
 

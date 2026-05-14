@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,11 @@ SLACK_PERMALINK_RE = re.compile(
     r"https://(?P<workspace>[^/]+)/archives/(?P<channel>[A-Z0-9]+)/p(?P<packed_ts>\d{16})"
     r"(?:\?(?P<query>[^>\s|]+))?"
 )
+SLACK_USER_REF_RE = re.compile(
+    r"<@(?P<bracketed>[UW][A-Z0-9]{8,})>|"
+    r"(?<![\w.-])@(?P<raw>[UW][A-Z0-9]{8,})(?![\w.-])"
+)
+SLACK_USER_AUTHOR_RE = re.compile(r"(?m)^(?P<user_id>[UW][A-Z0-9]{8,})(?=:)")
 
 
 @dataclass(frozen=True)
@@ -474,6 +480,30 @@ def normalize_slack_mrkdwn(text: str) -> str:
     return "".join(
         segment if segment.startswith("```") else _normalize_bold_markers(segment)
         for segment in segments
+    )
+
+
+def replace_slack_user_ids(
+    text: str,
+    display_name_for: Callable[[str], str | None] | None = None,
+    *,
+    fallback: str = "Slack user",
+) -> str:
+    def label(user_id: str) -> str:
+        if display_name_for is not None:
+            display_name = display_name_for(user_id)
+            if display_name and display_name.strip():
+                return display_name.strip()
+        return fallback
+
+    def replace_ref(match: re.Match[str]) -> str:
+        user_id = match.group("bracketed") or match.group("raw")
+        return label(user_id)
+
+    text = SLACK_USER_REF_RE.sub(replace_ref, text)
+    return SLACK_USER_AUTHOR_RE.sub(
+        lambda match: label(match.group("user_id")),
+        text,
     )
 
 

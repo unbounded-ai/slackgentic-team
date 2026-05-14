@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from agent_harness.slack import normalize_slack_mrkdwn, slack_blocks_for_markdow
 from agent_harness.team import TeamChatMessage
 
 SLACK_API_RETRY_LIMIT = 3
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -331,6 +333,7 @@ class SlackGateway:
             self.client.chat_postMessage,
             kwargs,
             auto_rendered_blocks=auto_rendered_blocks,
+            invalid_blocks_fallback=None,
         )
 
     def _chat_update(
@@ -343,6 +346,7 @@ class SlackGateway:
             self.client.chat_update,
             kwargs,
             auto_rendered_blocks=auto_rendered_blocks,
+            invalid_blocks_fallback=[],
         )
 
     def _call_slack_with_retries(
@@ -351,6 +355,7 @@ class SlackGateway:
         kwargs: dict[str, Any],
         *,
         auto_rendered_blocks: bool,
+        invalid_blocks_fallback: list[dict[str, Any]] | None,
     ):
         from slack_sdk.errors import SlackApiError
 
@@ -362,12 +367,17 @@ class SlackGateway:
                 return call(**current_kwargs)
             except SlackApiError as exc:
                 error = exc.response.get("error")
-                if (
-                    error == "invalid_blocks"
-                    and auto_rendered_blocks
-                    and not used_plain_text_fallback
-                ):
-                    current_kwargs.pop("blocks", None)
+                if error == "invalid_blocks" and "blocks" in current_kwargs:
+                    if used_plain_text_fallback:
+                        raise
+                    if invalid_blocks_fallback is None:
+                        current_kwargs.pop("blocks", None)
+                    else:
+                        current_kwargs["blocks"] = invalid_blocks_fallback
+                    LOGGER.info(
+                        "Slack rejected message blocks; retrying with text fallback",
+                        extra={"auto_rendered_blocks": auto_rendered_blocks},
+                    )
                     used_plain_text_fallback = True
                     continue
                 if error == "ratelimited" and attempts < SLACK_API_RETRY_LIMIT:

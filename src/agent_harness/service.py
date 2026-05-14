@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import plistlib
@@ -12,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_SERVICE_NAME = "slackgentic-team"
+LOGGER = logging.getLogger(__name__)
 MACOS_LABEL = "com.slackgentic-team.daemon"
 MACOS_CODEX_APP_SERVER_LABEL = "com.slackgentic-team.codex-app-server"
 CODEX_APP_SERVER_SERVICE_SUFFIX = "codex-app-server"
@@ -32,6 +34,7 @@ TRANSIENT_PATH_MARKERS = (
     "/var/run/com.apple.security.cryptexd/",
     "/node_modules/@openai/codex/node_modules/",
 )
+STABLE_PYTHON_COMMANDS = ("python3.13", "python3.12", "python3.11")
 SAFE_SERVICE_ENVIRONMENT = {
     "SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART": "false",
 }
@@ -224,7 +227,7 @@ def render_service(spec: ServiceSpec) -> tuple[Path, str | bytes]:
 
 def render_launchd_plist(spec: ServiceSpec) -> bytes:
     environment = {
-        "PATH": service_environment_path(),
+        "PATH": service_environment_path(service_bin_dir=_service_python_shim_dir(spec)),
         **spec.environment,
     }
     payload = {
@@ -243,7 +246,10 @@ def render_launchd_plist(spec: ServiceSpec) -> bytes:
 def render_systemd_unit(spec: ServiceSpec) -> str:
     command = shlex.join([str(spec.executable), *spec.args])
     environment_lines = [
-        _systemd_environment_line("PATH", service_environment_path()),
+        _systemd_environment_line(
+            "PATH",
+            service_environment_path(service_bin_dir=_service_python_shim_dir(spec)),
+        ),
         *[
             _systemd_environment_line(name, value)
             for name, value in sorted(spec.environment.items())
@@ -273,6 +279,7 @@ def render_systemd_unit(spec: ServiceSpec) -> str:
 
 
 def _install_launchd(spec: ServiceSpec) -> Path:
+    ensure_service_python_shims(spec)
     path, content = render_service(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
     spec.log_dir.mkdir(parents=True, exist_ok=True)
@@ -285,6 +292,8 @@ def _install_launchd(spec: ServiceSpec) -> Path:
 
 
 def _install_launchd_services(specs: list[ServiceSpec]) -> list[Path]:
+    for spec in specs:
+        ensure_service_python_shims(spec)
     paths: list[Path] = []
     for spec in specs:
         path, content = render_service(spec)
@@ -335,6 +344,7 @@ def _restart_launchd(*, force: bool = False) -> int:
 
 
 def _install_systemd(spec: ServiceSpec) -> Path:
+    ensure_service_python_shims(spec)
     path, content = render_service(spec)
     path.parent.mkdir(parents=True, exist_ok=True)
     spec.log_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +356,8 @@ def _install_systemd(spec: ServiceSpec) -> Path:
 
 
 def _install_systemd_services(specs: list[ServiceSpec]) -> list[Path]:
+    for spec in specs:
+        ensure_service_python_shims(spec)
     paths: list[Path] = []
     for spec in specs:
         path, content = render_service(spec)
@@ -546,8 +558,14 @@ def _systemd_status(name: str) -> int:
     return completed.returncode
 
 
-def service_environment_path(environ_path: str | None = None) -> str:
+def service_environment_path(
+    environ_path: str | None = None,
+    *,
+    service_bin_dir: Path | None = None,
+) -> str:
     paths: list[str] = []
+    if service_bin_dir is not None and _stable_python_executable() is not None:
+        paths.append(str(service_bin_dir))
     for command in ("codex", "claude"):
         found = shutil.which(command)
         if found:
@@ -568,6 +586,38 @@ def service_environment_path(environ_path: str | None = None) -> str:
         seen.add(expanded)
         stable_paths.append(expanded)
     return os.pathsep.join(stable_paths)
+
+
+def ensure_service_python_shims(spec: ServiceSpec) -> Path | None:
+    target = _stable_python_executable()
+    if target is None:
+        return None
+    bin_dir = _service_python_shim_dir(spec)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("python", "python3"):
+        link = bin_dir / name
+        try:
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(target)
+        except OSError:
+            LOGGER.debug("failed to create service Python shim %s -> %s", link, target)
+    return bin_dir
+
+
+def _service_python_shim_dir(spec: ServiceSpec) -> Path:
+    return spec.log_dir.parent / "bin"
+
+
+def _stable_python_executable() -> Path | None:
+    for command in STABLE_PYTHON_COMMANDS:
+        found = shutil.which(command)
+        if found:
+            return Path(found).resolve()
+    version = sys.version_info[:2]
+    if (3, 11) <= version < (3, 14):
+        return Path(sys.executable).resolve()
+    return None
 
 
 def _is_transient_path(path: str) -> bool:

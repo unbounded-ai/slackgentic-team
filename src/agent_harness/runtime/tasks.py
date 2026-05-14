@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import re
 import shlex
 import threading
@@ -28,6 +29,7 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     is_slackgentic_mcp_server_configured,
 )
+from agent_harness.slack import replace_slack_user_ids
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
@@ -39,6 +41,15 @@ MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
+CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
+MACOS_TCC_PROTECTED_HOME_DIRS = (
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+)
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str, str | None], bool]
@@ -67,6 +78,7 @@ class RunningTask:
     observed_agent_messages: set[str] | None = None
     control_signals: list[str] = field(default_factory=list)
     visible_message_count: int = 0
+    started_monotonic: float = field(default_factory=time.monotonic)
 
 
 class ManagedTaskRuntime:
@@ -82,6 +94,7 @@ class ManagedTaskRuntime:
         on_agent_control: AgentControlCallback | None = None,
         agent_icon_url: AgentIconUrlCallback | None = None,
         home: Path | None = None,
+        codex_thread_start_timeout: timedelta = CODEX_THREAD_START_TIMEOUT,
     ):
         self.store = store
         self.gateway = gateway
@@ -93,6 +106,7 @@ class ManagedTaskRuntime:
         self.on_agent_control = on_agent_control
         self.agent_icon_url = agent_icon_url
         self.home = home or Path.home()
+        self.codex_thread_start_timeout = codex_thread_start_timeout
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
 
@@ -106,6 +120,26 @@ class ManagedTaskRuntime:
     ) -> bool:
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
+        tcc_issue = _macos_tcc_protected_cwd_issue(
+            cwd,
+            home=self.home,
+            allow=self.commands.allow_macos_tcc_protected_paths,
+        )
+        if tcc_issue:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"I did not start {provider.value} because {tcc_issue}. "
+                    "Move the repo under an unprotected working directory such as ~/code, "
+                    "or set SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS=true after granting "
+                    "the chosen runtime the required macOS privacy access."
+                ),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(task.task_id)
+            return False
         claude_channel = provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(
             self.home
         )
@@ -236,6 +270,10 @@ class ManagedTaskRuntime:
         with self._lock:
             return bool(self._running)
 
+    def running_tasks(self) -> list[RunningTask]:
+        with self._lock:
+            return list(self._running.values())
+
     def _default_cwd(self) -> Path:
         configured = self.store.get_setting(SETTING_REPO_ROOT)
         if configured:
@@ -275,6 +313,9 @@ class ManagedTaskRuntime:
                 )
             for chunk in chunks:
                 self._post_agent_chunk(running, chunk)
+            if self._codex_thread_start_timed_out(running):
+                self._handle_codex_thread_start_timeout(running)
+                return
             if not running.process.is_alive():
                 time.sleep(0.05)
                 tail = running.process.read_available(max_reads=100, timeout=0.05)
@@ -308,18 +349,6 @@ class ManagedTaskRuntime:
                 if recovered_message:
                     self._post_agent_chunk(running, recovered_message)
                 if running.visible_message_count == 0 and not running.control_signals:
-                    recovered_message = self._recover_unseen_visible_message(
-                        completed_task,
-                        running,
-                    )
-                    if recovered_message:
-                        self._post_agent_chunk(running, recovered_message)
-                        completed_task = self._clear_managed_run_started(task_id) or completed_task
-                        if self._handle_agent_control_signals(running, completed_task):
-                            return
-                        if self.on_task_done:
-                            self.on_task_done(completed_task, running.agent, running.thread)
-                        return
                     self.gateway.post_thread_reply(
                         running.thread,
                         (
@@ -340,6 +369,42 @@ class ManagedTaskRuntime:
                     self.on_task_done(completed_task, running.agent, running.thread)
                 return
             time.sleep(self.poll_seconds)
+
+    def _codex_thread_start_timed_out(self, running: RunningTask) -> bool:
+        if _provider_for_running(running) != Provider.CODEX:
+            return False
+        if running.task.session_id:
+            return False
+        if running.visible_message_count or running.control_signals:
+            return False
+        if not running.process.is_alive():
+            return False
+        timeout_seconds = self.codex_thread_start_timeout.total_seconds()
+        if timeout_seconds <= 0:
+            return True
+        return time.monotonic() - running.started_monotonic >= timeout_seconds
+
+    def _handle_codex_thread_start_timeout(self, running: RunningTask) -> None:
+        task_id = running.task.task_id
+        try:
+            running.process.terminate()
+        except Exception:
+            LOGGER.debug("failed to stop Codex after startup timeout", exc_info=True)
+        with self._lock:
+            self._running.pop(task_id, None)
+        self._clear_managed_run_started(task_id)
+        self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+        self.store.delete_managed_thread_task(task_id)
+        self.gateway.post_thread_reply(
+            running.thread,
+            (
+                f"{running.agent.full_name} did not finish starting Codex within "
+                f"{int(self.codex_thread_start_timeout.total_seconds())} seconds, "
+                "so I stopped this run instead of leaving it stuck."
+            ),
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
 
     def _handle_task_worker_failure(self, task_id: str) -> None:
         running = self._get_running(task_id)
@@ -419,13 +484,22 @@ class ManagedTaskRuntime:
         return handled
 
     def _recover_visible_message(self, task: AgentTask, running: RunningTask) -> str | None:
-        if _provider_for_running(running) != Provider.CODEX or not task.session_id:
+        provider = _provider_for_running(running)
+        if not task.session_id:
             return None
-        return _latest_codex_transcript_message(
-            task.session_id,
-            self.home,
-            since=task.created_at,
-        )
+        if provider == Provider.CODEX:
+            return _latest_codex_transcript_message(
+                task.session_id,
+                self.home,
+                since=task.created_at,
+            )
+        if provider == Provider.CLAUDE:
+            return _latest_claude_transcript_message(
+                task.session_id,
+                self.home,
+                since=task.created_at,
+            )
+        return None
 
     def _recover_unseen_visible_message(
         self,
@@ -823,6 +897,10 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "handle inline near the beginning, wrap it in backticks, or bury it before "
             "the options."
         ),
+        (
+            "Do not write raw Slack user IDs such as U12345 or @U12345 in visible replies. "
+            "Use the person's display name when known, or say the Slack user."
+        ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",
     ]
@@ -832,13 +910,14 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         lines.append("Review the PR and report findings with concrete file or diff references.")
     thread_context = task.metadata.get("thread_context")
     if isinstance(thread_context, str) and thread_context.strip():
+        sanitized_thread_context = replace_slack_user_ids(thread_context.strip())
         lines.extend(
             [
                 "",
                 "Private Slack thread context. Use this to understand prior messages, "
                 "handoffs, reviews, and user intent. Do not quote this heading or describe "
                 "it as hidden context in Slack-visible replies:",
-                thread_context.strip(),
+                sanitized_thread_context,
             ]
         )
     return "\n".join(lines)
@@ -855,6 +934,44 @@ def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:
         if path.exists():
             return path
     return _requested_repo_cwd(task.prompt, default_cwd)
+
+
+def _macos_tcc_protected_cwd_issue(
+    cwd: Path,
+    *,
+    home: Path | None = None,
+    allow: bool = False,
+) -> str | None:
+    if allow or platform.system().lower() != "darwin":
+        return None
+    path = _resolved_path(cwd)
+    home_paths = [_resolved_path(home)] if home is not None else []
+    real_home = _resolved_path(Path.home())
+    if real_home not in home_paths:
+        home_paths.append(real_home)
+    for home_path in home_paths:
+        for dirname in MACOS_TCC_PROTECTED_HOME_DIRS:
+            protected_root = home_path / dirname
+            if _path_is_relative_to(path, protected_root):
+                return f"the working directory {path} is inside macOS-protected {dirname}"
+    if _path_is_relative_to(path, Path("/Volumes")):
+        return f"the working directory {path} is on a macOS-protected mounted volume"
+    return None
+
+
+def _resolved_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except OSError:
+        return path.expanduser().absolute()
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _requested_repo_cwd(prompt: str, default_cwd: Path) -> Path:
@@ -1554,6 +1671,58 @@ def _codex_transcript_record_message(record: dict) -> str | None:
     return None
 
 
+def _latest_claude_transcript_message(
+    session_id: str,
+    home: Path,
+    *,
+    since: datetime | None = None,
+) -> str | None:
+    projects_root = home / ".claude" / "projects"
+    if not projects_root.exists():
+        return None
+    try:
+        paths = sorted(
+            projects_root.rglob(f"{session_id}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in paths:
+        message = _latest_claude_transcript_message_from_path(path, since=since)
+        if message:
+            return message
+    return None
+
+
+def _latest_claude_transcript_message_from_path(
+    path: Path,
+    *,
+    since: datetime | None = None,
+) -> str | None:
+    latest: str | None = None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("type") != "assistant":
+            continue
+        timestamp = parse_timestamp(record.get("timestamp"))
+        if since is not None and timestamp is not None and timestamp < since:
+            continue
+        message = _claude_assistant_message_text(record)
+        if message:
+            latest = message
+    return latest
+
+
 def _claude_json_chunks(
     text: str,
     buffer: str = "",
@@ -1603,6 +1772,33 @@ def _render_claude_json_line(line: str) -> str | None:
         message = event.get("message") or event.get("error")
         return _format_claude_error(message)
     return None
+
+
+def _claude_assistant_message_text(record: dict) -> str | None:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        cleaned = _clean_terminal_output(content)
+        return cleaned or None
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        cleaned = _clean_terminal_output(text)
+        if cleaned:
+            parts.append(cleaned)
+    if not parts:
+        return None
+    return "\n\n".join(parts)
 
 
 def _format_claude_error(message: object) -> str:

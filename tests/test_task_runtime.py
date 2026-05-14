@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
@@ -23,6 +24,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
+    RunningTask,
     _allowed_session_tools_for_claude_denial,
     _allowed_tool_for_claude_denial,
     _allowed_tools_for_claude_denial,
@@ -32,6 +34,7 @@ from agent_harness.runtime.tasks import (
     _clean_terminal_output,
     _extract_agent_control_signals,
     _latest_codex_transcript_message,
+    _macos_tcc_protected_cwd_issue,
     _process_output_chunks,
     _requested_repo_cwd,
     _session_id_from_output,
@@ -412,6 +415,33 @@ class HoldingProcess(OneShotProcess):
         self.alive = False
 
 
+class ClaudeSessionOnlyProcess(OneShotProcess):
+    session_id = "claude-fallback-session"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return f'{{"type":"system","subtype":"init","session_id":"{self.session_id}"}}\n'
+        return ""
+
+
+class ClaudeAssistantOnlyProcess(OneShotProcess):
+    session_id = "claude-assistant-only-session"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                f'{{"type":"system","subtype":"init","session_id":"{self.session_id}"}}\n'
+                '{"type":"assistant","message":{"role":"assistant","content":'
+                '[{"type":"text","text":"Working on it"}]}}\n'
+                '{"type":"assistant","message":{"role":"assistant","content":'
+                '[{"type":"text","text":"PR up: '
+                'https://github.com/example/repo/pull/456"}]}}\n'
+            )
+        return ""
+
+
 class SessionOnlyProcess(OneShotProcess):
     session_id = "session-fallback"
 
@@ -497,6 +527,109 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("@nell pick one before I proceed", prompt)
         self.assertIn("Do not put that callback handle inline", prompt)
         self.assertNotIn("`@handle`", prompt)
+
+    def test_build_task_prompt_sanitizes_stored_slack_user_ids(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = replace(
+            create_agent_task(agent, "continue", "C1"),
+            metadata={
+                "thread_context": (
+                    "U0ARHEAU9B3: please check <@U0ARHEAU9B3>\nReviewer: @U0ARHEAU9B3 once ready"
+                )
+            },
+        )
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("Slack user: please check Slack user", prompt)
+        self.assertIn("Reviewer: Slack user once ready", prompt)
+        self.assertNotIn("U0ARHEAU9B3", prompt)
+
+    def test_macos_tcc_protected_cwd_detects_home_and_volume_paths(self):
+        home = Path("/Users/test")
+        with patch("agent_harness.runtime.tasks.platform.system", return_value="Darwin"):
+            self.assertIn(
+                "Documents",
+                _macos_tcc_protected_cwd_issue(home / "Documents" / "repo", home=home) or "",
+            )
+            self.assertIn(
+                "mounted volume",
+                _macos_tcc_protected_cwd_issue(Path("/Volumes/External/repo"), home=home) or "",
+            )
+            self.assertIsNone(_macos_tcc_protected_cwd_issue(home / "code" / "repo", home=home))
+
+    def test_runtime_refuses_macos_tcc_protected_working_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work in documents", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=home / "Documents" / "repo"),
+                    process_factory=process_factory,
+                    home=home,
+                )
+
+                with patch("agent_harness.runtime.tasks.platform.system", return_value="Darwin"):
+                    started = runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertFalse(started)
+                self.assertFalse(launched)
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertIn("macOS-protected Documents", runtime.gateway.replies[-1])
+            finally:
+                store.close()
+
+    def test_runtime_can_opt_into_macos_tcc_protected_working_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work in documents", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(
+                        default_cwd=home / "Documents" / "repo",
+                        allow_macos_tcc_protected_paths=True,
+                    ),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                with patch("agent_harness.runtime.tasks.platform.system", return_value="Darwin"):
+                    started = runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(started)
+                self.assertEqual(len(launched), 1)
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
 
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1102,6 +1235,49 @@ class TaskRuntimeTests(unittest.TestCase):
                 assert persisted is not None
                 self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
                 self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+            finally:
+                store.close()
+
+    def test_runtime_cancels_codex_run_that_never_starts_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "review a design", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                )
+                store.upsert_agent_task(task)
+                thread = SlackThreadRef("C1", "171.000001")
+                store.upsert_managed_thread_task(task, thread)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                    codex_thread_start_timeout=timedelta(seconds=0),
+                )
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=HoldingProcess(None),
+                    thread=thread,
+                    worker=threading.Thread(),
+                )
+
+                self.assertTrue(runtime._codex_thread_start_timed_out(running))
+                runtime._handle_codex_thread_start_timeout(running)
+
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+                self.assertIsNone(store.get_managed_thread_task("C1", "171.000001"))
+                self.assertIn("did not finish starting Codex", gateway.replies[-1])
             finally:
                 store.close()
 
@@ -2125,14 +2301,152 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
-                    if len(gateway.replies) >= 2:
-                        break
+                deadline = time.monotonic() + 5
+                while (
+                    len(gateway.replies) < 2 or not done_callbacks
+                ) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
                 self.assertEqual(gateway.replies, ["Working", "Recovered final"])
                 self.assertEqual(seen, ["Working", "Recovered final"])
                 self.assertEqual(done_callbacks, [task.task_id])
+            finally:
+                store.close()
+
+    def test_runtime_recovers_visible_message_from_claude_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "open the PR", "C1")
+                store.upsert_agent_task(task)
+                transcript_dir = home / ".claude" / "projects" / "-tmp-repo"
+                transcript_dir.mkdir(parents=True)
+                transcript_path = transcript_dir / f"{ClaudeSessionOnlyProcess.session_id}.jsonl"
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": task.created_at.isoformat(),
+                            "sessionId": ClaudeSessionOnlyProcess.session_id,
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": ("PR up: https://github.com/example/repo/pull/123"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ClaudeSessionOnlyProcess,
+                    poll_seconds=0.01,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(
+                    gateway.replies,
+                    ["PR up: https://github.com/example/repo/pull/123"],
+                )
+                self.assertEqual(done_callbacks, [task.task_id])
+                self.assertNotEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.CANCELLED,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_recovers_latest_claude_assistant_text_without_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "open the PR", "C1")
+                store.upsert_agent_task(task)
+                transcript_dir = home / ".claude" / "projects" / "-tmp-repo"
+                transcript_dir.mkdir(parents=True)
+                transcript_path = transcript_dir / f"{ClaudeAssistantOnlyProcess.session_id}.jsonl"
+                started_at = task.created_at.isoformat()
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": started_at,
+                            "sessionId": ClaudeAssistantOnlyProcess.session_id,
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "Working on it"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": started_at,
+                            "sessionId": ClaudeAssistantOnlyProcess.session_id,
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": ("PR up: https://github.com/example/repo/pull/456"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ClaudeAssistantOnlyProcess,
+                    poll_seconds=0.01,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000002"))
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(
+                    gateway.replies,
+                    ["PR up: https://github.com/example/repo/pull/456"],
+                )
+                self.assertEqual(done_callbacks, [task.task_id])
+                self.assertNotEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.CANCELLED,
+                )
             finally:
                 store.close()
 

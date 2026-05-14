@@ -7,7 +7,7 @@ no browser certificate warning.
 ## 1. Install locally
 
 ```sh
-python -m venv .venv && source .venv/bin/activate && pip install -e .
+python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .
 slackgentic slack doctor
 ```
 
