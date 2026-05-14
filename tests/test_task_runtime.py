@@ -422,6 +422,23 @@ class ClaudeSessionOnlyProcess(OneShotProcess):
         return ""
 
 
+class ClaudeAssistantOnlyProcess(OneShotProcess):
+    session_id = "claude-assistant-only-session"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                f'{{"type":"system","subtype":"init","session_id":"{self.session_id}"}}\n'
+                '{"type":"assistant","message":{"role":"assistant","content":'
+                '[{"type":"text","text":"Working on it"}]}}\n'
+                '{"type":"assistant","message":{"role":"assistant","content":'
+                '[{"type":"text","text":"PR up: '
+                'https://github.com/example/repo/pull/456"}]}}\n'
+            )
+        return ""
+
+
 class SessionOnlyProcess(OneShotProcess):
     session_id = "session-fallback"
 
@@ -2250,6 +2267,81 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(
                     gateway.replies,
                     ["PR up: https://github.com/example/repo/pull/123"],
+                )
+                self.assertEqual(done_callbacks, [task.task_id])
+                self.assertNotEqual(
+                    store.get_agent_task(task.task_id).status,
+                    AgentTaskStatus.CANCELLED,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_recovers_latest_claude_assistant_text_without_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "open the PR", "C1")
+                store.upsert_agent_task(task)
+                transcript_dir = home / ".claude" / "projects" / "-tmp-repo"
+                transcript_dir.mkdir(parents=True)
+                transcript_path = transcript_dir / f"{ClaudeAssistantOnlyProcess.session_id}.jsonl"
+                started_at = task.created_at.isoformat()
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": started_at,
+                            "sessionId": ClaudeAssistantOnlyProcess.session_id,
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "Working on it"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": started_at,
+                            "sessionId": ClaudeAssistantOnlyProcess.session_id,
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": ("PR up: https://github.com/example/repo/pull/456"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                gateway = FakeGateway()
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ClaudeAssistantOnlyProcess,
+                    poll_seconds=0.01,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000002"))
+                for _ in range(50):
+                    if gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(
+                    gateway.replies,
+                    ["PR up: https://github.com/example/repo/pull/456"],
                 )
                 self.assertEqual(done_callbacks, [task.task_id])
                 self.assertNotEqual(

@@ -316,18 +316,6 @@ class ManagedTaskRuntime:
                 if recovered_message:
                     self._post_agent_chunk(running, recovered_message)
                 if running.visible_message_count == 0 and not running.control_signals:
-                    recovered_message = self._recover_unseen_visible_message(
-                        completed_task,
-                        running,
-                    )
-                    if recovered_message:
-                        self._post_agent_chunk(running, recovered_message)
-                        completed_task = self._clear_managed_run_started(task_id) or completed_task
-                        if self._handle_agent_control_signals(running, completed_task):
-                            return
-                        if self.on_task_done:
-                            self.on_task_done(completed_task, running.agent, running.thread)
-                        return
                     self.gateway.post_thread_reply(
                         running.thread,
                         (
