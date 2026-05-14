@@ -24,7 +24,10 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
-from agent_harness.sessions.claude_channel import is_slackgentic_mcp_server_configured
+from agent_harness.sessions.claude_channel import (
+    SLACKGENTIC_MCP_PERMISSION_ALLOW,
+    is_slackgentic_mcp_server_configured,
+)
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
@@ -103,6 +106,14 @@ class ManagedTaskRuntime:
     ) -> bool:
         provider = agent.provider_preference or Provider.CODEX
         cwd = _task_cwd(task, self._default_cwd())
+        claude_channel = provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(
+            self.home
+        )
+        launch_allowed_tools = _initial_allowed_tools(
+            provider,
+            allowed_tools,
+            claude_channel=claude_channel,
+        )
         request = LaunchRequest(
             provider=provider,
             prompt=build_task_prompt(agent, task),
@@ -114,12 +125,10 @@ class ManagedTaskRuntime:
                 and (task.session_provider is None or task.session_provider == provider)
                 else None
             ),
-            claude_channel=(
-                provider == Provider.CLAUDE and is_slackgentic_mcp_server_configured(self.home)
-            ),
+            claude_channel=claude_channel,
             slack_channel_id=thread.channel_id,
             slack_thread_ts=thread.thread_ts,
-            allowed_tools=allowed_tools,
+            allowed_tools=launch_allowed_tools,
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
@@ -154,7 +163,7 @@ class ManagedTaskRuntime:
             thread=thread,
             worker=worker,
             resume_session_id=request.resume_session_id,
-            allowed_tools=allowed_tools,
+            allowed_tools=launch_allowed_tools,
         )
         with self._lock:
             self._running[task.task_id] = running
@@ -462,6 +471,8 @@ class ManagedTaskRuntime:
     ) -> bool:
         if _provider_for_running(running) != Provider.CLAUDE:
             return False
+        if running.process.request.dangerous:
+            return False
         denials, running.permission_buffer = _claude_permission_denials(
             output,
             running.permission_buffer,
@@ -534,6 +545,15 @@ class ManagedTaskRuntime:
         completed_task: AgentTask,
     ) -> None:
         denial = running.permission_denials[0]
+        internal_tool = _slackgentic_mcp_tool_for_claude_denial(denial)
+        if internal_tool:
+            self._retry_claude_permission_denial(
+                running,
+                completed_task,
+                denial,
+                (internal_tool,),
+            )
+            return
         allowed_tools = _allowed_tools_for_claude_denial(denial)
         if not allowed_tools:
             self.gateway.post_thread_reply(
@@ -572,7 +592,15 @@ class ManagedTaskRuntime:
                 allowed_tools,
                 _allowed_session_tools_for_claude_denial(denial),
             )
+        self._retry_claude_permission_denial(running, completed_task, denial, allowed_tools)
 
+    def _retry_claude_permission_denial(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+        denial: dict,
+        allowed_tools: tuple[str, ...],
+    ) -> None:
         current = self.store.get_agent_task(completed_task.task_id) or completed_task
         retry_task = replace(
             current,
@@ -593,6 +621,8 @@ class ManagedTaskRuntime:
         running: RunningTask,
         denial: dict,
     ) -> str | None:
+        if _slackgentic_mcp_tool_for_claude_denial(denial):
+            return None
         if not _allowed_tools_for_claude_denial(denial):
             return None
         key = _claude_denial_key(denial)
@@ -721,6 +751,17 @@ def should_resume_managed_run(
     if age is None:
         return False
     return age <= max_age
+
+
+def _initial_allowed_tools(
+    provider: Provider,
+    allowed_tools: tuple[str, ...],
+    *,
+    claude_channel: bool,
+) -> tuple[str, ...]:
+    if provider == Provider.CLAUDE and claude_channel:
+        return _append_allowed_tools(allowed_tools, SLACKGENTIC_MCP_PERMISSION_ALLOW)
+    return allowed_tools
 
 
 def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
@@ -1018,6 +1059,13 @@ def _allowed_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     return ()
 
 
+def _slackgentic_mcp_tool_for_claude_denial(denial: dict) -> str | None:
+    tool_name = str(denial.get("tool_name") or "")
+    if tool_name in SLACKGENTIC_MCP_PERMISSION_ALLOW:
+        return tool_name
+    return None
+
+
 def _allowed_session_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     tool_name = str(denial.get("tool_name") or "")
     tool_input = denial.get("tool_input")
@@ -1270,6 +1318,11 @@ def _status_inline_code(value: str, limit: int) -> str:
 
 
 def _claude_permission_retry_prompt(denial: dict) -> str:
+    if _slackgentic_mcp_tool_for_claude_denial(denial):
+        return (
+            "The internal Slackgentic Slack request tool is now allowed. "
+            "Retry the Slack request if it is still needed, then continue the task."
+        )
     tool_input = denial.get("tool_input")
     if isinstance(tool_input, dict):
         command = tool_input.get("command")
