@@ -32,6 +32,7 @@ from agent_harness.team import runtime_personality_prompt
 LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
 AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
+MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 ProcessFactory = Callable[[LaunchRequest], ManagedAgentProcess]
 TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
@@ -133,6 +134,7 @@ class ManagedTaskRuntime:
             self.store.delete_managed_thread_task(task.task_id)
             return False
 
+        task = self._mark_managed_run_started(task)
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
         self.store.update_agent_task_session(task.task_id, provider, task.session_id)
         self.store.upsert_managed_thread_task(task, thread)
@@ -172,13 +174,18 @@ class ManagedTaskRuntime:
     def stop_task(self, task_id: str, status: AgentTaskStatus = AgentTaskStatus.CANCELLED) -> bool:
         running = self._get_running(task_id)
         if running is None:
+            self._clear_managed_run_started(task_id)
             self.store.update_agent_task_status(task_id, status)
             return False
         running.process.terminate()
+        self._clear_managed_run_started(task_id)
         self.store.update_agent_task_status(task_id, status)
         with self._lock:
             self._running.pop(task_id, None)
         return True
+
+    def is_task_running(self, task_id: str) -> bool:
+        return self._get_running(task_id) is not None
 
     def running_task_for_thread(self, channel_id: str, thread_ts: str) -> RunningTask | None:
         with self._lock:
@@ -272,6 +279,7 @@ class ManagedTaskRuntime:
                     )
                     if recovered_message:
                         self._post_agent_chunk(running, recovered_message)
+                        completed_task = self._clear_managed_run_started(task_id) or completed_task
                         if self._handle_agent_control_signals(running, completed_task):
                             return
                         if self.on_task_done:
@@ -287,8 +295,10 @@ class ManagedTaskRuntime:
                         persona=running.agent,
                         icon_url=self._agent_icon_url(running.agent),
                     )
+                    self._clear_managed_run_started(task_id)
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
+                completed_task = self._clear_managed_run_started(task_id) or completed_task
                 if self._handle_agent_control_signals(running, completed_task):
                     return
                 if self.on_task_done:
@@ -309,6 +319,7 @@ class ManagedTaskRuntime:
             AgentTaskStatus.QUEUED,
             AgentTaskStatus.ACTIVE,
         }:
+            self._clear_managed_run_started(task_id)
             self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
             self.store.delete_managed_thread_task(task_id)
         if running is None:
@@ -598,6 +609,31 @@ class ManagedTaskRuntime:
     def _get_running(self, task_id: str) -> RunningTask | None:
         with self._lock:
             return self._running.get(task_id)
+
+    def _mark_managed_run_started(self, task: AgentTask) -> AgentTask:
+        metadata = dict(task.metadata)
+        metadata[MANAGED_RUN_STARTED_METADATA_KEY] = utc_now().isoformat()
+        updated = replace(task, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return updated
+
+    def _clear_managed_run_started(self, task_id: str) -> AgentTask | None:
+        try:
+            current = self.store.get_agent_task(task_id)
+        except Exception:
+            LOGGER.debug("failed to load task before clearing managed run marker", exc_info=True)
+            return None
+        if current is None or MANAGED_RUN_STARTED_METADATA_KEY not in current.metadata:
+            return current
+        metadata = dict(current.metadata)
+        metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        try:
+            self.store.upsert_agent_task(updated)
+        except Exception:
+            LOGGER.debug("failed to clear managed run marker", exc_info=True)
+            return current
+        return updated
 
 
 def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:

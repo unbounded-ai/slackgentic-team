@@ -18,6 +18,7 @@ from agent_harness.models import (
 )
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     _allowed_session_tools_for_claude_denial,
     _allowed_tool_for_claude_denial,
@@ -290,6 +291,21 @@ class SilentProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         self.reads += 1
         return ""
+
+
+class HoldingProcess(OneShotProcess):
+    def __init__(self, request):
+        super().__init__(request)
+        self.alive = True
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        return ""
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.alive = False
 
 
 class SessionOnlyProcess(OneShotProcess):
@@ -750,6 +766,49 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and MANAGED_RUN_STARTED_METADATA_KEY not in current.metadata:
+                        break
+                    time.sleep(0.01)
+                self.assertNotIn(
+                    MANAGED_RUN_STARTED_METADATA_KEY,
+                    store.get_agent_task(task.task_id).metadata,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_marks_managed_run_while_process_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "keep working", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                current = store.get_agent_task(task.task_id)
+                self.assertIsNotNone(current)
+                assert current is not None
+                self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
+
+                runtime.stop_task(task.task_id)
+
+                current = store.get_agent_task(task.task_id)
+                self.assertIsNotNone(current)
+                assert current is not None
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
             finally:
                 store.close()
 
