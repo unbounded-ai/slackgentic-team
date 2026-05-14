@@ -544,6 +544,34 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(chunks, ["Done"])
         self.assertEqual(buffer, "")
 
+    def test_codex_exec_json_output_hides_tool_transport_errors(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            (
+                "2026-05-14T03:13:23.414188Z ERROR "
+                "codex_core::tools::router: error=write_stdin failed: "
+                "Unknown process id 32391\n"
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Done"])
+        self.assertEqual(buffer, "")
+
+    def test_codex_exec_json_output_hides_raw_tool_result_fragments(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CODEX,
+            (
+                '":"        gateway.post_thread_reply(\\n'
+                "    secret tool output\\n"
+                '","exit_code":0,"status":"completed"}}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Done"])
+        self.assertEqual(buffer, "")
+
     def test_codex_exec_json_output_hides_malformed_json_records(self):
         chunks, buffer = _process_output_chunks(
             Provider.CODEX,
@@ -778,6 +806,18 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Sounds good.")
         self.assertEqual(signals, [AGENT_THREAD_DONE_SIGNAL])
+
+    def test_tool_transport_leak_lines_are_stripped_from_visible_text(self):
+        visible, signals = _extract_agent_control_signals(
+            "Working.\n"
+            "2026-05-14T03:13:23.414188Z ERROR "
+            "codex_core::tools::router: error=write_stdin failed: "
+            "Unknown process id 32391\n"
+            "Still working.\n"
+        )
+
+        self.assertEqual(visible, "Working.\nStill working.")
+        self.assertEqual(signals, [])
 
     def test_codex_transcript_fallback_uses_latest_agent_message_since_task(self):
         with tempfile.TemporaryDirectory() as tmp:
