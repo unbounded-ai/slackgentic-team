@@ -555,6 +555,15 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("at least every 5 minutes", prompt)
         self.assertIn("Slack-visible progress update", prompt)
 
+    def test_build_task_prompt_instructs_direct_question_handling(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "work carefully", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("Direct Slack questions are not optional", prompt)
+        self.assertIn("answer it explicitly in Slack", prompt)
+
     def test_build_task_prompt_instructs_timer_signal(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         task = create_agent_task(agent, "work carefully", "C1")

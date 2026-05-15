@@ -922,6 +922,11 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "5 minutes, and sooner for meaningful progress, blockers, or decisions."
         ),
         (
+            "Direct Slack questions are not optional. If a Slack reply asks a question, "
+            "answer it explicitly in Slack before continuing implementation work, opening "
+            "a PR, or scheduling a delayed follow-up."
+        ),
+        (
             "For delayed follow-ups, do not rely on terminal sleeps or background timers. "
             "Send a concise Slack-visible status update, then put a hidden timer control "
             "line on its own final line in the exact form "
