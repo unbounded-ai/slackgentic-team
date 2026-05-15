@@ -3045,6 +3045,68 @@ class SlackTeamController:
             if include_thread and message_ts == task.thread_ts:
                 continue
             self._clear_message_status_reactions(thread.channel_id, message_ts)
+        self._reconcile_pending_thread_reactions(task, thread)
+
+    def _reconcile_pending_thread_reactions(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> None:
+        # Backstop: surface and clear thread messages that the bot acknowledged
+        # or marked in-progress but never finalized. Otherwise the user sees
+        # :eyes: / :hourglass: lingering forever after the task closes.
+        if not thread.thread_ts:
+            return
+        lookup = getattr(self.gateway, "bot_user_id", None)
+        bot_user_id = lookup() if callable(lookup) else None
+        if not bot_user_id:
+            return
+        handled = set(_task_request_message_ts_values(task))
+        if task.thread_ts:
+            handled.add(task.thread_ts)
+        try:
+            messages = self.gateway.thread_messages(
+                thread.channel_id,
+                thread.thread_ts,
+                limit=200,
+            )
+        except Exception:
+            LOGGER.debug("failed to fetch thread for pending-reaction sweep", exc_info=True)
+            return
+        pending_reactions = {TASK_REACTION_ACKNOWLEDGED, TASK_REACTION_IN_PROGRESS}
+        pending: list[str] = []
+        for message in messages:
+            message_ts = message.get("ts")
+            if not message_ts or message_ts in handled:
+                continue
+            for reaction in message.get("reactions") or []:
+                if reaction.get("name") in pending_reactions and bot_user_id in (
+                    reaction.get("users") or []
+                ):
+                    pending.append(message_ts)
+                    break
+        if not pending:
+            return
+        links: list[str] = []
+        for message_ts in pending:
+            try:
+                url = self.gateway.permalink(thread.channel_id, message_ts)
+            except Exception:
+                url = None
+            links.append(f"- {url}" if url else f"- `{message_ts}`")
+        try:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    "Closing this task, but these replies were acknowledged "
+                    "and never marked complete — clearing their status "
+                    "reactions:\n" + "\n".join(links)
+                ),
+            )
+        except Exception:
+            LOGGER.debug("failed to post pending-reaction warning", exc_info=True)
+        for message_ts in pending:
+            self._clear_message_status_reactions(thread.channel_id, message_ts)
 
     def _clear_task_request_status_reactions(
         self,

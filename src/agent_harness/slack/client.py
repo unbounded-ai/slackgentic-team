@@ -76,6 +76,18 @@ class SlackGateway:
         data = getattr(response, "data", response)
         return dict(data)
 
+    def bot_user_id(self) -> str | None:
+        cached = getattr(self, "_bot_user_id_cache", None)
+        if cached is not None:
+            return cached or None
+        try:
+            user_id = self.auth_test().get("user_id")
+        except Exception:
+            LOGGER.debug("failed to look up bot user id", exc_info=True)
+            user_id = None
+        self._bot_user_id_cache = user_id if isinstance(user_id, str) else ""
+        return self._bot_user_id_cache or None
+
     def user_profile(self, user_id: str) -> SlackUserProfile:
         response = self.client.users_info(user=user_id)
         data = getattr(response, "data", response)
