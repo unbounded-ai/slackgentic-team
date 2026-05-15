@@ -432,6 +432,23 @@ class HoldingProcess(OneShotProcess):
         self.interrupts += 1
 
 
+class CrashingProcess(OneShotProcess):
+    def __init__(self, request):
+        super().__init__(request)
+        self.alive = True
+        self.terminated = False
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        raise UnicodeDecodeError("utf-8", b"\x94", 0, 1, "invalid start byte")
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminated = True
+        self.alive = False
+
+
 class ClaudeSessionOnlyProcess(OneShotProcess):
     session_id = "claude-fallback-session"
 
@@ -1424,6 +1441,50 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
 
                 runtime.stop_task(task.task_id)
+            finally:
+                store.close()
+
+    def test_runtime_worker_failure_terminates_orphan_child_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "read will crash", "C1")
+                store.upsert_agent_task(task)
+                created: list[CrashingProcess] = []
+
+                def factory(request):
+                    process = CrashingProcess(request)
+                    created.append(process)
+                    return process
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=factory,
+                    poll_seconds=0.01,
+                )
+
+                logging.disable(logging.CRITICAL)
+                try:
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                    for _ in range(50):
+                        current = store.get_agent_task(task.task_id)
+                        if current and current.status == AgentTaskStatus.CANCELLED:
+                            break
+                        time.sleep(0.01)
+                finally:
+                    logging.disable(logging.NOTSET)
+
+                self.assertEqual(len(created), 1)
+                self.assertTrue(
+                    created[0].terminated,
+                    "crashed worker must terminate its child process to avoid leaking it to init",
+                )
+                self.assertFalse(created[0].is_alive())
             finally:
                 store.close()
 

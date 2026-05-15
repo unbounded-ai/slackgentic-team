@@ -444,6 +444,16 @@ class ManagedTaskRuntime:
         running = self._get_running(task_id)
         with self._lock:
             self._running.pop(task_id, None)
+        if running is not None:
+            try:
+                if running.process.is_alive():
+                    running.process.terminate()
+            except Exception:
+                LOGGER.debug(
+                    "failed to terminate child process for crashed task %s",
+                    task_id,
+                    exc_info=True,
+                )
         try:
             current = self.store.get_agent_task(task_id)
         except Exception:
