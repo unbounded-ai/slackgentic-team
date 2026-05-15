@@ -111,6 +111,12 @@ In the main channel, write anything to hand it to an available agent. Use
 with `somebody ...` to bring in another agent for a subtask; the original agent
 then picks the thread back up with that new context.
 
+By default tasks launch in **safe-auto** permission mode: Codex runs with
+`--sandbox workspace-write` and Claude runs with `--permission-mode acceptEdits`
+plus an allowlist for read-only inspection commands such as `git status`,
+`git log`, `git diff`, `gh pr view`, `rg`, and `ls`. That keeps reviews and
+investigations unblocked without auto-approving anything destructive.
+
 Add `#dangerous-mode` to a task when you want that managed agent process to run
 with Codex `--dangerously-bypass-approvals-and-sandbox` or Claude
 `--dangerously-skip-permissions`. Slackgentic strips the tag from the task

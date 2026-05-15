@@ -7,7 +7,12 @@ import signal
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_harness.models import Provider
+from agent_harness.models import DEFAULT_PERMISSION_MODE, PermissionMode, Provider
+from agent_harness.permissions import (
+    claude_extra_allowed_tools,
+    claude_permission_flag,
+    codex_sandbox_for,
+)
 from agent_harness.slack import dangerous_flag
 
 LOGGER = logging.getLogger(__name__)
@@ -18,7 +23,7 @@ class LaunchRequest:
     provider: Provider
     prompt: str
     cwd: Path
-    dangerous: bool = False
+    permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
     model: str | None = None
     worktree: str | None = None
     resume_session_id: str | None = None
@@ -29,8 +34,13 @@ class LaunchRequest:
     codex_binary: str = "codex"
     claude_binary: str = "claude"
 
+    @property
+    def dangerous(self) -> bool:
+        return self.permission_mode == PermissionMode.DANGEROUS
+
 
 def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
+    mode = request.permission_mode
     if request.provider == Provider.CODEX:
         args: list[str] = ["exec"]
         if request.resume_session_id:
@@ -39,10 +49,12 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
         else:
             args.extend(["--json", "--color", "never", "--skip-git-repo-check"])
         args.extend(["-c", _codex_trust_override(request.cwd)])
-        if request.dangerous:
+        if mode == PermissionMode.DANGEROUS:
             args.append(dangerous_flag(Provider.CODEX))
         elif not request.resume_session_id:
-            args.extend(["--sandbox", "workspace-write"])
+            sandbox = codex_sandbox_for(mode)
+            if sandbox is not None:
+                args.extend(["--sandbox", sandbox])
         if request.model:
             args.extend(["--model", request.model])
         if request.resume_session_id:
@@ -57,14 +69,24 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             "--output-format",
             "stream-json",
         ]
-        for allowed_tool in request.allowed_tools:
+        merged_allowed: list[str] = []
+        seen: set[str] = set()
+        for tool in (*request.allowed_tools, *claude_extra_allowed_tools(mode)):
+            if tool not in seen:
+                merged_allowed.append(tool)
+                seen.add(tool)
+        for allowed_tool in merged_allowed:
             args.append(f"--allowedTools={allowed_tool}")
         if request.claude_channel:
             args.append("--dangerously-load-development-channels=server:slackgentic")
         if request.resume_session_id:
             args.extend(["--resume", request.resume_session_id])
-        if request.dangerous:
+        if mode == PermissionMode.DANGEROUS:
             args.append(dangerous_flag(Provider.CLAUDE))
+        else:
+            permission_flag = claude_permission_flag(mode)
+            if permission_flag:
+                args.extend(["--permission-mode", permission_flag])
         if request.model:
             args.extend(["--model", request.model])
         if request.worktree:

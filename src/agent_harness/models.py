@@ -7,12 +7,22 @@ from pathlib import Path
 from typing import Any
 
 DANGEROUS_MODE_METADATA_KEY = "dangerous_mode"
+PERMISSION_MODE_METADATA_KEY = "permission_mode"
 ASSIGNMENT_PROMPT_METADATA_KEY = "assignment_prompt"
 
 
 class Provider(StrEnum):
     CODEX = "codex"
     CLAUDE = "claude"
+
+
+class PermissionMode(StrEnum):
+    LOCKED = "locked"
+    SAFE_AUTO = "safe-auto"
+    DANGEROUS = "dangerous"
+
+
+DEFAULT_PERMISSION_MODE = PermissionMode.SAFE_AUTO
 
 
 class SessionStatus(StrEnum):

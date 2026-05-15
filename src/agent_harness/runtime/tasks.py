@@ -15,15 +15,16 @@ from secrets import token_urlsafe
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
-    DANGEROUS_MODE_METADATA_KEY,
     AgentTask,
     AgentTaskStatus,
+    PermissionMode,
     Provider,
     SlackThreadRef,
     TeamAgent,
     parse_timestamp,
     utc_now,
 )
+from agent_harness.permissions import task_permission_mode
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
@@ -157,11 +158,14 @@ class ManagedTaskRuntime:
             allowed_tools,
             claude_channel=claude_channel,
         )
+        mode = task_permission_mode(task)
+        if self.commands.dangerous_by_default and mode != PermissionMode.DANGEROUS:
+            mode = PermissionMode.DANGEROUS
         request = LaunchRequest(
             provider=provider,
             prompt=build_task_prompt(agent, task),
             cwd=cwd,
-            dangerous=self.commands.dangerous_by_default or _task_dangerous_mode(task),
+            permission_mode=mode,
             resume_session_id=(
                 task.session_id
                 if task.session_id
@@ -963,7 +967,7 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
 
 
 def _task_dangerous_mode(task: AgentTask) -> bool:
-    return bool(task.metadata.get(DANGEROUS_MODE_METADATA_KEY))
+    return task_permission_mode(task) == PermissionMode.DANGEROUS
 
 
 def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:
