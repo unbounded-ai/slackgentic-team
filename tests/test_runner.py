@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -394,6 +395,54 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_CHANNEL_ID"], "C1")
         self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_THREAD_TS"], "171.000001")
+
+    def test_managed_claude_dangerous_mode_sets_channel_dangerous_env(self):
+        child = FakeChild()
+        calls = []
+
+        def fake_spawn(command, args, **kwargs):
+            calls.append((command, args, kwargs))
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="hidden claude prompt",
+                cwd=Path("/tmp/repo"),
+                permission_mode=PermissionMode.DANGEROUS,
+            )
+        )
+
+        with patch("pexpect.spawn", fake_spawn):
+            process.start()
+
+        self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_DANGEROUS_MODE"], "1")
+
+    def test_managed_claude_safe_auto_omits_channel_dangerous_env(self):
+        child = FakeChild()
+        calls = []
+
+        def fake_spawn(command, args, **kwargs):
+            calls.append((command, args, kwargs))
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="hidden claude prompt",
+                cwd=Path("/tmp/repo"),
+            )
+        )
+
+        clean_env = dict(os.environ)
+        clean_env.pop("SLACKGENTIC_CLAUDE_DANGEROUS_MODE", None)
+        with patch.dict(os.environ, clean_env, clear=True), patch("pexpect.spawn", fake_spawn):
+            process.start()
+
+        self.assertNotIn(
+            "SLACKGENTIC_CLAUDE_DANGEROUS_MODE",
+            calls[0][2]["env"],
+        )
 
 
 if __name__ == "__main__":

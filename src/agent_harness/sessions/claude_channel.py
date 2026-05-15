@@ -18,6 +18,7 @@ CHANNEL_NAME = "slackgentic"
 CHANNEL_VERSION = "0.1.0"
 SLACK_THREAD_CHANNEL_ENV = "SLACKGENTIC_CLAUDE_CHANNEL_ID"
 SLACK_THREAD_TS_ENV = "SLACKGENTIC_CLAUDE_THREAD_TS"
+DANGEROUS_MODE_ENV = "SLACKGENTIC_CLAUDE_DANGEROUS_MODE"
 CHANNEL_INSTRUCTIONS = (
     "Slackgentic forwards Slack thread replies into this Claude Code session as "
     '<channel source="slackgentic" ...> events. Treat only the body of each event '
@@ -252,6 +253,20 @@ class ClaudeChannelServer:
                 }
             )
             return
+        if _dangerous_mode_from_env():
+            # Dangerous-mode tasks already run Claude with
+            # --dangerously-skip-permissions; routing the channel-side
+            # permission request through Slack approval anyway would silently
+            # deny on any imperfect round-trip (the bug that motivated this
+            # branch). Mirror the CLI behavior and allow.
+            self._write(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel/permission",
+                    "params": {"request_id": request_id, "behavior": "allow"},
+                }
+            )
+            return
         if self.request_handler is not None and self._current_thread is not None:
             try:
                 request_params = dict(params)
@@ -459,6 +474,11 @@ def _thread_from_env() -> SlackThreadRef | None:
     if channel_id and thread_ts:
         return SlackThreadRef(channel_id, thread_ts)
     return None
+
+
+def _dangerous_mode_from_env() -> bool:
+    raw = os.environ.get(DANGEROUS_MODE_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_identifier(value: str) -> bool:
