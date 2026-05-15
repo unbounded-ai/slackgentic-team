@@ -166,15 +166,13 @@ class ClaudePermissionDeniedProcess(OneShotProcess):
 
 class ClaudePipedGitStatusPermissionDeniedProcess(ClaudePermissionDeniedProcess):
     session_id = "claude-piped-git-status-session"
-    command = "git -C /Users/ilshat/code/unbounded-ai/talos status 2>&1 | head -30"
-    description = "Check Talos repo status"
+    command = "git -C /workspace/repos/example-project status 2>&1 | head -30"
+    description = "Check example repo status"
 
 
 class ClaudeSequencedPatchLookupPermissionDeniedProcess(ClaudePermissionDeniedProcess):
     session_id = "claude-sequenced-patch-lookup-session"
-    command = (
-        "ls /private/tmp/talos-qwen3-provider-analysis.patch 2>&1; ls /tmp/ | grep -i talos 2>&1"
-    )
+    command = "ls /tmp/example-provider-analysis.patch 2>&1; ls /tmp/ | grep -i example 2>&1"
     description = "Check for prior patch file"
 
 
@@ -996,7 +994,14 @@ class TaskRuntimeTests(unittest.TestCase):
             _allowed_tool_for_claude_denial(denial),
             "Bash(cd /workspace/repos/sample-app && git log --oneline -30)",
         )
-        self.assertIn("Bash(git log:*)", _allowed_tools_for_claude_denial(denial))
+        self.assertEqual(
+            _allowed_tools_for_claude_denial(denial),
+            (
+                "Bash(cd /workspace/repos/sample-app && git log --oneline -30)",
+                "Bash(git log:*)",
+                "Bash(git log *)",
+            ),
+        )
 
     def test_claude_permission_denial_allows_git_log_after_dash_c(self):
         denial = {
@@ -1950,7 +1955,10 @@ class TaskRuntimeTests(unittest.TestCase):
                     requests[1].resume_session_id,
                     "claude-piped-git-status-session",
                 )
-                self.assertIn("Bash(git status:*)", requests[1].allowed_tools)
+                self.assertIn(
+                    "Bash(git -C /workspace/repos/example-project status 2>&1 | head -30)",
+                    requests[1].allowed_tools,
+                )
                 self.assertEqual(
                     store.list_pending_slack_agent_requests("claude/channel/permission"),
                     [],
@@ -1997,8 +2005,8 @@ class TaskRuntimeTests(unittest.TestCase):
                     "claude-sequenced-patch-lookup-session",
                 )
                 self.assertIn(
-                    "Bash(ls /private/tmp/talos-qwen3-provider-analysis.patch 2>&1; "
-                    "ls /tmp/ | grep -i talos 2>&1)",
+                    "Bash(ls /tmp/example-provider-analysis.patch 2>&1; "
+                    "ls /tmp/ | grep -i example 2>&1)",
                     requests[1].allowed_tools,
                 )
                 self.assertEqual(
@@ -2192,6 +2200,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-stream-denied-session")
+                self.assertIn(
+                    "Bash(cd /workspace/repos/sample-app && git log --oneline -30)",
+                    requests[1].allowed_tools,
+                )
                 self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
             finally:
                 store.close()
@@ -2322,6 +2334,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-live-denied-session")
+                self.assertIn(
+                    "Bash(cd /workspace/repos/sample-app && git log --oneline -30)",
+                    requests[1].allowed_tools,
+                )
                 self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
             finally:
                 store.close()

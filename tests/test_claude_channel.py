@@ -372,17 +372,17 @@ class ClaudeChannelTests(unittest.TestCase):
                     (
                         "req-git-status",
                         {
-                            "command": ("git -C /Users/ilshat/code/unbounded-ai/talos status"),
-                            "description": "git status of Talos repo",
+                            "command": ("git -C /workspace/repos/example-project status"),
+                            "description": "git status of example repo",
                         },
                     ),
                     (
                         "req-ls-wc",
                         {
                             "command": (
-                                "ls /private/tmp/talos-qwen3-provider-analysis.patch "
+                                "ls /tmp/example-provider-analysis.patch "
                                 "2>&1 && wc -l "
-                                "/private/tmp/talos-qwen3-provider-analysis.patch"
+                                "/tmp/example-provider-analysis.patch"
                             ),
                             "description": "check patch file exists",
                         },
@@ -391,18 +391,17 @@ class ClaudeChannelTests(unittest.TestCase):
                         "req-git-status-head",
                         {
                             "command": (
-                                "git -C /Users/ilshat/code/unbounded-ai/talos "
-                                "status 2>&1 | head -30"
+                                "git -C /workspace/repos/example-project status 2>&1 | head -30"
                             ),
-                            "description": "check Talos repo status",
+                            "description": "check example repo status",
                         },
                     ),
                     (
                         "req-ls-grep-sequence",
                         {
                             "command": (
-                                "ls /private/tmp/talos-qwen3-provider-analysis.patch 2>&1; "
-                                "ls /tmp/ | grep -i talos 2>&1"
+                                "ls /tmp/example-provider-analysis.patch 2>&1; "
+                                "ls /tmp/ | grep -i example 2>&1"
                             ),
                             "description": "check for prior patch file",
                         },

@@ -10,6 +10,15 @@ working there directly causes one agent's changes to be stashed or overwritten
 by another's. See the **Worktrees** section of `CONTRIBUTING.md` for the
 commands.
 
+## Identifiable Information
+
+Do not include identifiable personal, customer, private repository, branch,
+workspace, home-directory, or local-machine information in examples, tests,
+fixtures, PR descriptions, Slack-visible summaries, or docs. Use generic
+placeholder paths and commands instead, such as
+`/workspace/repos/example-project`, `/tmp/example.patch`, and
+`example-org/example-repo`.
+
 ## Public Change Metadata
 
 Do not add automated assistant, agent, model, bot, or tool attribution anywhere
