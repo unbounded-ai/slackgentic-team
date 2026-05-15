@@ -181,12 +181,12 @@ def _safe_auto_bash_command(command: str) -> bool:
 def _split_shell_segments(parts: list[str]) -> list[list[str]]:
     segments: list[list[str]] = [[]]
     for part in parts:
-        if part == "&&":
+        if part in {"&&", "|"}:
             if not segments[-1]:
                 return []
             segments.append([])
             continue
-        if part in {";", "||", "|", "&"}:
+        if part in {";", "||", "&"}:
             return []
         segments[-1].append(part)
     if not segments[-1]:

@@ -387,6 +387,16 @@ class ClaudeChannelTests(unittest.TestCase):
                             "description": "check patch file exists",
                         },
                     ),
+                    (
+                        "req-git-status-head",
+                        {
+                            "command": (
+                                "git -C /Users/ilshat/code/unbounded-ai/talos "
+                                "status 2>&1 | head -30"
+                            ),
+                            "description": "check Talos repo status",
+                        },
+                    ),
                 )
 
                 with (
@@ -426,6 +436,7 @@ class ClaudeChannelTests(unittest.TestCase):
                     [
                         {"request_id": "req-git-status", "behavior": "allow"},
                         {"request_id": "req-ls-wc", "behavior": "allow"},
+                        {"request_id": "req-git-status-head", "behavior": "allow"},
                     ],
                 )
                 self.assertEqual(gateway.replies, [], "no Slack approval round-trip expected")
