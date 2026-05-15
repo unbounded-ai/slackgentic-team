@@ -51,10 +51,13 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
         args.extend(["-c", _codex_trust_override(request.cwd)])
         if mode == PermissionMode.DANGEROUS:
             args.append(dangerous_flag(Provider.CODEX))
-        elif not request.resume_session_id:
+        else:
             sandbox = codex_sandbox_for(mode)
             if sandbox is not None:
-                args.extend(["--sandbox", sandbox])
+                if request.resume_session_id:
+                    args.extend(["-c", f"sandbox_mode={json.dumps(sandbox)}"])
+                else:
+                    args.extend(["--sandbox", sandbox])
         if request.model:
             args.extend(["--model", request.model])
         if request.resume_session_id:
