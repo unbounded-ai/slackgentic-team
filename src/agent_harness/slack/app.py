@@ -21,6 +21,8 @@ from agent_harness.models import (
     PendingWorkRequest,
     PendingWorkRequestStatus,
     Provider,
+    ScheduledTimer,
+    ScheduledTimerStatus,
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
@@ -106,6 +108,7 @@ from agent_harness.team.routing import (
     parse_work_request,
     strip_dangerous_mode_tag,
 )
+from agent_harness.timers import is_agent_timer_signal, parse_agent_timer_signal
 
 LOGGER = logging.getLogger(__name__)
 SETTING_CHANNEL_ID = "slack.channel_id"
@@ -2255,9 +2258,91 @@ class SlackTeamController:
         thread: SlackThreadRef,
         signal: str,
     ) -> bool:
-        if signal != AGENT_THREAD_DONE_SIGNAL:
+        if signal == AGENT_THREAD_DONE_SIGNAL:
+            return self._complete_task_thread(thread.channel_id, thread.thread_ts)
+        if is_agent_timer_signal(signal):
+            return self._schedule_agent_timer(task, agent, thread, signal)
+        return False
+
+    def _schedule_agent_timer(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        parsed = parse_agent_timer_signal(signal)
+        if parsed.request is None:
+            message = parsed.error or "invalid timer control signal"
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not schedule that timer: {message}.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        self.store.create_scheduled_timer(
+            task,
+            thread,
+            prompt=parsed.request.prompt,
+            due_at=parsed.request.due_at,
+        )
+        return True
+
+    def fire_due_scheduled_timer(self, timer: ScheduledTimer) -> bool:
+        agent = self.store.get_team_agent(timer.agent_id)
+        if agent is None:
+            self.store.update_scheduled_timer_status(
+                timer.timer_id,
+                ScheduledTimerStatus.CANCELLED,
+            )
+            return True
+        previous_task = self.store.get_agent_task(timer.task_id)
+        if previous_task is None or previous_task.status in {
+            AgentTaskStatus.DONE,
+            AgentTaskStatus.CANCELLED,
+        }:
+            self.store.update_scheduled_timer_status(
+                timer.timer_id,
+                ScheduledTimerStatus.CANCELLED,
+            )
+            return True
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if callable(is_running) and is_running(previous_task.task_id):
             return False
-        return self._complete_task_thread(thread.channel_id, thread.thread_ts)
+        claimed = self.store.claim_scheduled_timer(timer.timer_id)
+        if claimed is None:
+            return True
+        request = WorkRequest(
+            prompt=claimed.prompt,
+            assignment_mode=AssignmentMode.SPECIFIC,
+            requested_handle=agent.handle,
+        )
+        thread = SlackThreadRef(
+            claimed.channel_id,
+            claimed.thread_ts,
+            claimed.parent_message_ts,
+        )
+        started = self._continue_same_thread_agent_task(
+            request,
+            previous_task,
+            agent,
+            thread,
+            requested_by_slack_user=previous_task.requested_by_slack_user,
+            try_live_send=False,
+        )
+        if started:
+            self.store.update_scheduled_timer_status(
+                claimed.timer_id,
+                ScheduledTimerStatus.FIRED,
+            )
+            self.refresh_or_post_roster(claimed.channel_id)
+            return True
+        self.store.update_scheduled_timer_status(
+            claimed.timer_id,
+            ScheduledTimerStatus.PENDING,
+        )
+        return False
 
     def _complete_task_thread(self, channel_id: str, thread_ts: str | None) -> bool:
         if not thread_ts:
@@ -2289,6 +2374,7 @@ class SlackTeamController:
 
         if not completed and not cancelled:
             return False
+        self.store.cancel_scheduled_timers_for_thread(channel_id, thread_ts)
         self._resume_pending_work_requests(channel_id)
         self.refresh_or_post_roster(channel_id)
         return True
@@ -2891,6 +2977,51 @@ class SlackMessageBackfill:
                 LOGGER.exception("failed to backfill missed Slack messages")
 
 
+class ScheduledTimerRunner:
+    def __init__(
+        self,
+        store: Store,
+        controller: SlackTeamController,
+        *,
+        poll_seconds: float = 5.0,
+    ):
+        self.store = store
+        self.controller = controller
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-scheduled-timers",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def sync_once(self) -> int:
+        fired = 0
+        for timer in self.store.list_due_scheduled_timers(limit=50):
+            if self.controller.fire_due_scheduled_timer(timer):
+                fired += 1
+        return fired
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.poll_seconds):
+            try:
+                self.sync_once()
+            except Exception:
+                LOGGER.exception("failed to run scheduled Slackgentic timers")
+
+
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
         if not config.slack.bot_token or not config.slack.app_token:
@@ -2960,6 +3091,12 @@ class SocketModeSlackApp:
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()
+        self.scheduled_timers = ScheduledTimerRunner(
+            self.store,
+            self.controller,
+            poll_seconds=max(config.poll_seconds, 1.0),
+        )
+        self.scheduled_timers.start()
         self.slack_message_backfill = SlackMessageBackfill(
             self.store,
             self.gateway,
@@ -2983,6 +3120,7 @@ class SocketModeSlackApp:
         self.awake_keeper.stop()
         self.claude_permission_auto_resolver.stop()
         self.slack_message_backfill.stop()
+        self.scheduled_timers.stop()
         self.session_mirror.stop()
         if self.runtime is not None:
             stop_all = getattr(self.runtime, "stop_all_running_tasks", None)

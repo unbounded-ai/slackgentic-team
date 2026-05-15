@@ -17,6 +17,8 @@ from agent_harness.models import (
     PendingWorkRequest,
     PendingWorkRequestStatus,
     Provider,
+    ScheduledTimer,
+    ScheduledTimerStatus,
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
@@ -221,6 +223,25 @@ CREATE TABLE IF NOT EXISTS dependencies (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (blocked_session_id, blocking_channel_id, blocking_thread_ts)
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_timers (
+  timer_id TEXT NOT NULL PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  parent_message_ts TEXT,
+  prompt TEXT NOT NULL,
+  due_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id),
+  FOREIGN KEY(agent_id) REFERENCES team_agents(agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_timers_due
+  ON scheduled_timers(status, due_at, created_at);
 """
 
 
@@ -1253,6 +1274,119 @@ class Store:
             for row in rows
         ]
 
+    def create_scheduled_timer(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+        *,
+        prompt: str,
+        due_at,
+    ) -> ScheduledTimer:
+        now = utc_now()
+        timer = ScheduledTimer(
+            timer_id=f"timer_{uuid.uuid4().hex[:12]}",
+            task_id=task.task_id,
+            agent_id=task.agent_id,
+            channel_id=thread.channel_id,
+            thread_ts=thread.thread_ts,
+            parent_message_ts=thread.message_ts,
+            prompt=prompt,
+            due_at=due_at,
+            status=ScheduledTimerStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO scheduled_timers (
+                  timer_id, task_id, agent_id, channel_id, thread_ts, parent_message_ts,
+                  prompt, due_at, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _scheduled_timer_values(timer),
+            )
+            self.conn.commit()
+        return timer
+
+    def list_due_scheduled_timers(self, *, now=None, limit: int = 20) -> list[ScheduledTimer]:
+        reference = now or utc_now()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM scheduled_timers
+                WHERE status = ? AND due_at <= ?
+                ORDER BY due_at, created_at, timer_id
+                LIMIT ?
+                """,
+                (ScheduledTimerStatus.PENDING.value, reference.isoformat(), limit),
+            ).fetchall()
+        return [_scheduled_timer_from_row(row) for row in rows]
+
+    def claim_scheduled_timer(self, timer_id: str) -> ScheduledTimer | None:
+        updated_at = utc_now().isoformat()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE scheduled_timers
+                SET status = ?, updated_at = ?
+                WHERE timer_id = ? AND status = ?
+                """,
+                (
+                    ScheduledTimerStatus.CLAIMED.value,
+                    updated_at,
+                    timer_id,
+                    ScheduledTimerStatus.PENDING.value,
+                ),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = self.conn.execute(
+                "SELECT * FROM scheduled_timers WHERE timer_id = ?",
+                (timer_id,),
+            ).fetchone()
+        return _scheduled_timer_from_row(row) if row else None
+
+    def update_scheduled_timer_status(
+        self,
+        timer_id: str,
+        status: ScheduledTimerStatus,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE scheduled_timers
+                SET status = ?, updated_at = ?
+                WHERE timer_id = ?
+                """,
+                (status.value, utc_now().isoformat(), timer_id),
+            )
+            self.conn.commit()
+
+    def cancel_scheduled_timers_for_thread(self, channel_id: str, thread_ts: str) -> int:
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE scheduled_timers
+                SET status = ?, updated_at = ?
+                WHERE channel_id = ?
+                  AND thread_ts = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    ScheduledTimerStatus.CANCELLED.value,
+                    utc_now().isoformat(),
+                    channel_id,
+                    thread_ts,
+                    ScheduledTimerStatus.PENDING.value,
+                    ScheduledTimerStatus.CLAIMED.value,
+                ),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
 
 def _team_agent_values(agent: TeamAgent) -> tuple[object, ...]:
     return (
@@ -1411,6 +1545,38 @@ def _pending_work_request_from_row(row: sqlite3.Row) -> PendingWorkRequest:
         extra_metadata=json.loads(row["extra_metadata_json"] or "{}"),
         exclude_agent_ids=tuple(json.loads(row["exclude_agent_ids_json"] or "[]")),
         status=PendingWorkRequestStatus(row["status"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+    )
+
+
+def _scheduled_timer_values(timer: ScheduledTimer) -> tuple[object, ...]:
+    return (
+        timer.timer_id,
+        timer.task_id,
+        timer.agent_id,
+        timer.channel_id,
+        timer.thread_ts,
+        timer.parent_message_ts,
+        timer.prompt,
+        timer.due_at.isoformat(),
+        timer.status.value,
+        timer.created_at.isoformat(),
+        timer.updated_at.isoformat(),
+    )
+
+
+def _scheduled_timer_from_row(row: sqlite3.Row) -> ScheduledTimer:
+    return ScheduledTimer(
+        timer_id=row["timer_id"],
+        task_id=row["task_id"],
+        agent_id=row["agent_id"],
+        channel_id=row["channel_id"],
+        thread_ts=row["thread_ts"],
+        parent_message_ts=row["parent_message_ts"],
+        prompt=row["prompt"],
+        due_at=parse_timestamp(row["due_at"]) or utc_now(),
+        status=ScheduledTimerStatus(row["status"]),
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
     )

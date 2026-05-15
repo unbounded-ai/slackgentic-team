@@ -46,6 +46,7 @@ from agent_harness.sessions.claude_channel import SLACKGENTIC_MCP_PERMISSION_ALL
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
+from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX, parse_agent_timer_signal
 
 
 class FakeGateway:
@@ -394,6 +395,18 @@ class ThreadDoneSignalProcess(OneShotProcess):
         return ""
 
 
+class TimerSignalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                '{"type":"item.completed","item":{"type":"agent_message",'
+                f'"text":"Wakeup scheduled.\\n{AGENT_TIMER_SIGNAL_PREFIX}'
+                '2s | Re-check the PR feedback."}}\n'
+            )
+        return ""
+
+
 class SilentProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         self.reads += 1
@@ -505,6 +518,16 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertIn("at least every 5 minutes", prompt)
         self.assertIn("Slack-visible progress update", prompt)
+
+    def test_build_task_prompt_instructs_timer_signal(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "work carefully", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn(AGENT_TIMER_SIGNAL_PREFIX, prompt)
+        self.assertIn("do not rely on terminal sleeps", prompt)
+        self.assertIn("resumes the same agent", prompt)
 
     def test_build_task_prompt_instructs_thread_done_signal(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
@@ -1019,6 +1042,40 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Sounds good.")
         self.assertEqual(signals, [AGENT_THREAD_DONE_SIGNAL])
+
+    def test_agent_timer_signal_is_stripped_from_visible_text(self):
+        visible, signals = _extract_agent_control_signals(
+            f"Wakeup scheduled.\n{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check CI.\n"
+        )
+
+        self.assertEqual(visible, "Wakeup scheduled.")
+        self.assertEqual(signals, [f"{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check CI."])
+
+    def test_parse_agent_timer_signal_accepts_delay(self):
+        now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+
+        parsed = parse_agent_timer_signal(
+            f"{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check CI.",
+            now=now,
+        )
+
+        self.assertIsNone(parsed.error)
+        self.assertIsNotNone(parsed.request)
+        self.assertEqual(parsed.request.due_at, now + timedelta(minutes=10))
+        self.assertEqual(parsed.request.prompt, "Re-check CI.")
+
+    def test_parse_agent_timer_signal_accepts_json(self):
+        now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+
+        parsed = parse_agent_timer_signal(
+            f'{AGENT_TIMER_SIGNAL_PREFIX}{{"delay_seconds": 3, "prompt": "Wake up"}}',
+            now=now,
+        )
+
+        self.assertIsNone(parsed.error)
+        self.assertIsNotNone(parsed.request)
+        self.assertEqual(parsed.request.due_at, now + timedelta(seconds=3))
+        self.assertEqual(parsed.request.prompt, "Wake up")
 
     def test_tool_transport_leak_lines_are_stripped_from_visible_text(self):
         visible, signals = _extract_agent_control_signals(
@@ -2222,6 +2279,42 @@ class TaskRuntimeTests(unittest.TestCase):
                     [(task.task_id, agent.agent_id, "171.000001", AGENT_THREAD_DONE_SIGNAL)],
                 )
                 self.assertEqual(done_callbacks, [])
+            finally:
+                store.close()
+
+    def test_runtime_hides_agent_timer_signal_and_notifies_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check later", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=TimerSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(signal) or True
+                    ),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if seen_controls:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Wakeup scheduled."])
+                self.assertEqual(
+                    seen_controls,
+                    [f"{AGENT_TIMER_SIGNAL_PREFIX}2s | Re-check the PR feedback."],
+                )
             finally:
                 store.close()
 
