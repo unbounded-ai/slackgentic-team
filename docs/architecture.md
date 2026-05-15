@@ -136,3 +136,17 @@ as:
 The daemon stores the blocked task, blocking thread reference, and status. When
 the blocking thread is marked done, Slackgentic resumes the waiting task with
 context from the blocking thread.
+
+## Agent Timers
+
+Managed agents cannot depend on provider-local sleeps for delayed Slack work:
+the provider process may exit, be restarted, or lose its terminal. Timer requests
+therefore use the same hidden control-signal pattern as thread completion. The
+runtime strips `SLACKGENTIC: TIMER ...` lines from Slack-visible text and passes
+the control signal to the Slack controller.
+
+The controller parses the timer into an absolute UTC due time plus a follow-up
+prompt, then stores it in `scheduled_timers`. A daemon poller claims due timers
+and resumes the same agent in the same thread using the existing same-thread
+continuation path, preserving the provider session id when one is known. Marking
+a thread done cancels pending timers for that thread.

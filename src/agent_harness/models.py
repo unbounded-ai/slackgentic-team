@@ -51,6 +51,13 @@ class PendingWorkRequestStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ScheduledTimerStatus(StrEnum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    FIRED = "fired"
+    CANCELLED = "cancelled"
+
+
 class AssignmentMode(StrEnum):
     ANYONE = "anyone"
     SPECIFIC = "specific"
@@ -208,6 +215,21 @@ class SessionDependency:
     created_by_slack_user: str | None = None
     reason: str | None = None
     status: str = "waiting"
+
+
+@dataclass(frozen=True)
+class ScheduledTimer:
+    timer_id: str
+    task_id: str
+    agent_id: str
+    channel_id: str
+    thread_ts: str
+    prompt: str
+    due_at: datetime
+    status: ScheduledTimerStatus
+    created_at: datetime
+    updated_at: datetime
+    parent_message_ts: str | None = None
 
 
 def utc_now() -> datetime:

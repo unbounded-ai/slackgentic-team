@@ -134,6 +134,10 @@ Agents can also talk to each other. When one is unsure, it can ask another agent
 for a review in the same thread; the router prefers a different provider when a
 cross-model review is useful.
 
+Agents can schedule one-off follow-ups in the same thread. Slackgentic stores
+those timers in the daemon state database, so the wakeup is not tied to a
+provider process or an open terminal session.
+
 Task threads have one control: `Finish and free up this agent`.
 
 ## Why Hire/Fire Agents?
@@ -288,8 +292,8 @@ notes are in [docs/architecture.md](docs/architecture.md).
 - Stabilization.
 - Link threads and wait for one thread to finish before automatically starting
   a follow-up task.
-- Scheduled tasks for recurring or one-off future work, such as nightly repo
-  checks, delayed follow-ups, and periodic review sweeps.
+- Recurring scheduled tasks for future work such as nightly repo checks and
+  periodic review sweeps.
 - More features.
 
 ## License

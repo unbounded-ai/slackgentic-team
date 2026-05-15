@@ -33,6 +33,7 @@ from agent_harness.slack import replace_slack_user_ids
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
+from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 
 LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
@@ -872,6 +873,15 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "5 minutes, and sooner for meaningful progress, blockers, or decisions."
         ),
         (
+            "For delayed follow-ups, do not rely on terminal sleeps or background timers. "
+            "Send a concise Slack-visible status update, then put a hidden timer control "
+            "line on its own final line in the exact form "
+            f"`{AGENT_TIMER_SIGNAL_PREFIX}<delay-or-UTC-time> | <instruction>`, for example "
+            f"`{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check the PR comments and CI, then keep "
+            "iterating until they are clear.` Slackgentic hides that line and resumes the "
+            "same agent in this thread when the timer is due."
+        ),
+        (
             "When a table is the clearest format, write one normal Markdown table in the "
             "message. Slackgentic renders one Markdown table per message as a native Slack "
             "table. If you need multiple tables, send separate messages."
@@ -1038,6 +1048,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
         normalized = re.sub(r"\s+", " ", line.strip()).upper()
         if normalized == AGENT_THREAD_DONE_SIGNAL:
             signals.append(AGENT_THREAD_DONE_SIGNAL)
+            continue
+        if normalized.startswith(AGENT_TIMER_SIGNAL_PREFIX):
+            signals.append(line.strip())
             continue
         visible_lines.append(line)
     return "\n".join(visible_lines).strip(), signals
