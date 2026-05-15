@@ -128,6 +128,13 @@ class ManagedAgentProcess:
 
             child_env[SLACK_THREAD_CHANNEL_ENV] = self.request.slack_channel_id
             child_env[SLACK_THREAD_TS_ENV] = self.request.slack_thread_ts
+        if (
+            self.request.provider == Provider.CLAUDE
+            and self.request.permission_mode == PermissionMode.DANGEROUS
+        ):
+            from agent_harness.sessions.claude_channel import DANGEROUS_MODE_ENV
+
+            child_env[DANGEROUS_MODE_ENV] = "1"
         if self._reads_prompt_from_stdin():
             from pexpect.popen_spawn import PopenSpawn
 

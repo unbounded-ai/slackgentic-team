@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -293,6 +294,60 @@ class ClaudeChannelTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM slack_agent_requests"
                 ).fetchone()
                 self.assertEqual(row_count[0], 0)
+            finally:
+                store.close()
+
+    def test_dangerous_mode_env_auto_allows_permission_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                    poll_seconds=0.01,
+                )
+                server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                from agent_harness.sessions.claude_channel import DANGEROUS_MODE_ENV
+
+                with (
+                    redirect_stdout(output),
+                    patch.dict(os.environ, {DANGEROUS_MODE_ENV: "1"}),
+                ):
+                    server._handle_message(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/claude/channel/permission_request",
+                            "params": {
+                                "request_id": "req-dangerous",
+                                "tool_name": "Bash",
+                                "description": "run launchctl",
+                                "input_preview": "launchctl kickstart -k ...",
+                            },
+                        }
+                    )
+                    self.assertTrue(
+                        _wait_for(
+                            lambda: "notifications/claude/channel/permission" in output.getvalue()
+                        )
+                    )
+
+                notification = json.loads(output.getvalue().splitlines()[-1])
+                self.assertEqual(
+                    notification["params"],
+                    {"request_id": "req-dangerous", "behavior": "allow"},
+                )
+                self.assertEqual(gateway.replies, [], "no Slack approval round-trip expected")
+                self.assertEqual(
+                    store.conn.execute("SELECT COUNT(*) FROM slack_agent_requests").fetchone()[0],
+                    0,
+                )
             finally:
                 store.close()
 
