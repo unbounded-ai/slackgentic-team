@@ -2,6 +2,14 @@
 
 Follow `CONTRIBUTING.md`.
 
+## Worktrees
+
+Always work in a dedicated git worktree branched from the latest `origin/main`,
+not the shared checkout. The shared checkout is reused across agents, and
+working there directly causes one agent's changes to be stashed or overwritten
+by another's. See the **Worktrees** section of `CONTRIBUTING.md` for the
+commands.
+
 ## Public Change Metadata
 
 Do not add automated assistant, agent, model, bot, or tool attribution anywhere

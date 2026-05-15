@@ -8,6 +8,8 @@ from pathlib import Path
 
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
+    DEFAULT_PERMISSION_MODE,
+    PERMISSION_MODE_METADATA_KEY,
     AgentSession,
     AgentTask,
     AgentTaskKind,
@@ -562,6 +564,8 @@ class Store:
     ) -> PendingWorkRequest:
         now = utc_now()
         metadata = dict(extra_metadata or {})
+        if request.permission_mode != DEFAULT_PERMISSION_MODE:
+            metadata[PERMISSION_MODE_METADATA_KEY] = request.permission_mode.value
         if request.dangerous_mode:
             metadata[DANGEROUS_MODE_METADATA_KEY] = True
         pending = PendingWorkRequest(

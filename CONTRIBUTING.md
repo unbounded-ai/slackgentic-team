@@ -37,6 +37,34 @@ or non-human coauthor trailers such as `Co-authored-by` for generated work. Keep
 public change metadata focused on the human-requested code change unless the
 human explicitly asks for attribution in that exact artifact.
 
+## Worktrees
+
+Agents working in this repo must use a dedicated git worktree branched from the
+latest `origin/main`, not the shared checkout. Multiple agents share the same
+clone, and working directly on a checked-out branch lets one agent stash or
+overwrite another's uncommitted changes. Worktrees give each task its own
+working tree pinned to its own branch.
+
+Before starting work:
+
+```sh
+git fetch origin
+git worktree add ../<repo>-<task-slug> -b <branch-name> origin/main
+cd ../<repo>-<task-slug>
+```
+
+Always branch from `origin/main`, not from whatever branch the shared checkout
+happens to have. When the task is finished and the branch has been pushed and
+merged (or abandoned), remove the worktree:
+
+```sh
+git worktree remove ../<repo>-<task-slug>
+```
+
+If you find your changes have been stashed by another agent, do not pop the
+stash into a shared checkout. Recover by creating a fresh worktree off
+`origin/main`, applying the stash there, and pushing from inside it.
+
 ## Development Notes
 
 - Keep provider-specific behavior behind the provider adapters, runtime, session

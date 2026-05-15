@@ -2,7 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_harness.models import AgentTaskKind, Provider
+from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
+    PERMISSION_MODE_METADATA_KEY,
+    AgentTaskKind,
+    PermissionMode,
+    Provider,
+)
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team
 from agent_harness.team.assignment import assign_channel_work_request
@@ -76,6 +82,51 @@ class AssignmentTests(unittest.TestCase):
                 assert result is not None
                 self.assertEqual(result.task.kind, AgentTaskKind.REVIEW)
                 self.assertEqual(result.agent.provider_preference, Provider.CLAUDE)
+            finally:
+                store.close()
+
+    def test_assign_channel_work_request_persists_dangerous_permission_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(codex_count=1, claude_count=1):
+                    store.upsert_team_agent(agent)
+
+                result = assign_channel_work_request(
+                    store,
+                    "Somebody #dangerous-mode rewrite history",
+                    channel_id="C1",
+                    requested_by_slack_user="U1",
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result.task.metadata[PERMISSION_MODE_METADATA_KEY],
+                    PermissionMode.DANGEROUS.value,
+                )
+                self.assertTrue(result.task.metadata[DANGEROUS_MODE_METADATA_KEY])
+            finally:
+                store.close()
+
+    def test_assign_channel_work_request_omits_permission_mode_for_safe_auto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(codex_count=1, claude_count=1):
+                    store.upsert_team_agent(agent)
+
+                result = assign_channel_work_request(
+                    store,
+                    "Somebody do update the docs",
+                    channel_id="C1",
+                    requested_by_slack_user="U1",
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertNotIn(PERMISSION_MODE_METADATA_KEY, result.task.metadata)
+                self.assertNotIn(DANGEROUS_MODE_METADATA_KEY, result.task.metadata)
             finally:
                 store.close()
 

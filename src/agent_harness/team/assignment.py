@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    DEFAULT_PERMISSION_MODE,
+    PERMISSION_MODE_METADATA_KEY,
     AgentTask,
     AssignmentMode,
     TeamAgent,
@@ -93,6 +95,8 @@ def assign_work_request(
     if extra_metadata:
         metadata.update(extra_metadata)
     metadata.setdefault(ASSIGNMENT_PROMPT_METADATA_KEY, request.prompt)
+    if request.permission_mode != DEFAULT_PERMISSION_MODE:
+        metadata[PERMISSION_MODE_METADATA_KEY] = request.permission_mode.value
     if request.dangerous_mode:
         metadata[DANGEROUS_MODE_METADATA_KEY] = True
     if metadata:

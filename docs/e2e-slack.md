@@ -116,6 +116,11 @@ Specific agent:
 @riley do update the README with install steps
 ```
 
+Tasks default to safe-auto permission mode: Codex runs with
+`--sandbox workspace-write` and Claude runs with `--permission-mode acceptEdits`
+plus an allowlist for read-only inspection commands so reviews and
+investigations are not blocked on every `git status`.
+
 Dangerous mode for one managed task:
 
 ```text
