@@ -9,7 +9,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.models import SlackThreadRef
+from agent_harness.models import PermissionMode, SlackThreadRef
+from agent_harness.permissions import CLAUDE_CHANNEL_PERMISSION_MODE_ENV
 from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
     SLACK_THREAD_CHANNEL_ENV,
@@ -347,6 +348,137 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertEqual(
                     store.conn.execute("SELECT COUNT(*) FROM slack_agent_requests").fetchone()[0],
                     0,
+                )
+            finally:
+                store.close()
+
+    def test_safe_auto_env_auto_allows_read_only_bash_permission_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                    poll_seconds=0.01,
+                )
+                server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+                requests = (
+                    (
+                        "req-git-status",
+                        {
+                            "command": ("git -C /Users/ilshat/code/unbounded-ai/talos status"),
+                            "description": "git status of Talos repo",
+                        },
+                    ),
+                    (
+                        "req-ls-wc",
+                        {
+                            "command": (
+                                "ls /private/tmp/talos-qwen3-provider-analysis.patch "
+                                "2>&1 && wc -l "
+                                "/private/tmp/talos-qwen3-provider-analysis.patch"
+                            ),
+                            "description": "check patch file exists",
+                        },
+                    ),
+                )
+
+                with (
+                    redirect_stdout(output),
+                    patch.dict(
+                        os.environ,
+                        {CLAUDE_CHANNEL_PERMISSION_MODE_ENV: PermissionMode.SAFE_AUTO.value},
+                    ),
+                ):
+                    for request_id, input_preview in requests:
+                        server._handle_message(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "notifications/claude/channel/permission_request",
+                                "params": {
+                                    "request_id": request_id,
+                                    "tool_name": "Bash",
+                                    "description": input_preview["description"],
+                                    "input_preview": json.dumps(input_preview),
+                                },
+                            }
+                        )
+                    self.assertTrue(
+                        _wait_for(
+                            lambda: (
+                                output.getvalue().count("notifications/claude/channel/permission")
+                                == len(requests)
+                            )
+                        )
+                    )
+
+                notifications = [
+                    json.loads(line) for line in output.getvalue().splitlines() if line.strip()
+                ]
+                self.assertEqual(
+                    [notification["params"] for notification in notifications],
+                    [
+                        {"request_id": "req-git-status", "behavior": "allow"},
+                        {"request_id": "req-ls-wc", "behavior": "allow"},
+                    ],
+                )
+                self.assertEqual(gateway.replies, [], "no Slack approval round-trip expected")
+                self.assertEqual(
+                    store.conn.execute("SELECT COUNT(*) FROM slack_agent_requests").fetchone()[0],
+                    0,
+                )
+            finally:
+                store.close()
+
+    def test_safe_auto_env_still_routes_mutating_bash_permission_requests_to_slack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=0.01,
+                    store=store,
+                    provider_label="Claude",
+                    poll_seconds=0.01,
+                )
+                server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                with (
+                    redirect_stdout(output),
+                    patch.dict(
+                        os.environ,
+                        {CLAUDE_CHANNEL_PERMISSION_MODE_ENV: PermissionMode.SAFE_AUTO.value},
+                    ),
+                ):
+                    server._handle_permission_request_worker(
+                        "req-commit",
+                        {
+                            "tool_name": "Bash",
+                            "description": "Commit changes",
+                            "input_preview": json.dumps(
+                                {"command": "git -C /repo commit -m update"}
+                            ),
+                        },
+                    )
+
+                notification = json.loads(output.getvalue())
+                self.assertEqual(
+                    notification["params"],
+                    {"request_id": "req-commit", "behavior": "deny"},
+                )
+                self.assertEqual(
+                    gateway.replies[0]["text"],
+                    "Claude requests command approval: git",
                 )
             finally:
                 store.close()

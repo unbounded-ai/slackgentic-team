@@ -12,8 +12,10 @@ from unittest.mock import patch
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
+    PERMISSION_MODE_METADATA_KEY,
     AgentTaskKind,
     AgentTaskStatus,
+    PermissionMode,
     Provider,
     SlackThreadRef,
 )
@@ -497,6 +499,13 @@ class ProgressOnlySessionProcess(OneShotProcess):
                 '{"type":"event_msg","payload":{"type":"agent_message","message":"Working"}}\n'
             )
         return ""
+
+
+def _with_permission_mode(task, mode: PermissionMode):
+    return replace(
+        task,
+        metadata={**task.metadata, PERMISSION_MODE_METADATA_KEY: mode.value},
+    )
 
 
 class TaskRuntimeTests(unittest.TestCase):
@@ -1837,6 +1846,49 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_retries_safe_auto_claude_read_only_denial_without_slack_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudePermissionDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check PR metadata", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Done"])
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[1].resume_session_id, "claude-denied-session")
+                self.assertIn("Bash(gh pr view:*)", requests[1].allowed_tools)
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("claude/channel/permission"),
+                    [],
+                )
+            finally:
+                store.close()
+
     def test_runtime_retries_managed_claude_after_slack_approval(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1866,6 +1918,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "check gh auth", "C1")
+                task = _with_permission_mode(task, PermissionMode.LOCKED)
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -1931,6 +1984,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "check gh auth", "C1")
+                task = _with_permission_mode(task, PermissionMode.LOCKED)
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -1987,6 +2041,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "show recent sample-app commits", "C1")
+                task = _with_permission_mode(task, PermissionMode.LOCKED)
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -2119,6 +2174,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "show recent sample-app commits", "C1")
+                task = _with_permission_mode(task, PermissionMode.LOCKED)
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -2182,6 +2238,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "check prs", "C1")
+                task = _with_permission_mode(task, PermissionMode.LOCKED)
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
