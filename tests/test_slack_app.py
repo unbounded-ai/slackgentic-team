@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,6 +12,7 @@ from agent_harness.models import (
     AssignmentMode,
     ControlMode,
     Provider,
+    ScheduledWorkKind,
     SessionStatus,
     SlackThreadRef,
     TeamAgentStatus,
@@ -25,6 +27,11 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_STARTED_METADATA_KEY,
     managed_run_resume_attempts,
 )
+from agent_harness.schedules import (
+    AGENT_SCHEDULE_SIGNAL_PREFIX,
+    SCHEDULE_RESOLUTION_ATTEMPTS_METADATA_KEY,
+    SCHEDULE_RESOLUTION_METADATA_KEY,
+)
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
@@ -34,6 +41,7 @@ from agent_harness.slack.app import (
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
     ClaudePermissionAutoResolver,
     ScheduledTimerRunner,
+    ScheduledWorkRunner,
     SlackMessageBackfill,
     SlackReplyTarget,
     SlackTeamController,
@@ -170,7 +178,9 @@ class FakeRuntime:
     def __init__(self):
         self.started = []
         self.sent = []
+        self.interrupted_sent = []
         self.stopped = []
+        self.interrupted = []
         self.resumed = []
         self.running_task_ids: set[str] = set()
 
@@ -182,11 +192,19 @@ class FakeRuntime:
         self.sent.append((task_id, message))
         return True
 
+    def send_to_interrupted_task(self, task_id, message):
+        self.interrupted_sent.append((task_id, message))
+        return True
+
     def is_task_running(self, task_id: str) -> bool:
         return task_id in self.running_task_ids
 
     def stop_task(self, task_id, status=AgentTaskStatus.CANCELLED):
         self.stopped.append((task_id, status))
+        return True
+
+    def interrupt_task(self, task_id):
+        self.interrupted.append(task_id)
         return True
 
     def resume_orphaned_task(self, task, agent, thread):
@@ -892,6 +910,41 @@ class SlackAppTests(unittest.TestCase):
                         gateway.removed_reactions,
                     )
                     self.assertIn(("C1", message_ts, "eyes"), gateway.removed_reactions)
+            finally:
+                store.close()
+
+    def test_runtime_agent_message_keeps_top_level_task_hourglass_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "keep the parent active", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={"request_message_ts": "171.thread"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "I am still working on this.",
+                    "171.agent",
+                )
+
+                self.assertFalse(handled)
+                self.assertNotIn(
+                    ("C1", "171.thread", "hourglass_flowing_sand"),
+                    gateway.removed_reactions,
+                )
+                self.assertNotIn(("C1", "171.thread", "eyes"), gateway.removed_reactions)
             finally:
                 store.close()
 
@@ -5500,6 +5553,23 @@ class SlackAppTests(unittest.TestCase):
                     prompt="wake later",
                     due_at=utc_now() + timedelta(minutes=5),
                 )
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="queued scheduled work",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=first_agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=utc_now() + timedelta(minutes=5),
+                    recurrence={
+                        "frequency": "daily",
+                        "time": "17:00",
+                        "timezone": "America/New_York",
+                    },
+                    timezone="America/New_York",
+                    requested_by_slack_user="U1",
+                )
                 controller = SlackTeamController(store, gateway, default_channel_id="C1")
 
                 handled = controller.handle_runtime_agent_control(
@@ -5526,6 +5596,11 @@ class SlackAppTests(unittest.TestCase):
                     (timer.timer_id,),
                 ).fetchone()
                 self.assertEqual(timer_row["status"], "cancelled")
+                scheduled_row = store.conn.execute(
+                    "SELECT status FROM scheduled_work_requests WHERE schedule_id = ?",
+                    (scheduled.schedule_id,),
+                ).fetchone()
+                self.assertEqual(scheduled_row["status"], "cancelled")
                 self.assertEqual(
                     {update["ts"] for update in gateway.updates},
                     {"171.parent", "171.bot2"},
@@ -5537,6 +5612,431 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn(("C1", "171.thread", "white_check_mark"), gateway.reactions)
                 self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_same_thread_replies_while_managed_task_running_are_replayed_as_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                runtime = DetachedRuntime()
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                for text, ts in (
+                    ("Do not use manual parsing; use the agent LLM.", "171.user1"),
+                    ("Keep each queued follow-up pending until answered.", "171.user2"),
+                ):
+                    controller.handle_event(
+                        {
+                            "event": {
+                                "type": "message",
+                                "channel": "C1",
+                                "user": "U1",
+                                "text": text,
+                                "ts": ts,
+                                "thread_ts": "171.thread",
+                            }
+                        }
+                    )
+
+                queued_task = store.get_agent_task(task.task_id)
+                assert queued_task is not None
+                queued = queued_task.metadata.get("queued_thread_followups")
+                self.assertIsInstance(queued, list)
+                self.assertEqual(len(queued), 2)
+                self.assertEqual(runtime.started, [])
+                self.assertIn(("C1", "171.user1", "hourglass_flowing_sand"), gateway.reactions)
+                self.assertIn(("C1", "171.user2", "hourglass_flowing_sand"), gateway.reactions)
+
+                runtime.running_task_ids.clear()
+                controller.handle_runtime_task_done(
+                    queued_task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                resumed_task = runtime.started[0][0]
+                self.assertIn("Do not use manual parsing", resumed_task.prompt)
+                self.assertIn("Keep each queued follow-up", resumed_task.prompt)
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertEqual(
+                    current_task.metadata.get("active_thread_followup_message_ts_values"),
+                    ["171.user1", "171.user2"],
+                )
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+                self.assertNotIn(("C1", "171.user1", "white_check_mark"), gateway.reactions)
+                self.assertNotIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+
+                controller.handle_runtime_task_done(
+                    resumed_task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+
+                self.assertIn(("C1", "171.user1", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+                self.assertEqual(len(runtime.started), 1)
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertNotIn("active_thread_followup_message_ts", current_task.metadata)
+                self.assertNotIn("active_thread_followup_message_ts_values", current_task.metadata)
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+            finally:
+                store.close()
+
+    def test_stop_in_task_thread_interrupts_running_managed_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "long running task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                runtime = FakeRuntime()
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "stop",
+                            "ts": "171.stop",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.interrupted, [task.task_id])
+                self.assertEqual(runtime.sent, [])
+                self.assertEqual(runtime.interrupted_sent, [])
+                self.assertEqual(runtime.started, [])
+                self.assertIn(task.task_id, runtime.running_task_ids)
+                self.assertIn(("C1", "171.stop", "white_check_mark"), gateway.reactions)
+                self.assertIn(("C1", "171.stop", "eyes"), gateway.removed_reactions)
+                self.assertIn("Interrupted the current run", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_stop_in_task_thread_replays_queued_followups_after_interrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                runtime = DetachedRuntime()
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                for text, ts in (
+                    ("Switch to the LLM schedule resolver.", "171.user1"),
+                    ("Also keep the stop command.", "171.user2"),
+                    ("stop", "171.stop"),
+                ):
+                    controller.handle_event(
+                        {
+                            "event": {
+                                "type": "message",
+                                "channel": "C1",
+                                "user": "U1",
+                                "text": text,
+                                "ts": ts,
+                                "thread_ts": "171.thread",
+                            }
+                        }
+                    )
+
+                self.assertEqual(runtime.interrupted, [task.task_id])
+                self.assertEqual(runtime.started, [])
+                self.assertEqual(len(runtime.interrupted_sent), 1)
+                sent_task_id, sent_prompt = runtime.interrupted_sent[0]
+                self.assertEqual(sent_task_id, task.task_id)
+                self.assertIn("Switch to the LLM schedule resolver", sent_prompt)
+                self.assertIn("Also keep the stop command", sent_prompt)
+                self.assertIn(task.task_id, runtime.running_task_ids)
+                self.assertIn(("C1", "171.stop", "white_check_mark"), gateway.reactions)
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertEqual(
+                    current_task.metadata.get("active_thread_followup_message_ts_values"),
+                    ["171.user1", "171.user2"],
+                )
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+                self.assertIn("sent the queued follow-ups", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_user_schedule_message_starts_agent_resolution_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "schedule @avery to check CI every day at 5pm ET",
+                            "ts": "171.schedule",
+                        }
+                    }
+                )
+
+                rows = store.conn.execute("SELECT * FROM scheduled_work_requests").fetchall()
+                self.assertEqual(rows, [])
+                self.assertEqual(len(runtime.started), 1)
+                task, started_agent, thread = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                self.assertEqual(thread.thread_ts, "171.schedule")
+                self.assertIn(AGENT_SCHEDULE_SIGNAL_PREFIX, task.prompt)
+                self.assertIn("schedule @avery to check CI every day at 5pm ET", task.prompt)
+                self.assertTrue(task.metadata[SCHEDULE_RESOLUTION_METADATA_KEY])
+                self.assertIn("is creating this schedule", gateway.thread_replies[-1]["text"])
+                self.assertIn(("C1", "171.schedule", "eyes"), gateway.reactions)
+                self.assertIn(("C1", "171.schedule", "hourglass_flowing_sand"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_agent_schedule_control_signal_creates_scheduled_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "resolve schedule", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    requested_by_slack_user="U1",
+                    metadata={SCHEDULE_RESOLUTION_METADATA_KEY: True},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                payload = {
+                    "task": "check the patio lights",
+                    "target": agent.handle,
+                    "schedule": {
+                        "kind": "one_off",
+                        "run_at": (utc_now() + timedelta(hours=1)).isoformat(),
+                        "timezone": "America/Chicago",
+                        "description": "tomorrow at sunset in Waco",
+                    },
+                }
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    f"{AGENT_SCHEDULE_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+
+                self.assertTrue(handled)
+                rows = store.conn.execute("SELECT * FROM scheduled_work_requests").fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["prompt"], "check the patio lights")
+                self.assertEqual(rows[0]["requested_handle"], agent.handle)
+                self.assertEqual(rows[0]["schedule_kind"], "one_off")
+                self.assertEqual(rows[0]["status"], "pending")
+                self.assertIn("tomorrow at sunset in Waco", gateway.thread_replies[-1]["text"])
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+            finally:
+                store.close()
+
+    def test_invalid_agent_schedule_control_retries_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "resolve schedule", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        SCHEDULE_RESOLUTION_METADATA_KEY: True,
+                        SCHEDULE_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                    },
+                )
+                store.upsert_agent_task(task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    f"{AGENT_SCHEDULE_SIGNAL_PREFIX}{{not json",
+                )
+
+                self.assertTrue(handled)
+                self.assertEqual(len(runtime.started), 1)
+                retry_task = runtime.started[0][0]
+                self.assertIn("previous schedule control line was invalid", retry_task.prompt)
+                self.assertEqual(retry_task.metadata[SCHEDULE_RESOLUTION_ATTEMPTS_METADATA_KEY], 1)
+            finally:
+                store.close()
+
+    def test_due_scheduled_work_starts_task_and_marks_one_off_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.ONE_OFF,
+                    next_run_at=utc_now() - timedelta(seconds=1),
+                    requested_by_slack_user="U1",
+                )
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                runner = ScheduledWorkRunner(store, controller, poll_seconds=0.01)
+
+                fired = runner.sync_once()
+
+                self.assertEqual(fired, 1)
+                self.assertEqual(len(runtime.started), 1)
+                task, started_agent, thread = runtime.started[0]
+                self.assertEqual(task.prompt, "check CI")
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                self.assertEqual(thread.thread_ts, "171.thread")
+                row = store.conn.execute(
+                    "SELECT status, last_task_id FROM scheduled_work_requests WHERE schedule_id = ?",
+                    (scheduled.schedule_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "done")
+                self.assertEqual(row["last_task_id"], task.task_id)
+                self.assertIn("is due now", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_due_recurring_scheduled_work_reschedules_next_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=utc_now() - timedelta(seconds=1),
+                    recurrence={
+                        "frequency": "daily",
+                        "time": "17:00",
+                        "timezone": "America/New_York",
+                    },
+                    timezone="America/New_York",
+                    requested_by_slack_user="U1",
+                )
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                runner = ScheduledWorkRunner(store, controller, poll_seconds=0.01)
+
+                fired = runner.sync_once()
+
+                self.assertEqual(fired, 1)
+                row = store.conn.execute(
+                    "SELECT status, next_run_at, last_task_id FROM scheduled_work_requests "
+                    "WHERE schedule_id = ?",
+                    (scheduled.schedule_id,),
+                ).fetchone()
+                self.assertEqual(row["status"], "pending")
+                self.assertGreater(row["next_run_at"], utc_now().isoformat())
+                self.assertEqual(row["last_task_id"], runtime.started[0][0].task_id)
             finally:
                 store.close()
 

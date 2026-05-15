@@ -137,6 +137,11 @@ class ManagedAgentProcess:
             raise RuntimeError("process is not started")
         self.child.sendline(message)
 
+    def interrupt(self) -> None:
+        if self.child is None:
+            raise RuntimeError("process is not started")
+        self.child.send("\x1b")
+
     def read_available(self, max_reads: int = 20, timeout: float = 0.05) -> str:
         if self.child is None:
             raise RuntimeError("process is not started")

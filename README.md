@@ -138,7 +138,25 @@ Agents can schedule one-off follow-ups in the same thread. Slackgentic stores
 those timers in the daemon state database, so the wakeup is not tied to a
 provider process or an open terminal session.
 
-Task threads have one control: `Finish and free up this agent`.
+Users can schedule future work directly from Slack too:
+
+```text
+schedule @riley to check CI tomorrow at 9am PT
+schedule somebody review the nightly report every day at 5pm ET
+schedule @riley inspect the deploy every Monday at 10:30am America/New_York
+schedule @riley check the patio lights during tomorrow's sunset time in Waco
+```
+
+Slackgentic asks an agent to resolve the human-language schedule into a validated
+hidden control message, so richer requests can use the model instead of a local
+regex parser. The validated schedule is stored in SQLite and claimed by the
+daemon when due. One-off items run once; recurring items are rescheduled after
+each due occurrence.
+
+Task threads have two controls: `Finish and free up this agent` ends the task
+and frees the agent; replying `stop` sends an Esc-style interrupt to the current
+managed run without closing the task thread, so the next reply can change
+course.
 
 ## Why Hire/Fire Agents?
 
@@ -292,8 +310,6 @@ notes are in [docs/architecture.md](docs/architecture.md).
 - Stabilization.
 - Link threads and wait for one thread to finish before automatically starting
   a follow-up task.
-- Recurring scheduled tasks for future work such as nightly repo checks and
-  periodic review sweeps.
 - More features.
 
 ## License

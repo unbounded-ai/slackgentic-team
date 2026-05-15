@@ -417,6 +417,7 @@ class HoldingProcess(OneShotProcess):
     def __init__(self, request):
         super().__init__(request)
         self.alive = True
+        self.interrupts = 0
 
     def read_available(self, max_reads=20, timeout=0.05):
         return ""
@@ -426,6 +427,9 @@ class HoldingProcess(OneShotProcess):
 
     def terminate(self):
         self.alive = False
+
+    def interrupt(self):
+        self.interrupts += 1
 
 
 class ClaudeSessionOnlyProcess(OneShotProcess):
@@ -1387,6 +1391,39 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIsNotNone(current)
                 assert current is not None
                 self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
+            finally:
+                store.close()
+
+    def test_runtime_interrupt_sends_escape_but_keeps_task_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "stop current run only", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                running = runtime.running_tasks()[0]
+
+                self.assertTrue(runtime.interrupt_task(task.task_id))
+                self.assertTrue(runtime.has_running_tasks())
+                self.assertEqual(running.process.interrupts, 1)
+                self.assertTrue(running.process.is_alive())
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+                self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
+
+                runtime.stop_task(task.task_id)
             finally:
                 store.close()
 

@@ -25,6 +25,7 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
+from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     is_slackgentic_mcp_server_configured,
@@ -213,10 +214,16 @@ class ManagedTaskRuntime:
         return True
 
     def send_to_task(self, task_id: str, message: str) -> bool:
+        return self._send_to_running_task(task_id, message, allow_cli=False)
+
+    def send_to_interrupted_task(self, task_id: str, message: str) -> bool:
+        return self._send_to_running_task(task_id, message, allow_cli=True)
+
+    def _send_to_running_task(self, task_id: str, message: str, *, allow_cli: bool) -> bool:
         running = self._get_running(task_id)
         if running is None:
             return False
-        if _provider_for_running(running) in {Provider.CODEX, Provider.CLAUDE}:
+        if not allow_cli and _provider_for_running(running) in {Provider.CODEX, Provider.CLAUDE}:
             return False
         try:
             running.process.send(message)
@@ -242,6 +249,21 @@ class ManagedTaskRuntime:
             self.store.update_agent_task_status(task_id, status)
         with self._lock:
             self._running.pop(task_id, None)
+        return True
+
+    def interrupt_task(self, task_id: str) -> bool:
+        running = self._get_running(task_id)
+        if running is None:
+            return False
+        interrupt = getattr(running.process, "interrupt", None)
+        try:
+            if callable(interrupt):
+                interrupt()
+            else:
+                running.process.send("\x1b")
+        except Exception:
+            LOGGER.debug("failed to interrupt running managed task", exc_info=True)
+            return False
         return True
 
     def is_task_running(self, task_id: str) -> bool:
@@ -1050,6 +1072,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
             signals.append(AGENT_THREAD_DONE_SIGNAL)
             continue
         if normalized.startswith(AGENT_TIMER_SIGNAL_PREFIX):
+            signals.append(line.strip())
+            continue
+        if normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
         visible_lines.append(line)
