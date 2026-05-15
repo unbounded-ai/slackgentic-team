@@ -7,8 +7,10 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_harness.models import (
+    DEFAULT_PERMISSION_MODE,
     AgentTaskKind,
     AssignmentMode,
+    PermissionMode,
     ScheduledWorkKind,
     WorkRequest,
     parse_timestamp,
@@ -259,7 +261,9 @@ def _work_request(
         assignment_mode=assignment_mode,
         requested_handle=requested_handle,
         task_kind=parsed_kind,
-        dangerous_mode=bool(dangerous_mode),
+        permission_mode=(
+            PermissionMode.DANGEROUS if bool(dangerous_mode) else DEFAULT_PERMISSION_MODE
+        ),
     )
 
 

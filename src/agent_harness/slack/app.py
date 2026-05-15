@@ -15,12 +15,14 @@ from agent_harness.config import AppConfig, load_config_from_env
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    DEFAULT_PERMISSION_MODE,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
     PendingWorkRequest,
     PendingWorkRequestStatus,
+    PermissionMode,
     Provider,
     ScheduledTimer,
     ScheduledTimerStatus,
@@ -4122,7 +4124,9 @@ def _work_request_from_scheduled_work(scheduled: ScheduledWork) -> WorkRequest:
         task_kind=scheduled.task_kind,
         author_handle=scheduled.author_handle,
         pr_url=scheduled.pr_url,
-        dangerous_mode=scheduled.dangerous_mode,
+        permission_mode=(
+            PermissionMode.DANGEROUS if scheduled.dangerous_mode else DEFAULT_PERMISSION_MODE
+        ),
     )
 
 
@@ -4186,7 +4190,7 @@ def _multi_specific_work_requests(
             request = parse_work_request(f"@{handle} {prompt}", known_handles)
             if request is not None and request.assignment_mode == AssignmentMode.SPECIFIC:
                 if dangerous_mode and not request.dangerous_mode:
-                    request = replace(request, dangerous_mode=True)
+                    request = replace(request, permission_mode=PermissionMode.DANGEROUS)
                 requests.append(request)
         if len(requests) >= 2:
             return requests

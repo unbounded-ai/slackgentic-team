@@ -3,7 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from agent_harness.models import AgentTaskKind, AssignmentMode, TeamAgent, WorkRequest
+from agent_harness.models import (
+    AgentTaskKind,
+    AssignmentMode,
+    PermissionMode,
+    TeamAgent,
+    WorkRequest,
+)
 from agent_harness.team import normalize_handle
 
 ANYONE_WORDS = ("somebody", "someone", "anyone", "any agent", "whoever")
@@ -233,7 +239,7 @@ def _with_dangerous_mode(
 ) -> WorkRequest | None:
     if request is None or not dangerous_mode:
         return request
-    return replace(request, dangerous_mode=True)
+    return replace(request, permission_mode=PermissionMode.DANGEROUS)
 
 
 def _task_kind_for(verb: str, prompt: str, pr_url: str | None) -> AgentTaskKind:

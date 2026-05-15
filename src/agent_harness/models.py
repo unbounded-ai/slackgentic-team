@@ -203,7 +203,11 @@ class WorkRequest:
     task_kind: AgentTaskKind = AgentTaskKind.WORK
     author_handle: str | None = None
     pr_url: str | None = None
-    dangerous_mode: bool = False
+    permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
+
+    @property
+    def dangerous_mode(self) -> bool:
+        return self.permission_mode == PermissionMode.DANGEROUS
 
 
 @dataclass(frozen=True)
