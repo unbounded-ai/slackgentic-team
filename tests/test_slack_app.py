@@ -2086,6 +2086,237 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_top_level_request_with_same_channel_link_redirects_into_linked_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                parent_ts = "1712345670.000001"
+                reply_ts = "1712345670.000002"
+                gateway.thread_history_messages[("C1", parent_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U2",
+                        "text": "Original request kicked off here.",
+                        "ts": parent_ts,
+                    },
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "username": "agent",
+                        "text": "Earlier reply from the agent.",
+                        "ts": reply_ts,
+                        "thread_ts": parent_ts,
+                    },
+                ]
+                linked_url = (
+                    "https://example.slack.com/archives/C1/"
+                    f"p{reply_ts.replace('.', '')}?thread_ts={parent_ts}&cid=C1"
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"Fix the threading bug from {linked_url}",
+                            "ts": "1712345680.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task = runtime.started[0][0]
+                self.assertEqual(task.thread_ts, parent_ts)
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].thread_ts,
+                    parent_ts,
+                )
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].message_ts,
+                    "1712345680.000001",
+                )
+            finally:
+                store.close()
+
+    def test_top_level_request_resolves_reply_permalink_to_parent_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                parent_ts = "1712345670.000001"
+                reply_ts = "1712345670.000002"
+                # Permalink with no ?thread_ts= query — points at the reply.
+                # Slack's conversations.replies returns the whole thread with the
+                # parent first when called with either parent or reply ts.
+                gateway.thread_history_messages[("C1", reply_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U2",
+                        "text": "Original request kicked off here.",
+                        "ts": parent_ts,
+                    },
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "username": "agent",
+                        "text": "Earlier reply from the agent.",
+                        "ts": reply_ts,
+                        "thread_ts": parent_ts,
+                    },
+                ]
+                linked_url = f"https://example.slack.com/archives/C1/p{reply_ts.replace('.', '')}"
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"Fix the threading bug from {linked_url}",
+                            "ts": "1712345680.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task = runtime.started[0][0]
+                self.assertEqual(task.thread_ts, parent_ts)
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].thread_ts,
+                    parent_ts,
+                )
+            finally:
+                store.close()
+
+    def test_top_level_request_with_cross_channel_link_does_not_redirect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                foreign_parent = "1712345670.000003"
+                gateway.thread_history_messages[("C2", foreign_parent)] = [
+                    {
+                        "type": "message",
+                        "channel": "C2",
+                        "user": "U2",
+                        "text": "Different channel context.",
+                        "ts": foreign_parent,
+                    }
+                ]
+                linked_url = (
+                    "https://example.slack.com/archives/C2/"
+                    f"p{foreign_parent.replace('.', '')}?thread_ts={foreign_parent}&cid=C2"
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"Look at {linked_url} and fix it",
+                            "ts": "1712345680.000002",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task = runtime.started[0][0]
+                self.assertEqual(task.thread_ts, "1712345680.000002")
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].thread_ts,
+                    "1712345680.000002",
+                )
+            finally:
+                store.close()
+
+    def test_thread_reply_with_link_keeps_user_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                other_parent = "1712345670.000004"
+                gateway.thread_history_messages[("C1", other_parent)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U2",
+                        "text": "An unrelated thread to reference.",
+                        "ts": other_parent,
+                    }
+                ]
+                linked_url = (
+                    "https://example.slack.com/archives/C1/"
+                    f"p{other_parent.replace('.', '')}?thread_ts={other_parent}&cid=C1"
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "thread_ts": "1712345680.000003",
+                            "text": f"Please look at {linked_url}",
+                            "ts": "1712345680.000004",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task = runtime.started[0][0]
+                self.assertEqual(task.thread_ts, "1712345680.000003")
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].thread_ts,
+                    "1712345680.000003",
+                )
+            finally:
+                store.close()
+
     def test_repeated_slack_message_event_is_processed_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
