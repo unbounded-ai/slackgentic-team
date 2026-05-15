@@ -674,6 +674,41 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_channel_task_assignment_refreshes_existing_roster_to_occupied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "write the status update",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(gateway.updates[-1]["ts"], "171.roster")
+                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
+            finally:
+                store.close()
+
     def test_roster_shows_runtime_running_task_occupancy(self):
         class RuntimeWithRunningTask(FakeRuntime):
             def __init__(self, running):

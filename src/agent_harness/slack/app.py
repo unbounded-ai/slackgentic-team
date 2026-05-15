@@ -462,8 +462,7 @@ class SlackTeamController:
             posted.ts,
         )
         task = self.store.get_agent_task(result.task.task_id) or result.task
-        if self.runtime:
-            self.runtime.start_task(task, result.agent, thread)
+        self._start_runtime_task(task, result.agent, thread)
         self._mark_message_in_progress(channel_id, event.get("ts"))
 
     def handle_team_command(
@@ -653,8 +652,7 @@ class SlackTeamController:
             PendingWorkRequestStatus.ASSIGNED,
         )
         task = self.store.get_agent_task(result.task.task_id) or result.task
-        if self.runtime:
-            self.runtime.start_task(task, result.agent, thread)
+        self._start_runtime_task(task, result.agent, thread)
         if request_message_ts:
             self._mark_message_in_progress(pending.channel_id, request_message_ts)
         return True
@@ -957,6 +955,17 @@ class SlackTeamController:
                     )
             return latest_roster_ts
         return self.post_roster(channel_id)
+
+    def _refresh_existing_roster(self, channel_id: str) -> None:
+        self._discover_recent_roster_messages(channel_id)
+        if self._remembered_roster_ts_values(channel_id):
+            self.refresh_or_post_roster(channel_id)
+
+    def _start_runtime_task(self, task: AgentTask, agent, thread: SlackThreadRef) -> bool:
+        started = self.runtime.start_task(task, agent, thread) if self.runtime else True
+        if started:
+            self._refresh_existing_roster(thread.channel_id)
+        return started
 
     def _remember_roster_message(self, channel_id: str, message_ts: str) -> None:
         self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
@@ -1478,8 +1487,7 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(result.task.task_id, thread_ts, posted.ts)
         task = self.store.get_agent_task(result.task.task_id) or result.task
-        if self.runtime:
-            self.runtime.start_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
+        self._start_runtime_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
         self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
 
@@ -1579,8 +1587,7 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(result.task.task_id, thread_ts, posted.ts)
         task = self.store.get_agent_task(result.task.task_id) or result.task
-        if self.runtime:
-            self.runtime.start_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
+        self._start_runtime_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
         self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
 
@@ -1654,9 +1661,7 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
         reviewer_task = self.store.get_agent_task(result.task.task_id) or result.task
-        started = (
-            self.runtime.start_task(reviewer_task, result.agent, thread) if self.runtime else True
-        )
+        started = self._start_runtime_task(reviewer_task, result.agent, thread)
         if started and message_ts:
             self._mark_message_in_progress(thread.channel_id, message_ts)
         elif message_ts:
@@ -1778,9 +1783,7 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
         delegated_task = self.store.get_agent_task(result.task.task_id) or result.task
-        started = (
-            self.runtime.start_task(delegated_task, result.agent, thread) if self.runtime else True
-        )
+        started = self._start_runtime_task(delegated_task, result.agent, thread)
         if started and message_ts:
             self._mark_message_in_progress(thread.channel_id, message_ts)
         elif message_ts:
@@ -1869,8 +1872,7 @@ class SlackTeamController:
             )
             self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
             task = self.store.get_agent_task(result.task.task_id) or result.task
-            if self.runtime:
-                self.runtime.start_task(task, result.agent, thread)
+            self._start_runtime_task(task, result.agent, thread)
             started = True
             handled = True
         if started and request_message_ts:
@@ -1993,8 +1995,7 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(task.task_id, thread.thread_ts, posted.ts)
         task = self.store.get_agent_task(task.task_id) or task
-        if self.runtime:
-            self.runtime.start_task(task, agent, thread)
+        self._start_runtime_task(task, agent, thread)
         return True
 
     def _start_external_session_agent_followup(
@@ -2090,9 +2091,7 @@ class SlackTeamController:
         )
         self.store.upsert_agent_task(task)
         self._restore_task_action_buttons_if_active(task)
-        if not self.runtime:
-            return True
-        return self.runtime.start_task(task, agent, thread)
+        return self._start_runtime_task(task, agent, thread)
 
     def _active_thread_task_for_agent(
         self,
@@ -2249,8 +2248,7 @@ class SlackTeamController:
         )
         self.store.update_agent_task_thread(delegated_task.task_id, thread.thread_ts, posted.ts)
         delegated_task = self.store.get_agent_task(delegated_task.task_id) or delegated_task
-        if self.runtime:
-            self.runtime.start_task(delegated_task, target_agent, thread)
+        self._start_runtime_task(delegated_task, target_agent, thread)
 
     def handle_runtime_agent_control(
         self,
