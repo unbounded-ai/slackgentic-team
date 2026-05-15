@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_harness.config import load_config_from_env
-from agent_harness.models import SlackThreadRef
+from agent_harness.models import PermissionMode, SlackThreadRef
+from agent_harness.permissions import (
+    claude_channel_permission_mode_from_env,
+    claude_safe_auto_permission_request_allowed,
+)
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.storage.store import Store
 
@@ -267,6 +271,18 @@ class ClaudeChannelServer:
                 }
             )
             return
+        if (
+            _permission_mode_from_env() == PermissionMode.SAFE_AUTO
+            and claude_safe_auto_permission_request_allowed(params)
+        ):
+            self._write(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel/permission",
+                    "params": {"request_id": request_id, "behavior": "allow"},
+                }
+            )
+            return
         if self.request_handler is not None and self._current_thread is not None:
             try:
                 request_params = dict(params)
@@ -479,6 +495,10 @@ def _thread_from_env() -> SlackThreadRef | None:
 def _dangerous_mode_from_env() -> bool:
     raw = os.environ.get(DANGEROUS_MODE_ENV, "")
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _permission_mode_from_env() -> PermissionMode | None:
+    return claude_channel_permission_mode_from_env(os.environ)
 
 
 def _is_identifier(value: str) -> bool:

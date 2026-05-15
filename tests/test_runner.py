@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pexpect
 
 from agent_harness.models import PermissionMode, Provider
+from agent_harness.permissions import CLAUDE_CHANNEL_PERMISSION_MODE_ENV
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess, build_command
 
 
@@ -442,6 +443,10 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn(
             "SLACKGENTIC_CLAUDE_DANGEROUS_MODE",
             calls[0][2]["env"],
+        )
+        self.assertEqual(
+            calls[0][2]["env"][CLAUDE_CHANNEL_PERMISSION_MODE_ENV],
+            PermissionMode.SAFE_AUTO.value,
         )
 
 

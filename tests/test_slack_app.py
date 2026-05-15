@@ -3568,6 +3568,58 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_task_thread_question_is_sent_to_runtime_with_answer_first_instruction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody do update docs",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                task = store.list_agent_tasks()[0]
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Is there a better way to do this?",
+                            "ts": "171.000002",
+                            "thread_ts": task.thread_ts,
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.sent), 1)
+                task_id, message = runtime.sent[0]
+                self.assertEqual(task_id, task.task_id)
+                self.assertIn("answer it explicitly in Slack before continuing", message)
+                self.assertIn("Is there a better way to do this?", message)
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.metadata["request_message_ts"], "171.000002")
+            finally:
+                store.close()
+
     def test_status_in_task_thread_posts_usage_not_runtime_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

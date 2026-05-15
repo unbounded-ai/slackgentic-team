@@ -1481,7 +1481,10 @@ class SlackTeamController:
             return True
         if self._record_dependency_if_requested(task.task_id, event, text, agent):
             return True
-        if self.runtime and self.runtime.send_to_task(target_task.task_id, text):
+        if self.runtime and self.runtime.send_to_task(
+            target_task.task_id,
+            _live_thread_followup_prompt(text),
+        ):
             self._remember_request_message_for_task(target_task, message_ts)
             self._mark_message_in_progress(channel_id, message_ts)
             return True
@@ -2139,12 +2142,13 @@ class SlackTeamController:
                 thread.channel_id,
                 thread.thread_ts,
             )
+        live_prompt = _live_thread_followup_prompt(request.prompt)
         if (
             previous_task
             and self.runtime
             and self.runtime.send_to_task(
                 previous_task.task_id,
-                request.prompt,
+                live_prompt,
             )
         ):
             self._remember_request_message_for_task(previous_task, request_message_ts)
@@ -2264,7 +2268,10 @@ class SlackTeamController:
         if (
             try_live_send
             and self.runtime
-            and self.runtime.send_to_task(previous_task.task_id, request.prompt)
+            and self.runtime.send_to_task(
+                previous_task.task_id,
+                _live_thread_followup_prompt(request.prompt),
+            )
         ):
             self._remember_request_message_for_task(previous_task, request_message_ts)
             return True
@@ -4114,17 +4121,69 @@ def _active_thread_followup_message_ts_values(metadata: dict[str, object]) -> li
 
 def _queued_followup_prompt(prompts: list[str]) -> str:
     if len(prompts) == 1:
+        question_instruction = (
+            " If it asks a direct question, answer it explicitly before continuing "
+            "or scheduling a delayed follow-up."
+            if _looks_like_direct_question(prompts[0])
+            else ""
+        )
         return (
             "The user sent this follow-up while you were already working. "
-            "Treat it as the latest instruction and continue:\n\n"
+            f"Treat it as the latest instruction and continue.{question_instruction}\n\n"
             f"{prompts[0]}"
         )
     formatted = "\n\n".join(f"{index}. {prompt}" for index, prompt in enumerate(prompts, start=1))
+    question_instruction = (
+        " If any follow-up asks a direct question, answer it explicitly before continuing "
+        "or scheduling a delayed follow-up."
+        if any(_looks_like_direct_question(prompt) for prompt in prompts)
+        else ""
+    )
     return (
         "The user sent these follow-ups while you were already working. "
-        "Treat later messages as newer instructions and continue from the latest direction:\n\n"
+        "Treat later messages as newer instructions and continue from the latest direction."
+        f"{question_instruction}\n\n"
         f"{formatted}"
     )
+
+
+def _live_thread_followup_prompt(prompt: str) -> str:
+    if not _looks_like_direct_question(prompt):
+        return prompt
+    return (
+        "The user sent this follow-up while you were already working. "
+        "It asks a direct question; answer it explicitly in Slack before continuing "
+        "implementation work, opening a PR, or scheduling a delayed follow-up.\n\n"
+        f"{prompt}"
+    )
+
+
+def _looks_like_direct_question(text: str) -> bool:
+    compact = " ".join(text.strip().lower().split())
+    if not compact:
+        return False
+    if "?" in compact:
+        return True
+    starters = (
+        "are ",
+        "can ",
+        "can you ",
+        "could ",
+        "could you ",
+        "did ",
+        "do ",
+        "does ",
+        "how ",
+        "is ",
+        "should ",
+        "what ",
+        "when ",
+        "where ",
+        "why ",
+        "will ",
+        "would ",
+    )
+    return compact.startswith(starters)
 
 
 def _last_queued_requested_by(queued: list[dict[str, object]]) -> str | None:
