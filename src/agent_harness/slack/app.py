@@ -403,13 +403,9 @@ class SlackTeamController:
         if self._handle_task_thread_reply(event, channel_id, text):
             return
         active_agents = self.store.list_team_agents()
+        thread = self._request_thread_anchor(event, channel_id, text)
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
         if multi_requests:
-            thread = SlackThreadRef(
-                channel_id=channel_id,
-                thread_ts=event.get("thread_ts") or event.get("ts"),
-                message_ts=event.get("ts"),
-            )
             self._mark_message_acknowledged(channel_id, event.get("ts"))
             self._start_specific_requests_in_thread(
                 multi_requests,
@@ -426,11 +422,6 @@ class SlackTeamController:
         if request is None:
             return
         self._mark_message_acknowledged(channel_id, event.get("ts"))
-        thread = SlackThreadRef(
-            channel_id=channel_id,
-            thread_ts=event.get("thread_ts") or event.get("ts"),
-            message_ts=event.get("ts"),
-        )
         extra_metadata = self._with_linked_thread_context(
             {"request_message_ts": event.get("ts")},
             text,
@@ -455,7 +446,7 @@ class SlackTeamController:
             self._post_assignment_unavailable(
                 SlackReplyTarget(
                     channel_id=channel_id,
-                    thread_ts=event.get("thread_ts") or event.get("ts"),
+                    thread_ts=thread.thread_ts,
                 ),
                 request,
                 requested_by_slack_user=event.get("user"),
@@ -706,11 +697,7 @@ class SlackTeamController:
         schedule_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
         if not looks_like_schedule_request(schedule_text):
             return False
-        thread = SlackThreadRef(
-            channel_id=channel_id,
-            thread_ts=event.get("thread_ts") or event.get("ts"),
-            message_ts=event.get("ts"),
-        )
+        thread = self._request_thread_anchor(event, channel_id, text)
         active_agents = self.store.list_team_agents()
         if not active_agents:
             self._post_capacity_message(
@@ -2945,7 +2932,7 @@ class SlackTeamController:
         *,
         current_thread: SlackThreadRef | None,
     ) -> str | None:
-        ref = parse_thread_ref(text)
+        ref = self._resolve_linked_thread_ref(text)
         if ref is None or not ref.thread_ts:
             return None
         if (
@@ -2961,6 +2948,50 @@ class SlackTeamController:
         if ref.permalink:
             label = f"{label}: {ref.permalink}"
         return f"{label}\n{context}"
+
+    def _request_thread_anchor(
+        self,
+        event: dict,
+        channel_id: str,
+        text: str,
+    ) -> SlackThreadRef:
+        message_ts = event.get("ts")
+        user_thread_ts = event.get("thread_ts")
+        if user_thread_ts:
+            return SlackThreadRef(
+                channel_id=channel_id,
+                thread_ts=user_thread_ts,
+                message_ts=message_ts,
+            )
+        linked = self._resolve_linked_thread_ref(text)
+        if linked is not None and linked.channel_id == channel_id and linked.thread_ts:
+            return SlackThreadRef(
+                channel_id=channel_id,
+                thread_ts=linked.thread_ts,
+                message_ts=message_ts,
+            )
+        return SlackThreadRef(
+            channel_id=channel_id,
+            thread_ts=message_ts,
+            message_ts=message_ts,
+        )
+
+    def _resolve_linked_thread_ref(self, text: str) -> SlackThreadRef | None:
+        ref = parse_thread_ref(text)
+        if ref is None or not ref.thread_ts:
+            return ref
+        if ref.thread_ts != ref.message_ts:
+            return ref
+        try:
+            messages = self.gateway.thread_messages(ref.channel_id, ref.thread_ts, limit=1)
+        except Exception:
+            LOGGER.debug("failed to resolve linked Slack thread parent", exc_info=True)
+            return ref
+        for message in messages:
+            candidate = message.get("thread_ts") or message.get("ts")
+            if isinstance(candidate, str) and candidate and candidate != ref.thread_ts:
+                return replace(ref, thread_ts=candidate)
+        return ref
 
     def _thread_context(self, channel_id: str, thread_ts: str) -> str | None:
         try:
