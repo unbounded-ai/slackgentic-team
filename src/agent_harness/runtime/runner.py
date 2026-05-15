@@ -137,6 +137,7 @@ class ManagedAgentProcess:
                 cwd=str(self.request.cwd),
                 env=child_env,
                 encoding="utf-8",
+                codec_errors="replace",
                 timeout=0.1,
             )
             self.child.send(self.request.prompt)
@@ -150,6 +151,7 @@ class ManagedAgentProcess:
             cwd=str(self.request.cwd),
             env=child_env,
             encoding="utf-8",
+            codec_errors="replace",
             timeout=0.1,
             echo=False,
         )

@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -244,6 +245,38 @@ class StoreTests(unittest.TestCase):
 
                 self.assertFalse(store.is_claude_channel_message_delivered(message_id))
                 self.assertEqual(store.pending_claude_channel_messages(123), [])
+            finally:
+                store.close()
+
+    def test_setting_operations_are_thread_safe(self):
+        # The Store connection is shared across threads (mirror loop, Slack handlers,
+        # task runtime). Without locking, concurrent get/set/delete against the same
+        # sqlite3.Connection raise InterfaceError: bad parameter or other API misuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                errors: list[BaseException] = []
+                start = threading.Barrier(8)
+
+                def worker(index: int) -> None:
+                    start.wait()
+                    try:
+                        for round_index in range(50):
+                            key = f"setting.{index}.{round_index}"
+                            store.set_setting(key, str(round_index))
+                            store.get_setting(key)
+                            store.delete_setting(key)
+                    except BaseException as exc:  # pragma: no cover - exercised on failure
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(errors, [])
             finally:
                 store.close()
 
