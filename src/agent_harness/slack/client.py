@@ -76,6 +76,18 @@ class SlackGateway:
         data = getattr(response, "data", response)
         return dict(data)
 
+    def bot_user_id(self) -> str | None:
+        cached = getattr(self, "_bot_user_id_cache", None)
+        if cached is not None:
+            return cached or None
+        try:
+            user_id = self.auth_test().get("user_id")
+        except Exception:
+            LOGGER.debug("failed to look up bot user id", exc_info=True)
+            user_id = None
+        self._bot_user_id_cache = user_id if isinstance(user_id, str) else ""
+        return self._bot_user_id_cache or None
+
     def user_profile(self, user_id: str) -> SlackUserProfile:
         response = self.client.users_info(user=user_id)
         data = getattr(response, "data", response)
@@ -390,7 +402,12 @@ class SlackGateway:
         from slack_sdk.errors import SlackApiError
 
         try:
-            self.client.reactions_add(channel=channel_id, timestamp=ts, name=reaction_name)
+            self._call_reaction_with_retry(
+                self.client.reactions_add,
+                channel=channel_id,
+                timestamp=ts,
+                name=reaction_name,
+            )
         except SlackApiError as exc:
             if exc.response.get("error") == "already_reacted":
                 return False
@@ -401,12 +418,34 @@ class SlackGateway:
         from slack_sdk.errors import SlackApiError
 
         try:
-            self.client.reactions_remove(channel=channel_id, timestamp=ts, name=reaction_name)
+            self._call_reaction_with_retry(
+                self.client.reactions_remove,
+                channel=channel_id,
+                timestamp=ts,
+                name=reaction_name,
+            )
         except SlackApiError as exc:
             if exc.response.get("error") in {"no_reaction", "not_reacted"}:
                 return False
             raise
         return True
+
+    def _call_reaction_with_retry(self, call, **kwargs):
+        # Without this retry, a transient ratelimit on reactions.remove leaves
+        # stale status reactions on a message (e.g. :eyes: lingering after the
+        # next add(:hourglass:) succeeds) and the message looks stuck in Slack.
+        from slack_sdk.errors import SlackApiError
+
+        attempts = 0
+        while True:
+            try:
+                return call(**kwargs)
+            except SlackApiError as exc:
+                if exc.response.get("error") == "ratelimited" and attempts < SLACK_API_RETRY_LIMIT:
+                    attempts += 1
+                    time.sleep(_retry_after_seconds(exc))
+                    continue
+                raise
 
 
 def _identity_name(identity: TeamAgent) -> str:

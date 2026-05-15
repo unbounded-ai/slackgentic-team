@@ -82,6 +82,41 @@ class RateLimitedOnceClient(FakeSlackClient):
         return super().chat_postMessage(**kwargs)
 
 
+class RateLimitedReactionsClient(FakeSlackClient):
+    def __init__(self):
+        super().__init__()
+        self.add_calls = 0
+        self.remove_calls = 0
+        self.added = []
+        self.removed = []
+
+    def reactions_add(self, **kwargs):
+        self.add_calls += 1
+        if self.add_calls == 1:
+            raise SlackApiError(
+                "rate limited",
+                FakeSlackResponse(
+                    {"ok": False, "error": "ratelimited"},
+                    headers={"Retry-After": "0"},
+                ),
+            )
+        self.added.append(kwargs)
+        return {"ok": True}
+
+    def reactions_remove(self, **kwargs):
+        self.remove_calls += 1
+        if self.remove_calls == 1:
+            raise SlackApiError(
+                "rate limited",
+                FakeSlackResponse(
+                    {"ok": False, "error": "ratelimited"},
+                    headers={"Retry-After": "0"},
+                ),
+            )
+        self.removed.append(kwargs)
+        return {"ok": True}
+
+
 class InvalidUpdateBlocksOnceClient(FakeSlackClient):
     def __init__(self):
         super().__init__()
@@ -225,6 +260,24 @@ class SlackGatewayTests(unittest.TestCase):
 
         self.assertEqual(gateway.client.calls[1]["blocks"], [])
         self.assertEqual(gateway.client.updates[0]["blocks"], [])
+
+    def test_add_reaction_retries_after_rate_limit(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = RateLimitedReactionsClient()
+
+        self.assertTrue(gateway.add_reaction("C1", "171.000001", "eyes"))
+
+        self.assertEqual(gateway.client.add_calls, 2)
+        self.assertEqual(gateway.client.added[0]["name"], "eyes")
+
+    def test_remove_reaction_retries_after_rate_limit(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = RateLimitedReactionsClient()
+
+        self.assertTrue(gateway.remove_reaction("C1", "171.000001", "eyes"))
+
+        self.assertEqual(gateway.client.remove_calls, 2)
+        self.assertEqual(gateway.client.removed[0]["name"], "eyes")
 
 
 if __name__ == "__main__":

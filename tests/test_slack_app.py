@@ -55,6 +55,8 @@ from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 
 
 class FakeGateway:
+    bot_user_id_value = "UBOT"
+
     def __init__(self):
         self.posts = []
         self.updates = []
@@ -67,6 +69,23 @@ class FakeGateway:
         self.pins = []
         self.history_messages = []
         self.thread_history_messages = {}
+
+    def bot_user_id(self):
+        return self.bot_user_id_value
+
+    def _current_reactions(self, channel_id, message_ts):
+        active: dict[str, int] = {}
+        for ch, ts, name in self.reactions:
+            if ch == channel_id and ts == message_ts:
+                active[name] = active.get(name, 0) + 1
+        for ch, ts, name in self.removed_reactions:
+            if ch == channel_id and ts == message_ts and active.get(name, 0) > 0:
+                active[name] -= 1
+        return [
+            {"name": name, "count": count, "users": [self.bot_user_id_value]}
+            for name, count in active.items()
+            if count > 0
+        ]
 
     def create_channel(self, name, is_private):
         self.channels.append((name, is_private))
@@ -164,7 +183,14 @@ class FakeGateway:
         combined = parents + messages
         if oldest:
             combined = [item for item in combined if float(item.get("ts", 0)) > float(oldest)]
-        return combined[-limit:]
+        result = []
+        for item in combined[-limit:]:
+            decorated = dict(item)
+            reactions = self._current_reactions(channel_id, item.get("ts"))
+            if reactions:
+                decorated["reactions"] = reactions
+            result.append(decorated)
+        return result
 
     def channel_messages(self, channel_id, oldest=None, limit=200):
         messages = [
@@ -1065,6 +1091,87 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIsNone(store.get_managed_thread_task("C1", "171.000001", agent.agent_id))
                 self.assertIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_mark_task_complete_surfaces_lingering_thread_reactions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "wrap up", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.thread",
+                    metadata={"request_message_ts": "171.user1"},
+                )
+                store.upsert_agent_task(task)
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {
+                        "ts": "171.000099",
+                        "text": "follow-up the agent forgot",
+                        "thread_ts": "171.thread",
+                    },
+                ]
+                gateway.reactions.append(("C1", "171.000099", "eyes"))
+                gateway.reactions.append(("C1", "171.000099", "hourglass_flowing_sand"))
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller._mark_task_complete(
+                    task,
+                    SlackThreadRef("C1", "171.thread"),
+                    include_thread=True,
+                )
+
+                warnings = [
+                    reply
+                    for reply in gateway.thread_replies
+                    if "never marked complete" in reply["text"]
+                ]
+                self.assertEqual(len(warnings), 1, gateway.thread_replies)
+                self.assertIn("p171000099", warnings[0]["text"])
+                self.assertIn(("C1", "171.000099", "eyes"), gateway.removed_reactions)
+                self.assertIn(
+                    ("C1", "171.000099", "hourglass_flowing_sand"),
+                    gateway.removed_reactions,
+                )
+            finally:
+                store.close()
+
+    def test_mark_task_complete_skips_warning_when_thread_is_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "clean exit", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.thread",
+                    metadata={"request_message_ts": "171.user1"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller._mark_task_complete(
+                    task,
+                    SlackThreadRef("C1", "171.thread"),
+                    include_thread=True,
+                )
+
+                warnings = [
+                    reply
+                    for reply in gateway.thread_replies
+                    if "never marked complete" in reply["text"]
+                ]
+                self.assertEqual(warnings, [])
             finally:
                 store.close()
 

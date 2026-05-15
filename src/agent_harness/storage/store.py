@@ -331,25 +331,28 @@ class Store:
         self.conn.commit()
 
     def set_setting(self, key: str, value: str) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO settings (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-              value = excluded.value,
-              updated_at = excluded.updated_at
-            """,
-            (key, value, utc_now().isoformat()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value,
+                  updated_at = excluded.updated_at
+                """,
+                (key, value, utc_now().isoformat()),
+            )
+            self.conn.commit()
 
     def get_setting(self, key: str) -> str | None:
-        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
     def delete_setting(self, key: str) -> None:
-        self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            self.conn.commit()
 
     def list_settings(self, prefix: str | None = None) -> dict[str, str]:
         if prefix is None:
