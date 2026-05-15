@@ -94,6 +94,18 @@ The managed runtime launches the selected provider process, streams visible
 assistant output into the thread, and forwards user replies back into the live
 process when the provider supports interactive input.
 
+When live delivery is unavailable for a running managed task, same-thread user
+replies are persisted in the task metadata as queued follow-ups. When the
+current provider process exits, Slackgentic resumes the same task/session with
+all queued follow-ups together instead of acknowledging and dropping them. Each
+queued Slack message keeps its own in-progress reaction and is cleared by its
+own timestamp when the resumed provider run completes.
+
+Replying `stop` in a task thread sends an Esc-style interrupt into the current
+managed provider process without marking the task done or terminating the
+process. This mirrors an interactive interrupt: the thread stays active and the
+next reply can continue from a new direction.
+
 For review requests, the parser records the author handle when text contains
 phrasing such as `@riley's PR` or `PR by @riley`. The picker first prefers
 reviewers whose provider differs from the author agent, then falls back to the
@@ -150,3 +162,26 @@ prompt, then stores it in `scheduled_timers`. A daemon poller claims due timers
 and resumes the same agent in the same thread using the existing same-thread
 continuation path, preserving the provider session id when one is known. Marking
 a thread done cancels pending timers for that thread.
+
+## User Scheduled Work
+
+Users can create one-off or recurring scheduled work from the agent channel with
+natural-language phrases such as `tomorrow at 9am PT`, `in 30 minutes`,
+`every day at 5pm ET`, `every Monday at 10:30am America/New_York`, or
+`during tomorrow's sunset time in Waco`.
+
+The Slack controller only detects that the message is asking to schedule work.
+It then starts a normal managed agent task whose prompt asks the LLM to resolve
+the schedule into a hidden `SLACKGENTIC: SCHEDULE {...}` control line. This keeps
+interpretation with the agent instead of a local regex parser. The controller
+validates the structured JSON and retries the same agent with the validation
+error when the control line is malformed.
+
+After validation, Slackgentic stores the resulting `WorkRequest` plus recurrence
+metadata in `scheduled_work_requests` and acknowledges the schedule in the
+original thread. A daemon poller claims due rows and starts normal Slackgentic
+work in that same thread. If no matching agent is available at the due time, the
+due occurrence is queued as pending work so it can resume when capacity opens.
+One-off schedules move to `done` after their due occurrence is launched or
+queued; recurring schedules compute their next run after each due occurrence.
+Marking a thread done cancels pending schedules for that thread.

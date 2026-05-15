@@ -19,6 +19,9 @@ from agent_harness.models import (
     Provider,
     ScheduledTimer,
     ScheduledTimerStatus,
+    ScheduledWork,
+    ScheduledWorkKind,
+    ScheduledWorkStatus,
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
@@ -242,6 +245,33 @@ CREATE TABLE IF NOT EXISTS scheduled_timers (
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_timers_due
   ON scheduled_timers(status, due_at, created_at);
+
+CREATE TABLE IF NOT EXISTS scheduled_work_requests (
+  schedule_id TEXT NOT NULL PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  message_ts TEXT,
+  prompt TEXT NOT NULL,
+  assignment_mode TEXT NOT NULL,
+  requested_handle TEXT,
+  task_kind TEXT NOT NULL,
+  author_handle TEXT,
+  pr_url TEXT,
+  dangerous_mode INTEGER NOT NULL DEFAULT 0,
+  requested_by_slack_user TEXT,
+  schedule_kind TEXT NOT NULL,
+  recurrence_json TEXT NOT NULL DEFAULT '{}',
+  timezone TEXT,
+  next_run_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_run_at TEXT,
+  last_task_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_work_due
+  ON scheduled_work_requests(status, next_run_at, created_at);
 """
 
 
@@ -1387,6 +1417,185 @@ class Store:
             self.conn.commit()
         return int(cursor.rowcount)
 
+    def create_scheduled_work_request(
+        self,
+        thread: SlackThreadRef,
+        request: WorkRequest,
+        *,
+        schedule_kind: ScheduledWorkKind,
+        next_run_at,
+        recurrence: dict[str, object] | None = None,
+        timezone: str | None = None,
+        requested_by_slack_user: str | None = None,
+    ) -> ScheduledWork:
+        now = utc_now()
+        scheduled = ScheduledWork(
+            schedule_id=f"schedule_{uuid.uuid4().hex[:12]}",
+            channel_id=thread.channel_id,
+            thread_ts=thread.thread_ts,
+            message_ts=thread.message_ts,
+            prompt=request.prompt,
+            assignment_mode=request.assignment_mode,
+            requested_handle=request.requested_handle,
+            task_kind=request.task_kind,
+            author_handle=request.author_handle,
+            pr_url=request.pr_url,
+            dangerous_mode=request.dangerous_mode,
+            requested_by_slack_user=requested_by_slack_user,
+            schedule_kind=schedule_kind,
+            recurrence=dict(recurrence or {}),
+            timezone=timezone,
+            next_run_at=next_run_at,
+            status=ScheduledWorkStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO scheduled_work_requests (
+                  schedule_id, channel_id, thread_ts, message_ts, prompt, assignment_mode,
+                  requested_handle, task_kind, author_handle, pr_url, dangerous_mode,
+                  requested_by_slack_user, schedule_kind, recurrence_json, timezone,
+                  next_run_at, status, created_at, updated_at, last_run_at, last_task_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _scheduled_work_values(scheduled),
+            )
+            self.conn.commit()
+        return scheduled
+
+    def list_due_scheduled_work(
+        self,
+        *,
+        now=None,
+        limit: int = 20,
+    ) -> list[ScheduledWork]:
+        reference = now or utc_now()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM scheduled_work_requests
+                WHERE status = ? AND next_run_at <= ?
+                ORDER BY next_run_at, created_at, schedule_id
+                LIMIT ?
+                """,
+                (ScheduledWorkStatus.PENDING.value, reference.isoformat(), limit),
+            ).fetchall()
+        return [_scheduled_work_from_row(row) for row in rows]
+
+    def claim_scheduled_work(self, schedule_id: str) -> ScheduledWork | None:
+        updated_at = utc_now().isoformat()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET status = ?, updated_at = ?
+                WHERE schedule_id = ? AND status = ?
+                """,
+                (
+                    ScheduledWorkStatus.CLAIMED.value,
+                    updated_at,
+                    schedule_id,
+                    ScheduledWorkStatus.PENDING.value,
+                ),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = self.conn.execute(
+                "SELECT * FROM scheduled_work_requests WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return _scheduled_work_from_row(row) if row else None
+
+    def complete_scheduled_work(
+        self,
+        schedule_id: str,
+        *,
+        last_task_id: str,
+        next_run_at=None,
+    ) -> None:
+        now = utc_now()
+        status = (
+            ScheduledWorkStatus.PENDING if next_run_at is not None else ScheduledWorkStatus.DONE
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET status = ?, next_run_at = COALESCE(?, next_run_at),
+                    updated_at = ?, last_run_at = ?, last_task_id = ?
+                WHERE schedule_id = ?
+                """,
+                (
+                    status.value,
+                    next_run_at.isoformat() if next_run_at is not None else None,
+                    now.isoformat(),
+                    now.isoformat(),
+                    last_task_id,
+                    schedule_id,
+                ),
+            )
+            self.conn.commit()
+
+    def release_scheduled_work(self, schedule_id: str, *, next_run_at=None) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET status = ?, next_run_at = COALESCE(?, next_run_at), updated_at = ?
+                WHERE schedule_id = ? AND status = ?
+                """,
+                (
+                    ScheduledWorkStatus.PENDING.value,
+                    next_run_at.isoformat() if next_run_at is not None else None,
+                    utc_now().isoformat(),
+                    schedule_id,
+                    ScheduledWorkStatus.CLAIMED.value,
+                ),
+            )
+            self.conn.commit()
+
+    def update_scheduled_work_status(
+        self,
+        schedule_id: str,
+        status: ScheduledWorkStatus,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET status = ?, updated_at = ?
+                WHERE schedule_id = ?
+                """,
+                (status.value, utc_now().isoformat(), schedule_id),
+            )
+            self.conn.commit()
+
+    def cancel_scheduled_work_for_thread(self, channel_id: str, thread_ts: str) -> int:
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET status = ?, updated_at = ?
+                WHERE channel_id = ?
+                  AND thread_ts = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    ScheduledWorkStatus.CANCELLED.value,
+                    utc_now().isoformat(),
+                    channel_id,
+                    thread_ts,
+                    ScheduledWorkStatus.PENDING.value,
+                    ScheduledWorkStatus.CLAIMED.value,
+                ),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
 
 def _team_agent_values(agent: TeamAgent) -> tuple[object, ...]:
     return (
@@ -1579,4 +1788,56 @@ def _scheduled_timer_from_row(row: sqlite3.Row) -> ScheduledTimer:
         status=ScheduledTimerStatus(row["status"]),
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+    )
+
+
+def _scheduled_work_values(scheduled: ScheduledWork) -> tuple[object, ...]:
+    return (
+        scheduled.schedule_id,
+        scheduled.channel_id,
+        scheduled.thread_ts,
+        scheduled.message_ts,
+        scheduled.prompt,
+        scheduled.assignment_mode.value,
+        scheduled.requested_handle,
+        scheduled.task_kind.value,
+        scheduled.author_handle,
+        scheduled.pr_url,
+        int(scheduled.dangerous_mode),
+        scheduled.requested_by_slack_user,
+        scheduled.schedule_kind.value,
+        json.dumps(scheduled.recurrence, sort_keys=True),
+        scheduled.timezone,
+        scheduled.next_run_at.isoformat(),
+        scheduled.status.value,
+        scheduled.created_at.isoformat(),
+        scheduled.updated_at.isoformat(),
+        scheduled.last_run_at.isoformat() if scheduled.last_run_at else None,
+        scheduled.last_task_id,
+    )
+
+
+def _scheduled_work_from_row(row: sqlite3.Row) -> ScheduledWork:
+    return ScheduledWork(
+        schedule_id=row["schedule_id"],
+        channel_id=row["channel_id"],
+        thread_ts=row["thread_ts"],
+        message_ts=row["message_ts"],
+        prompt=row["prompt"],
+        assignment_mode=AssignmentMode(row["assignment_mode"]),
+        requested_handle=row["requested_handle"],
+        task_kind=AgentTaskKind(row["task_kind"]),
+        author_handle=row["author_handle"],
+        pr_url=row["pr_url"],
+        dangerous_mode=bool(row["dangerous_mode"]),
+        requested_by_slack_user=row["requested_by_slack_user"],
+        schedule_kind=ScheduledWorkKind(row["schedule_kind"]),
+        recurrence=json.loads(row["recurrence_json"] or "{}"),
+        timezone=row["timezone"],
+        next_run_at=parse_timestamp(row["next_run_at"]) or utc_now(),
+        status=ScheduledWorkStatus(row["status"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+        last_run_at=parse_timestamp(row["last_run_at"]),
+        last_task_id=row["last_task_id"],
     )

@@ -167,6 +167,9 @@ Task thread buttons:
 
 - `Finish and free up this agent` terminates any attached managed process and
   releases the agent for new work.
+- Reply `stop` in a task thread to send an Esc-style interrupt to the current
+  managed run without finishing the task; send the next reply in the thread to
+  continue from the new direction.
 
 Usage:
 

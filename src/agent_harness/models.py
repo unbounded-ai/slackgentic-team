@@ -58,6 +58,18 @@ class ScheduledTimerStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ScheduledWorkStatus(StrEnum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class ScheduledWorkKind(StrEnum):
+    ONE_OFF = "one_off"
+    RECURRING = "recurring"
+
+
 class AssignmentMode(StrEnum):
     ANYONE = "anyone"
     SPECIFIC = "specific"
@@ -230,6 +242,31 @@ class ScheduledTimer:
     created_at: datetime
     updated_at: datetime
     parent_message_ts: str | None = None
+
+
+@dataclass(frozen=True)
+class ScheduledWork:
+    schedule_id: str
+    channel_id: str
+    thread_ts: str
+    prompt: str
+    assignment_mode: AssignmentMode
+    task_kind: AgentTaskKind
+    schedule_kind: ScheduledWorkKind
+    status: ScheduledWorkStatus
+    next_run_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    message_ts: str | None = None
+    requested_handle: str | None = None
+    author_handle: str | None = None
+    pr_url: str | None = None
+    requested_by_slack_user: str | None = None
+    dangerous_mode: bool = False
+    recurrence: dict[str, Any] = field(default_factory=dict)
+    timezone: str | None = None
+    last_run_at: datetime | None = None
+    last_task_id: str | None = None
 
 
 def utc_now() -> datetime:

@@ -91,13 +91,13 @@ def _json_due_at(payload: dict[str, Any], *, now: datetime | None) -> datetime |
 def _parse_due_at(text: str, *, now: datetime | None) -> datetime | None:
     if not text:
         return None
-    delay = _parse_delay(text)
+    delay = parse_delay(text)
     if delay is not None:
         return (now or utc_now()) + delay
     return parse_timestamp(text)
 
 
-def _parse_delay(text: str) -> timedelta | None:
+def parse_delay(text: str) -> timedelta | None:
     total_seconds = 0.0
     position = 0
     matches = list(

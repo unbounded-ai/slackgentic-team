@@ -1,8 +1,18 @@
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
-from agent_harness.models import AgentTaskStatus, Provider, SessionDependency, SlackThreadRef
+from agent_harness.models import (
+    AgentTaskStatus,
+    AssignmentMode,
+    Provider,
+    ScheduledWorkKind,
+    SessionDependency,
+    SlackThreadRef,
+    WorkRequest,
+    utc_now,
+)
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 
@@ -172,6 +182,54 @@ class StoreTests(unittest.TestCase):
 
                 self.assertTrue(store.is_claude_channel_message_delivered(message_id))
                 self.assertEqual(store.pending_claude_channel_messages(123), [])
+            finally:
+                store.close()
+
+    def test_scheduled_work_round_trip_claim_and_reschedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                due_at = utc_now() - timedelta(seconds=1)
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.message"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=due_at,
+                    recurrence={
+                        "frequency": "daily",
+                        "time": "17:00",
+                        "timezone": "America/New_York",
+                    },
+                    timezone="America/New_York",
+                    requested_by_slack_user="U1",
+                )
+
+                due = store.list_due_scheduled_work()
+                self.assertEqual([item.schedule_id for item in due], [scheduled.schedule_id])
+
+                claimed = store.claim_scheduled_work(scheduled.schedule_id)
+                self.assertIsNotNone(claimed)
+                self.assertEqual(store.list_due_scheduled_work(), [])
+
+                next_run_at = utc_now() + timedelta(days=1)
+                store.complete_scheduled_work(
+                    scheduled.schedule_id,
+                    last_task_id="task_123",
+                    next_run_at=next_run_at,
+                )
+                row = store.conn.execute(
+                    "SELECT status, next_run_at, last_task_id FROM scheduled_work_requests "
+                    "WHERE schedule_id = ?",
+                    (scheduled.schedule_id,),
+                ).fetchone()
+
+                self.assertEqual(row["status"], "pending")
+                self.assertEqual(row["next_run_at"], next_run_at.isoformat())
+                self.assertEqual(row["last_task_id"], "task_123")
             finally:
                 store.close()
 
