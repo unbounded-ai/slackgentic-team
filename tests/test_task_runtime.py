@@ -170,6 +170,14 @@ class ClaudePipedGitStatusPermissionDeniedProcess(ClaudePermissionDeniedProcess)
     description = "Check Talos repo status"
 
 
+class ClaudeSequencedPatchLookupPermissionDeniedProcess(ClaudePermissionDeniedProcess):
+    session_id = "claude-sequenced-patch-lookup-session"
+    command = (
+        "ls /private/tmp/talos-qwen3-provider-analysis.patch 2>&1; ls /tmp/ | grep -i talos 2>&1"
+    )
+    description = "Check for prior patch file"
+
+
 class ClaudeDangerousPermissionDeniedThenFinalProcess(OneShotProcess):
     session_id = "claude-dangerous-denied-session"
 
@@ -1943,6 +1951,56 @@ class TaskRuntimeTests(unittest.TestCase):
                     "claude-piped-git-status-session",
                 )
                 self.assertIn("Bash(git status:*)", requests[1].allowed_tools)
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("claude/channel/permission"),
+                    [],
+                )
+            finally:
+                store.close()
+
+    def test_runtime_retries_safe_auto_sequenced_read_only_denial_without_slack_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudeSequencedPatchLookupPermissionDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check for prior patch file", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Done"])
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(
+                    requests[1].resume_session_id,
+                    "claude-sequenced-patch-lookup-session",
+                )
+                self.assertIn(
+                    "Bash(ls /private/tmp/talos-qwen3-provider-analysis.patch 2>&1; "
+                    "ls /tmp/ | grep -i talos 2>&1)",
+                    requests[1].allowed_tools,
+                )
                 self.assertEqual(
                     store.list_pending_slack_agent_requests("claude/channel/permission"),
                     [],

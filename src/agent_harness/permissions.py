@@ -167,7 +167,7 @@ def _safe_auto_bash_command(command: str) -> bool:
     if not command or any(value in command for value in ("\n", "\r", "$(", "`")):
         return False
     try:
-        parts = shlex.split(command)
+        parts = shlex.split(_space_shell_control_operators(command))
     except ValueError:
         return False
     if not parts:
@@ -178,15 +178,42 @@ def _safe_auto_bash_command(command: str) -> bool:
     return all(_safe_auto_bash_segment(segment) for segment in segments)
 
 
+def _space_shell_control_operators(command: str) -> str:
+    spaced: list[str] = []
+    index = 0
+    while index < len(command):
+        char = command[index]
+        next_char = command[index + 1] if index + 1 < len(command) else ""
+        if char == ";":
+            spaced.append(" ; ")
+            index += 1
+            continue
+        if char == "|":
+            if next_char == "|":
+                spaced.append(" || ")
+                index += 2
+                continue
+            spaced.append(" | ")
+            index += 1
+            continue
+        if char == "&" and next_char == "&":
+            spaced.append(" && ")
+            index += 2
+            continue
+        spaced.append(char)
+        index += 1
+    return "".join(spaced)
+
+
 def _split_shell_segments(parts: list[str]) -> list[list[str]]:
     segments: list[list[str]] = [[]]
     for part in parts:
-        if part in {"&&", "|"}:
+        if part in {"&&", "|", ";"}:
             if not segments[-1]:
                 return []
             segments.append([])
             continue
-        if part in {";", "||", "&"}:
+        if part in {"||", "&"}:
             return []
         segments[-1].append(part)
     if not segments[-1]:

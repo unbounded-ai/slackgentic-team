@@ -397,6 +397,16 @@ class ClaudeChannelTests(unittest.TestCase):
                             "description": "check Talos repo status",
                         },
                     ),
+                    (
+                        "req-ls-grep-sequence",
+                        {
+                            "command": (
+                                "ls /private/tmp/talos-qwen3-provider-analysis.patch 2>&1; "
+                                "ls /tmp/ | grep -i talos 2>&1"
+                            ),
+                            "description": "check for prior patch file",
+                        },
+                    ),
                 )
 
                 with (
@@ -437,6 +447,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         {"request_id": "req-git-status", "behavior": "allow"},
                         {"request_id": "req-ls-wc", "behavior": "allow"},
                         {"request_id": "req-git-status-head", "behavior": "allow"},
+                        {"request_id": "req-ls-grep-sequence", "behavior": "allow"},
                     ],
                 )
                 self.assertEqual(gateway.replies, [], "no Slack approval round-trip expected")
