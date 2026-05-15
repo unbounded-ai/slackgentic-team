@@ -16,6 +16,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     AgentTask,
+    AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
     PendingWorkRequest,
@@ -3757,8 +3758,13 @@ def _render_delegate_template(text: str, sender, target) -> str:
 
 def _is_subtask(task: AgentTask) -> bool:
     parent_task_id = task.metadata.get("parent_task_id")
-    if isinstance(parent_task_id, str) and parent_task_id != task.task_id:
-        return True
+    if isinstance(parent_task_id, str):
+        if parent_task_id != task.task_id:
+            return True
+        # Review tasks are one-off helpers even when a same-thread continuation
+        # reuses the prior review task row and makes it self-parented.
+        if task.kind == AgentTaskKind.REVIEW:
+            return True
     return any(
         isinstance(task.metadata.get(key), str)
         for key in ("delegated_from_task_id", "delegate_to_agent_id")
