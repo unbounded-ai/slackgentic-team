@@ -8,6 +8,7 @@ from pathlib import Path
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     AgentSession,
+    AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
     ControlMode,
@@ -691,6 +692,41 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_channel_task_assignment_refreshes_existing_roster_to_occupied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "write the status update",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(gateway.updates[-1]["ts"], "171.roster")
+                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
+            finally:
+                store.close()
+
     def test_roster_shows_runtime_running_task_occupancy(self):
         class RuntimeWithRunningTask(FakeRuntime):
             def __init__(self, running):
@@ -834,6 +870,54 @@ class SlackAppTests(unittest.TestCase):
                 )
                 self.assertNotIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_runtime_self_parented_review_followup_frees_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(
+                        agent,
+                        "review the updated design",
+                        "C1",
+                        kind=AgentTaskKind.REVIEW,
+                    ),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.000001",
+                    parent_message_ts="171.bot",
+                )
+                task = replace(
+                    task,
+                    metadata={
+                        "parent_task_id": task.task_id,
+                        "parent_agent_id": agent.agent_id,
+                        "request_message_ts": "171.user",
+                    },
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertEqual(
+                    [item.agent_id for item in store.idle_team_agents()],
+                    [agent.agent_id],
+                )
+                self.assertIn(
+                    ("C1", "171.user", "hourglass_flowing_sand"),
+                    gateway.removed_reactions,
+                )
             finally:
                 store.close()
 
@@ -2753,6 +2837,89 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(task.session_id, "claude-mina")
                 self.assertEqual(task.metadata["parent_task_id"], requested_prior_task.task_id)
                 self.assertNotEqual(task.session_id, "codex-original")
+            finally:
+                store.close()
+
+    def test_same_thread_review_continuation_frees_reviewer_after_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(1, 1)
+                original = next(
+                    agent for agent in agents if agent.provider_preference == Provider.CODEX
+                )
+                reviewer = next(
+                    agent for agent in agents if agent.provider_preference == Provider.CLAUDE
+                )
+                original = replace(original, handle="ravi")
+                reviewer = replace(reviewer, handle="livia", full_name="Livia Singh")
+                store.upsert_team_agent(original)
+                store.upsert_team_agent(reviewer)
+                original_task = replace(
+                    create_agent_task(
+                        original,
+                        "design the install flow",
+                        "C1",
+                        requested_by_slack_user="U1",
+                    ),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                prior_review = replace(
+                    create_agent_task(
+                        reviewer,
+                        "review v1",
+                        "C1",
+                        requested_by_slack_user="U1",
+                        kind=AgentTaskKind.REVIEW,
+                    ),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.review",
+                    metadata={
+                        "parent_task_id": original_task.task_id,
+                        "parent_agent_id": original.agent_id,
+                    },
+                )
+                store.upsert_agent_task(original_task)
+                store.upsert_agent_task(prior_review)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "@livia review the v2 patch",
+                            "ts": "171.000003",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task, agent, thread = runtime.started[0]
+                self.assertEqual(task.task_id, prior_review.task_id)
+                self.assertEqual(task.metadata["parent_task_id"], prior_review.task_id)
+                self.assertEqual(task.kind, AgentTaskKind.REVIEW)
+
+                controller.handle_runtime_task_done(task, agent, thread)
+
+                self.assertEqual(
+                    store.get_agent_task(prior_review.task_id).status,
+                    AgentTaskStatus.DONE,
+                )
+                self.assertIsNone(store.active_task_for_agent(reviewer.agent_id))
             finally:
                 store.close()
 

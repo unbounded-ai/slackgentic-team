@@ -2392,9 +2392,8 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
-                    if gateway.replies:
-                        break
+                deadline = time.monotonic() + 5
+                while (not gateway.replies or not done_callbacks) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
                 self.assertEqual(gateway.replies, ["Recovered answer"])
@@ -2506,9 +2505,8 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
-                    if gateway.replies:
-                        break
+                deadline = time.monotonic() + 5
+                while (not gateway.replies or not done_callbacks) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
                 self.assertEqual(
@@ -2581,9 +2579,8 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000002"))
-                for _ in range(50):
-                    if gateway.replies:
-                        break
+                deadline = time.monotonic() + 5
+                while (not gateway.replies or not done_callbacks) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
                 self.assertEqual(
