@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent_harness.models import DEFAULT_PERMISSION_MODE, PermissionMode, Provider
 from agent_harness.permissions import (
+    CLAUDE_CHANNEL_PERMISSION_MODE_ENV,
     claude_extra_allowed_tools,
     claude_permission_flag,
     codex_sandbox_for,
@@ -128,6 +129,8 @@ class ManagedAgentProcess:
 
             child_env[SLACK_THREAD_CHANNEL_ENV] = self.request.slack_channel_id
             child_env[SLACK_THREAD_TS_ENV] = self.request.slack_thread_ts
+        if self.request.provider == Provider.CLAUDE:
+            child_env[CLAUDE_CHANNEL_PERMISSION_MODE_ENV] = self.request.permission_mode.value
         if (
             self.request.provider == Provider.CLAUDE
             and self.request.permission_mode == PermissionMode.DANGEROUS

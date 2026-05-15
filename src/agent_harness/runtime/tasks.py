@@ -24,7 +24,10 @@ from agent_harness.models import (
     parse_timestamp,
     utc_now,
 )
-from agent_harness.permissions import task_permission_mode
+from agent_harness.permissions import (
+    claude_safe_auto_permission_request_allowed,
+    task_permission_mode,
+)
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
@@ -616,7 +619,8 @@ class ManagedTaskRuntime:
                 continue
             running.permission_denial_keys.add(key)
             running.permission_denials.append(denial)
-            self._ensure_claude_permission_request(running, denial)
+            if not _claude_safe_auto_denial_allowed(running, denial):
+                self._ensure_claude_permission_request(running, denial)
             new_denial = True
             break
         return new_denial
@@ -682,6 +686,15 @@ class ManagedTaskRuntime:
                 completed_task,
                 denial,
                 (internal_tool,),
+            )
+            return
+        safe_auto_allowed_tools = _safe_auto_allowed_tools_for_claude_denial(running, denial)
+        if safe_auto_allowed_tools:
+            self._retry_claude_permission_denial(
+                running,
+                completed_task,
+                denial,
+                safe_auto_allowed_tools,
             )
             return
         allowed_tools = _allowed_tools_for_claude_denial(denial)
@@ -1266,6 +1279,29 @@ def _allowed_tools_for_claude_denial(denial: dict) -> tuple[str, ...]:
     if tool_name in {"Edit", "MultiEdit", "Write"}:
         return (tool_name,)
     return ()
+
+
+def _claude_safe_auto_denial_allowed(running: RunningTask, denial: dict) -> bool:
+    return bool(_safe_auto_allowed_tools_for_claude_denial(running, denial))
+
+
+def _safe_auto_allowed_tools_for_claude_denial(
+    running: RunningTask,
+    denial: dict,
+) -> tuple[str, ...]:
+    if running.process.request.permission_mode != PermissionMode.SAFE_AUTO:
+        return ()
+    tool_name = str(denial.get("tool_name") or "")
+    tool_input = denial.get("tool_input")
+    params: dict[str, object] = {"tool_name": tool_name}
+    if isinstance(tool_input, dict):
+        params["tool_input"] = tool_input
+    if not claude_safe_auto_permission_request_allowed(params):
+        return ()
+    allowed_tools = _allowed_tools_for_claude_denial(denial)
+    if allowed_tools:
+        return allowed_tools
+    return (tool_name,) if tool_name else ()
 
 
 def _slackgentic_mcp_tool_for_claude_denial(denial: dict) -> str | None:
