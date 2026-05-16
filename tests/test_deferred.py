@@ -30,6 +30,21 @@ class DeferredDetectorTests(unittest.TestCase):
         text = "wait for @riley to finish, then summarize the report"
         self.assertTrue(looks_like_deferred_request(text))
 
+    def test_detects_common_completion_wordings_with_handle_and_followon(self):
+        for gate in (
+            "is done",
+            "is complete",
+            "is completed",
+            "completed",
+            "completes",
+            "is finished",
+            "finished",
+            "finishes",
+        ):
+            with self.subTest(gate=gate):
+                text = f"after @riley {gate} @nell summarize the report"
+                self.assertTrue(looks_like_deferred_request(text))
+
     def test_detects_schedule_with_dep(self):
         text = f"schedule @nell to review the dashboard in 20 minutes after {PERMALINK} finishes"
         self.assertTrue(looks_like_deferred_request(text))
@@ -49,6 +64,11 @@ class DeferredDetectorTests(unittest.TestCase):
     def test_rejects_after_without_dep_target(self):
         text = "after we ship, do a retro"
         self.assertFalse(looks_like_deferred_request(text))
+
+    def test_rejects_after_dependency_without_followon_instruction(self):
+        for text in ("after @riley is done", "after @riley is done,", "after @riley finishes,"):
+            with self.subTest(text=text):
+                self.assertFalse(looks_like_deferred_request(text))
 
 
 class DeferredSignalTests(unittest.TestCase):
@@ -99,6 +119,25 @@ class DeferredSignalTests(unittest.TestCase):
         assert deferred is not None
         self.assertEqual(deferred.request.requested_handle, "nell")
         self.assertEqual(deferred.depends_on[0].task_id, "task_xyz")
+
+    def test_parses_future_assignee_from_task_when_target_is_anyone(self):
+        result = parse_agent_deferred_signal(
+            self._signal(
+                {
+                    "task": "@nell cd into slackgentic-team and run the checks",
+                    "target": "somebody",
+                    "depends_on": [{"kind": "agent_busy", "handle": "riley"}],
+                }
+            ),
+            known_handles=["riley", "nell"],
+            occupied_task_ids={"riley": "task_xyz"},
+        )
+        self.assertIsNone(result.error)
+        deferred = result.deferred
+        assert deferred is not None
+        self.assertEqual(deferred.request.assignment_mode, AssignmentMode.SPECIFIC)
+        self.assertEqual(deferred.request.requested_handle, "nell")
+        self.assertEqual(deferred.request.prompt, "cd into slackgentic-team and run the checks")
 
     def test_agent_busy_rejects_idle_agent(self):
         result = parse_agent_deferred_signal(

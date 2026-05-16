@@ -16,6 +16,7 @@ from agent_harness.models import (
     parse_timestamp,
     utc_now,
 )
+from agent_harness.team.routing import parse_work_request
 
 AGENT_DEFERRED_SIGNAL_PREFIX = "SLACKGENTIC: DEPEND "
 DEFERRED_RESOLUTION_METADATA_KEY = "deferred_resolution"
@@ -33,9 +34,21 @@ _AFTER_PREFIX_RE = re.compile(
     r"^\s*(?:<@[A-Z0-9]+>\s*[:,]?\s*)?(after|once|wait\s+for|wait\s+until|when)\b",
     re.IGNORECASE,
 )
+_DEP_GATE_WORD_RE = (
+    r"(?:"
+    r"done|"
+    r"complete|completed|completes?|"
+    r"finish|finished|finishes?|"
+    r"landed?|lands?|"
+    r"free|frees?\s+up|free\s+up|"
+    r"wrapped?\s+up|wraps?\s+up|"
+    r"merged?|merges?|"
+    r"goes?\s+in"
+    r")"
+)
 _SCHEDULE_WITH_GATE_RE = re.compile(
-    r"\b(after|once|when|wait\s+for|wait\s+until)\b.{0,200}\b(finish|finishe[ds]?|complet[eds]?|"
-    r"land[eds]?|done|free|free\s+up|wraps?\s+up|wrap[ped]+\s+up|merge[ds]?|goes?\s+in)\b",
+    rf"\b(after|once|when|wait\s+for|wait\s+until)\b.{{0,200}}\b(?:is|are|be|been|has|have|"
+    rf"gets?|becomes?|to)?\s*{_DEP_GATE_WORD_RE}\b",
     re.IGNORECASE | re.DOTALL,
 )
 # The legacy in-thread "I am waiting on the linked thread" idiom — handled by
@@ -87,13 +100,13 @@ def _strip_dep_clause(text: str) -> str:
     cleaned = _AT_HANDLE_RE.sub(" ", cleaned)
     # Drop the lead-in connectors so we can see whether real instruction text remains.
     cleaned = re.sub(
-        r"\b(after|once|when|wait\s+for|wait\s+until|and|then|,|finish(?:es|ed)?|"
-        r"complete(?:s|d)?|land(?:s|ed)?|done|free(?:\s+up)?|wrap(?:s|ped)?(?:\s+up)?|"
-        r"merge(?:s|d)?|goes?\s+in)\b",
+        rf"\b(after|once|when|wait\s+for|wait\s+until|and|then|is|are|be|been|has|have|"
+        rf"gets?|becomes?|to|,|{_DEP_GATE_WORD_RE})\b",
         " ",
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(r"[,.;:]+", " ", cleaned)
     cleaned = re.sub(r"https?://\S+", " ", cleaned)
     cleaned = re.sub(r"[<>]", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
@@ -150,7 +163,7 @@ def build_deferred_resolution_prompt(
             "Resolve which threads and which busy agents this request depends on. Use the "
             "Slack permalinks the user pasted to identify thread dependencies. Use the "
             "occupied agents list to record agent-busy dependencies as the agent's current "
-            "task_id (snapshot it now)."
+            "task_id or external_session dependency id (snapshot it now)."
         ),
         "",
         "Emit exactly one hidden control line on its own final line:",
@@ -184,7 +197,9 @@ def build_deferred_resolution_prompt(
         (
             "Rules: depends_on must include at least one entry. Use kind=thread with the "
             "full permalink the user pasted (do not invent permalinks). Use kind=agent_busy "
-            "with handle and the current task_id from the occupied list. Either delay OR "
+            "with handle and the current task_id from the occupied list. If the user writes "
+            "'after @ravi is done @eli do X', @ravi is the dependency and @eli is the "
+            "target for the future task. Either delay OR "
             "run_at may be set, never both. delay.seconds is the number of seconds to wait "
             "after every dependency is satisfied. run_at is an absolute UTC timestamp; the "
             "task will fire at max(deps_satisfied_at, run_at), never earlier than deps. The "
@@ -383,8 +398,17 @@ def _work_request(
 ) -> WorkRequest | str:
     normalized_target = str(target or "somebody").strip().lstrip("@").lower()
     if normalized_target in ANYONE_TARGETS:
-        assignment_mode = AssignmentMode.ANYONE
-        requested_handle = None
+        embedded_request = parse_work_request(task, known_handles)
+        if (
+            embedded_request is not None
+            and embedded_request.assignment_mode == AssignmentMode.SPECIFIC
+        ):
+            assignment_mode = AssignmentMode.SPECIFIC
+            requested_handle = embedded_request.requested_handle
+            task = embedded_request.prompt
+        else:
+            assignment_mode = AssignmentMode.ANYONE
+            requested_handle = None
     else:
         normalized_handles = {handle.lower(): handle for handle in known_handles}
         requested_handle = normalized_handles.get(normalized_target)
