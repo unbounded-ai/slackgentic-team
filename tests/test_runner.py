@@ -144,7 +144,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(args[permission_index + 1], "acceptEdits")
         self.assertNotIn("--dangerously-skip-permissions", args)
         self.assertIn("--allowedTools=Bash(git status:*)", args)
+        self.assertIn("--allowedTools=Bash(git pull --ff-only:*)", args)
         self.assertIn("--allowedTools=Bash(gh pr view:*)", args)
+        self.assertIn("--allowedTools=Bash(gh pr create:*)", args)
 
     def test_claude_safe_auto_allowlist_excludes_mutating_commands(self):
         command, args = build_command(

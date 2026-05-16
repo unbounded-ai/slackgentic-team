@@ -53,8 +53,14 @@ _GIT_SAFE_SUBCOMMAND_TOOLS: dict[str, tuple[str, ...]] = {
     "merge-base": ("Bash(git merge-base:*)", "Bash(git merge-base *)"),
     "for-each-ref": ("Bash(git for-each-ref:*)", "Bash(git for-each-ref *)"),
 }
+_GIT_FAST_FORWARD_PULL_TOOLS = (
+    "Bash(git pull --ff-only)",
+    "Bash(git pull --ff-only:*)",
+    "Bash(git pull --ff-only *)",
+)
 _GH_SAFE_COMMAND_TOOLS: dict[tuple[str, str], tuple[str, ...]] = {
     ("pr", "checks"): ("Bash(gh pr checks:*)", "Bash(gh pr checks *)"),
+    ("pr", "create"): ("Bash(gh pr create:*)", "Bash(gh pr create *)"),
     ("pr", "diff"): ("Bash(gh pr diff:*)", "Bash(gh pr diff *)"),
     ("pr", "list"): ("Bash(gh pr list:*)", "Bash(gh pr list *)"),
     ("pr", "status"): ("Bash(gh pr status:*)", "Bash(gh pr status *)"),
@@ -71,6 +77,7 @@ BASH_SAFE_AUTO_ALLOWED_TOOLS: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
             *[tool for tools in _GIT_SAFE_SUBCOMMAND_TOOLS.values() for tool in tools],
+            *_GIT_FAST_FORWARD_PULL_TOOLS,
             "Bash(gh auth status)",
             *[tool for tools in _GH_SAFE_COMMAND_TOOLS.values() for tool in tools],
             *[tool for tools in _SAFE_SIMPLE_EXECUTABLE_TOOLS.values() for tool in tools],
@@ -289,6 +296,8 @@ def _unsafe_git_reason(parts: tuple[str, ...]) -> str | None:
     action, remaining = parsed
     if _contains_git_output_redirect_flag(remaining):
         return "git output redirect flag"
+    if action == "pull":
+        return _unsafe_git_pull_reason(remaining)
     if action not in _GIT_SAFE_SUBCOMMAND_TOOLS:
         return f"unsupported git subcommand {action}"
     if not all(_safe_shell_arg(part) for part in remaining):
@@ -298,6 +307,21 @@ def _unsafe_git_reason(parts: tuple[str, ...]) -> str | None:
 
 def _contains_git_output_redirect_flag(parts: tuple[str, ...] | list[str]) -> bool:
     return any(part == "--output" or part.startswith("--output=") for part in parts)
+
+
+def _unsafe_git_pull_reason(parts: tuple[str, ...]) -> str | None:
+    has_fast_forward_only = False
+    for part in parts:
+        if part == "--ff-only":
+            has_fast_forward_only = True
+            continue
+        if part.startswith("-"):
+            return "git pull without only fast-forward"
+        if not _safe_shell_arg(part):
+            return "unsafe git pull argument"
+    if not has_fast_forward_only:
+        return "git pull without only fast-forward"
+    return None
 
 
 def _git_subcommand(parts: tuple[str, ...]) -> tuple[str, tuple[str, ...]] | None:
@@ -499,6 +523,14 @@ def _allowed_gh_bash_tools(
 
 
 def _allowed_git_bash_tools(parts: tuple[str, ...]) -> tuple[str, ...]:
+    parsed = _git_subcommand(parts)
+    if parsed is not None:
+        action, remaining = parsed
+        if action == "pull" and _unsafe_git_pull_reason(remaining) is None:
+            prefix = _git_action_prefix(parts)
+            if prefix == "git pull":
+                return _GIT_FAST_FORWARD_PULL_TOOLS
+            return ()
     git_command = _git_read_only_command(parts)
     if git_command is None:
         return ()

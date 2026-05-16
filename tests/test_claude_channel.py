@@ -406,6 +406,20 @@ class ClaudeChannelTests(unittest.TestCase):
                             "description": "check for prior patch file",
                         },
                     ),
+                    (
+                        "req-git-pull-ff-only",
+                        {
+                            "command": ("git -C /workspace/repos/example-project pull --ff-only"),
+                            "description": "fast-forward example repo main",
+                        },
+                    ),
+                    (
+                        "req-gh-pr-create",
+                        {
+                            "command": ("gh pr create --title update --body summary"),
+                            "description": "create pull request",
+                        },
+                    ),
                 )
 
                 with (
@@ -447,6 +461,8 @@ class ClaudeChannelTests(unittest.TestCase):
                         {"request_id": "req-ls-wc", "behavior": "allow"},
                         {"request_id": "req-git-status-head", "behavior": "allow"},
                         {"request_id": "req-ls-grep-sequence", "behavior": "allow"},
+                        {"request_id": "req-git-pull-ff-only", "behavior": "allow"},
+                        {"request_id": "req-gh-pr-create", "behavior": "allow"},
                     ],
                 )
                 self.assertEqual(gateway.replies, [], "no Slack approval round-trip expected")
