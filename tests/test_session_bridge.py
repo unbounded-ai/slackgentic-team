@@ -5,6 +5,7 @@ import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import AgentSession, Provider, SessionStatus, SlackThreadRef
@@ -16,15 +17,24 @@ from agent_harness.sessions.bridge import (
     is_session_exit_request,
 )
 from agent_harness.sessions.terminal import TerminalTarget
+from agent_harness.slack.agent_requests import SlackAgentRequestHandler
+from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
 
 
 class FakeGateway:
     def __init__(self):
         self.replies = []
+        self.updates = []
 
     def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
         self.replies.append((thread, text))
+        return PostedMessage(
+            thread.channel_id, f"1712345678.{len(self.replies):06d}", thread.thread_ts
+        )
+
+    def update_message(self, channel_id, ts, text, blocks=None):
+        self.updates.append((channel_id, ts, text, blocks))
 
 
 class FakeTerminalNotifier:
@@ -462,6 +472,161 @@ class SessionBridgeTests(unittest.TestCase):
                     store.get_session(Provider.CODEX, "codex-s1").status,
                     SessionStatus.DONE,
                 )
+            finally:
+                store.close()
+
+    def test_codex_bypass_session_auto_approves_app_server_command_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command=(
+                            "codex --dangerously-bypass-approvals-and-sandbox "
+                            "--remote ws://localhost:47684"
+                        ),
+                        started_at=started,
+                    )
+                ]
+            )
+            clients = []
+
+            class FakeAppServerClient:
+                def __init__(self, url, timeout_seconds=8.0, server_request_handler=None):
+                    self.url = url
+                    self.server_request_handler = server_request_handler
+                    self.responses = []
+                    clients.append(self)
+
+                def send_to_thread(self, thread_id, text, cwd=None):
+                    self.responses.append(
+                        self.server_request_handler(
+                            {
+                                "id": 1,
+                                "method": "item/commandExecution/requestApproval",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "command": "git rebase origin/main",
+                                    "cwd": str(cwd),
+                                },
+                            }
+                        )
+                    )
+                    return True
+
+            try:
+                store.init_schema()
+                gateway = FakeGateway()
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    terminal_notifier=terminal,
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=datetime.now(UTC),
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient", FakeAppServerClient
+                ):
+                    handled = bridge.send_to_session(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                self.assertEqual(clients[0].responses, [{"decision": "acceptForSession"}])
+                self.assertEqual(gateway.replies, [])
+            finally:
+                store.close()
+
+    def test_codex_non_bypass_session_still_posts_app_server_command_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command="codex --remote ws://localhost:47684",
+                    )
+                ]
+            )
+            clients = []
+
+            class FakeAppServerClient:
+                def __init__(self, url, timeout_seconds=8.0, server_request_handler=None):
+                    self.server_request_handler = server_request_handler
+                    self.responses = []
+                    clients.append(self)
+
+                def send_to_thread(self, thread_id, text, cwd=None):
+                    self.responses.append(
+                        self.server_request_handler(
+                            {
+                                "id": 1,
+                                "method": "item/commandExecution/requestApproval",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "command": "git rebase origin/main",
+                                    "cwd": str(cwd),
+                                },
+                            }
+                        )
+                    )
+                    return True
+
+            try:
+                store.init_schema()
+                gateway = FakeGateway()
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    terminal_notifier=terminal,
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    agent_request_handler=SlackAgentRequestHandler(
+                        gateway,
+                        timeout_seconds=0.01,
+                        provider_label="Codex",
+                    ),
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    last_seen_at=datetime.now(UTC),
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient", FakeAppServerClient
+                ):
+                    handled = bridge.send_to_session(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                self.assertEqual(clients[0].responses, [{"decision": "cancel"}])
+                self.assertEqual(len(gateway.replies), 1)
+                self.assertIn("Codex requests command approval.", gateway.replies[0][1])
             finally:
                 store.close()
 

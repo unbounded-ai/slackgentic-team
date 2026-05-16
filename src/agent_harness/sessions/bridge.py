@@ -13,10 +13,17 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from agent_harness.config import AgentCommandConfig
-from agent_harness.models import AgentSession, Provider, SessionStatus, SlackThreadRef, utc_now
+from agent_harness.models import (
+    AgentSession,
+    PermissionMode,
+    Provider,
+    SessionStatus,
+    SlackThreadRef,
+    utc_now,
+)
 from agent_harness.runtime.codex_app_server import (
     CodexAppServerClient,
 )
@@ -222,8 +229,21 @@ class ExternalSessionBridge:
         else:
             server_request_handler = None
             if thread is not None:
+                bypass_approvals = _codex_session_bypasses_approvals(
+                    session,
+                    self.terminal_notifier,
+                    self.commands,
+                )
 
                 def server_request_handler(request):
+                    if bypass_approvals:
+                        response = _codex_bypass_approval_response(request)
+                        if response is not None:
+                            LOGGER.info(
+                                "auto-approved Codex app-server request for bypass session %s",
+                                session.session_id,
+                            )
+                            return response
                     return self.agent_request_handler.handle_server_request(
                         request,
                         thread,
@@ -584,6 +604,45 @@ def _session_can_use_live_target(session: AgentSession) -> bool:
     if entrypoint is None:
         return True
     return entrypoint == "cli"
+
+
+def _codex_session_bypasses_approvals(
+    session: AgentSession,
+    terminal_notifier: SessionTerminalNotifier,
+    commands: AgentCommandConfig,
+) -> bool:
+    if session.provider != Provider.CODEX:
+        return False
+    if commands.dangerous_by_default:
+        return True
+    if session.permission_mode == PermissionMode.DANGEROUS.value:
+        return True
+    if session.metadata.get("dangerous_mode") is True:
+        return True
+    for target in terminal_notifier.targets_for_session(session):
+        if _codex_command_bypasses_approvals(target.command):
+            return True
+    return False
+
+
+def _codex_command_bypasses_approvals(command: str) -> bool:
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        args = command.split()
+    return dangerous_flag(Provider.CODEX) in args
+
+
+def _codex_bypass_approval_response(request: dict[str, Any]) -> dict[str, Any] | None:
+    method = str(request.get("method") or "")
+    params = request.get("params") if isinstance(request.get("params"), dict) else {}
+    if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+        return {"decision": "acceptForSession"}
+    if method == "item/permissions/requestApproval":
+        return {"permissions": params.get("permissions") or {}, "scope": "session"}
+    if method in {"execCommandApproval", "applyPatchApproval"}:
+        return {"decision": "approved_for_session"}
+    return None
 
 
 def _same_path(left: Path, right: Path) -> bool:
