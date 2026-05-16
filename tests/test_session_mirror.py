@@ -1581,6 +1581,76 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_codex_subagent_session_is_not_mirrored_as_external(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=1, claude_count=0)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="subagent-s1",
+                    transcript_path=Path(tmp) / "codex-subagent.jsonl",
+                    status=SessionStatus.ACTIVE,
+                    metadata={
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "parent_thread_id": "parent-s1",
+                                    "depth": 1,
+                                }
+                            }
+                        }
+                    },
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="subagent-s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={
+                            "payload": {
+                                "type": "user_message",
+                                "message": "private Slack task context",
+                            }
+                        },
+                    ),
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="subagent-s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=2,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    ),
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(
+                        Provider.CODEX,
+                        "subagent-s1",
+                        "T1",
+                        "C1",
+                    )
+                )
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "subagent-s1"), 0)
+            finally:
+                store.close()
+
     def test_external_session_requires_matching_provider_capacity(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
