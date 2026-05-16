@@ -77,6 +77,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Register the Slackgentic Claude channel in user-level Claude MCP config",
     )
 
+    codex_mcp = sub.add_parser("codex-mcp", help="Run the Slackgentic MCP server for Codex")
+    codex_mcp.add_argument("--db", type=Path)
+    codex_mcp.add_argument(
+        "--install",
+        action="store_true",
+        help="Register the Slackgentic MCP server in user-level Codex config",
+    )
+
     team = sub.add_parser("team", help="Manage the lightweight agent team")
     team_sub = team.add_subparsers(dest="team_command", required=True)
 
@@ -263,6 +271,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         return run_channel_server(args.db)
+    if args.command == "codex-mcp":
+        from agent_harness.sessions.claude_channel import (
+            install_codex_mcp_server,
+            run_channel_server,
+        )
+
+        if args.install:
+            install_codex_mcp_server()
+            print("registered Codex MCP server: slackgentic")
+            return 0
+        return run_channel_server(args.db, provider_label="Codex")
     if args.command == "team":
         return _team(args)
     if args.command == "service":

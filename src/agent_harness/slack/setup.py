@@ -183,6 +183,7 @@ def run_interactive_setup(options: SlackSetupOptions | None = None) -> int:
     )
     print(f"Saved Slackgentic credentials to {saved_path}.")
     _install_claude_channel_if_available()
+    _install_codex_mcp_if_available()
     print("Sessions started outside Slack will be mirrored with this Slack app identity.")
     command = _slackgentic_executable()
     print("Next, install and start the background service:")
@@ -204,6 +205,21 @@ def _install_claude_channel_if_available() -> None:
         print("Run `slackgentic claude-channel --install` after Claude is available.")
         return
     print("Registered Claude Slack channel MCP server.")
+
+
+def _install_codex_mcp_if_available() -> None:
+    if shutil.which("codex") is None:
+        print("Codex CLI not found on PATH; skipping Codex MCP registration.")
+        return
+    try:
+        from agent_harness.sessions.claude_channel import install_codex_mcp_server
+
+        install_codex_mcp_server()
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Warning: failed to register Codex MCP server: {exc}")
+        print("Run `slackgentic codex-mcp --install` after Codex is available.")
+        return
+    print("Registered Codex MCP server.")
 
 
 def update_slack_app_manifest(options: SlackManifestUpdateOptions | None = None) -> int:

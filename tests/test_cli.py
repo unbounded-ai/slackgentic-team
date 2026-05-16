@@ -216,6 +216,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("TCC privacy prompts", output.getvalue())
 
+    def test_codex_mcp_install_registers_server(self):
+        output = io.StringIO()
+        with (
+            patch("agent_harness.sessions.claude_channel.install_codex_mcp_server") as install,
+            redirect_stdout(output),
+        ):
+            code = main(["codex-mcp", "--install"])
+
+        self.assertEqual(code, 0)
+        install.assert_called_once_with()
+        self.assertIn("registered Codex MCP server", output.getvalue())
+
     def test_service_install_refuses_python_314_runtime(self):
         output = io.StringIO()
         with (

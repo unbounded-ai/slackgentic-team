@@ -774,6 +774,58 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_refresh_skips_unchanged_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                roster_ts = controller.post_roster("C1")
+                controller.refresh_or_post_roster("C1")
+
+                self.assertEqual(gateway.updates, [])
+                self.assertEqual(gateway.pins, [("C1", roster_ts)])
+
+                task = create_agent_task(agent, "ship the fix", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.thread", "171.thread")
+                controller.refresh_or_post_roster("C1")
+                controller.refresh_or_post_roster("C1")
+
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn("0 available, 1 occupied", gateway.updates[0]["text"])
+                self.assertEqual(gateway.pins, [("C1", roster_ts)])
+            finally:
+                store.close()
+
+    def test_task_status_reaction_transition_removes_only_known_previous_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller._mark_message_acknowledged("C1", "171.000001")
+                gateway.removed_reactions.clear()
+
+                controller._mark_message_in_progress("C1", "171.000001")
+                controller._mark_message_in_progress("C1", "171.000001")
+
+                self.assertEqual(
+                    gateway.reactions[-1], ("C1", "171.000001", "hourglass_flowing_sand")
+                )
+                self.assertEqual(
+                    gateway.removed_reactions,
+                    [("C1", "171.000001", "eyes")],
+                )
+            finally:
+                store.close()
+
     def test_roster_shows_runtime_running_task_occupancy(self):
         class RuntimeWithRunningTask(FakeRuntime):
             def __init__(self, running):

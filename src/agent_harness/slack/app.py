@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -152,6 +153,8 @@ SETTING_CHANNEL_ID = "slack.channel_id"
 SETTING_ROSTER_TS = "slack.roster_ts"
 SETTING_ROSTER_MESSAGE_PREFIX = "slack.roster_message."
 SETTING_ROSTER_DISCOVERY_PREFIX = "slack.roster_discovery."
+SETTING_ROSTER_RENDER_HASH_PREFIX = "slack.roster_render_hash."
+SETTING_ROSTER_PINNED_PREFIX = "slack.roster_pinned."
 SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
 SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
@@ -174,7 +177,9 @@ TASK_STATUS_REACTIONS = (
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
 SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
+SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SLACK_BACKFILL_FETCH_LIMIT = 500
+SLACK_BACKFILL_KNOWN_THREAD_LIMIT = 200
 SLACK_BACKFILL_GRACE_SECONDS = 5.0
 SLACK_BACKFILL_SLEEP_GAP_SECONDS = 30.0
 DEFAULT_AGENT_AVATAR_BASE_URL = (
@@ -1331,16 +1336,19 @@ class SlackTeamController:
     ) -> str:
         agents = self.store.list_team_agents()
         statuses = self._roster_statuses(agents)
+        text = _roster_text(agents, statuses)
+        blocks = build_team_roster_blocks(agents, statuses)
         posted = self.gateway.post_message(
             channel_id,
-            _roster_text(agents, statuses),
-            blocks=build_team_roster_blocks(agents, statuses),
+            text,
+            blocks=blocks,
             thread_ts=thread_ts,
         )
         if remember:
             self._remember_roster_message(channel_id, posted.ts)
+            self._remember_roster_render(channel_id, posted.ts, text, blocks)
             if thread_ts is None:
-                self._pin_roster(channel_id, posted.ts)
+                self._pin_roster_once(channel_id, posted.ts)
         return posted.ts
 
     def refresh_or_post_roster(self, channel_id: str) -> str:
@@ -1355,10 +1363,12 @@ class SlackTeamController:
             self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
             self.store.set_setting(SETTING_ROSTER_TS, latest_roster_ts)
             try:
-                self._pin_roster(channel_id, latest_roster_ts)
+                self._pin_roster_once(channel_id, latest_roster_ts)
             except Exception:
                 LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
             for roster_ts in roster_ts_values:
+                if self._roster_render_is_current(channel_id, roster_ts, text, blocks):
+                    continue
                 try:
                     self.gateway.update_message(
                         channel_id,
@@ -1366,6 +1376,7 @@ class SlackTeamController:
                         text,
                         blocks=blocks,
                     )
+                    self._remember_roster_render(channel_id, roster_ts, text, blocks)
                 except Exception:
                     LOGGER.debug(
                         "failed to update Slack roster message %s",
@@ -1390,6 +1401,29 @@ class SlackTeamController:
         self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
         self.store.set_setting(SETTING_ROSTER_TS, message_ts)
         self.store.set_setting(_roster_message_setting_key(channel_id, message_ts), message_ts)
+
+    def _remember_roster_render(
+        self,
+        channel_id: str,
+        message_ts: str,
+        text: str,
+        blocks: list[dict],
+    ) -> None:
+        self.store.set_setting(
+            _roster_render_hash_setting_key(channel_id, message_ts),
+            _roster_render_hash(text, blocks),
+        )
+
+    def _roster_render_is_current(
+        self,
+        channel_id: str,
+        message_ts: str,
+        text: str,
+        blocks: list[dict],
+    ) -> bool:
+        return self.store.get_setting(
+            _roster_render_hash_setting_key(channel_id, message_ts)
+        ) == _roster_render_hash(text, blocks)
 
     def _remembered_roster_ts_values(self, channel_id: str) -> list[str]:
         values: list[str] = []
@@ -1436,14 +1470,23 @@ class SlackTeamController:
             return 0
         return self.resume_pending_work_requests(channel_id)
 
-    def _pin_roster(self, channel_id: str, message_ts: str) -> None:
-        self._pin_message(channel_id, message_ts, "roster message")
+    def _pin_roster(self, channel_id: str, message_ts: str) -> bool:
+        return self._pin_message(channel_id, message_ts, "roster message")
 
-    def _pin_message(self, channel_id: str, message_ts: str, label: str) -> None:
+    def _pin_roster_once(self, channel_id: str, message_ts: str) -> None:
+        key = _roster_pinned_setting_key(channel_id, message_ts)
+        if self.store.get_setting(key):
+            return
+        if self._pin_roster(channel_id, message_ts):
+            self.store.set_setting(key, utc_now().isoformat())
+
+    def _pin_message(self, channel_id: str, message_ts: str, label: str) -> bool:
         try:
             self.gateway.pin_message(channel_id, message_ts)
         except Exception:
             LOGGER.debug("failed to pin Slack %s", label, exc_info=True)
+            return False
+        return True
 
     def post_initial_introductions(self, channel_id: str) -> None:
         agents = self.store.list_team_agents()
@@ -4061,13 +4104,23 @@ class SlackTeamController:
     ) -> None:
         if not message_ts:
             return
+        current_reaction = self.store.get_setting(
+            _message_status_reaction_setting_key(channel_id, message_ts)
+        )
+        if current_reaction == reaction_name:
+            return
         self._clear_message_status_reactions(
             channel_id,
             message_ts,
             except_reaction=reaction_name,
+            known_reaction=current_reaction,
         )
         try:
             self.gateway.add_reaction(channel_id, message_ts, reaction_name)
+            self.store.set_setting(
+                _message_status_reaction_setting_key(channel_id, message_ts),
+                reaction_name,
+            )
         except Exception:
             LOGGER.debug("failed to add Slack task status reaction", exc_info=True)
 
@@ -4077,18 +4130,29 @@ class SlackTeamController:
         message_ts: str | None,
         *,
         except_reaction: str | None = None,
+        known_reaction: str | None = None,
     ) -> None:
         if not message_ts:
             return
         remove_reaction = getattr(self.gateway, "remove_reaction", None)
-        if callable(remove_reaction):
-            for reaction in TASK_STATUS_REACTIONS:
-                if reaction == except_reaction:
-                    continue
-                try:
-                    remove_reaction(channel_id, message_ts, reaction)
-                except Exception:
-                    LOGGER.debug("failed to remove stale Slack task reaction", exc_info=True)
+        if not callable(remove_reaction):
+            return
+        status_key = _message_status_reaction_setting_key(channel_id, message_ts)
+        stored_reaction = known_reaction or self.store.get_setting(status_key)
+        if stored_reaction in TASK_STATUS_REACTIONS:
+            reactions = (stored_reaction,)
+        else:
+            reactions = TASK_STATUS_REACTIONS
+        for reaction in reactions:
+            if reaction == except_reaction:
+                continue
+            try:
+                remove_reaction(channel_id, message_ts, reaction)
+            except Exception:
+                LOGGER.debug("failed to remove stale Slack task reaction", exc_info=True)
+        if except_reaction and stored_reaction == except_reaction:
+            return
+        self.store.delete_setting(status_key)
 
     def _remove_task_action_buttons_if_resolved(self, task: AgentTask) -> None:
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
@@ -4444,12 +4508,30 @@ class SlackMessageBackfill:
         return list(events_by_ts.values())
 
     def _known_thread_ts(self, channel_id: str) -> set[str]:
-        thread_ts_values = {
-            task.thread_ts
+        thread_ts_values: set[str] = set()
+        tasks = [
+            task
             for task in self.store.list_agent_tasks(include_done=True)
             if task.channel_id == channel_id and task.thread_ts
-        }
-        for session in self.store.list_sessions():
+        ]
+        tasks.sort(
+            key=lambda task: (
+                task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE},
+                -(task.updated_at.timestamp()),
+            )
+        )
+        for task in tasks[:SLACK_BACKFILL_KNOWN_THREAD_LIMIT]:
+            if task.thread_ts:
+                thread_ts_values.add(task.thread_ts)
+        remaining = max(0, SLACK_BACKFILL_KNOWN_THREAD_LIMIT - len(thread_ts_values))
+        sessions = sorted(
+            self.store.list_sessions(),
+            key=lambda session: (
+                session.status != SessionStatus.ACTIVE,
+                -((session.last_seen_at or utc_now()).timestamp()),
+            ),
+        )
+        for session in sessions[:remaining]:
             thread = self.store.get_slack_thread_for_session(
                 session.provider,
                 session.session_id,
@@ -4968,8 +5050,29 @@ def _roster_message_setting_key(channel_id: str, message_ts: str) -> str:
     return f"{_roster_message_channel_prefix(channel_id)}{message_ts}"
 
 
+def _roster_render_hash_setting_key(channel_id: str, message_ts: str) -> str:
+    return f"{SETTING_ROSTER_RENDER_HASH_PREFIX}{channel_id}.{message_ts}"
+
+
+def _roster_pinned_setting_key(channel_id: str, message_ts: str) -> str:
+    return f"{SETTING_ROSTER_PINNED_PREFIX}{channel_id}.{message_ts}"
+
+
 def _roster_discovery_setting_key(channel_id: str) -> str:
     return f"{SETTING_ROSTER_DISCOVERY_PREFIX}{channel_id}"
+
+
+def _roster_render_hash(text: str, blocks: list[dict]) -> str:
+    payload = json.dumps(
+        {"text": text, "blocks": blocks},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _message_status_reaction_setting_key(channel_id: str, message_ts: str) -> str:
+    return f"{SETTING_MESSAGE_STATUS_REACTION_PREFIX}{channel_id}.{message_ts}"
 
 
 def _is_roster_message(message: dict) -> bool:

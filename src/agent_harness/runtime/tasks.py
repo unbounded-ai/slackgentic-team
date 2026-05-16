@@ -53,6 +53,8 @@ MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
+FAST_STREAM_POLL_SECONDS = 0.1
+MIN_STREAM_POLL_SECONDS = 0.01
 MACOS_TCC_PROTECTED_HOME_DIRS = (
     "Desktop",
     "Documents",
@@ -91,6 +93,7 @@ class RunningTask:
     visible_message_count: int = 0
     started_monotonic: float = field(default_factory=time.monotonic)
     stop_requested: bool = False
+    wake_event: threading.Event = field(default_factory=threading.Event)
 
 
 class ManagedTaskRuntime:
@@ -245,6 +248,7 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.debug("failed to send message to running managed task", exc_info=True)
             return False
+        running.wake_event.set()
         return True
 
     def stop_task(
@@ -261,6 +265,7 @@ class ManagedTaskRuntime:
                 self.store.update_agent_task_status(task_id, status)
             return False
         running.stop_requested = True
+        running.wake_event.set()
         running.process.terminate()
         if status is not None:
             self._clear_managed_run_started(task_id)
@@ -288,6 +293,7 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.debug("failed to interrupt running managed task", exc_info=True)
             return False
+        running.wake_event.set()
         return True
 
     def is_task_running(self, task_id: str) -> bool:
@@ -351,11 +357,13 @@ class ManagedTaskRuntime:
             self._handle_task_worker_failure(task_id)
 
     def _stream_task_loop(self, task_id: str) -> None:
+        sleep_seconds = _fast_stream_poll_seconds(self.poll_seconds)
         while True:
             running = self._get_running(task_id)
             if running is None:
                 return
             output = running.process.read_available()
+            had_output = bool(output)
             if running.stop_requested:
                 self._remove_running_task(task_id, running)
                 return
@@ -432,7 +440,14 @@ class ManagedTaskRuntime:
                 if self.on_task_done:
                     self.on_task_done(completed_task, running.agent, running.thread)
                 return
-            time.sleep(self.poll_seconds)
+            sleep_seconds = _next_stream_poll_seconds(
+                sleep_seconds,
+                configured_poll_seconds=self.poll_seconds,
+                had_output=had_output,
+            )
+            if running.wake_event.wait(sleep_seconds):
+                running.wake_event.clear()
+                sleep_seconds = _fast_stream_poll_seconds(self.poll_seconds)
 
     def _codex_thread_start_timed_out(self, running: RunningTask) -> bool:
         if _provider_for_running(running) != Provider.CODEX:
@@ -891,6 +906,26 @@ def managed_run_resume_attempts(task: AgentTask) -> int:
     return 0
 
 
+def _fast_stream_poll_seconds(configured_poll_seconds: float) -> float:
+    return min(
+        max(MIN_STREAM_POLL_SECONDS, configured_poll_seconds),
+        FAST_STREAM_POLL_SECONDS,
+    )
+
+
+def _next_stream_poll_seconds(
+    current_sleep_seconds: float,
+    *,
+    configured_poll_seconds: float,
+    had_output: bool,
+) -> float:
+    fast = _fast_stream_poll_seconds(configured_poll_seconds)
+    if had_output:
+        return fast
+    max_sleep = max(fast, configured_poll_seconds)
+    return min(max_sleep, max(fast, current_sleep_seconds * 1.5))
+
+
 def managed_run_started_age(
     task: AgentTask,
     *,
@@ -998,6 +1033,12 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         (
             "Do not write raw Slack user IDs such as U12345 or @U12345 in visible replies. "
             "Use the person's display name when known, or say the Slack user."
+        ),
+        (
+            "When opening a GitHub pull request, prefer Slackgentic's "
+            "`create_pull_request` MCP tool if it is available; it runs the narrow PR "
+            "creation workflow through Slackgentic so PR creation still works when "
+            "ordinary shell networking or sandbox policy gets in the way."
         ),
         f"Task kind: {task.kind.value}",
         f"Task: {task.prompt}",
