@@ -27,6 +27,7 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    external_session_dependency_id,
     utc_now,
 )
 from agent_harness.runtime.tasks import (
@@ -927,6 +928,42 @@ class SlackAppTests(unittest.TestCase):
                 )
                 self.assertNotIn(("C1", "171.000001", "eyes"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.000001", "white_check_mark"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_runtime_task_exit_clears_request_message_hourglass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "put up the PR", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.bot",
+                    metadata={"request_message_ts": "171.user"},
+                )
+                store.upsert_agent_task(task)
+                gateway.reactions.append(("C1", "171.user", "eyes"))
+                gateway.reactions.append(("C1", "171.user", "hourglass_flowing_sand"))
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.bot"),
+                )
+
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
+                self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
+                self.assertIn(
+                    ("C1", "171.user", "hourglass_flowing_sand"),
+                    gateway.removed_reactions,
+                )
+                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
 
@@ -7396,6 +7433,99 @@ class DeferredWorkFlowTests(unittest.TestCase):
                 self.assertIn("summarize the deploy", task.prompt)
                 self.assertTrue(task.metadata[DEFERRED_RESOLUTION_METADATA_KEY])
                 self.assertEqual(thread.thread_ts, "171.user")
+            finally:
+                store.close()
+
+    def test_deferred_after_external_busy_agent_routes_to_explicit_future_assignee(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                eli, matt, mila = [
+                    replace(agent, handle=handle, agent_id=f"agent_{handle}", sort_order=index)
+                    for index, (agent, handle) in enumerate(
+                        zip(
+                            build_initial_model_team(3, 0),
+                            ("eli", "matt", "mila"),
+                            strict=True,
+                        )
+                    )
+                ]
+                store.upsert_team_agent(eli)
+                store.upsert_team_agent(matt)
+                store.upsert_team_agent(mila)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="busy-eli",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_agent.codex.busy-eli", eli.agent_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": (
+                                "after @Eli is done @matt put up a PR and get @mila to review"
+                            ),
+                            "ts": "171.user",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                resolver_task, resolver_agent, resolver_thread = runtime.started[0]
+                external_dep = external_session_dependency_id(Provider.CODEX, "busy-eli")
+                self.assertIn(
+                    f"@eli is currently working on task_id={external_dep}", resolver_task.prompt
+                )
+                self.assertNotEqual(resolver_agent.handle, "eli")
+
+                payload = {
+                    "task": "@matt put up a PR and get @mila to review",
+                    "target": "somebody",
+                    "depends_on": [{"kind": "agent_busy", "handle": "eli"}],
+                }
+                handled = controller.handle_runtime_agent_control(
+                    resolver_task,
+                    resolver_agent,
+                    resolver_thread,
+                    f"{AGENT_DEFERRED_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+                self.assertTrue(handled)
+                deferred_rows = store.list_deferred_work()
+                self.assertEqual(len(deferred_rows), 1)
+                row = deferred_rows[0]
+                self.assertEqual(row.requested_handle, "matt")
+                self.assertEqual(row.prompt, "put up a PR and get @mila to review")
+                self.assertEqual(row.depends_on[0].task_id, external_dep)
+                self.assertEqual(controller.evaluate_pending_deferred_work(row.deferred_id), 0)
+
+                store.delete_setting("external_session_agent.codex.busy-eli")
+                self.assertEqual(controller.evaluate_pending_deferred_work(row.deferred_id), 1)
+                runner = DeferredWorkRunner(store, controller, poll_seconds=0.01)
+                runner.sync_once()
+
+                self.assertEqual(len(runtime.started), 2)
+                final_task, final_agent, _final_thread = runtime.started[-1]
+                self.assertEqual(final_agent.handle, "matt")
+                self.assertEqual(final_task.prompt, "put up a PR and get @mila to review")
+                final = store.get_deferred_work(row.deferred_id)
+                assert final is not None
+                self.assertEqual(final.status, DeferredWorkStatus.DONE)
             finally:
                 store.close()
 

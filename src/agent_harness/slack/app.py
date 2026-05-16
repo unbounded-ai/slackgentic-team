@@ -51,6 +51,8 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    external_session_dependency_id,
+    parse_external_session_dependency_id,
     parse_timestamp,
     utc_now,
 )
@@ -892,6 +894,7 @@ class SlackTeamController:
 
     def _occupied_handle_task_ids(self) -> list[tuple[str, str]]:
         occupied: list[tuple[str, str]] = []
+        seen_handles: set[str] = set()
         for agent in self.store.list_team_agents():
             task = self.store.active_task_for_agent(agent.agent_id)
             if task is not None and task.status in {
@@ -899,6 +902,19 @@ class SlackTeamController:
                 AgentTaskStatus.ACTIVE,
             }:
                 occupied.append((agent.handle, task.task_id))
+                seen_handles.add(agent.handle)
+        agents_by_id = {agent.agent_id: agent for agent in self.store.list_team_agents()}
+        for agent_id, session in self._active_external_sessions_by_agent().items():
+            agent = agents_by_id.get(agent_id)
+            if agent is None or agent.handle in seen_handles:
+                continue
+            occupied.append(
+                (
+                    agent.handle,
+                    external_session_dependency_id(session.provider, session.session_id),
+                )
+            )
+            seen_handles.add(agent.handle)
         return occupied
 
     def _handle_scheduled_work_request(self, event: dict, channel_id: str, text: str) -> bool:
@@ -3106,6 +3122,7 @@ class SlackTeamController:
                 exc_info=True,
             )
         task = self._complete_active_thread_followup(task, thread)
+        self._clear_completed_run_pending_reactions(task, thread)
         if self._resume_queued_thread_followups(task, agent, thread):
             return
         self.refresh_or_post_roster(thread.channel_id)
@@ -3505,6 +3522,9 @@ class SlackTeamController:
                         [],
                         f"agent_busy dependency for @{dep.handle} is missing task_id",
                     )
+                if parse_external_session_dependency_id(dep.task_id) is not None:
+                    resolved.append(dep)
+                    continue
                 task = self.store.get_agent_task(dep.task_id)
                 if task is None:
                     return (
@@ -4093,6 +4113,41 @@ class SlackTeamController:
                 continue
             self._clear_message_status_reactions(thread.channel_id, message_ts)
 
+    def _clear_completed_run_pending_reactions(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> None:
+        task = self.store.get_agent_task(task.task_id) or task
+        if self._keeps_request_status_in_progress(task, thread):
+            return
+        request_message_ts_values: list[str] = []
+        request_message_ts = task.metadata.get("request_message_ts")
+        if isinstance(request_message_ts, str) and request_message_ts:
+            request_message_ts_values.append(request_message_ts)
+        history = task.metadata.get("request_message_ts_history")
+        if isinstance(history, list):
+            request_message_ts_values.extend(item for item in history if isinstance(item, str))
+        for message_ts in dict.fromkeys(request_message_ts_values):
+            self._clear_pending_message_status_reactions(thread.channel_id, message_ts)
+
+    def _keeps_request_status_in_progress(self, task: AgentTask, thread: SlackThreadRef) -> bool:
+        if isinstance(task.metadata.get(MANAGED_RUN_STARTED_METADATA_KEY), str):
+            return True
+        if isinstance(task.metadata.get("delegate_to_agent_id"), str) or isinstance(
+            task.metadata.get("delegate_prompt"), str
+        ):
+            return True
+        parent_task_id = task.metadata.get("parent_task_id")
+        if isinstance(parent_task_id, str) and parent_task_id == task.task_id:
+            return True
+        for thread_task in self.store.list_thread_agent_tasks(thread.channel_id, thread.thread_ts):
+            if thread_task.task_id == task.task_id:
+                continue
+            if thread_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+                return True
+        return False
+
     def _mark_message_complete(self, channel_id: str, message_ts: str | None) -> None:
         self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_DONE)
 
@@ -4153,6 +4208,21 @@ class SlackTeamController:
         if except_reaction and stored_reaction == except_reaction:
             return
         self.store.delete_setting(status_key)
+
+    def _clear_pending_message_status_reactions(
+        self,
+        channel_id: str,
+        message_ts: str | None,
+    ) -> None:
+        if not message_ts:
+            return
+        remove_reaction = getattr(self.gateway, "remove_reaction", None)
+        if callable(remove_reaction):
+            for reaction in (TASK_REACTION_ACKNOWLEDGED, TASK_REACTION_IN_PROGRESS):
+                try:
+                    remove_reaction(channel_id, message_ts, reaction)
+                except Exception:
+                    LOGGER.debug("failed to remove pending Slack task reaction", exc_info=True)
 
     def _remove_task_action_buttons_if_resolved(self, task: AgentTask) -> None:
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
@@ -5470,7 +5540,7 @@ def _format_deferred_work_ack(
             label = dep.permalink or f"{dep.channel_id}/{dep.thread_ts}"
             dep_lines.append(f"- thread {label}")
         else:
-            dep_lines.append(f"- @{dep.handle} (task `{dep.task_id}`)")
+            dep_lines.append(f"- @{dep.handle} ({_format_agent_busy_dependency(dep.task_id)})")
     deps_text = "\n".join(dep_lines)
     timing = ""
     if deferred.after_dep_delay_seconds:
@@ -5481,6 +5551,14 @@ def _format_deferred_work_ack(
         f"Deferred `{deferred.deferred_id}`: {target} will run `{request.prompt}` "
         f"{description}.{timing}\nWaiting on:\n{deps_text}"
     )
+
+
+def _format_agent_busy_dependency(task_id: str | None) -> str:
+    external_session = parse_external_session_dependency_id(task_id)
+    if external_session is not None:
+        provider, session_id = external_session
+        return f"{provider.value} external session `{session_id}`"
+    return f"task `{task_id}`"
 
 
 def _format_deferred_ready_message(deferred: DeferredWork) -> str:

@@ -35,6 +35,7 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    parse_external_session_dependency_id,
     parse_timestamp,
     utc_now,
 )
@@ -2022,11 +2023,22 @@ class Store:
         if dep.kind == WorkDependencyKind.AGENT_BUSY:
             if not dep.task_id:
                 return False
+            external_session = parse_external_session_dependency_id(dep.task_id)
+            if external_session is not None:
+                provider, session_id = external_session
+                return not self._external_session_is_occupying_agent(provider, session_id)
             task = self.get_agent_task(dep.task_id)
             if task is None:
                 return False
             return task.status in terminal
         return False
+
+    def _external_session_is_occupying_agent(self, provider: Provider, session_id: str) -> bool:
+        agent_id = self.get_setting(f"external_session_agent.{provider.value}.{session_id}")
+        if not agent_id:
+            return False
+        session = self.get_session(provider, session_id)
+        return bool(session and session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE})
 
     def cancel_deferred_work_for_thread(self, channel_id: str, thread_ts: str) -> int:
         with self._lock:

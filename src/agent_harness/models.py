@@ -9,6 +9,7 @@ from typing import Any
 DANGEROUS_MODE_METADATA_KEY = "dangerous_mode"
 PERMISSION_MODE_METADATA_KEY = "permission_mode"
 ASSIGNMENT_PROMPT_METADATA_KEY = "assignment_prompt"
+EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
 
 
 class Provider(StrEnum):
@@ -332,6 +333,24 @@ class DeferredWork:
     dispatched_at: datetime | None = None
     last_task_id: str | None = None
     description: str | None = None
+
+
+def external_session_dependency_id(provider: Provider, session_id: str) -> str:
+    return f"{EXTERNAL_SESSION_DEPENDENCY_PREFIX}{provider.value}:{session_id}"
+
+
+def parse_external_session_dependency_id(value: str | None) -> tuple[Provider, str] | None:
+    if not value or not value.startswith(EXTERNAL_SESSION_DEPENDENCY_PREFIX):
+        return None
+    body = value.removeprefix(EXTERNAL_SESSION_DEPENDENCY_PREFIX)
+    provider_text, separator, session_id = body.partition(":")
+    if not separator or not session_id:
+        return None
+    try:
+        provider = Provider(provider_text)
+    except ValueError:
+        return None
+    return provider, session_id
 
 
 def utc_now() -> datetime:
