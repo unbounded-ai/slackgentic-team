@@ -18,6 +18,7 @@ from agent_harness.bash_policy import (
     classify_bash_command,
 )
 from agent_harness.config import AgentCommandConfig
+from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.models import (
     AgentTask,
     AgentTaskStatus,
@@ -1145,6 +1146,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
             signals.append(line.strip())
             continue
         if normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX):
+            signals.append(line.strip())
+            continue
+        if normalized.startswith(AGENT_DEFERRED_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
         visible_lines.append(line)

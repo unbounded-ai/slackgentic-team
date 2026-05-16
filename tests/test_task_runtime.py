@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
+from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -1234,6 +1235,14 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Wakeup scheduled.")
         self.assertEqual(signals, [f"{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check CI."])
+
+    def test_agent_deferred_signal_is_stripped_from_visible_text(self):
+        signal = f'{AGENT_DEFERRED_SIGNAL_PREFIX}{{"task":"follow up","depends_on":[]}}'
+
+        visible, signals = _extract_agent_control_signals(f"Deferred.\n{signal}\n")
+
+        self.assertEqual(visible, "Deferred.")
+        self.assertEqual(signals, [signal])
 
     def test_parse_agent_timer_signal_accepts_delay(self):
         now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)

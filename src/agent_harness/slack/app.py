@@ -9,9 +9,21 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from pathlib import Path
 
 from agent_harness.config import AppConfig, load_config_from_env
+from agent_harness.deferred import (
+    DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
+    DEFERRED_RESOLUTION_METADATA_KEY,
+    DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY,
+    DEFERRED_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
+    MAX_DEFERRED_RESOLUTION_ATTEMPTS,
+    build_deferred_resolution_prompt,
+    is_agent_deferred_signal,
+    looks_like_deferred_request,
+    parse_agent_deferred_signal,
+)
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
@@ -20,6 +32,8 @@ from agent_harness.models import (
     AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
+    DeferredWork,
+    DeferredWorkStatus,
     PendingWorkRequest,
     PendingWorkRequestStatus,
     PermissionMode,
@@ -33,6 +47,8 @@ from agent_harness.models import (
     SessionStatus,
     SlackThreadRef,
     TeamAgentStatus,
+    WorkDependency,
+    WorkDependencyKind,
     WorkRequest,
     parse_timestamp,
     utc_now,
@@ -416,6 +432,8 @@ class SlackTeamController:
         if command:
             self.handle_team_command(command, target)
             return
+        if self._handle_deferred_work_request(event, channel_id, text):
+            return
         if self._handle_scheduled_work_request(event, channel_id, text):
             return
         if self._handle_task_thread_reply(event, channel_id, text):
@@ -797,6 +815,86 @@ class SlackTeamController:
                         "or ask someone else."
                     )
         return CAPACITY_MESSAGE
+
+    def _handle_deferred_work_request(self, event: dict, channel_id: str, text: str) -> bool:
+        deferred_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
+        if not looks_like_deferred_request(deferred_text):
+            return False
+        thread = self._request_thread_anchor(event, channel_id, text)
+        active_agents = self.store.list_team_agents()
+        if not active_agents:
+            self._post_capacity_message(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts)
+            )
+            return True
+        occupied = self._occupied_handle_task_ids()
+        resolver_prompt = build_deferred_resolution_prompt(
+            deferred_text,
+            [agent.handle for agent in active_agents],
+            occupied=[{"handle": handle, "task_id": task_id} for handle, task_id in occupied],
+            now=utc_now(),
+        )
+        request = WorkRequest(
+            prompt=resolver_prompt,
+            assignment_mode=AssignmentMode.ANYONE,
+        )
+        extra_metadata = self._with_linked_thread_context(
+            {
+                DEFERRED_RESOLUTION_METADATA_KEY: True,
+                DEFERRED_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: deferred_text,
+                DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY: [
+                    {"handle": handle, "task_id": task_id} for handle, task_id in occupied
+                ],
+                ASSIGNMENT_PROMPT_METADATA_KEY: deferred_text,
+                "request_message_ts": event.get("ts"),
+            },
+            deferred_text,
+            current_thread=thread,
+        )
+        self._mark_message_acknowledged(channel_id, event.get("ts"))
+        result = assign_work_request(
+            self.store,
+            request,
+            channel_id,
+            requested_by_slack_user=event.get("user"),
+            extra_metadata=extra_metadata,
+            exclude_agent_ids=self._external_busy_agent_ids(),
+        )
+        if result is None:
+            self._post_assignment_unavailable(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts),
+                request,
+                requested_by_slack_user=event.get("user"),
+                extra_metadata=extra_metadata,
+            )
+            return True
+        posted = self.gateway.post_thread_reply(
+            thread,
+            (
+                f"@{result.agent.handle} is resolving this deferred request: "
+                f"`{_shorten(deferred_text, 180)}`"
+            ),
+            persona=result.agent,
+            icon_url=self._agent_icon_url(result.agent),
+        )
+        self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
+        task = self.store.get_agent_task(result.task.task_id) or result.task
+        if self.runtime:
+            self.runtime.start_task(task, result.agent, thread)
+        self._mark_message_in_progress(channel_id, event.get("ts"))
+        return True
+
+    def _occupied_handle_task_ids(self) -> list[tuple[str, str]]:
+        occupied: list[tuple[str, str]] = []
+        for agent in self.store.list_team_agents():
+            task = self.store.active_task_for_agent(agent.agent_id)
+            if task is not None and task.status in {
+                AgentTaskStatus.QUEUED,
+                AgentTaskStatus.ACTIVE,
+            }:
+                occupied.append((agent.handle, task.task_id))
+        return occupied
 
     def _handle_scheduled_work_request(self, event: dict, channel_id: str, text: str) -> bool:
         schedule_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
@@ -1586,6 +1684,13 @@ class SlackTeamController:
                 self._mark_task_complete(completed_task, thread, include_thread=True)
             if thread.thread_ts:
                 self.gateway.post_thread_reply(thread, "Finished and freed up this agent.")
+            try:
+                self.evaluate_pending_deferred_work()
+            except Exception:
+                LOGGER.debug(
+                    "failed to evaluate deferred work after task button completion",
+                    exc_info=True,
+                )
             self._resume_pending_work_requests(channel_id)
             self.refresh_or_post_roster(channel_id)
 
@@ -2950,6 +3055,13 @@ class SlackTeamController:
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
             self._clear_task_request_status_reactions(task, thread)
+        try:
+            self.evaluate_pending_deferred_work()
+        except Exception:
+            LOGGER.debug(
+                "failed to evaluate deferred work after runtime task done",
+                exc_info=True,
+            )
         task = self._complete_active_thread_followup(task, thread)
         if self._resume_queued_thread_followups(task, agent, thread):
             return
@@ -3048,6 +3160,8 @@ class SlackTeamController:
             return self._schedule_agent_timer(task, agent, thread, signal)
         if is_agent_schedule_signal(signal):
             return self._schedule_user_work_from_agent(task, agent, thread, signal)
+        if is_agent_deferred_signal(signal):
+            return self._create_deferred_work_from_agent(task, agent, thread, signal)
         return False
 
     def _schedule_agent_timer(
@@ -3177,6 +3291,310 @@ class SlackTeamController:
             self.refresh_or_post_roster(thread.channel_id)
         return True
 
+    def _create_deferred_work_from_agent(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        active_agents = self.store.list_team_agents()
+        occupied_task_ids = dict(self._occupied_handle_task_ids())
+        parsed = parse_agent_deferred_signal(
+            signal,
+            known_handles=[item.handle for item in active_agents],
+            occupied_task_ids=occupied_task_ids,
+            now=utc_now(),
+        )
+        if parsed.deferred is None:
+            return self._retry_deferred_resolution(
+                task, agent, thread, parsed.error or "invalid deferred request"
+            )
+        resolved_deps, error = self._resolve_deferred_dependencies(parsed.deferred.depends_on)
+        if error is not None:
+            return self._retry_deferred_resolution(task, agent, thread, error)
+        deferred = self.store.create_deferred_work_request(
+            thread,
+            parsed.deferred.request,
+            depends_on=tuple(resolved_deps),
+            after_dep_delay_seconds=parsed.deferred.after_dep_delay_seconds,
+            run_at=parsed.deferred.run_at,
+            description=parsed.deferred.description,
+            requested_by_slack_user=task.requested_by_slack_user,
+        )
+        self.gateway.post_thread_reply(
+            thread,
+            _format_deferred_work_ack(
+                deferred, parsed.deferred.description, parsed.deferred.request
+            ),
+            persona=agent,
+            icon_url=self._agent_icon_url(agent),
+        )
+        # Best-effort: evaluate dependencies immediately so already-finished deps fire promptly.
+        self.evaluate_pending_deferred_work(deferred.deferred_id)
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+        resolved_task = self.store.get_agent_task(task.task_id) or task
+        self._remove_task_action_buttons_if_resolved(resolved_task)
+        for message_ts in _task_request_message_ts_values(resolved_task):
+            self._mark_message_complete(thread.channel_id, message_ts)
+        self.refresh_or_post_roster(thread.channel_id)
+        return True
+
+    def _retry_deferred_resolution(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        error: str,
+    ) -> bool:
+        if not task.metadata.get(DEFERRED_RESOLUTION_METADATA_KEY):
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not create that deferred request: {error}.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return False
+        attempts = int(task.metadata.get(DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY) or 0)
+        if attempts >= MAX_DEFERRED_RESOLUTION_ATTEMPTS or not self.runtime:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    "I could not resolve that deferred request after "
+                    f"{MAX_DEFERRED_RESOLUTION_ATTEMPTS} validation retries: {error}. "
+                    "Cancelling the request — please double check and try again."
+                ),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.refresh_or_post_roster(thread.channel_id)
+            return True
+        original_text = task.metadata.get(DEFERRED_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
+        if not isinstance(original_text, str) or not original_text.strip():
+            original_text = task.prompt
+        active_agents = self.store.list_team_agents()
+        occupied_meta = task.metadata.get(DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY) or []
+        occupied: list[dict[str, str]] = []
+        if isinstance(occupied_meta, list):
+            for item in occupied_meta:
+                if not isinstance(item, dict):
+                    continue
+                handle = item.get("handle")
+                task_id_value = item.get("task_id")
+                if isinstance(handle, str) and isinstance(task_id_value, str):
+                    occupied.append({"handle": handle, "task_id": task_id_value})
+        retry_prompt = build_deferred_resolution_prompt(
+            original_text,
+            [item.handle for item in active_agents],
+            occupied=occupied,
+            now=utc_now(),
+            validation_error=error,
+        )
+        metadata = dict(task.metadata)
+        metadata[DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
+        retry_task = replace(
+            task,
+            prompt=retry_prompt,
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(retry_task)
+        started = self.runtime.start_task(retry_task, agent, thread)
+        if not started:
+            self.gateway.post_thread_reply(
+                thread,
+                ("I could not restart deferred validation, so I cancelled this deferred request."),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.refresh_or_post_roster(thread.channel_id)
+        return True
+
+    def _resolve_deferred_dependencies(
+        self,
+        deps: tuple[WorkDependency, ...],
+    ) -> tuple[list[WorkDependency], str | None]:
+        active_agents = {agent.handle for agent in self.store.list_team_agents()}
+        resolved: list[WorkDependency] = []
+        for dep in deps:
+            if dep.kind == WorkDependencyKind.THREAD:
+                channel_id = dep.channel_id
+                thread_ts = dep.thread_ts
+                if (not channel_id or not thread_ts) and dep.permalink:
+                    parsed_ref = parse_thread_ref(dep.permalink)
+                    if parsed_ref is not None:
+                        channel_id = channel_id or parsed_ref.channel_id
+                        thread_ts = thread_ts or parsed_ref.thread_ts
+                if not channel_id or not thread_ts:
+                    return (
+                        [],
+                        f"could not parse thread dependency permalink: {dep.permalink}",
+                    )
+                thread_tasks = self.store.list_thread_agent_tasks(channel_id, thread_ts)
+                if not thread_tasks:
+                    return (
+                        [],
+                        (
+                            f"thread dependency does not match a tracked Slackgentic task: "
+                            f"{dep.permalink or f'{channel_id}/{thread_ts}'}"
+                        ),
+                    )
+                resolved.append(
+                    replace(
+                        dep,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        task_id=dep.task_id or thread_tasks[0].task_id,
+                    )
+                )
+                continue
+            if dep.kind == WorkDependencyKind.AGENT_BUSY:
+                if not dep.handle or dep.handle not in active_agents:
+                    return (
+                        [],
+                        f"agent_busy handle is not active: {dep.handle}",
+                    )
+                if not dep.task_id:
+                    return (
+                        [],
+                        f"agent_busy dependency for @{dep.handle} is missing task_id",
+                    )
+                task = self.store.get_agent_task(dep.task_id)
+                if task is None:
+                    return (
+                        [],
+                        (
+                            f"agent_busy task_id {dep.task_id} for @{dep.handle} not "
+                            "found; ensure the agent is currently occupied"
+                        ),
+                    )
+                resolved.append(dep)
+                continue
+            return ([], f"unsupported dependency kind: {dep.kind}")
+        return (resolved, None)
+
+    def evaluate_pending_deferred_work(self, deferred_id: str | None = None) -> int:
+        promoted = 0
+        if deferred_id is not None:
+            row = self.store.get_deferred_work(deferred_id)
+            rows = [row] if row is not None else []
+        else:
+            rows = self.store.list_waiting_deferred_work(limit=200)
+        for row in rows:
+            if row.status != DeferredWorkStatus.WAITING_DEPS:
+                continue
+            satisfied, _missing = self.store.evaluate_deferred_dependencies(row)
+            if not satisfied:
+                continue
+            now = utc_now()
+            if row.after_dep_delay_seconds:
+                fire_at = now + timedelta(seconds=row.after_dep_delay_seconds)
+            elif row.run_at is not None and row.run_at > now:
+                fire_at = row.run_at
+            else:
+                fire_at = now
+            updated = self.store.mark_deferred_work_ready(
+                row.deferred_id,
+                fire_at=fire_at,
+                deps_satisfied_at=now,
+            )
+            if updated is None:
+                continue
+            promoted += 1
+            self.gateway.post_thread_reply(
+                SlackThreadRef(row.channel_id, row.thread_ts),
+                _format_deferred_ready_message(updated),
+            )
+        return promoted
+
+    def fire_due_deferred_work(self, deferred: DeferredWork) -> bool:
+        claimed = self.store.claim_deferred_work(deferred.deferred_id)
+        if claimed is None:
+            return True
+        thread = SlackThreadRef(claimed.channel_id, claimed.thread_ts, claimed.message_ts)
+        request = _work_request_from_deferred_work(claimed)
+        author_agent = (
+            self.store.get_team_agent(request.author_handle) if request.author_handle else None
+        )
+        if (
+            request.assignment_mode == AssignmentMode.SPECIFIC
+            and request.requested_handle
+            and self.store.get_team_agent(request.requested_handle) is None
+        ):
+            self.store.update_deferred_work_status(
+                claimed.deferred_id,
+                DeferredWorkStatus.CANCELLED,
+            )
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"Cancelled deferred `{claimed.deferred_id}` because "
+                    f"@{request.requested_handle} is not an active agent."
+                ),
+            )
+            return True
+        metadata = {
+            "deferred_work_id": claimed.deferred_id,
+            "deferred_work_fire_at": claimed.fire_at.isoformat() if claimed.fire_at else "",
+        }
+        result = assign_work_request(
+            self.store,
+            request,
+            claimed.channel_id,
+            requested_by_slack_user=claimed.requested_by_slack_user,
+            author_agent=author_agent,
+            extra_metadata=metadata,
+            exclude_agent_ids=self._external_busy_agent_ids(),
+        )
+        if result is None:
+            pending = self.store.create_pending_work_request(
+                thread,
+                request,
+                requested_by_slack_user=claimed.requested_by_slack_user,
+                author_agent=author_agent,
+                extra_metadata=metadata,
+                exclude_agent_ids=self._external_busy_agent_ids(),
+            )
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"Deferred `{claimed.deferred_id}` is ready, but no matching agent "
+                    "is available. I queued it and will start it when capacity opens."
+                ),
+            )
+            self.store.complete_deferred_work(
+                claimed.deferred_id,
+                last_task_id=pending.pending_id,
+            )
+            return True
+        text = f"Deferred `{claimed.deferred_id}` is ready now.\n\n" + format_agent_assignment(
+            result.agent,
+            result.request.prompt,
+            claimed.requested_by_slack_user,
+            dangerous_mode=_task_dangerous_mode(result.task),
+        )
+        blocks = build_task_thread_blocks(result.task, result.agent)
+        posted = self.gateway.post_thread_reply(
+            thread,
+            text,
+            persona=result.agent,
+            blocks=blocks,
+            icon_url=self._agent_icon_url(result.agent),
+        )
+        self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
+        task = self.store.get_agent_task(result.task.task_id) or result.task
+        if self.runtime:
+            self.runtime.start_task(task, result.agent, thread)
+        self.store.complete_deferred_work(
+            claimed.deferred_id,
+            last_task_id=result.task.task_id,
+        )
+        self.refresh_or_post_roster(claimed.channel_id)
+        return True
+
     def fire_due_scheduled_timer(self, timer: ScheduledTimer) -> bool:
         agent = self.store.get_team_agent(timer.agent_id)
         if agent is None:
@@ -3265,13 +3683,23 @@ class SlackTeamController:
             channel_id,
             thread_ts,
         )
+        cancelled_deferred_work = self.store.cancel_deferred_work_for_thread(
+            channel_id,
+            thread_ts,
+        )
         if (
             not completed
             and not cancelled
             and not cancelled_timers
             and not cancelled_scheduled_work
+            and not cancelled_deferred_work
         ):
             return False
+        # Threads outside this one may have just satisfied a dependency.
+        try:
+            self.evaluate_pending_deferred_work()
+        except Exception:
+            LOGGER.debug("failed to evaluate deferred work after thread completion", exc_info=True)
         self._resume_pending_work_requests(channel_id)
         self.refresh_or_post_roster(channel_id)
         return True
@@ -4146,6 +4574,58 @@ class ScheduledWorkRunner:
                     break
 
 
+class DeferredWorkRunner:
+    def __init__(
+        self,
+        store: Store,
+        controller: SlackTeamController,
+        *,
+        poll_seconds: float = 5.0,
+    ):
+        self.store = store
+        self.controller = controller
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-deferred-work",
+        )
+        self._thread.start()
+
+    def stop(self) -> bool:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
+
+    def sync_once(self) -> int:
+        promoted = self.controller.evaluate_pending_deferred_work()
+        fired = 0
+        for deferred in self.store.list_due_deferred_work(limit=50):
+            if self.controller.fire_due_deferred_work(deferred):
+                fired += 1
+        return promoted + fired
+
+    def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
+        while not self._stop.wait(self.poll_seconds):
+            try:
+                self.sync_once()
+                backoff.reset()
+            except Exception:
+                log_loop_failure(LOGGER, "failed to run deferred Slackgentic work", backoff)
+                if backoff.wait(self._stop):
+                    break
+
+
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
         if not config.slack.bot_token or not config.slack.app_token:
@@ -4227,6 +4707,12 @@ class SocketModeSlackApp:
             poll_seconds=max(config.poll_seconds, 1.0),
         )
         self.scheduled_work.start()
+        self.deferred_work = DeferredWorkRunner(
+            self.store,
+            self.controller,
+            poll_seconds=max(config.poll_seconds, 1.0),
+        )
+        self.deferred_work.start()
         self.slack_message_backfill = SlackMessageBackfill(
             self.store,
             self.gateway,
@@ -4254,6 +4740,7 @@ class SocketModeSlackApp:
         self.awake_keeper.stop()
         all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
         all_stopped = self.slack_message_backfill.stop() and all_stopped
+        all_stopped = self.deferred_work.stop() and all_stopped
         all_stopped = self.scheduled_work.stop() and all_stopped
         all_stopped = self.scheduled_timers.stop() and all_stopped
         all_stopped = self.session_mirror.stop() and all_stopped
@@ -4850,6 +5337,55 @@ def _format_scheduled_work_schedule(scheduled: ScheduledWork) -> str:
 
 def _format_schedule_timestamp(value) -> str:
     return value.isoformat(timespec="minutes")
+
+
+def _work_request_from_deferred_work(deferred: DeferredWork) -> WorkRequest:
+    return WorkRequest(
+        prompt=deferred.prompt,
+        assignment_mode=deferred.assignment_mode,
+        requested_handle=deferred.requested_handle,
+        task_kind=deferred.task_kind,
+        author_handle=deferred.author_handle,
+        pr_url=deferred.pr_url,
+        permission_mode=(
+            PermissionMode.DANGEROUS if deferred.dangerous_mode else DEFAULT_PERMISSION_MODE
+        ),
+    )
+
+
+def _format_deferred_work_ack(
+    deferred: DeferredWork,
+    description: str,
+    request: WorkRequest,
+) -> str:
+    target = "somebody"
+    if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
+        target = f"@{request.requested_handle}"
+    dep_lines = []
+    for dep in deferred.depends_on:
+        if dep.kind == WorkDependencyKind.THREAD:
+            label = dep.permalink or f"{dep.channel_id}/{dep.thread_ts}"
+            dep_lines.append(f"- thread {label}")
+        else:
+            dep_lines.append(f"- @{dep.handle} (task `{dep.task_id}`)")
+    deps_text = "\n".join(dep_lines)
+    timing = ""
+    if deferred.after_dep_delay_seconds:
+        timing = f" then wait {deferred.after_dep_delay_seconds}s"
+    elif deferred.run_at is not None:
+        timing = f" then at {_format_schedule_timestamp(deferred.run_at)}"
+    return (
+        f"Deferred `{deferred.deferred_id}`: {target} will run `{request.prompt}` "
+        f"{description}.{timing}\nWaiting on:\n{deps_text}"
+    )
+
+
+def _format_deferred_ready_message(deferred: DeferredWork) -> str:
+    fire_at = _format_schedule_timestamp(deferred.fire_at) if deferred.fire_at else "shortly"
+    return (
+        f"Dependencies for deferred `{deferred.deferred_id}` are satisfied. "
+        f"Starting at `{fire_at}` UTC."
+    )
 
 
 def _weekday_label(value) -> str | None:

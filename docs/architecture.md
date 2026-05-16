@@ -149,6 +149,41 @@ The daemon stores the blocked task, blocking thread reference, and status. When
 the blocking thread is marked done, Slackgentic resumes the waiting task with
 context from the blocking thread.
 
+## Deferred Work (DAG Dependencies)
+
+Users can stage new work that fires only after one or more existing pieces of
+work finish. From the agent channel:
+
+- `after <permalink> finishes, summarize the deploy`
+- `wait for @riley to finish, then update the dashboard`
+- `schedule @nell to review the dashboard 20 minutes after <permalink> finishes`
+- `after <permalink> and @riley finish, post the release notes`
+
+The Slack controller only detects that the message is a dependency-gated work
+request. It then starts a normal managed agent task whose prompt asks the LLM
+to resolve the request into a hidden `SLACKGENTIC: DEPEND {...}` control line.
+The controller validates the structured JSON, snapshots the active task id for
+each occupied agent dependency, and retries the same agent with the validation
+error when the control line is malformed (up to three attempts before
+cancelling with a Slack-visible message).
+
+After validation, Slackgentic stores the resulting `WorkRequest` plus the
+dependency set, optional post-satisfaction delay, and optional absolute run-at
+in `deferred_work_requests` and acknowledges the deferred entry in the
+originating thread. A daemon poller evaluates waiting rows on every tick and
+when every dependency reaches `done` or `cancelled` it promotes the row to
+`ready`, computes `fire_at = max(now, run_at)` (or `now + delay` when a
+post-satisfaction delay was set), and the same poller fires the work when
+`fire_at` arrives. Firing reuses the scheduled-work path: claim → assign →
+start the task in the originating thread, or queue it as pending work if no
+matching agent is available.
+
+Dependency satisfaction is also re-evaluated whenever a task in the system
+finishes (managed task done, finish button, or thread-done control signal),
+so newly-satisfied deferred rows promote promptly without waiting for the next
+poll tick. Marking the originating thread done cancels its deferred rows
+before they fire.
+
 ## Agent Timers
 
 Managed agents cannot depend on provider-local sleeps for delayed Slack work:

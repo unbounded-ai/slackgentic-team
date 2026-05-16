@@ -5,6 +5,12 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
+from agent_harness.deferred import (
+    AGENT_DEFERRED_SIGNAL_PREFIX,
+    DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
+    DEFERRED_RESOLUTION_METADATA_KEY,
+    DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY,
+)
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     AgentSession,
@@ -12,11 +18,14 @@ from agent_harness.models import (
     AgentTaskStatus,
     AssignmentMode,
     ControlMode,
+    DeferredWorkStatus,
     Provider,
     ScheduledWorkKind,
     SessionStatus,
     SlackThreadRef,
     TeamAgentStatus,
+    WorkDependency,
+    WorkDependencyKind,
     WorkRequest,
     utc_now,
 )
@@ -41,6 +50,7 @@ from agent_harness.slack.app import (
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
     ClaudePermissionAutoResolver,
+    DeferredWorkRunner,
     ScheduledTimerRunner,
     ScheduledWorkRunner,
     SlackMessageBackfill,
@@ -7290,6 +7300,288 @@ class SlackAppTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+
+class DeferredWorkFlowTests(unittest.TestCase):
+    PERMALINK = "https://example.slack.com/archives/C1/p0000000171000001"
+
+    def _setup_controller(self, tmp: str):
+        store = Store(Path(tmp) / "state.sqlite")
+        gateway = FakeGateway()
+        runtime = FakeRuntime()
+        store.init_schema()
+        agents = build_initial_model_team(1, 1)
+        for agent in agents:
+            store.upsert_team_agent(agent)
+        controller = SlackTeamController(
+            store,
+            gateway,
+            default_channel_id="C1",
+            runtime=runtime,
+        )
+        return store, gateway, runtime, agents, controller
+
+    def test_user_message_starts_deferred_resolver_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, runtime, _agents, controller = self._setup_controller(tmp)
+            try:
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"after {self.PERMALINK} finishes, summarize the deploy",
+                            "ts": "171.user",
+                        }
+                    }
+                )
+                self.assertEqual(len(runtime.started), 1)
+                task, _agent, thread = runtime.started[0]
+                self.assertIn(AGENT_DEFERRED_SIGNAL_PREFIX, task.prompt)
+                self.assertIn("summarize the deploy", task.prompt)
+                self.assertTrue(task.metadata[DEFERRED_RESOLUTION_METADATA_KEY])
+                self.assertEqual(thread.thread_ts, "171.user")
+            finally:
+                store.close()
+
+    def test_deferred_signal_creates_row_and_fires_after_dep_completes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, runtime, agents, controller = self._setup_controller(tmp)
+            try:
+                blocking_agent = agents[0]
+                blocking_task = create_agent_task(blocking_agent, "blocker", "C1")
+                store.upsert_agent_task(blocking_task)
+                store.update_agent_task_thread(blocking_task.task_id, "171.blocking", "171.parent")
+                store.update_agent_task_status(blocking_task.task_id, AgentTaskStatus.ACTIVE)
+
+                resolver_agent = agents[1]
+                resolver_task = replace(
+                    create_agent_task(resolver_agent, "resolve deferred", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.resolver",
+                    parent_message_ts="171.resolver",
+                    requested_by_slack_user="U1",
+                    metadata={
+                        DEFERRED_RESOLUTION_METADATA_KEY: True,
+                        DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY: [],
+                    },
+                )
+                store.upsert_agent_task(resolver_task)
+                payload = {
+                    "task": "summarize the deploy thread",
+                    "target": blocking_agent.handle,
+                    "depends_on": [
+                        {
+                            "kind": "thread",
+                            "permalink": (
+                                "https://example.slack.com/archives/C1/p0000000171000001"
+                            ),
+                            "channel_id": "C1",
+                            "thread_ts": "171.blocking",
+                        }
+                    ],
+                }
+                handled = controller.handle_runtime_agent_control(
+                    resolver_task,
+                    resolver_agent,
+                    SlackThreadRef("C1", "171.resolver", "171.resolver"),
+                    f"{AGENT_DEFERRED_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+                self.assertTrue(handled)
+                deferred_rows = store.list_deferred_work()
+                self.assertEqual(len(deferred_rows), 1)
+                row = deferred_rows[0]
+                self.assertEqual(row.status, DeferredWorkStatus.WAITING_DEPS)
+                self.assertEqual(row.depends_on[0].thread_ts, "171.blocking")
+
+                # Dependency unsatisfied — fire path stays empty.
+                started_before = list(runtime.started)
+                runner = DeferredWorkRunner(store, controller, poll_seconds=0.01)
+                runner.sync_once()
+                self.assertEqual(runtime.started, started_before)
+
+                # Mark the blocking task done; runner should promote and fire.
+                store.update_agent_task_status(blocking_task.task_id, AgentTaskStatus.DONE)
+                runner.sync_once()  # promote waiting -> ready
+                runner.sync_once()  # fire ready -> claim/start
+                started_tasks = [task for task, _, _ in runtime.started]
+                self.assertTrue(
+                    any(task.prompt == "summarize the deploy thread" for task in started_tasks),
+                    runtime.started,
+                )
+                final = store.get_deferred_work(row.deferred_id)
+                assert final is not None
+                self.assertEqual(final.status, DeferredWorkStatus.DONE)
+            finally:
+                store.close()
+
+    def test_deferred_with_after_delay_anchors_on_dep_satisfaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, _runtime, agents, controller = self._setup_controller(tmp)
+            try:
+                blocking_task = create_agent_task(agents[0], "blocker", "C1")
+                store.upsert_agent_task(blocking_task)
+                store.update_agent_task_thread(blocking_task.task_id, "171.blocking", "p")
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.user", "171.user"),
+                    WorkRequest(prompt="follow up", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.THREAD,
+                            channel_id="C1",
+                            thread_ts="171.blocking",
+                            task_id=blocking_task.task_id,
+                        ),
+                    ),
+                    after_dep_delay_seconds=1200,
+                )
+                # While dep not satisfied: promotion is a no-op.
+                self.assertEqual(controller.evaluate_pending_deferred_work(), 0)
+                # Complete dep, then promote.
+                store.update_agent_task_status(blocking_task.task_id, AgentTaskStatus.DONE)
+                before = utc_now()
+                self.assertEqual(controller.evaluate_pending_deferred_work(), 1)
+                refreshed = store.get_deferred_work(deferred.deferred_id)
+                assert refreshed is not None
+                self.assertEqual(refreshed.status, DeferredWorkStatus.READY)
+                self.assertIsNotNone(refreshed.fire_at)
+                assert refreshed.fire_at is not None
+                delta = refreshed.fire_at - before
+                # Window has slack to cover test execution jitter.
+                self.assertGreaterEqual(delta, timedelta(seconds=1199))
+                self.assertLessEqual(delta, timedelta(seconds=1205))
+            finally:
+                store.close()
+
+    def test_deferred_with_run_at_waits_for_max_of_dep_and_absolute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, _runtime, agents, controller = self._setup_controller(tmp)
+            try:
+                blocking_task = create_agent_task(agents[0], "blocker", "C1")
+                store.upsert_agent_task(blocking_task)
+                store.update_agent_task_thread(blocking_task.task_id, "171.blocking", "p")
+                future_run_at = utc_now() + timedelta(hours=2)
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.user", "171.user"),
+                    WorkRequest(prompt="follow up", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.THREAD,
+                            channel_id="C1",
+                            thread_ts="171.blocking",
+                            task_id=blocking_task.task_id,
+                        ),
+                    ),
+                    run_at=future_run_at,
+                )
+                store.update_agent_task_status(blocking_task.task_id, AgentTaskStatus.DONE)
+                self.assertEqual(controller.evaluate_pending_deferred_work(), 1)
+                refreshed = store.get_deferred_work(deferred.deferred_id)
+                assert refreshed is not None and refreshed.fire_at is not None
+                self.assertEqual(refreshed.fire_at, future_run_at)
+            finally:
+                store.close()
+
+    def test_multi_dependency_waits_until_all_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, _runtime, agents, controller = self._setup_controller(tmp)
+            try:
+                first = create_agent_task(agents[0], "first", "C1")
+                second = create_agent_task(agents[1], "second", "C1")
+                store.upsert_agent_task(first)
+                store.upsert_agent_task(second)
+                store.update_agent_task_thread(first.task_id, "171.first", "p1")
+                store.update_agent_task_thread(second.task_id, "171.second", "p2")
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.user", "171.user"),
+                    WorkRequest(prompt="finalize", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.THREAD,
+                            channel_id="C1",
+                            thread_ts="171.first",
+                            task_id=first.task_id,
+                        ),
+                        WorkDependency(
+                            kind=WorkDependencyKind.AGENT_BUSY,
+                            handle=agents[1].handle,
+                            task_id=second.task_id,
+                        ),
+                    ),
+                )
+                store.update_agent_task_status(first.task_id, AgentTaskStatus.DONE)
+                self.assertEqual(controller.evaluate_pending_deferred_work(), 0)
+                store.update_agent_task_status(second.task_id, AgentTaskStatus.DONE)
+                self.assertEqual(controller.evaluate_pending_deferred_work(), 1)
+                refreshed = store.get_deferred_work(deferred.deferred_id)
+                assert refreshed is not None
+                self.assertEqual(refreshed.status, DeferredWorkStatus.READY)
+            finally:
+                store.close()
+
+    def test_invalid_deferred_signal_retries_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, runtime, agents, controller = self._setup_controller(tmp)
+            try:
+                resolver_agent = agents[0]
+                task = replace(
+                    create_agent_task(resolver_agent, "resolve deferred", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        DEFERRED_RESOLUTION_METADATA_KEY: True,
+                        DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY: [],
+                    },
+                )
+                store.upsert_agent_task(task)
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    resolver_agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    f"{AGENT_DEFERRED_SIGNAL_PREFIX}{{not json",
+                )
+                self.assertTrue(handled)
+                self.assertEqual(len(runtime.started), 1)
+                retry_task = runtime.started[0][0]
+                self.assertIn("previous deferred control line was invalid", retry_task.prompt)
+                self.assertEqual(retry_task.metadata[DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY], 1)
+            finally:
+                store.close()
+
+    def test_deferred_cancelled_when_originating_thread_is_finished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _gateway, _runtime, agents, controller = self._setup_controller(tmp)
+            try:
+                blocking_task = create_agent_task(agents[0], "blocker", "C1")
+                store.upsert_agent_task(blocking_task)
+                store.update_agent_task_thread(blocking_task.task_id, "171.blocking", "p")
+                user_task = create_agent_task(agents[1], "deferred holder", "C1")
+                store.upsert_agent_task(user_task)
+                store.update_agent_task_thread(user_task.task_id, "171.user", "171.user")
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.user", "171.user"),
+                    WorkRequest(prompt="follow up", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.THREAD,
+                            channel_id="C1",
+                            thread_ts="171.blocking",
+                            task_id=blocking_task.task_id,
+                        ),
+                    ),
+                )
+                self.assertEqual(deferred.status, DeferredWorkStatus.WAITING_DEPS)
+                # Simulate the user marking the deferred holder thread done.
+                completed = controller._complete_task_thread("C1", "171.user")
+                self.assertTrue(completed)
+                refreshed = store.get_deferred_work(deferred.deferred_id)
+                assert refreshed is not None
+                self.assertEqual(refreshed.status, DeferredWorkStatus.CANCELLED)
             finally:
                 store.close()
 
