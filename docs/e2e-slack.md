@@ -119,7 +119,9 @@ Specific agent:
 Tasks default to safe-auto permission mode: Codex runs with
 `--sandbox workspace-write` and Claude runs with `--permission-mode acceptEdits`
 plus an allowlist for read-only inspection commands so reviews and
-investigations are not blocked on every `git status`.
+investigations are not blocked on every `git status`. Codex also gets the
+configured repo root as an additional writable directory so Git worktrees under
+that root can update shared metadata during normal safe-auto edits and commits.
 
 Dangerous mode for one managed task:
 

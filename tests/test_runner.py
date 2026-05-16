@@ -93,6 +93,35 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("workspace-write", args)
         self.assertNotIn("--ask-for-approval", args)
 
+    def test_codex_command_adds_safe_auto_writable_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="fix it",
+                cwd=Path("/workspace/repos/example-project"),
+                codex_writable_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertIn("--add-dir", args)
+        root_index = args.index("--add-dir")
+        self.assertEqual(args[root_index + 1], "/workspace/repos")
+
+    def test_codex_command_does_not_add_locked_writable_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="fix it",
+                cwd=Path("/workspace/repos/example-project"),
+                permission_mode=PermissionMode.LOCKED,
+                codex_writable_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertNotIn("--add-dir", args)
+
     def test_codex_command_uses_read_only_sandbox_when_locked(self):
         command, args = build_command(
             LaunchRequest(
@@ -231,6 +260,21 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("-C", args)
         self.assertNotEqual(args[-1], "-")
         self.assertIn('sandbox_mode="workspace-write"', args)
+
+    def test_codex_resume_command_adds_safe_auto_writable_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="continue",
+                cwd=Path("/workspace/repos/example-project"),
+                resume_session_id="thread-1",
+                codex_writable_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertNotIn("--add-dir", args)
+        self.assertIn('sandbox_workspace_write.writable_roots=["/workspace/repos"]', args)
 
     def test_codex_resume_command_enforces_locked_sandbox(self):
         command, args = build_command(
