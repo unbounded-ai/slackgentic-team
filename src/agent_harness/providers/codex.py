@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
-from agent_harness.storage.jsonl import first_jsonl_record, iter_jsonl
+from agent_harness.storage.jsonl import first_jsonl_record, iter_jsonl, last_jsonl_line_number
 
 
 class CodexProvider:
@@ -25,6 +27,7 @@ class CodexProvider:
     def __init__(self, home: Path | None = None, active_within_seconds: int = 900):
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
+        self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
 
     @property
     def sessions_root(self) -> Path:
@@ -34,27 +37,53 @@ class CodexProvider:
         if not self.sessions_root.exists():
             return []
         sessions: list[AgentSession] = []
+        seen_paths: set[Path] = set()
+        now = datetime.now(UTC)
         for path in sorted(self.sessions_root.rglob("*.jsonl")):
-            session = self._session_from_path(path)
+            seen_paths.add(path)
+            session = self._cached_session_from_path(path, now)
             if session:
                 sessions.append(session)
+        self._drop_deleted_cache_entries(seen_paths)
         return sorted(
             sessions,
             key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
 
-    def _session_from_path(self, path: Path) -> AgentSession | None:
+    def _cached_session_from_path(self, path: Path, now: datetime) -> AgentSession | None:
+        stat = path.stat()
+        signature = _stat_signature(stat)
+        cached = self._session_cache.get(path)
+        if cached and cached[0] == signature:
+            return _refresh_observed_status(cached[1], self.active_within_seconds, now)
+        session = self._session_from_path(path, stat=stat, now=now)
+        self._session_cache[path] = (signature, session)
+        return session
+
+    def _drop_deleted_cache_entries(self, seen_paths: set[Path]) -> None:
+        for path in list(self._session_cache):
+            if path not in seen_paths:
+                self._session_cache.pop(path, None)
+
+    def _session_from_path(
+        self,
+        path: Path,
+        *,
+        stat: os.stat_result | None = None,
+        now: datetime | None = None,
+    ) -> AgentSession | None:
         first = first_jsonl_record(path)
         record = first[1] if first else {}
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         session_id = payload.get("id") or _session_id_from_filename(path)
         if not session_id:
             return None
-        stat = path.stat()
+        stat = stat or path.stat()
+        now = now or datetime.now(UTC)
         last_seen = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
         started = parse_timestamp(payload.get("timestamp")) or _timestamp_from_path(path)
-        age = (datetime.now(UTC) - last_seen).total_seconds()
+        age = (now - last_seen).total_seconds()
         status = SessionStatus.ACTIVE if age <= self.active_within_seconds else SessionStatus.IDLE
         cwd = Path(payload["cwd"]) if isinstance(payload.get("cwd"), str) else None
         return AgentSession(
@@ -75,8 +104,15 @@ class CodexProvider:
         )
 
     def iter_events(self, transcript_path: Path) -> Iterator[AgentEvent]:
+        yield from self.iter_events_after(transcript_path, 0)
+
+    def iter_events_after(
+        self,
+        transcript_path: Path,
+        line_number: int,
+    ) -> Iterator[AgentEvent]:
         session_id = _session_id_from_filename(transcript_path) or "unknown"
-        for line_number, record in iter_jsonl(transcript_path):
+        for event_line_number, record in iter_jsonl(transcript_path, after_line=line_number):
             timestamp = parse_timestamp(record.get("timestamp"))
             record_type = str(record.get("type", "unknown"))
             if record_type == "session_meta":
@@ -89,7 +125,7 @@ class CodexProvider:
                     timestamp=timestamp,
                     event_type="session_meta",
                     source_path=transcript_path,
-                    line_number=line_number,
+                    line_number=event_line_number,
                     metadata=payload if isinstance(payload, dict) else {},
                 )
                 continue
@@ -102,7 +138,7 @@ class CodexProvider:
                     timestamp=timestamp,
                     event_type="usage",
                     source_path=transcript_path,
-                    line_number=line_number,
+                    line_number=event_line_number,
                     metadata={"usage_snapshot": snapshot},
                 )
                 continue
@@ -114,9 +150,12 @@ class CodexProvider:
                 event_type=record_type,
                 text=text,
                 source_path=transcript_path,
-                line_number=line_number,
+                line_number=event_line_number,
                 metadata=record,
             )
+
+    def last_event_line_number(self, transcript_path: Path) -> int:
+        return last_jsonl_line_number(transcript_path)
 
     def usage_for_day(self, transcript_paths: Iterable[Path], day: str) -> list[UsageSnapshot]:
         snapshots: list[UsageSnapshot] = []
@@ -214,3 +253,21 @@ def _event_text(record: dict[str, Any]) -> str | None:
         if payload.get("type") == "function_call_output":
             return "tool result"
     return None
+
+
+def _stat_signature(stat: os.stat_result) -> tuple[int, int]:
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _refresh_observed_status(
+    session: AgentSession | None,
+    active_within_seconds: int,
+    now: datetime,
+) -> AgentSession | None:
+    if session is None or session.status == SessionStatus.DONE or session.last_seen_at is None:
+        return session
+    age = (now - session.last_seen_at).total_seconds()
+    status = SessionStatus.ACTIVE if age <= active_within_seconds else SessionStatus.IDLE
+    if status == session.status:
+        return session
+    return replace(session, status=status)
