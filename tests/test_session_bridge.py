@@ -71,9 +71,26 @@ class FakeCodexLiveClient:
     def __init__(self, handled=True):
         self.handled = handled
         self.calls = []
+        self.options = []
 
-    def send_to_thread(self, thread_id, text, cwd=None):
+    def send_to_thread(
+        self,
+        thread_id,
+        text,
+        cwd=None,
+        *,
+        approval_policy=None,
+        sandbox=None,
+        sandbox_policy=None,
+    ):
         self.calls.append((thread_id, text, cwd))
+        self.options.append(
+            {
+                "approval_policy": approval_policy,
+                "sandbox": sandbox,
+                "sandbox_policy": sandbox_policy,
+            }
+        )
         if isinstance(self.handled, Exception):
             raise self.handled
         return self.handled
@@ -1097,6 +1114,62 @@ class SessionBridgeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_dangerous_codex_remote_send_overrides_app_server_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            live = FakeCodexLiveClient()
+            started_at = datetime(2026, 5, 16, 12, 0, tzinfo=UTC)
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command=(
+                            "codex --dangerously-bypass-approvals-and-sandbox "
+                            "--remote ws://127.0.0.1:47684"
+                        ),
+                        started_at=started_at,
+                    )
+                ]
+            )
+
+            try:
+                store.init_schema()
+                bridge = ExternalSessionBridge(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    codex_live_client=live,
+                    terminal_notifier=terminal,
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    started_at=started_at,
+                    last_seen_at=started_at,
+                )
+
+                handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
+
+                self.assertTrue(handled)
+                self.assertEqual(live.calls, [("codex-s1", "continue", Path(tmp))])
+                self.assertEqual(
+                    live.options,
+                    [
+                        {
+                            "approval_policy": "never",
+                            "sandbox": "danger-full-access",
+                            "sandbox_policy": {"type": "dangerFullAccess"},
+                        }
+                    ],
+                )
+            finally:
+                store.close()
+
     def test_codex_slash_text_uses_regular_app_server_send(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1190,6 +1263,61 @@ class SessionBridgeTests(unittest.TestCase):
                         "/model gpt-5",
                     )
                 )
+            finally:
+                store.close()
+
+    def test_dangerous_codex_app_server_fallback_resumes_with_bypass_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            calls = []
+            ran = threading.Event()
+            live = FakeCodexLiveClient(RuntimeError("no app server"))
+            started_at = datetime(2026, 5, 16, 12, 0, tzinfo=UTC)
+            terminal = FakeTerminalNotifier(
+                [
+                    TerminalTarget(
+                        pid=123,
+                        tty="ttys001",
+                        cwd=Path(tmp),
+                        command=(
+                            "codex -a never --sandbox danger-full-access "
+                            "--remote ws://127.0.0.1:47684"
+                        ),
+                        started_at=started_at,
+                    )
+                ]
+            )
+
+            def runner(args, **kwargs):
+                calls.append(args)
+                ran.set()
+                return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            try:
+                store.init_schema()
+                bridge = ExternalSessionBridge(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    command_runner=runner,
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    codex_live_client=live,
+                    terminal_notifier=terminal,
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    started_at=started_at,
+                    last_seen_at=started_at,
+                )
+
+                handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
+
+                self.assertTrue(handled)
+                self.assertTrue(ran.wait(timeout=1))
+                self.assertIn("--dangerously-bypass-approvals-and-sandbox", calls[0])
             finally:
                 store.close()
 
