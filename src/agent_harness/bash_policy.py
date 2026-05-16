@@ -53,11 +53,12 @@ _GIT_SAFE_SUBCOMMAND_TOOLS: dict[str, tuple[str, ...]] = {
     "merge-base": ("Bash(git merge-base:*)", "Bash(git merge-base *)"),
     "for-each-ref": ("Bash(git for-each-ref:*)", "Bash(git for-each-ref *)"),
 }
-_GIT_FAST_FORWARD_PULL_TOOLS = (
-    "Bash(git pull --ff-only)",
-    "Bash(git pull --ff-only:*)",
-    "Bash(git pull --ff-only *)",
-)
+_GIT_PR_AUTHORING_SUBCOMMAND_TOOLS: dict[str, tuple[str, ...]] = {
+    "add": ("Bash(git add:*)", "Bash(git add *)"),
+    "commit": ("Bash(git commit:*)", "Bash(git commit *)"),
+}
+_GIT_PULL_TOOLS = ("Bash(git pull:*)", "Bash(git pull *)")
+_GIT_CONFIG_READ_TOOLS = ("Bash(git config user.name)", "Bash(git config user.email)")
 _GH_SAFE_COMMAND_TOOLS: dict[tuple[str, str], tuple[str, ...]] = {
     ("pr", "checks"): ("Bash(gh pr checks:*)", "Bash(gh pr checks *)"),
     ("pr", "create"): ("Bash(gh pr create:*)", "Bash(gh pr create *)"),
@@ -77,7 +78,9 @@ BASH_SAFE_AUTO_ALLOWED_TOOLS: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
             *[tool for tools in _GIT_SAFE_SUBCOMMAND_TOOLS.values() for tool in tools],
-            *_GIT_FAST_FORWARD_PULL_TOOLS,
+            *[tool for tools in _GIT_PR_AUTHORING_SUBCOMMAND_TOOLS.values() for tool in tools],
+            *_GIT_PULL_TOOLS,
+            *_GIT_CONFIG_READ_TOOLS,
             "Bash(gh auth status)",
             *[tool for tools in _GH_SAFE_COMMAND_TOOLS.values() for tool in tools],
             *[tool for tools in _SAFE_SIMPLE_EXECUTABLE_TOOLS.values() for tool in tools],
@@ -92,6 +95,9 @@ def classify_bash_command(command: str) -> BashCommandDecision:
     command = command.strip()
     if not command:
         return _decision(command, False, "empty command")
+    unparsed_git_commit = _classify_unparsed_git_commit(command)
+    if unparsed_git_commit is not None:
+        return unparsed_git_commit
     if "\n" in command or "\r" in command:
         return _decision(command, False, "multiline command")
     if "$(" in command or "`" in command:
@@ -298,6 +304,12 @@ def _unsafe_git_reason(parts: tuple[str, ...]) -> str | None:
         return "git output redirect flag"
     if action == "pull":
         return _unsafe_git_pull_reason(remaining)
+    if action == "config":
+        return _unsafe_git_config_reason(remaining)
+    if action == "add":
+        return _unsafe_git_add_reason(remaining)
+    if action == "commit":
+        return _unsafe_git_commit_reason(remaining)
     if action not in _GIT_SAFE_SUBCOMMAND_TOOLS:
         return f"unsupported git subcommand {action}"
     if not all(_safe_shell_arg(part) for part in remaining):
@@ -310,17 +322,109 @@ def _contains_git_output_redirect_flag(parts: tuple[str, ...] | list[str]) -> bo
 
 
 def _unsafe_git_pull_reason(parts: tuple[str, ...]) -> str | None:
-    has_fast_forward_only = False
     for part in parts:
-        if part == "--ff-only":
-            has_fast_forward_only = True
-            continue
-        if part.startswith("-"):
-            return "git pull without only fast-forward"
         if not _safe_shell_arg(part):
             return "unsafe git pull argument"
-    if not has_fast_forward_only:
-        return "git pull without only fast-forward"
+    return None
+
+
+def _unsafe_git_config_reason(parts: tuple[str, ...]) -> str | None:
+    if parts in {("user.name",), ("user.email",)}:
+        return None
+    if len(parts) == 2 and parts[0] == "--get" and parts[1] in {"user.name", "user.email"}:
+        return None
+    return "unsupported git config lookup"
+
+
+def _unsafe_git_add_reason(parts: tuple[str, ...]) -> str | None:
+    if not parts:
+        return "git add without pathspec"
+    if not all(_safe_shell_arg(part) for part in parts):
+        return "unsafe git add argument"
+    return None
+
+
+def _unsafe_git_commit_reason(parts: tuple[str, ...]) -> str | None:
+    if not parts:
+        return "git commit without arguments"
+    for part in parts:
+        if _safe_shell_arg(part) or _safe_git_commit_message_arg(part):
+            continue
+        return "unsafe git commit argument"
+    return None
+
+
+def _safe_git_commit_message_arg(value: str) -> bool:
+    opener = "$(cat <<'EOF'\n"
+    terminator = "\nEOF\n)"
+    return (
+        value.startswith(opener)
+        and value.endswith(terminator)
+        and value.count(terminator) == 1
+        and "\r" not in value
+        and "`" not in value
+    )
+
+
+def _classify_unparsed_git_commit(command: str) -> BashCommandDecision | None:
+    if "commit" not in command or "$(cat <<'EOF'\n" not in command:
+        return None
+    tokens = _shell_tokens(command)
+    if isinstance(tokens, str):
+        return _decision(command, False, tokens)
+
+    parsed = _git_commit_segments_from_tokens(tokens)
+    if isinstance(parsed, str):
+        return _decision(command, False, parsed)
+    if parsed is None:
+        return None
+    segments, operators = parsed
+    git_segment = segments[-1]
+    parsed_git = _git_subcommand(git_segment.argv)
+    if parsed_git is None:
+        return None
+    action, remaining = parsed_git
+    if action != "commit":
+        return None
+    reason = _unsafe_git_commit_reason(remaining)
+    if reason:
+        return _decision(command, False, reason, segments=segments, operators=operators)
+    return _decision(
+        command,
+        True,
+        "safe git commit command",
+        segments=segments,
+        operators=operators,
+        safe_allowed_tools=_safe_allowed_tools(command, segments, operators),
+        approval_allowed_tools=_approval_tools_for_safe_command(command, segments, operators),
+    )
+
+
+def _git_commit_segments_from_tokens(
+    tokens: list[str],
+) -> tuple[tuple[BashSegment, ...], tuple[str, ...]] | str | None:
+    if not tokens:
+        return "empty command"
+    if tokens[0] == "git":
+        if any(token in _ALLOWED_OPERATORS or token in _REJECTED_OPERATORS for token in tokens[1:]):
+            return "unsupported git commit shell structure"
+        return (BashSegment(tuple(tokens)),), ()
+    if (
+        len(tokens) >= 5
+        and tokens[0] == "cd"
+        and _safe_shell_arg(tokens[1])
+        and tokens[2] == "&&"
+        and tokens[3] == "git"
+    ):
+        git_tokens = tokens[3:]
+        if any(
+            token in _ALLOWED_OPERATORS or token in _REJECTED_OPERATORS for token in git_tokens[1:]
+        ):
+            return "unsupported git commit shell structure"
+        return (
+            BashSegment(("cd", tokens[1])),
+            BashSegment(tuple(git_tokens)),
+        ), ("&&",)
     return None
 
 
@@ -528,9 +632,24 @@ def _allowed_git_bash_tools(parts: tuple[str, ...]) -> tuple[str, ...]:
         action, remaining = parsed
         if action == "pull" and _unsafe_git_pull_reason(remaining) is None:
             prefix = _git_action_prefix(parts)
-            if prefix == "git pull":
-                return _GIT_FAST_FORWARD_PULL_TOOLS
-            return ()
+            tools = list(_GIT_PULL_TOOLS)
+            if prefix and prefix != "git pull":
+                tools.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
+            return tuple(dict.fromkeys(tools))
+        if action == "config" and _unsafe_git_config_reason(remaining) is None:
+            key = remaining[-1]
+            return (f"Bash(git config {key})",)
+        if action in _GIT_PR_AUTHORING_SUBCOMMAND_TOOLS:
+            if action == "add":
+                reason = _unsafe_git_add_reason(remaining)
+            else:
+                reason = _unsafe_git_commit_reason(remaining)
+            if reason is None:
+                prefix = _git_action_prefix(parts)
+                tools = list(_GIT_PR_AUTHORING_SUBCOMMAND_TOOLS[action])
+                if prefix and prefix != f"git {action}":
+                    tools.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
+                return tuple(dict.fromkeys(tools))
     git_command = _git_read_only_command(parts)
     if git_command is None:
         return ()
