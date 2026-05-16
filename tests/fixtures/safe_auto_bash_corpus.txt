@@ -1,0 +1,18 @@
+{"decision":"allow","command":"git -C /workspace/repos/example-project status","safe_allowed_tools":["Bash(git -C /workspace/repos/example-project status)","Bash(git status)","Bash(git status:*)","Bash(git status *)","Bash(git -C /workspace/repos/example-project status:*)","Bash(git -C /workspace/repos/example-project status *)"]}
+{"decision":"allow","command":"ls /tmp/example-provider-analysis.patch 2>&1 && wc -l /tmp/example-provider-analysis.patch","safe_allowed_tools":["Bash(ls /tmp/example-provider-analysis.patch 2>&1 && wc -l /tmp/example-provider-analysis.patch)"]}
+{"decision":"allow","command":"git -C /workspace/repos/example-project status 2>&1 | head -30","safe_allowed_tools":["Bash(git -C /workspace/repos/example-project status 2>&1 | head -30)"]}
+{"decision":"allow","command":"ls /tmp/example-provider-analysis.patch 2>&1; ls /tmp/ | grep -i example 2>&1","safe_allowed_tools":["Bash(ls /tmp/example-provider-analysis.patch 2>&1; ls /tmp/ | grep -i example 2>&1)"]}
+{"decision":"allow","command":"gh pr view 33 --json url,state,mergeable,statusCheckRollup","safe_allowed_tools":["Bash(gh pr view:*)","Bash(gh pr view *)"]}
+{"decision":"allow","command":"cd /workspace/repos/sample-app && git log --oneline -30","safe_allowed_tools":["Bash(cd /workspace/repos/sample-app && git log --oneline -30)","Bash(git log:*)","Bash(git log *)"]}
+{"decision":"allow","command":"git blame file.py","safe_allowed_tools":["Bash(git blame file.py)","Bash(git blame:*)","Bash(git blame *)"]}
+{"decision":"allow","command":"git rev-parse --show-toplevel","safe_allowed_tools":["Bash(git rev-parse --show-toplevel)","Bash(git rev-parse:*)","Bash(git rev-parse *)"]}
+{"decision":"allow","command":"gh issue list","safe_allowed_tools":["Bash(gh issue list)","Bash(gh issue list:*)","Bash(gh issue list *)"]}
+{"decision":"allow","command":"sed -n 1,120p src/agent_harness/permissions.py","safe_allowed_tools":["Bash(sed -n:*)","Bash(sed -n *)"]}
+{"decision":"deny","command":"git -C /repo commit -m update","safe_allowed_tools":[]}
+{"decision":"deny","command":"git fetch origin main","safe_allowed_tools":[]}
+{"decision":"deny","command":"sed -I '' s/a/b/ f","safe_allowed_tools":[]}
+{"decision":"deny","command":"ls /tmp || rm -rf /tmp/nope","safe_allowed_tools":[]}
+{"decision":"deny","command":"cat <<EOF","safe_allowed_tools":[]}
+{"decision":"deny","command":"grep \"a;b\" file","safe_allowed_tools":[]}
+{"decision":"deny","command":"cat <(printf hi)","safe_allowed_tools":[]}
+{"decision":"deny","command":"ls /tmp &","safe_allowed_tools":[]}

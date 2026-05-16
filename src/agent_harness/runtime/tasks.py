@@ -4,7 +4,6 @@ import json
 import logging
 import platform
 import re
-import shlex
 import threading
 import time
 from collections.abc import Callable
@@ -13,6 +12,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from secrets import token_urlsafe
 
+from agent_harness.bash_policy import (
+    allowed_bash_session_tools_for_command,
+    allowed_bash_tools_for_command,
+    classify_bash_command,
+)
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
     AgentTask,
@@ -1298,6 +1302,15 @@ def _safe_auto_allowed_tools_for_claude_denial(
         return ()
     tool_name = str(denial.get("tool_name") or "")
     tool_input = denial.get("tool_input")
+    if tool_name == "Bash" and isinstance(tool_input, dict):
+        command = tool_input.get("command")
+        if not isinstance(command, str):
+            return ()
+        decision = classify_bash_command(command)
+        if not decision.safe:
+            LOGGER.info("safe-auto denied Claude Bash runtime retry: %s", decision.reason)
+            return ()
+        return decision.safe_allowed_tools
     params: dict[str, object] = {"tool_name": tool_name}
     if isinstance(tool_input, dict):
         params["tool_input"] = tool_input
@@ -1343,158 +1356,16 @@ def _append_allowed_tools(
 
 
 def _allowed_bash_tools_for_command(command: str) -> tuple[str, ...]:
-    command = command.strip()
-    if not command or "\r" in command:
-        return ()
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = []
-    effective_parts = _strip_cd_prefix(parts)
-    tools: list[str] = []
-    exact_allowed = _exact_bash_permission_allowed(command)
-    if effective_parts and effective_parts[0] == "gh":
-        prefix_tools = _allowed_gh_bash_tools(
-            effective_parts,
-            include_generic=not exact_allowed,
-        )
-    elif effective_parts and effective_parts[0] == "git":
-        prefix_tools = _allowed_git_bash_tools(effective_parts)
-    else:
-        prefix_tools = ()
-    if exact_allowed:
-        tools.append(f"Bash({command})")
-    if prefix_tools:
-        tools.extend(prefix_tools)
-    elif not exact_allowed:
-        tools.extend(_generic_bash_tools(command, effective_parts))
-    return tuple(dict.fromkeys(tools))
-
-
-def _exact_bash_permission_allowed(command: str) -> bool:
-    return not any(value in command for value in (")", ",", "\n", "\r"))
-
-
-def _generic_bash_tools(command: str, parts: list[str]) -> tuple[str, ...]:
-    prefix = _generic_bash_prefix(command, parts)
-    if prefix is None:
-        return ()
-    return (f"Bash({prefix}:*)", f"Bash({prefix} *)")
-
-
-def _generic_bash_prefix(command: str, parts: list[str]) -> str | None:
-    for prefix_len in range(len(parts), 1, -1):
-        prefix = shlex.join(parts[:prefix_len])
-        if ")" in prefix or "," in prefix or "\n" in prefix or "\r" in prefix:
-            continue
-        if command.startswith(prefix):
-            return prefix
-    return None
+    return allowed_bash_tools_for_command(command)
 
 
 def _allowed_bash_session_tools_for_command(command: str) -> tuple[str, ...]:
-    command = command.strip()
-    if not command or "\r" in command:
-        return ()
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return ()
-    effective_parts = _strip_cd_prefix(parts)
-    if not effective_parts:
-        return ()
-    executable = shlex.join(effective_parts[:1])
-    if any(value in executable for value in (")", ",", "\n", "\r")):
-        return ()
-    return (f"Bash({executable}:*)", f"Bash({executable} *)")
-
-
-def _strip_cd_prefix(parts: list[str]) -> list[str]:
-    if len(parts) >= 4 and parts[0] == "cd" and parts[2] == "&&":
-        return parts[3:]
-    return parts
+    return allowed_bash_session_tools_for_command(command)
 
 
 def _allowed_bash_tool_for_command(command: str) -> str | None:
     allowed_tools = _allowed_bash_tools_for_command(command)
     return allowed_tools[0] if allowed_tools else None
-
-
-def _allowed_gh_bash_tools(
-    parts: list[str],
-    *,
-    include_generic: bool = True,
-) -> tuple[str, ...]:
-    if parts == ["gh", "auth", "status"]:
-        return ("Bash(gh auth status)",)
-    if len(parts) < 3:
-        return ()
-    group, action = parts[1], parts[2]
-    safe_patterns = {
-        ("pr", "checks"): ("Bash(gh pr checks:*)", "Bash(gh pr checks *)"),
-        ("pr", "diff"): ("Bash(gh pr diff:*)", "Bash(gh pr diff *)"),
-        ("pr", "list"): ("Bash(gh pr list:*)", "Bash(gh pr list *)"),
-        ("pr", "status"): ("Bash(gh pr status:*)", "Bash(gh pr status *)"),
-        ("pr", "view"): ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
-        ("repo", "view"): ("Bash(gh repo view:*)", "Bash(gh repo view *)"),
-        ("run", "list"): ("Bash(gh run list:*)", "Bash(gh run list *)"),
-        ("run", "view"): ("Bash(gh run view:*)", "Bash(gh run view *)"),
-        ("search", "prs"): ("Bash(gh search prs:*)", "Bash(gh search prs *)"),
-    }
-    patterns = list(safe_patterns.get((group, action), ()))
-    prefix = shlex.join(parts[:3])
-    if include_generic and ")" not in prefix and "," not in prefix:
-        patterns.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
-    return tuple(dict.fromkeys(patterns))
-
-
-def _allowed_git_bash_tools(parts: list[str]) -> tuple[str, ...]:
-    git_command = _git_read_only_command(parts)
-    if git_command is None:
-        return ()
-    action, prefix = git_command
-    safe_patterns = {
-        "branch": ("Bash(git branch:*)", "Bash(git branch *)"),
-        "diff": ("Bash(git diff:*)", "Bash(git diff *)"),
-        "log": ("Bash(git log:*)", "Bash(git log *)"),
-        "show": ("Bash(git show:*)", "Bash(git show *)"),
-        "status": ("Bash(git status)", "Bash(git status:*)", "Bash(git status *)"),
-    }
-    patterns = list(safe_patterns.get(action, ()))
-    if ")" not in prefix and "," not in prefix:
-        patterns.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))
-    return tuple(dict.fromkeys(patterns))
-
-
-def _git_read_only_command(parts: list[str]) -> tuple[str, str] | None:
-    if len(parts) < 2 or parts[0] != "git":
-        return None
-    index = 1
-    while index < len(parts):
-        part = parts[index]
-        if part == "-C":
-            if index + 1 >= len(parts):
-                return None
-            index += 2
-            continue
-        if part.startswith("-C") and len(part) > 2:
-            index += 1
-            continue
-        if part in {"--no-pager", "--paginate", "--no-optional-locks"}:
-            index += 1
-            continue
-        if part in {"-c", "--git-dir", "--work-tree", "--namespace"}:
-            if index + 1 >= len(parts):
-                return None
-            index += 2
-            continue
-        if part.startswith(("-c", "--git-dir=", "--work-tree=", "--namespace=")):
-            index += 1
-            continue
-        if part.startswith("-"):
-            return None
-        return part, shlex.join(parts[: index + 1])
-    return None
 
 
 def _claude_denial_request_params(denial: dict) -> dict[str, object]:
