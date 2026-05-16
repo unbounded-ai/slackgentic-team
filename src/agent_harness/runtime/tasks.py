@@ -1786,6 +1786,8 @@ def _render_claude_json_line(line: str) -> str | None:
             return _format_claude_error(message)
         result = event.get("result")
         return _clean_terminal_output(str(result)) if result else None
+    if event_type == "assistant":
+        return _claude_assistant_message_text(event)
     if event_type == "error":
         message = event.get("message") or event.get("error")
         return _format_claude_error(message)
