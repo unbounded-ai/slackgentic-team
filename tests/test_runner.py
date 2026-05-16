@@ -144,7 +144,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(args[permission_index + 1], "acceptEdits")
         self.assertNotIn("--dangerously-skip-permissions", args)
         self.assertIn("--allowedTools=Bash(git status:*)", args)
-        self.assertIn("--allowedTools=Bash(git pull --ff-only:*)", args)
+        self.assertIn("--allowedTools=Bash(git add:*)", args)
+        self.assertIn("--allowedTools=Bash(git commit:*)", args)
+        self.assertIn("--allowedTools=Bash(git pull:*)", args)
+        self.assertIn("--allowedTools=Bash(git config user.name)", args)
+        self.assertIn("--allowedTools=Bash(git config user.email)", args)
         self.assertIn("--allowedTools=Bash(gh pr view:*)", args)
         self.assertIn("--allowedTools=Bash(gh pr create:*)", args)
 
@@ -159,7 +163,6 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(command, "claude")
         forbidden = (
-            "Bash(git pull:*)",
             "Bash(git branch:*)",
             "Bash(git remote:*)",
             "Bash(gh api:*)",

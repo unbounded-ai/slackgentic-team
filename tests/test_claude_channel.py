@@ -420,6 +420,42 @@ class ClaudeChannelTests(unittest.TestCase):
                             "description": "create pull request",
                         },
                     ),
+                    (
+                        "req-git-config-sequence",
+                        {
+                            "command": (
+                                "git -C /workspace/repos/example-project config user.name; "
+                                "git -C /workspace/repos/example-project config user.email"
+                            ),
+                            "description": "check git author config",
+                        },
+                    ),
+                    (
+                        "req-git-add",
+                        {
+                            "command": (
+                                "git -C /workspace/repos/example-project add "
+                                "docs/vendors/index.html docs/vendors/modal_embeddings.html "
+                                "docs/vendors/vendor-style.css "
+                                "docs/vendors/inference_provider.html"
+                            ),
+                            "description": "stage vendor docs",
+                        },
+                    ),
+                    (
+                        "req-git-commit",
+                        {
+                            "command": (
+                                "cd /workspace/repos/example-project && "
+                                "git commit -m \"$(cat <<'EOF'\n"
+                                "[docs][vendors] Add Qwen3 inference decision\n\n"
+                                "Refresh embedding backends.\n"
+                                "EOF\n"
+                                ')"'
+                            ),
+                            "description": "commit vendor docs",
+                        },
+                    ),
                 )
 
                 with (
@@ -463,6 +499,9 @@ class ClaudeChannelTests(unittest.TestCase):
                         {"request_id": "req-ls-grep-sequence", "behavior": "allow"},
                         {"request_id": "req-git-pull-ff-only", "behavior": "allow"},
                         {"request_id": "req-gh-pr-create", "behavior": "allow"},
+                        {"request_id": "req-git-config-sequence", "behavior": "allow"},
+                        {"request_id": "req-git-add", "behavior": "allow"},
+                        {"request_id": "req-git-commit", "behavior": "allow"},
                     ],
                 )
                 self.assertEqual(gateway.replies, [], "no Slack approval round-trip expected")
@@ -501,10 +540,8 @@ class ClaudeChannelTests(unittest.TestCase):
                         "req-commit",
                         {
                             "tool_name": "Bash",
-                            "description": "Commit changes",
-                            "input_preview": json.dumps(
-                                {"command": "git -C /repo commit -m update"}
-                            ),
+                            "description": "Reset changes",
+                            "input_preview": json.dumps({"command": "git -C /repo reset --hard"}),
                         },
                     )
 

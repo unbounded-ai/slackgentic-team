@@ -31,12 +31,15 @@ class BashPolicyTests(unittest.TestCase):
     def test_startup_allowlist_is_derived_from_policy_tables(self):
         self.assertIn("Bash(git blame:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertIn("Bash(gh issue list:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
-        self.assertIn("Bash(git pull --ff-only:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(git add:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(git commit:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(git pull:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(git config user.name)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(git config user.email)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertIn("Bash(gh pr create:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertNotIn("Bash(git fetch:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
-        self.assertNotIn("Bash(git pull:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
 
-    def test_safe_auto_preserves_manual_approval_tool_for_multiline_commit(self):
+    def test_safe_auto_allows_multiline_commit_by_prefix(self):
         command = """git -C /workspace/repos/sample-app commit -m "$(cat <<'EOF'
 [sample-app] Add parity adapter and rollout bridge
 
@@ -46,8 +49,8 @@ EOF
 
         decision = classify_bash_command(command)
 
-        self.assertFalse(decision.safe)
+        self.assertTrue(decision.safe, decision.reason)
         self.assertIn(
             "Bash(git -C /workspace/repos/sample-app commit:*)",
-            decision.approval_allowed_tools,
+            decision.safe_allowed_tools,
         )

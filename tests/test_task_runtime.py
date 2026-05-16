@@ -1023,19 +1023,20 @@ class TaskRuntimeTests(unittest.TestCase):
         )
         self.assertIn("Bash(git log:*)", allowed_tools)
 
-    def test_claude_permission_denial_allows_git_pull_ff_only_exactly(self):
+    def test_claude_permission_denial_allows_git_pull(self):
         denial = {
             "tool_name": "Bash",
-            "tool_input": {"command": "git -C /workspace/repos/example-project pull --ff-only"},
+            "tool_input": {"command": "git -C /workspace/repos/example-project pull origin main"},
         }
 
         allowed_tools = _allowed_tools_for_claude_denial(denial)
 
         self.assertEqual(
             _allowed_tool_for_claude_denial(denial),
-            "Bash(git -C /workspace/repos/example-project pull --ff-only)",
+            "Bash(git -C /workspace/repos/example-project pull origin main)",
         )
-        self.assertNotIn("Bash(git pull:*)", allowed_tools)
+        self.assertIn("Bash(git pull:*)", allowed_tools)
+        self.assertIn("Bash(git -C /workspace/repos/example-project pull:*)", allowed_tools)
 
     def test_claude_permission_denial_allows_gh_pr_create(self):
         denial = {
@@ -1051,6 +1052,18 @@ class TaskRuntimeTests(unittest.TestCase):
         )
         self.assertIn("Bash(gh pr create:*)", allowed_tools)
         self.assertIn("Bash(gh pr create *)", allowed_tools)
+
+    def test_claude_permission_denial_allows_git_config_author_sequence(self):
+        command = (
+            "git -C /workspace/repos/example-project config user.name; "
+            "git -C /workspace/repos/example-project config user.email"
+        )
+        denial = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+
+        self.assertEqual(_allowed_tool_for_claude_denial(denial), f"Bash({command})")
+        self.assertEqual(allowed_tools, (f"Bash({command})",))
 
     def test_claude_permission_denial_allows_file_edit_tools(self):
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Edit"}), "Edit")
@@ -2237,29 +2250,16 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_runtime_handles_multiline_claude_bash_permission_denial(self):
+    def test_runtime_retries_safe_auto_multiline_commit_without_slack_approval(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             requests = []
-            approved = threading.Event()
 
             def process_factory(request):
                 requests.append(request)
                 if len(requests) == 1:
                     return ClaudeMultilineCommitPermissionDeniedProcess(request)
                 return ClaudeOneShotProcess(request)
-
-            def approve_request():
-                for _ in range(100):
-                    rows = store.list_pending_slack_agent_requests("claude/channel/permission")
-                    if rows:
-                        params = json.loads(rows[0]["params_json"])
-                        self.assertEqual(params["tool_name"], "Bash")
-                        self.assertIn("Commit codex parity", params["input_preview"])
-                        store.resolve_slack_agent_request(rows[0]["token"], {"behavior": "allow"})
-                        approved.set()
-                        return
-                    time.sleep(0.01)
 
             try:
                 store.init_schema()
@@ -2275,32 +2275,27 @@ class TaskRuntimeTests(unittest.TestCase):
                     process_factory=process_factory,
                     poll_seconds=0.01,
                 )
-                approver = threading.Thread(target=approve_request)
-                approver.start()
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
                 for _ in range(100):
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
-                approver.join(timeout=1)
 
-                self.assertTrue(approved.is_set())
-                self.assertIn(
-                    "I'm blocked on approval before I can continue: commit codex parity",
-                    gateway.replies[0],
-                )
-                self.assertIn("Claude requests command approval: git", gateway.replies)
+                self.assertEqual(gateway.replies, ["Done"])
                 self.assertNotIn(
                     "Claude requested a tool approval I cannot safely resume automatically.",
                     gateway.replies,
                 )
-                self.assertIn("Done", gateway.replies)
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[1].resume_session_id, "claude-multiline-commit-session")
                 self.assertIn(
                     "Bash(git -C /workspace/repos/sample-app commit:*)",
                     requests[1].allowed_tools,
+                )
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("claude/channel/permission"),
+                    [],
                 )
             finally:
                 store.close()
