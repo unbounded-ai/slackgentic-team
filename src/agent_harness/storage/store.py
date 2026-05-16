@@ -17,6 +17,8 @@ from agent_harness.models import (
     AgentTaskStatus,
     AssignmentMode,
     ControlMode,
+    DeferredWork,
+    DeferredWorkStatus,
     PendingWorkRequest,
     PendingWorkRequestStatus,
     Provider,
@@ -30,6 +32,8 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgent,
     TeamAgentStatus,
+    WorkDependency,
+    WorkDependencyKind,
     WorkRequest,
     parse_timestamp,
     utc_now,
@@ -275,6 +279,35 @@ CREATE TABLE IF NOT EXISTS scheduled_work_requests (
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_work_due
   ON scheduled_work_requests(status, next_run_at, created_at);
+
+CREATE TABLE IF NOT EXISTS deferred_work_requests (
+  deferred_id TEXT NOT NULL PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  message_ts TEXT,
+  prompt TEXT NOT NULL,
+  assignment_mode TEXT NOT NULL,
+  requested_handle TEXT,
+  task_kind TEXT NOT NULL,
+  author_handle TEXT,
+  pr_url TEXT,
+  dangerous_mode INTEGER NOT NULL DEFAULT 0,
+  requested_by_slack_user TEXT,
+  depends_on_json TEXT NOT NULL DEFAULT '[]',
+  after_dep_delay_seconds INTEGER,
+  run_at TEXT,
+  fire_at TEXT,
+  deps_satisfied_at TEXT,
+  status TEXT NOT NULL,
+  description TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  dispatched_at TEXT,
+  last_task_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deferred_work_status
+  ON deferred_work_requests(status, fire_at, created_at);
 """
 
 
@@ -1640,6 +1673,293 @@ class Store:
             self.conn.commit()
         return int(cursor.rowcount)
 
+    def create_deferred_work_request(
+        self,
+        thread: SlackThreadRef,
+        request: WorkRequest,
+        *,
+        depends_on: tuple[WorkDependency, ...] | list[WorkDependency],
+        after_dep_delay_seconds: int | None = None,
+        run_at=None,
+        description: str | None = None,
+        requested_by_slack_user: str | None = None,
+    ) -> DeferredWork:
+        now = utc_now()
+        deferred = DeferredWork(
+            deferred_id=f"defer_{uuid.uuid4().hex[:12]}",
+            channel_id=thread.channel_id,
+            thread_ts=thread.thread_ts,
+            message_ts=thread.message_ts,
+            prompt=request.prompt,
+            assignment_mode=request.assignment_mode,
+            requested_handle=request.requested_handle,
+            task_kind=request.task_kind,
+            author_handle=request.author_handle,
+            pr_url=request.pr_url,
+            dangerous_mode=request.dangerous_mode,
+            requested_by_slack_user=requested_by_slack_user,
+            depends_on=tuple(depends_on),
+            after_dep_delay_seconds=after_dep_delay_seconds,
+            run_at=run_at,
+            fire_at=None,
+            deps_satisfied_at=None,
+            status=DeferredWorkStatus.WAITING_DEPS,
+            description=description,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO deferred_work_requests (
+                  deferred_id, channel_id, thread_ts, message_ts, prompt, assignment_mode,
+                  requested_handle, task_kind, author_handle, pr_url, dangerous_mode,
+                  requested_by_slack_user, depends_on_json, after_dep_delay_seconds, run_at,
+                  fire_at, deps_satisfied_at, status, description, created_at, updated_at,
+                  dispatched_at, last_task_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _deferred_work_values(deferred),
+            )
+            self.conn.commit()
+        return deferred
+
+    def get_deferred_work(self, deferred_id: str) -> DeferredWork | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM deferred_work_requests WHERE deferred_id = ?",
+                (deferred_id,),
+            ).fetchone()
+        return _deferred_work_from_row(row) if row else None
+
+    def list_deferred_work(
+        self,
+        *,
+        statuses: tuple[DeferredWorkStatus, ...] | None = None,
+        channel_id: str | None = None,
+        limit: int = 100,
+    ) -> list[DeferredWork]:
+        selected = statuses or (
+            DeferredWorkStatus.WAITING_DEPS,
+            DeferredWorkStatus.READY,
+            DeferredWorkStatus.CLAIMED,
+        )
+        if not selected:
+            return []
+        where = [f"status IN ({', '.join('?' for _ in selected)})"]
+        params: list[object] = [item.value for item in selected]
+        if channel_id:
+            where.append("channel_id = ?")
+            params.append(channel_id)
+        params.append(limit)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM deferred_work_requests
+                WHERE {" AND ".join(where)}
+                ORDER BY created_at, deferred_id
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_deferred_work_from_row(row) for row in rows]
+
+    def list_waiting_deferred_work(self, *, limit: int = 50) -> list[DeferredWork]:
+        return self.list_deferred_work(
+            statuses=(DeferredWorkStatus.WAITING_DEPS,),
+            limit=limit,
+        )
+
+    def list_due_deferred_work(self, *, now=None, limit: int = 50) -> list[DeferredWork]:
+        reference = now or utc_now()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM deferred_work_requests
+                WHERE status = ? AND fire_at IS NOT NULL AND fire_at <= ?
+                ORDER BY fire_at, created_at, deferred_id
+                LIMIT ?
+                """,
+                (DeferredWorkStatus.READY.value, reference.isoformat(), limit),
+            ).fetchall()
+        return [_deferred_work_from_row(row) for row in rows]
+
+    def mark_deferred_work_ready(
+        self,
+        deferred_id: str,
+        *,
+        fire_at,
+        deps_satisfied_at,
+    ) -> DeferredWork | None:
+        now = utc_now()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, fire_at = ?, deps_satisfied_at = ?, updated_at = ?
+                WHERE deferred_id = ? AND status = ?
+                """,
+                (
+                    DeferredWorkStatus.READY.value,
+                    fire_at.isoformat(),
+                    deps_satisfied_at.isoformat(),
+                    now.isoformat(),
+                    deferred_id,
+                    DeferredWorkStatus.WAITING_DEPS.value,
+                ),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+        return self.get_deferred_work(deferred_id)
+
+    def claim_deferred_work(self, deferred_id: str) -> DeferredWork | None:
+        now = utc_now()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, updated_at = ?
+                WHERE deferred_id = ? AND status = ?
+                """,
+                (
+                    DeferredWorkStatus.CLAIMED.value,
+                    now.isoformat(),
+                    deferred_id,
+                    DeferredWorkStatus.READY.value,
+                ),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+        return self.get_deferred_work(deferred_id)
+
+    def complete_deferred_work(
+        self,
+        deferred_id: str,
+        *,
+        last_task_id: str | None,
+    ) -> None:
+        now = utc_now()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, dispatched_at = ?, last_task_id = ?, updated_at = ?
+                WHERE deferred_id = ?
+                """,
+                (
+                    DeferredWorkStatus.DONE.value,
+                    now.isoformat(),
+                    last_task_id,
+                    now.isoformat(),
+                    deferred_id,
+                ),
+            )
+            self.conn.commit()
+
+    def release_deferred_work(self, deferred_id: str) -> None:
+        now = utc_now()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, updated_at = ?
+                WHERE deferred_id = ? AND status = ?
+                """,
+                (
+                    DeferredWorkStatus.READY.value,
+                    now.isoformat(),
+                    deferred_id,
+                    DeferredWorkStatus.CLAIMED.value,
+                ),
+            )
+            self.conn.commit()
+
+    def update_deferred_work_status(
+        self,
+        deferred_id: str,
+        status: DeferredWorkStatus,
+    ) -> None:
+        now = utc_now()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, updated_at = ?
+                WHERE deferred_id = ?
+                """,
+                (status.value, now.isoformat(), deferred_id),
+            )
+            self.conn.commit()
+
+    def list_thread_agent_tasks(
+        self,
+        channel_id: str,
+        thread_ts: str,
+    ) -> list[AgentTask]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM agent_tasks
+            WHERE channel_id = ? AND thread_ts = ?
+            ORDER BY created_at ASC
+            """,
+            (channel_id, thread_ts),
+        ).fetchall()
+        return [_agent_task_from_row(row) for row in rows]
+
+    def evaluate_deferred_dependencies(
+        self,
+        deferred: DeferredWork,
+    ) -> tuple[bool, list[WorkDependency]]:
+        unsatisfied: list[WorkDependency] = []
+        for dep in deferred.depends_on:
+            if not self._dependency_is_satisfied(dep):
+                unsatisfied.append(dep)
+        return (not unsatisfied, unsatisfied)
+
+    def _dependency_is_satisfied(self, dep: WorkDependency) -> bool:
+        terminal = {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}
+        if dep.kind == WorkDependencyKind.THREAD:
+            if not dep.channel_id or not dep.thread_ts:
+                return False
+            thread_tasks = self.list_thread_agent_tasks(dep.channel_id, dep.thread_ts)
+            if not thread_tasks:
+                return False
+            return all(task.status in terminal for task in thread_tasks)
+        if dep.kind == WorkDependencyKind.AGENT_BUSY:
+            if not dep.task_id:
+                return False
+            task = self.get_agent_task(dep.task_id)
+            if task is None:
+                return False
+            return task.status in terminal
+        return False
+
+    def cancel_deferred_work_for_thread(self, channel_id: str, thread_ts: str) -> int:
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, updated_at = ?
+                WHERE channel_id = ?
+                  AND thread_ts = ?
+                  AND status IN (?, ?, ?)
+                """,
+                (
+                    DeferredWorkStatus.CANCELLED.value,
+                    utc_now().isoformat(),
+                    channel_id,
+                    thread_ts,
+                    DeferredWorkStatus.WAITING_DEPS.value,
+                    DeferredWorkStatus.READY.value,
+                    DeferredWorkStatus.CLAIMED.value,
+                ),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
 
 def _team_agent_values(agent: TeamAgent) -> tuple[object, ...]:
     return (
@@ -1883,5 +2203,91 @@ def _scheduled_work_from_row(row: sqlite3.Row) -> ScheduledWork:
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
         last_run_at=parse_timestamp(row["last_run_at"]),
+        last_task_id=row["last_task_id"],
+    )
+
+
+def _serialize_dependency(dep: WorkDependency) -> dict[str, object]:
+    return {
+        "kind": dep.kind.value,
+        "channel_id": dep.channel_id,
+        "thread_ts": dep.thread_ts,
+        "permalink": dep.permalink,
+        "task_id": dep.task_id,
+        "handle": dep.handle,
+        "description": dep.description,
+    }
+
+
+def _deserialize_dependency(raw: dict[str, object]) -> WorkDependency:
+    return WorkDependency(
+        kind=WorkDependencyKind(str(raw.get("kind"))),
+        channel_id=raw.get("channel_id") if isinstance(raw.get("channel_id"), str) else None,
+        thread_ts=raw.get("thread_ts") if isinstance(raw.get("thread_ts"), str) else None,
+        permalink=raw.get("permalink") if isinstance(raw.get("permalink"), str) else None,
+        task_id=raw.get("task_id") if isinstance(raw.get("task_id"), str) else None,
+        handle=raw.get("handle") if isinstance(raw.get("handle"), str) else None,
+        description=raw.get("description") if isinstance(raw.get("description"), str) else None,
+    )
+
+
+def _deferred_work_values(deferred: DeferredWork) -> tuple[object, ...]:
+    return (
+        deferred.deferred_id,
+        deferred.channel_id,
+        deferred.thread_ts,
+        deferred.message_ts,
+        deferred.prompt,
+        deferred.assignment_mode.value,
+        deferred.requested_handle,
+        deferred.task_kind.value,
+        deferred.author_handle,
+        deferred.pr_url,
+        int(deferred.dangerous_mode),
+        deferred.requested_by_slack_user,
+        json.dumps([_serialize_dependency(dep) for dep in deferred.depends_on], sort_keys=True),
+        deferred.after_dep_delay_seconds,
+        deferred.run_at.isoformat() if deferred.run_at else None,
+        deferred.fire_at.isoformat() if deferred.fire_at else None,
+        deferred.deps_satisfied_at.isoformat() if deferred.deps_satisfied_at else None,
+        deferred.status.value,
+        deferred.description,
+        deferred.created_at.isoformat(),
+        deferred.updated_at.isoformat(),
+        deferred.dispatched_at.isoformat() if deferred.dispatched_at else None,
+        deferred.last_task_id,
+    )
+
+
+def _deferred_work_from_row(row: sqlite3.Row) -> DeferredWork:
+    deps_raw = json.loads(row["depends_on_json"] or "[]")
+    deps = tuple(_deserialize_dependency(item) for item in deps_raw if isinstance(item, dict))
+    return DeferredWork(
+        deferred_id=row["deferred_id"],
+        channel_id=row["channel_id"],
+        thread_ts=row["thread_ts"],
+        message_ts=row["message_ts"],
+        prompt=row["prompt"],
+        assignment_mode=AssignmentMode(row["assignment_mode"]),
+        requested_handle=row["requested_handle"],
+        task_kind=AgentTaskKind(row["task_kind"]),
+        author_handle=row["author_handle"],
+        pr_url=row["pr_url"],
+        dangerous_mode=bool(row["dangerous_mode"]),
+        requested_by_slack_user=row["requested_by_slack_user"],
+        depends_on=deps,
+        after_dep_delay_seconds=(
+            int(row["after_dep_delay_seconds"])
+            if row["after_dep_delay_seconds"] is not None
+            else None
+        ),
+        run_at=parse_timestamp(row["run_at"]),
+        fire_at=parse_timestamp(row["fire_at"]),
+        deps_satisfied_at=parse_timestamp(row["deps_satisfied_at"]),
+        status=DeferredWorkStatus(row["status"]),
+        description=row["description"],
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+        dispatched_at=parse_timestamp(row["dispatched_at"]),
         last_task_id=row["last_task_id"],
     )

@@ -7,15 +7,19 @@ from pathlib import Path
 
 from agent_harness.models import (
     AgentSession,
+    AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
     ControlMode,
+    DeferredWorkStatus,
     PendingWorkRequestStatus,
     Provider,
     ScheduledWorkKind,
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
+    WorkDependency,
+    WorkDependencyKind,
     WorkRequest,
     utc_now,
 )
@@ -75,6 +79,104 @@ class StoreTests(unittest.TestCase):
                 self.assertIsNotNone(active_task)
                 assert active_task is not None
                 self.assertEqual(active_task.status, AgentTaskStatus.QUEUED)
+            finally:
+                store.close()
+
+    def test_deferred_work_round_trip_and_ready_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                blocking_task = create_agent_task(agent, "blocking work", "C1")
+                store.upsert_agent_task(blocking_task)
+                store.update_agent_task_thread(blocking_task.task_id, "171.000001", "171.parent")
+                request = WorkRequest(
+                    prompt="follow-up after the blocker",
+                    assignment_mode=AssignmentMode.ANYONE,
+                    task_kind=AgentTaskKind.WORK,
+                )
+                thread_ref = SlackThreadRef(
+                    channel_id="C1",
+                    thread_ts="171.000002",
+                    message_ts="171.000002",
+                )
+                deps = (
+                    WorkDependency(
+                        kind=WorkDependencyKind.THREAD,
+                        channel_id="C1",
+                        thread_ts="171.000001",
+                        permalink="https://example.slack.com/archives/C1/p0000000171000001",
+                        task_id=blocking_task.task_id,
+                    ),
+                )
+                deferred = store.create_deferred_work_request(
+                    thread_ref,
+                    request,
+                    depends_on=deps,
+                )
+                self.assertEqual(deferred.status, DeferredWorkStatus.WAITING_DEPS)
+                self.assertEqual(len(store.list_waiting_deferred_work()), 1)
+                satisfied, missing = store.evaluate_deferred_dependencies(deferred)
+                self.assertFalse(satisfied)
+                self.assertEqual(len(missing), 1)
+                store.update_agent_task_status(blocking_task.task_id, AgentTaskStatus.DONE)
+                satisfied, _ = store.evaluate_deferred_dependencies(deferred)
+                self.assertTrue(satisfied)
+                fire_at = utc_now() + timedelta(seconds=30)
+                ready = store.mark_deferred_work_ready(
+                    deferred.deferred_id,
+                    fire_at=fire_at,
+                    deps_satisfied_at=utc_now(),
+                )
+                assert ready is not None
+                self.assertEqual(ready.status, DeferredWorkStatus.READY)
+                self.assertEqual(
+                    store.list_due_deferred_work(now=fire_at + timedelta(seconds=1)), [ready]
+                )
+                claimed = store.claim_deferred_work(ready.deferred_id)
+                assert claimed is not None
+                self.assertEqual(claimed.status, DeferredWorkStatus.CLAIMED)
+                self.assertIsNone(store.claim_deferred_work(ready.deferred_id))
+                store.complete_deferred_work(claimed.deferred_id, last_task_id="task_xyz")
+                stored = store.get_deferred_work(claimed.deferred_id)
+                assert stored is not None
+                self.assertEqual(stored.status, DeferredWorkStatus.DONE)
+                self.assertEqual(stored.last_task_id, "task_xyz")
+            finally:
+                store.close()
+
+    def test_deferred_work_cancellation_by_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                blocking = create_agent_task(agent, "blocker", "C1")
+                store.upsert_agent_task(blocking)
+                store.update_agent_task_thread(blocking.task_id, "171.000001", "171.parent")
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef(channel_id="C1", thread_ts="171.000002"),
+                    WorkRequest(
+                        prompt="follow up",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.THREAD,
+                            channel_id="C1",
+                            thread_ts="171.000001",
+                            task_id=blocking.task_id,
+                        ),
+                    ),
+                )
+                cancelled = store.cancel_deferred_work_for_thread("C1", "171.000002")
+                self.assertEqual(cancelled, 1)
+                stored = store.get_deferred_work(deferred.deferred_id)
+                assert stored is not None
+                self.assertEqual(stored.status, DeferredWorkStatus.CANCELLED)
             finally:
                 store.close()
 

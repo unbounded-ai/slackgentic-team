@@ -80,6 +80,19 @@ class ScheduledWorkKind(StrEnum):
     RECURRING = "recurring"
 
 
+class DeferredWorkStatus(StrEnum):
+    WAITING_DEPS = "waiting_deps"
+    READY = "ready"
+    CLAIMED = "claimed"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class WorkDependencyKind(StrEnum):
+    THREAD = "thread"
+    AGENT_BUSY = "agent_busy"
+
+
 class AssignmentMode(StrEnum):
     ANYONE = "anyone"
     SPECIFIC = "specific"
@@ -281,6 +294,44 @@ class ScheduledWork:
     timezone: str | None = None
     last_run_at: datetime | None = None
     last_task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkDependency:
+    kind: WorkDependencyKind
+    channel_id: str | None = None
+    thread_ts: str | None = None
+    permalink: str | None = None
+    task_id: str | None = None
+    handle: str | None = None
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class DeferredWork:
+    deferred_id: str
+    channel_id: str
+    thread_ts: str
+    prompt: str
+    assignment_mode: AssignmentMode
+    task_kind: AgentTaskKind
+    status: DeferredWorkStatus
+    depends_on: tuple[WorkDependency, ...]
+    created_at: datetime
+    updated_at: datetime
+    message_ts: str | None = None
+    requested_handle: str | None = None
+    author_handle: str | None = None
+    pr_url: str | None = None
+    requested_by_slack_user: str | None = None
+    dangerous_mode: bool = False
+    after_dep_delay_seconds: int | None = None
+    run_at: datetime | None = None
+    fire_at: datetime | None = None
+    deps_satisfied_at: datetime | None = None
+    dispatched_at: datetime | None = None
+    last_task_id: str | None = None
+    description: str | None = None
 
 
 def utc_now() -> datetime:
