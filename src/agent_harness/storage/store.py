@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 from agent_harness.models import (
@@ -281,13 +282,49 @@ class Store:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._connection_lock = threading.RLock()
+        self._local = threading.local()
+        self._connections: dict[int, sqlite3.Connection] = {}
+        self._closed = False
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        with self._connection_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed Store")
+            existing = getattr(self._local, "conn", None)
+            if existing is not None:
+                return existing
+        connection = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            isolation_level=None,
+            timeout=30.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        with self._connection_lock:
+            if self._closed:
+                connection.close()
+                raise sqlite3.ProgrammingError("Cannot operate on a closed Store")
+            self._connections[id(connection)] = connection
+            self._local.conn = connection
+        return connection
 
     def close(self) -> None:
-        with self._lock:
-            self.conn.close()
+        with self._connection_lock:
+            if self._closed:
+                return
+            self._closed = True
+            connections = list(self._connections.values())
+            self._connections.clear()
+        for connection in connections:
+            with suppress(sqlite3.Error):
+                connection.close()
+        if getattr(self._local, "conn", None) is not None:
+            delattr(self._local, "conn")
 
     def init_schema(self) -> None:
         with self._lock:

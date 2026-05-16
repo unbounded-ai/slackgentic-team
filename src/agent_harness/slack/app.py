@@ -47,6 +47,7 @@ from agent_harness.runtime.codex_app_server import (
     DEFAULT_CODEX_APP_SERVER_URL,
     CodexAppServerManager,
 )
+from agent_harness.runtime.health import LoopBackoff, ProcessCpuWatchdog, log_loop_failure
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
@@ -3530,6 +3531,7 @@ class ClaudePermissionAutoResolver:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -3537,10 +3539,12 @@ class ClaudePermissionAutoResolver:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
 
     def resolve_once(self) -> int:
         resolved = 0
@@ -3582,11 +3586,19 @@ class ClaudePermissionAutoResolver:
             LOGGER.debug("failed to reformat Claude permission prompt", exc_info=True)
 
     def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=30.0)
         while not self._stop.is_set():
             try:
                 self.resolve_once()
+                backoff.reset()
             except Exception:
-                LOGGER.exception("failed to auto-resolve Claude Slackgentic permission")
+                log_loop_failure(
+                    LOGGER,
+                    "failed to auto-resolve Claude Slackgentic permission",
+                    backoff,
+                )
+                if backoff.wait(self._stop):
+                    break
             self._stop.wait(self.poll_seconds)
 
 
@@ -3618,6 +3630,7 @@ class SlackMessageBackfill:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self.sync_once()
         self._thread = threading.Thread(
             target=self._run,
@@ -3626,10 +3639,12 @@ class SlackMessageBackfill:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
 
     def sync_once(self) -> int:
         now = float(self.now())
@@ -3733,11 +3748,15 @@ class SlackMessageBackfill:
         return thread_ts_values
 
     def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
         while not self._stop.wait(self.poll_seconds):
             try:
                 self.sync_once()
+                backoff.reset()
             except Exception:
-                LOGGER.exception("failed to backfill missed Slack messages")
+                log_loop_failure(LOGGER, "failed to backfill missed Slack messages", backoff)
+                if backoff.wait(self._stop):
+                    break
 
 
 class ScheduledTimerRunner:
@@ -3765,10 +3784,12 @@ class ScheduledTimerRunner:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
 
     def sync_once(self) -> int:
         fired = 0
@@ -3778,11 +3799,15 @@ class ScheduledTimerRunner:
         return fired
 
     def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
         while not self._stop.wait(self.poll_seconds):
             try:
                 self.sync_once()
+                backoff.reset()
             except Exception:
-                LOGGER.exception("failed to run scheduled Slackgentic timers")
+                log_loop_failure(LOGGER, "failed to run scheduled Slackgentic timers", backoff)
+                if backoff.wait(self._stop):
+                    break
 
 
 class ScheduledWorkRunner:
@@ -3810,10 +3835,12 @@ class ScheduledWorkRunner:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
 
     def sync_once(self) -> int:
         fired = 0
@@ -3823,11 +3850,15 @@ class ScheduledWorkRunner:
         return fired
 
     def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
         while not self._stop.wait(self.poll_seconds):
             try:
                 self.sync_once()
+                backoff.reset()
             except Exception:
-                LOGGER.exception("failed to run scheduled Slackgentic work")
+                log_loop_failure(LOGGER, "failed to run scheduled Slackgentic work", backoff)
+                if backoff.wait(self._stop):
+                    break
 
 
 class SocketModeSlackApp:
@@ -3929,14 +3960,18 @@ class SocketModeSlackApp:
             lambda: self.runtime.has_running_tasks() or self.session_mirror.has_active_sessions()
         )
         self.awake_keeper.start()
+        self.cpu_watchdog = ProcessCpuWatchdog()
+        self.cpu_watchdog.start()
 
     def close(self) -> None:
+        all_stopped = True
+        all_stopped = self.cpu_watchdog.stop() and all_stopped
         self.awake_keeper.stop()
-        self.claude_permission_auto_resolver.stop()
-        self.slack_message_backfill.stop()
-        self.scheduled_work.stop()
-        self.scheduled_timers.stop()
-        self.session_mirror.stop()
+        all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
+        all_stopped = self.slack_message_backfill.stop() and all_stopped
+        all_stopped = self.scheduled_work.stop() and all_stopped
+        all_stopped = self.scheduled_timers.stop() and all_stopped
+        all_stopped = self.session_mirror.stop() and all_stopped
         if self.runtime is not None:
             stop_all = getattr(self.runtime, "stop_all_running_tasks", None)
             if callable(stop_all):
@@ -3946,9 +3981,19 @@ class SocketModeSlackApp:
                     stop_all(status=None)
                 except Exception:
                     LOGGER.exception("failed to stop running managed tasks during shutdown")
+                    all_stopped = False
+                if self.runtime.has_running_tasks():
+                    LOGGER.warning(
+                        "managed task workers did not stop before daemon shutdown; "
+                        "leaving Store open to avoid closing a database still in use"
+                    )
+                    all_stopped = False
         if self.codex_app_server:
             self.codex_app_server.close()
-        self.store.close()
+        if all_stopped:
+            self.store.close()
+        else:
+            LOGGER.warning("background workers are still active; Store close skipped")
 
     def run_forever(self) -> None:
         import signal
