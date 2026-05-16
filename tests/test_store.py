@@ -1,15 +1,20 @@
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
 from agent_harness.models import (
+    AgentSession,
     AgentTaskStatus,
     AssignmentMode,
+    ControlMode,
+    PendingWorkRequestStatus,
     Provider,
     ScheduledWorkKind,
     SessionDependency,
+    SessionStatus,
     SlackThreadRef,
     WorkRequest,
     utc_now,
@@ -271,6 +276,89 @@ class StoreTests(unittest.TestCase):
                         errors.append(exc)
 
                 threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(errors, [])
+            finally:
+                store.close()
+
+    def test_runtime_store_operations_are_thread_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                base_agent = build_initial_model_team(1, 0)[0]
+                errors: list[BaseException] = []
+                start = threading.Barrier(6)
+
+                def worker(index: int) -> None:
+                    start.wait()
+                    try:
+                        agent = replace(
+                            base_agent,
+                            agent_id=f"agent_{index}",
+                            handle=f"agent{index}",
+                            sort_order=index,
+                        )
+                        store.upsert_team_agent(agent)
+                        for round_index in range(12):
+                            suffix = f"{index}-{round_index}"
+                            ts_suffix = f"{index:03d}{round_index:03d}"
+                            session = AgentSession(
+                                provider=Provider.CODEX,
+                                session_id=f"session-{suffix}",
+                                transcript_path=Path(tmp) / f"session-{suffix}.jsonl",
+                                cwd=Path(tmp),
+                                status=SessionStatus.ACTIVE,
+                                control_mode=ControlMode.MANAGED,
+                            )
+                            store.upsert_session(session)
+
+                            task = create_agent_task(agent, f"task {suffix}", "C1")
+                            task = replace(task, thread_ts=f"171.{ts_suffix}")
+                            store.upsert_agent_task(task)
+                            store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
+                            store.update_agent_task_session(
+                                task.task_id,
+                                Provider.CODEX,
+                                session.session_id,
+                            )
+                            thread = SlackThreadRef("C1", task.thread_ts or "171.0")
+                            store.upsert_managed_thread_task(task, thread)
+                            store.get_agent_task(task.task_id)
+                            store.get_managed_thread_task("C1", thread.thread_ts, agent.agent_id)
+
+                            pending = store.create_pending_work_request(
+                                SlackThreadRef("C1", thread.thread_ts, f"172.{ts_suffix}"),
+                                WorkRequest(f"follow-up {suffix}", AssignmentMode.ANYONE),
+                            )
+                            store.list_pending_work_requests("C1", limit=10)
+                            store.update_pending_work_request_status(
+                                pending.pending_id,
+                                PendingWorkRequestStatus.ASSIGNED,
+                            )
+
+                            token = f"token-{suffix}"
+                            store.create_slack_agent_request(
+                                token,
+                                "Codex",
+                                "item/permissions/requestApproval",
+                                {"command": "git status"},
+                                thread,
+                                message_ts=f"173.{ts_suffix}",
+                            )
+                            store.get_slack_agent_request_response(token)
+                            store.resolve_slack_agent_request(token, {"behavior": "allow"})
+                            resolved, response = store.get_slack_agent_request_response(token)
+                            self.assertTrue(resolved)
+                            self.assertEqual(response, {"behavior": "allow"})
+                    except BaseException as exc:  # pragma: no cover - exercised on failure
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
                 for thread in threads:
                     thread.start()
                 for thread in threads:
