@@ -236,6 +236,31 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(row["status"], "pending")
                 self.assertEqual(row["next_run_at"], next_run_at.isoformat())
                 self.assertEqual(row["last_task_id"], "task_123")
+
+                listed = store.list_scheduled_work()
+                self.assertEqual([item.schedule_id for item in listed], [scheduled.schedule_id])
+
+                changed_run_at = utc_now() + timedelta(days=2)
+                changed = store.reschedule_scheduled_work(
+                    scheduled.schedule_id,
+                    next_run_at=changed_run_at,
+                    recurrence={
+                        "frequency": "daily",
+                        "time": "18:00",
+                        "timezone": "America/Chicago",
+                    },
+                    timezone="America/Chicago",
+                )
+                self.assertIsNotNone(changed)
+                assert changed is not None
+                self.assertEqual(changed.next_run_at, changed_run_at)
+                self.assertEqual(changed.recurrence["time"], "18:00")
+
+                cancelled = store.cancel_scheduled_work(scheduled.schedule_id)
+                self.assertIsNotNone(cancelled)
+                assert cancelled is not None
+                self.assertEqual(cancelled.status.value, "cancelled")
+                self.assertEqual(store.list_scheduled_work(), [])
             finally:
                 store.close()
 

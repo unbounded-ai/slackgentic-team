@@ -50,7 +50,13 @@ from agent_harness.slack.app import (
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
-from agent_harness.team.commands import FireCommand, FireEveryoneCommand, HireCommand, RosterCommand
+from agent_harness.team.commands import (
+    FireCommand,
+    FireEveryoneCommand,
+    HireCommand,
+    RosterCommand,
+    ScheduledTasksCommand,
+)
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 
 
@@ -6765,6 +6771,235 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(rows[0]["status"], "pending")
                 self.assertIn("tomorrow at sunset in Waco", gateway.thread_replies[-1]["text"])
                 self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+            finally:
+                store.close()
+
+    def test_roster_shows_specific_pending_schedule_as_occupied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=utc_now() + timedelta(hours=1),
+                    recurrence={
+                        "frequency": "daily",
+                        "time": "17:00",
+                        "timezone": "America/New_York",
+                    },
+                    timezone="America/New_York",
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                blocks_text = str(gateway.posts[-1]["blocks"])
+                self.assertIn("Scheduled task: check CI", blocks_text)
+                self.assertIn("daily at 17:00 America/New_York", blocks_text)
+            finally:
+                store.close()
+
+    def test_scheduled_agent_is_not_assigned_new_channel_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.ONE_OFF,
+                    next_run_at=utc_now() + timedelta(hours=1),
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody update docs",
+                            "ts": "171.user",
+                        }
+                    }
+                )
+
+                self.assertEqual(store.list_agent_tasks(), [])
+                self.assertEqual(runtime.started, [])
+                self.assertIn(
+                    "No agents are available right now", gateway.thread_replies[-1]["text"]
+                )
+            finally:
+                store.close()
+
+    def test_scheduled_tasks_command_posts_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.ONE_OFF,
+                    next_run_at=utc_now() + timedelta(hours=1),
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    ScheduledTasksCommand(),
+                    SlackReplyTarget(channel_id="C1"),
+                )
+
+                self.assertIn("Scheduled tasks: 1 active", gateway.posts[-1]["text"])
+                action_block = next(
+                    block
+                    for block in gateway.posts[-1]["blocks"]
+                    if block.get("block_id") == f"schedule.actions.{scheduled.schedule_id}"
+                )
+                self.assertEqual(
+                    [element["action_id"] for element in action_block["elements"]],
+                    ["schedule.cancel", "schedule.change", "thread.open"],
+                )
+            finally:
+                store.close()
+
+    def test_schedule_cancel_button_deschedules_and_updates_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.ONE_OFF,
+                    next_run_at=utc_now() + timedelta(hours=1),
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.list"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "schedule.cancel",
+                                    schedule_id=scheduled.schedule_id,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                current = store.get_scheduled_work(scheduled.schedule_id)
+                assert current is not None
+                self.assertEqual(current.status.value, "cancelled")
+                self.assertIn("Descheduled", gateway.thread_replies[-1]["text"])
+                self.assertEqual(gateway.updates[-1]["text"], "Scheduled tasks: none.")
+            finally:
+                store.close()
+
+    def test_schedule_change_button_opens_modal_and_submission_updates_next_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                scheduled = store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    schedule_kind=ScheduledWorkKind.ONE_OFF,
+                    next_run_at=utc_now() + timedelta(hours=1),
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.list"},
+                        "trigger_id": "TRIGGER",
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "schedule.change",
+                                    schedule_id=scheduled.schedule_id,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(gateway.views[-1][0], "TRIGGER")
+                modal = gateway.views[-1][1]
+                changed_run_at = utc_now() + timedelta(days=2)
+                response = controller.handle_view_submission(
+                    {
+                        "type": "view_submission",
+                        "view": {
+                            "callback_id": "schedule.change",
+                            "private_metadata": modal["private_metadata"],
+                            "state": {
+                                "values": {
+                                    "schedule_next_run": {
+                                        "value": {"value": changed_run_at.isoformat()}
+                                    }
+                                }
+                            },
+                        },
+                    }
+                )
+
+                self.assertIsNone(response)
+                current = store.get_scheduled_work(scheduled.schedule_id)
+                assert current is not None
+                self.assertEqual(current.next_run_at, changed_run_at)
+                self.assertIn("Changed schedule", gateway.thread_replies[-1]["text"])
+                self.assertIn("Scheduled tasks: 1 active", gateway.updates[-1]["text"])
             finally:
                 store.close()
 
