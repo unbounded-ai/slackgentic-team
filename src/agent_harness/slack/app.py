@@ -2850,7 +2850,7 @@ class SlackTeamController:
             request.prompt,
             current_thread=thread,
         )
-        if request.dangerous_mode or _task_dangerous_mode(previous_task):
+        if request.dangerous_mode:
             metadata[DANGEROUS_MODE_METADATA_KEY] = True
         task = replace(
             previous_task,
@@ -3750,13 +3750,17 @@ class SlackTeamController:
     def _start_thread_followup(self, parent_task: AgentTask, event: dict, text: str, agent) -> bool:
         channel_id = event["channel"]
         thread_ts = event["thread_ts"]
-        prompt = text.strip()
+        prompt, dangerous_mode = strip_dangerous_mode_tag(text)
+        prompt = prompt.strip()
         if not prompt:
             return False
         request = WorkRequest(
             prompt=prompt,
             assignment_mode=AssignmentMode.SPECIFIC,
             requested_handle=agent.handle,
+            permission_mode=(
+                PermissionMode.DANGEROUS if dangerous_mode else DEFAULT_PERMISSION_MODE
+            ),
         )
         return self._continue_same_thread_agent_task(
             request,

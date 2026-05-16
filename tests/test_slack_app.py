@@ -5752,7 +5752,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].prompt, "let's do it!")
                 self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
                 self.assertEqual(tasks[0].thread_ts, parent_task.thread_ts)
-                self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertNotIn(DANGEROUS_MODE_METADATA_KEY, tasks[0].metadata)
                 self.assertIn(
                     "Original task: summarize pyproject",
                     tasks[0].metadata["thread_context"],
@@ -5799,6 +5799,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(tasks[0].task_id, parent_task.task_id)
                 self.assertEqual(tasks[0].prompt, "try again")
                 self.assertEqual(tasks[0].status, AgentTaskStatus.ACTIVE)
+                self.assertNotIn(DANGEROUS_MODE_METADATA_KEY, tasks[0].metadata)
                 thread_context = tasks[0].metadata["thread_context"]
                 self.assertIn("Original task: summarize pyproject", thread_context)
                 self.assertNotIn("Original task: let's do it!", thread_context)
@@ -5806,6 +5807,55 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(gateway.updates), 1)
                 self.assertIn("summarize pyproject", gateway.updates[0]["text"])
                 self.assertNotIn("try again", gateway.updates[0]["text"])
+            finally:
+                store.close()
+
+    def test_plain_thread_reply_can_opt_back_into_dangerous_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody summarize pyproject",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                parent_task = store.list_agent_tasks(include_done=True)[0]
+                self.assertNotIn(DANGEROUS_MODE_METADATA_KEY, parent_task.metadata)
+                store.update_agent_task_status(parent_task.task_id, AgentTaskStatus.DONE)
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "#dangerous-mode let's do it!",
+                            "ts": "171.000002",
+                            "thread_ts": parent_task.thread_ts,
+                        }
+                    }
+                )
+
+                tasks = store.list_agent_tasks(include_done=True)
+                self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertTrue(runtime.started[-1][0].metadata[DANGEROUS_MODE_METADATA_KEY])
             finally:
                 store.close()
 
