@@ -1413,6 +1413,74 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_stop_task_keeps_unjoined_worker_visible_until_exit(self):
+        class BlockingReadProcess(OneShotProcess):
+            def __init__(self, request):
+                super().__init__(request)
+                self.alive = True
+                self.reading = threading.Event()
+                self.release = threading.Event()
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                self.reading.set()
+                self.release.wait(timeout=5.0)
+                return ""
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            processes: list[BlockingReadProcess] = []
+
+            def process_factory(request):
+                process = BlockingReadProcess(request)
+                processes.append(process)
+                return process
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "stop carefully", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+                with self.assertLogs("agent_harness.runtime.tasks", level="WARNING") as logs:
+                    self.assertFalse(
+                        runtime.stop_task(task.task_id, status=None, join_timeout=0.01)
+                    )
+                self.assertTrue(
+                    any("managed task worker did not stop" in message for message in logs.output)
+                )
+                self.assertTrue(runtime.has_running_tasks())
+
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+                self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+
+                processes[0].release.set()
+                deadline = time.monotonic() + 1.0
+                while runtime.has_running_tasks() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(runtime.has_running_tasks())
+            finally:
+                for process in processes:
+                    process.release.set()
+                store.close()
+
     def test_runtime_cancels_codex_run_that_never_starts_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

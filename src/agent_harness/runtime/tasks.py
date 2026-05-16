@@ -89,6 +89,7 @@ class RunningTask:
     control_signals: list[str] = field(default_factory=list)
     visible_message_count: int = 0
     started_monotonic: float = field(default_factory=time.monotonic)
+    stop_requested: bool = False
 
 
 class ManagedTaskRuntime:
@@ -247,6 +248,8 @@ class ManagedTaskRuntime:
         self,
         task_id: str,
         status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
+        *,
+        join_timeout: float = 2.0,
     ) -> bool:
         running = self._get_running(task_id)
         if running is None:
@@ -254,12 +257,19 @@ class ManagedTaskRuntime:
                 self._clear_managed_run_started(task_id)
                 self.store.update_agent_task_status(task_id, status)
             return False
+        running.stop_requested = True
         running.process.terminate()
         if status is not None:
             self._clear_managed_run_started(task_id)
             self.store.update_agent_task_status(task_id, status)
-        with self._lock:
-            self._running.pop(task_id, None)
+        if running.worker is threading.current_thread():
+            self._remove_running_task(task_id, running)
+            return True
+        running.worker.join(timeout=max(0.0, join_timeout))
+        if running.worker.is_alive():
+            LOGGER.warning("managed task worker did not stop for %s", task_id)
+            return False
+        self._remove_running_task(task_id, running)
         return True
 
     def interrupt_task(self, task_id: str) -> bool:
@@ -283,13 +293,15 @@ class ManagedTaskRuntime:
     def stop_all_running_tasks(
         self,
         status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
+        *,
+        join_timeout: float = 2.0,
     ) -> int:
         with self._lock:
             task_ids = list(self._running.keys())
         stopped = 0
         for task_id in task_ids:
             try:
-                if self.stop_task(task_id, status):
+                if self.stop_task(task_id, status, join_timeout=join_timeout):
                     stopped += 1
             except Exception:
                 LOGGER.debug(
@@ -315,6 +327,11 @@ class ManagedTaskRuntime:
         with self._lock:
             return list(self._running.values())
 
+    def _remove_running_task(self, task_id: str, running: RunningTask) -> None:
+        with self._lock:
+            if self._running.get(task_id) is running:
+                self._running.pop(task_id, None)
+
     def _default_cwd(self) -> Path:
         configured = self.store.get_setting(SETTING_REPO_ROOT)
         if configured:
@@ -336,6 +353,9 @@ class ManagedTaskRuntime:
             if running is None:
                 return
             output = running.process.read_available()
+            if running.stop_requested:
+                self._remove_running_task(task_id, running)
+                return
             self._capture_session_id(running, output)
             permission_denied = self._capture_permission_denials(running, output)
             self._capture_resume_errors(running, output)

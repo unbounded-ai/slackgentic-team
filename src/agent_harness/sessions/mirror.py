@@ -23,6 +23,7 @@ from agent_harness.models import (
 )
 from agent_harness.providers.base import AgentProvider
 from agent_harness.runtime.codex_app_server import DEFAULT_CODEX_APP_SERVER_URL
+from agent_harness.runtime.health import LoopBackoff, log_loop_failure
 from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.bridge import (
     _codex_remote_enabled,
@@ -96,12 +97,13 @@ class SessionMirror:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return
         try:
             self.sync_once(backfill_new_sessions=False)
         except Exception:
             LOGGER.exception("initial external session mirror sync failed")
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -109,14 +111,21 @@ class SessionMirror:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            return not self._thread.is_alive()
+        return True
 
     def has_active_sessions(self) -> bool:
         for provider in self.providers:
-            for session in provider.discover():
+            try:
+                sessions = provider.discover()
+            except Exception:
+                LOGGER.debug("failed to discover provider sessions for awake check", exc_info=True)
+                continue
+            for session in sessions:
                 if session.status == SessionStatus.ACTIVE:
                     return True
         return False
@@ -177,11 +186,15 @@ class SessionMirror:
         self._sync_capacity_notices(channel_id)
 
     def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
         while not self._stop.wait(self.poll_seconds):
             try:
                 self.sync_once(backfill_new_sessions=True)
+                backoff.reset()
             except Exception:
-                LOGGER.exception("failed to mirror external agent sessions")
+                log_loop_failure(LOGGER, "failed to mirror external agent sessions", backoff)
+                if backoff.wait(self._stop):
+                    break
 
     def _thread_for_session(
         self,
