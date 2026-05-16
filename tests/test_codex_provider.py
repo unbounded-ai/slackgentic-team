@@ -26,6 +26,8 @@ class CodexProviderTests(unittest.TestCase):
                             "id": "019dcf88-26b6-7cc3-a23e-3c9e45e12e24",
                             "cwd": str(session_dir),
                             "model": "gpt-test",
+                            "source": {"subagent": {"thread_spawn": {"depth": 1}}},
+                            "thread_source": "subagent",
                         },
                     }
                 )
@@ -36,6 +38,11 @@ class CodexProviderTests(unittest.TestCase):
 
             self.assertEqual(
                 provider.discover()[0].session_id, "019dcf88-26b6-7cc3-a23e-3c9e45e12e24"
+            )
+            self.assertEqual(provider.discover()[0].metadata["thread_source"], "subagent")
+            self.assertEqual(
+                provider.discover()[0].metadata["source"],
+                {"subagent": {"thread_spawn": {"depth": 1}}},
             )
 
             with patch.object(provider, "_session_from_path", side_effect=AssertionError):

@@ -150,6 +150,8 @@ class SessionMirror:
                     session = replace(session, status=SessionStatus.DONE)
                 self.store.upsert_session(session)
                 self._cleanup_hidden_external_session_summary(session)
+                if self._skip_internal_session(session, channel_id):
+                    continue
                 if self._skip_managed_task_session(session, channel_id):
                     continue
                 if not self._should_keep_external_session(session, channel_id):
@@ -618,6 +620,12 @@ class SessionMirror:
             or self._thread_for_session(session, channel_id) is not None
         )
 
+    def _skip_internal_session(self, session: AgentSession, channel_id: str) -> bool:
+        if not _is_codex_subagent_session(session):
+            return False
+        self._clear_external_tracking(session, channel_id)
+        return True
+
     def _skip_managed_task_session(self, session: AgentSession, channel_id: str) -> bool:
         managed_prompt = _managed_prompt_from_session_transcript(session)
         if managed_prompt:
@@ -936,6 +944,15 @@ def _looks_like_slackgentic_managed_prompt(prompt: str) -> bool:
         and "You are working from Slack." in prompt
         and "Task kind:" in prompt
     )
+
+
+def _is_codex_subagent_session(session: AgentSession) -> bool:
+    if session.provider != Provider.CODEX:
+        return False
+    source = session.metadata.get("source")
+    if isinstance(source, dict) and isinstance(source.get("subagent"), dict):
+        return True
+    return session.metadata.get("thread_source") == "subagent"
 
 
 def _session_channel_notice_key(session: AgentSession) -> str:

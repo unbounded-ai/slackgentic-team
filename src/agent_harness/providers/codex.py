@@ -100,6 +100,7 @@ class CodexProvider:
                 "originator": payload.get("originator"),
                 "cli_version": payload.get("cli_version"),
                 "source": payload.get("source"),
+                "thread_source": payload.get("thread_source"),
             },
         )
 
