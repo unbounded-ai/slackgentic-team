@@ -11,6 +11,7 @@ class FakeSlackClient:
         self.messages = []
         self.updates = []
         self.archived_channels = []
+        self.pins = []
 
     def auth_test(self):
         return type("SlackResponse", (), {"data": {"ok": True, "bot_id": "B1"}})()
@@ -40,6 +41,10 @@ class FakeSlackClient:
 
     def conversations_archive(self, channel):
         self.archived_channels.append(channel)
+        return {"ok": True}
+
+    def pins_add(self, **kwargs):
+        self.pins.append(kwargs)
         return {"ok": True}
 
 
@@ -115,6 +120,15 @@ class RateLimitedReactionsClient(FakeSlackClient):
             )
         self.removed.append(kwargs)
         return {"ok": True}
+
+
+class AlreadyPinnedClient(FakeSlackClient):
+    def pins_add(self, **kwargs):
+        self.pins.append(kwargs)
+        raise SlackApiError(
+            "already pinned",
+            FakeSlackResponse({"ok": False, "error": "already_pinned"}),
+        )
 
 
 class InvalidUpdateBlocksOnceClient(FakeSlackClient):
@@ -235,6 +249,14 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertTrue(gateway.archive_channel("C1"))
 
         self.assertEqual(gateway.client.archived_channels, ["C1"])
+
+    def test_pin_message_ignores_already_pinned(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = AlreadyPinnedClient()
+
+        gateway.pin_message("C1", "171.000001")
+
+        self.assertEqual(gateway.client.pins, [{"channel": "C1", "timestamp": "171.000001"}])
 
     def test_update_message_can_send_empty_blocks_to_clear_buttons(self):
         gateway = object.__new__(SlackGateway)

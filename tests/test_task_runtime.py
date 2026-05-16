@@ -581,6 +581,15 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("do not rely on terminal sleeps", prompt)
         self.assertIn("resumes the same agent", prompt)
 
+    def test_build_task_prompt_prefers_slackgentic_pr_mcp(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "open the PR", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("create_pull_request", prompt)
+        self.assertIn("MCP tool", prompt)
+
     def test_build_task_prompt_instructs_thread_done_signal(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         task = create_agent_task(agent, "work carefully", "C1")

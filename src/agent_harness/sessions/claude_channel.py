@@ -45,6 +45,12 @@ CHANNEL_INSTRUCTIONS = (
     "MCP tool; it runs the narrow `gh pr create` workflow through the channel so "
     "PR creation still works when Claude Bash is sandboxed."
 )
+CODEX_MCP_INSTRUCTIONS = (
+    "Slackgentic provides MCP tools for Slack-mediated workflows. When opening a "
+    "GitHub pull request, prefer the `create_pull_request` tool; it runs the narrow "
+    "`gh pr create` workflow through Slackgentic so PR creation still works when "
+    "ordinary shell networking or sandbox policy gets in the way."
+)
 SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__create_pull_request",
     f"mcp__{CHANNEL_NAME}__request_approval",
@@ -63,12 +69,14 @@ class ClaudeChannelServer:
         poll_seconds: float = 0.2,
         request_handler: SlackAgentRequestHandler | None = None,
         command_runner: CommandRunner | None = None,
+        instructions: str = CHANNEL_INSTRUCTIONS,
     ):
         self.store = store
         self.target_pid = target_pid or os.getppid()
         self.poll_seconds = poll_seconds
         self.request_handler = request_handler
         self.command_runner = command_runner or subprocess.run
+        self.instructions = instructions
         self._current_thread = _thread_from_env()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -117,7 +125,7 @@ class ClaudeChannelServer:
                             "name": CHANNEL_NAME,
                             "version": CHANNEL_VERSION,
                         },
-                        "instructions": CHANNEL_INSTRUCTIONS,
+                        "instructions": self.instructions,
                     },
                 }
             )
@@ -360,7 +368,7 @@ class ClaudeChannelServer:
             sys.stdout.flush()
 
 
-def run_channel_server(db_path: Path | None = None) -> int:
+def run_channel_server(db_path: Path | None = None, *, provider_label: str = "Claude") -> int:
     config = load_config_from_env()
     store = Store(db_path or config.state_db)
     try:
@@ -372,9 +380,14 @@ def run_channel_server(db_path: Path | None = None) -> int:
             request_handler = SlackAgentRequestHandler(
                 SlackGateway(config.slack.bot_token),
                 store=store,
-                provider_label="Claude",
+                provider_label=provider_label,
             )
-        return ClaudeChannelServer(store, request_handler=request_handler).run()
+        instructions = CODEX_MCP_INSTRUCTIONS if provider_label == "Codex" else CHANNEL_INSTRUCTIONS
+        return ClaudeChannelServer(
+            store,
+            request_handler=request_handler,
+            instructions=instructions,
+        ).run()
     finally:
         store.close()
 
@@ -421,6 +434,70 @@ def install_claude_mcp_server(command: str | None = None, home: Path | None = No
                 stderr=completed.stderr,
             )
     ensure_claude_mcp_permissions(home)
+
+
+def install_codex_mcp_server(command: str | None = None, home: Path | None = None) -> None:
+    if command is None:
+        resolved, command_args = _current_slackgentic_invocation()
+    else:
+        resolved, command_args = command, []
+    add_command = [
+        "codex",
+        "mcp",
+        "add",
+        CHANNEL_NAME,
+        "--",
+        resolved,
+        *command_args,
+        "codex-mcp",
+    ]
+    env = _codex_mcp_env(home)
+    completed = subprocess.run(
+        add_command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if completed.returncode == 0:
+        return
+    if "already exists" not in output.lower():
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    subprocess.run(
+        ["codex", "mcp", "remove", CHANNEL_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    completed = subprocess.run(
+        add_command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+def _codex_mcp_env(home: Path | None) -> dict[str, str] | None:
+    if home is None:
+        return None
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home / ".codex")
+    return env
 
 
 def ensure_claude_mcp_permissions(home: Path | None = None) -> Path:

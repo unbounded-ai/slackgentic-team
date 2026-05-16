@@ -184,6 +184,7 @@ agents.
 Codex:
 
 ```sh
+slackgentic codex-mcp --install
 codex --remote ws://127.0.0.1:47684
 ```
 
@@ -194,14 +195,14 @@ slackgentic claude-channel --install
 claude --dangerously-load-development-channels server:slackgentic
 ```
 
-`slackgentic slack setup` tries to register the Claude channel automatically
-when `claude` is on `PATH`. Run `slackgentic claude-channel --install` manually
-if setup could not reach Claude, and restart any already-open Claude sessions
-after installing. The installer registers the Slackgentic MCP server and adds
-its Slack request tools to Claude's allowlist so they do not require their own
-approval. No extra MCP flag is needed after registration unless you start Claude
-with `--strict-mcp-config` or another custom MCP config that excludes user-level
-servers.
+`slackgentic slack setup` tries to register the Codex MCP server and Claude
+channel automatically when those CLIs are on `PATH`. Run
+`slackgentic codex-mcp --install` or `slackgentic claude-channel --install`
+manually if setup could not reach a CLI, and restart any already-open sessions
+after installing. The Claude installer adds Slackgentic's Slack request tools to
+Claude's allowlist so they do not require their own approval. No extra MCP flag
+is needed after registration unless you start Claude with `--strict-mcp-config`
+or another custom MCP config that excludes user-level servers.
 
 Those commands create tracked Slack threads for sessions you started outside
 Slack. If all matching team seats are occupied, Slackgentic posts a

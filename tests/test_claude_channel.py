@@ -14,12 +14,14 @@ from agent_harness.models import PermissionMode, SlackThreadRef
 from agent_harness.permissions import CLAUDE_CHANNEL_PERMISSION_MODE_ENV
 from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
+    CODEX_MCP_INSTRUCTIONS,
     SLACK_THREAD_CHANNEL_ENV,
     SLACK_THREAD_TS_ENV,
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
     ensure_claude_mcp_permissions,
     install_claude_mcp_server,
+    install_codex_mcp_server,
     is_slackgentic_mcp_server_configured,
     mcp_config,
     session_transcript_has_slackgentic_mcp,
@@ -127,6 +129,34 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertIn("GitHub pull request", tools["create_pull_request"]["description"])
                 self.assertIn("multiple options", tools["request_user_input"]["description"])
                 self.assertIn("one concrete action", tools["request_approval"]["description"])
+            finally:
+                store.close()
+
+    def test_codex_mcp_instructions_focus_on_pr_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            output = io.StringIO()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(
+                    store,
+                    target_pid=123,
+                    instructions=CODEX_MCP_INSTRUCTIONS,
+                )
+
+                with redirect_stdout(output):
+                    server._handle_message(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {"protocolVersion": "2024-11-05"},
+                        }
+                    )
+
+                response = json.loads(output.getvalue())
+                self.assertIn("create_pull_request", response["result"]["instructions"])
+                self.assertNotIn("Claude Code session", response["result"]["instructions"])
             finally:
                 store.close()
 
@@ -790,6 +820,69 @@ class ClaudeChannelTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_install_registers_codex_mcp_server(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return type(
+                "Completed", (), {"returncode": 0, "stdout": "", "stderr": "", "args": args}
+            )()
+
+        with tempfile.TemporaryDirectory() as tmp, patch("subprocess.run", fake_run):
+            install_codex_mcp_server("/opt/slackgentic", home=Path(tmp))
+
+        self.assertEqual(
+            calls[0][0],
+            [
+                "codex",
+                "mcp",
+                "add",
+                CHANNEL_NAME,
+                "--",
+                "/opt/slackgentic",
+                "codex-mcp",
+            ],
+        )
+        self.assertFalse(calls[0][1]["check"])
+        self.assertTrue(calls[0][1]["capture_output"])
+        self.assertTrue(calls[0][1]["text"])
+        self.assertEqual(calls[0][1]["env"]["CODEX_HOME"], str(Path(tmp) / ".codex"))
+
+    def test_install_replaces_existing_codex_mcp_server(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:3] == ["codex", "mcp", "add"] and len(calls) == 1:
+                return type(
+                    "Completed",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "MCP server slackgentic already exists",
+                        "stderr": "",
+                        "args": args,
+                    },
+                )()
+            return type(
+                "Completed", (), {"returncode": 0, "stdout": "", "stderr": "", "args": args}
+            )()
+
+        with tempfile.TemporaryDirectory() as tmp, patch("subprocess.run", fake_run):
+            install_codex_mcp_server("/opt/slackgentic", home=Path(tmp))
+
+        self.assertEqual(
+            [call[0][:3] for call in calls],
+            [
+                ["codex", "mcp", "add"],
+                ["codex", "mcp", "remove"],
+                ["codex", "mcp", "add"],
+            ],
+        )
+        for _args, kwargs in calls:
+            self.assertEqual(kwargs["env"]["CODEX_HOME"], str(Path(tmp) / ".codex"))
 
     def test_install_registers_python_module_when_slackgentic_script_is_unavailable(self):
         calls = []

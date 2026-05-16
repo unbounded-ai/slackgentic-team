@@ -119,7 +119,14 @@ class SlackGateway:
         return response.get("permalink")
 
     def pin_message(self, channel_id: str, message_ts: str) -> None:
-        self.client.pins_add(channel=channel_id, timestamp=message_ts)
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self.client.pins_add(channel=channel_id, timestamp=message_ts)
+        except SlackApiError as exc:
+            if exc.response.get("error") == "already_pinned":
+                return
+            raise
 
     def post_message(
         self,
