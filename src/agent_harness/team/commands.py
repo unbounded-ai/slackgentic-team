@@ -30,11 +30,23 @@ class RosterCommand:
 
 
 @dataclass(frozen=True)
+class ScheduledTasksCommand:
+    pass
+
+
+@dataclass(frozen=True)
 class RepoRootCommand:
     path: Path | None = None
 
 
-TeamCommand = HireCommand | FireCommand | FireEveryoneCommand | RosterCommand | RepoRootCommand
+TeamCommand = (
+    HireCommand
+    | FireCommand
+    | FireEveryoneCommand
+    | RosterCommand
+    | ScheduledTasksCommand
+    | RepoRootCommand
+)
 
 
 def parse_team_command(text: str) -> TeamCommand | None:
@@ -44,6 +56,7 @@ def parse_team_command(text: str) -> TeamCommand | None:
     return (
         _parse_hire(cleaned)
         or _parse_fire(cleaned)
+        or _parse_scheduled_tasks(cleaned)
         or _parse_roster(cleaned)
         or _parse_repo_root(cleaned)
     )
@@ -85,6 +98,16 @@ def _parse_fire(text: str) -> FireCommand | FireEveryoneCommand | None:
 def _parse_roster(text: str) -> RosterCommand | None:
     if re.match(r"^(?:show\s+)?(?:team|roster|agents)\s*$", text, flags=re.IGNORECASE):
         return RosterCommand()
+    return None
+
+
+def _parse_scheduled_tasks(text: str) -> ScheduledTasksCommand | None:
+    if re.match(
+        r"^(?:(?:show|list)\s+)?(?:scheduled\s+(?:tasks?|work)|schedules?)\s*$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return ScheduledTasksCommand()
     return None
 
 
