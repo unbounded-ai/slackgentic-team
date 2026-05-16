@@ -97,9 +97,7 @@ class ExternalSessionBridge:
                 return True
             return self._terminate_live_session(session, thread)
         self.store.add_session_bridge_prompt(session.provider, session.session_id, prompt)
-        if self._send_to_codex_app_server(session, prompt, thread):
-            return True
-        if self._send_to_claude_channel(session, text, thread, slack_user):
+        if self._send_live_prompt_to_session(session, text, prompt, thread, slack_user):
             return True
         send = BridgeSend(
             session=session,
@@ -115,6 +113,33 @@ class ExternalSessionBridge:
         )
         worker.start()
         return True
+
+    def send_live_to_session(
+        self,
+        session: AgentSession,
+        text: str,
+        thread: SlackThreadRef,
+        slack_user: str | None = None,
+    ) -> bool:
+        prompt = build_external_session_prompt(text, slack_user)
+        if not prompt.strip() or is_session_exit_request(prompt):
+            return False
+        if not self._send_live_prompt_to_session(session, text, prompt, thread, slack_user):
+            return False
+        self.store.add_session_bridge_prompt(session.provider, session.session_id, prompt)
+        return True
+
+    def _send_live_prompt_to_session(
+        self,
+        session: AgentSession,
+        text: str,
+        prompt: str,
+        thread: SlackThreadRef,
+        slack_user: str | None,
+    ) -> bool:
+        if self._send_to_codex_app_server(session, prompt, thread):
+            return True
+        return self._send_to_claude_channel(session, text, thread, slack_user)
 
     def handle_agent_request_block_action(
         self,
