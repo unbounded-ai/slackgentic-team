@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.models import SessionStatus
 from agent_harness.providers.claude import ClaudeProvider
@@ -117,6 +118,70 @@ class ClaudeProviderTests(unittest.TestCase):
             sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
 
             self.assertEqual(sessions[0].metadata["entrypoint"], "sdk-cli")
+
+    def test_discover_reuses_cached_session_when_transcript_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / ".claude" / "projects" / "-tmp-repo"
+            project.mkdir(parents=True)
+            path = project / "session-1.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "cwd": str(project),
+                        "sessionId": "session-1",
+                    }
+                )
+                + "\n"
+            )
+            now = datetime.now(UTC).timestamp()
+            os.utime(path, (now, now))
+            provider = ClaudeProvider(home=home, active_within_seconds=3600)
+
+            self.assertEqual(provider.discover()[0].session_id, "session-1")
+
+            with patch.object(provider, "_session_from_path", side_effect=AssertionError):
+                self.assertEqual(provider.discover()[0].session_id, "session-1")
+
+    def test_discover_reparses_cached_session_when_transcript_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / ".claude" / "projects" / "-tmp-repo"
+            project.mkdir(parents=True)
+            path = project / "session-1.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "cwd": str(project),
+                        "sessionId": "session-1",
+                        "entrypoint": "cli",
+                    }
+                )
+                + "\n"
+            )
+            provider = ClaudeProvider(home=home, active_within_seconds=3600)
+
+            self.assertEqual(provider.discover()[0].metadata["entrypoint"], "cli")
+
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": "2026-04-27T12:00:01.000Z",
+                            "cwd": str(project),
+                            "sessionId": "session-1",
+                            "entrypoint": "sdk-cli",
+                        }
+                    )
+                    + "\n"
+                )
+
+            self.assertEqual(provider.discover()[0].metadata["entrypoint"], "sdk-cli")
 
     def test_exit_command_marks_recent_session_done(self):
         with tempfile.TemporaryDirectory() as tmp:

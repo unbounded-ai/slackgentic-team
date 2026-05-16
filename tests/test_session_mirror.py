@@ -93,6 +93,27 @@ class FakeProvider:
         return []
 
 
+class CursorAwareProvider(FakeProvider):
+    def __init__(self, session, events, last_line=0):
+        super().__init__(session, events)
+        self.last_line = last_line
+        self.after_calls = []
+        self.last_line_calls = []
+        self.iter_events_calls = 0
+
+    def iter_events(self, transcript_path):
+        self.iter_events_calls += 1
+        raise AssertionError("iter_events should not be called")
+
+    def iter_events_after(self, transcript_path, line_number):
+        self.after_calls.append(line_number)
+        return iter(self.events)
+
+    def last_event_line_number(self, transcript_path):
+        self.last_line_calls.append(transcript_path)
+        return self.last_line
+
+
 class FakeTerminalNotifier:
     def __init__(self, targets=None, provider_targets=None):
         self.targets = targets or []
@@ -174,6 +195,86 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(gateway.parents, [])
                 self.assertEqual(gateway.replies, [])
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 1)
+            finally:
+                store.close()
+
+    def test_initial_sync_marks_existing_events_without_decoding_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                transcript_path = Path(tmp) / "codex.jsonl"
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=transcript_path,
+                    status=SessionStatus.ACTIVE,
+                )
+                provider = CursorAwareProvider(session, [], last_line=42)
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [provider],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertEqual(provider.last_line_calls, [transcript_path])
+                self.assertEqual(provider.after_calls, [])
+                self.assertEqual(provider.iter_events_calls, 0)
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 42)
+            finally:
+                store.close()
+
+    def test_existing_thread_reads_only_events_after_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                transcript_path = Path(tmp) / "codex.jsonl"
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=transcript_path,
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                store.set_session_mirror_cursor(Provider.CODEX, "s1", 5)
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=6,
+                        metadata={"payload": {"type": "agent_message", "message": "new"}},
+                    )
+                ]
+                provider = CursorAwareProvider(session, events)
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [provider],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(provider.after_calls, [5])
+                self.assertEqual(provider.iter_events_calls, 0)
+                self.assertEqual([reply[1] for reply in gateway.replies], ["new"])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 6)
             finally:
                 store.close()
 
