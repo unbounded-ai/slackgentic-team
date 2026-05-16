@@ -3716,6 +3716,86 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_detached_task_thread_followups_preserve_request_message_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Somebody do update docs",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+                task = store.list_agent_tasks()[0]
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Are you stuck?",
+                            "ts": "171.000002",
+                            "thread_ts": task.thread_ts,
+                        }
+                    }
+                )
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "What is happening?",
+                            "ts": "171.000003",
+                            "thread_ts": task.thread_ts,
+                        }
+                    }
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.metadata["request_message_ts"], "171.000003")
+                self.assertCountEqual(
+                    current.metadata["request_message_ts_history"],
+                    ["171.000001", "171.000002"],
+                )
+                agent = store.get_team_agent(task.agent_id)
+                assert agent is not None
+
+                controller.handle_runtime_agent_message(
+                    current,
+                    agent,
+                    SlackThreadRef("C1", task.thread_ts),
+                    "Answered the follow-ups.",
+                    "171.agent",
+                )
+
+                for message_ts in ("171.000002", "171.000003"):
+                    self.assertIn(
+                        ("C1", message_ts, "hourglass_flowing_sand"),
+                        gateway.removed_reactions,
+                    )
+                    self.assertIn(("C1", message_ts, "eyes"), gateway.removed_reactions)
+            finally:
+                store.close()
+
     def test_task_thread_question_is_sent_to_runtime_with_answer_first_instruction(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
