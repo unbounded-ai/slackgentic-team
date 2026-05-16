@@ -185,7 +185,7 @@ class ManagedTaskRuntime:
             slack_channel_id=thread.channel_id,
             slack_thread_ts=thread.thread_ts,
             allowed_tools=launch_allowed_tools,
-            codex_writable_roots=_codex_writable_roots(provider, cwd, default_cwd),
+            safe_auto_extra_roots=_safe_auto_extra_roots(provider, cwd, default_cwd),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
@@ -1033,8 +1033,8 @@ def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:
     return _requested_repo_cwd(task.prompt, default_cwd)
 
 
-def _codex_writable_roots(provider: Provider, cwd: Path, default_cwd: Path) -> tuple[Path, ...]:
-    if provider != Provider.CODEX:
+def _safe_auto_extra_roots(provider: Provider, cwd: Path, default_cwd: Path) -> tuple[Path, ...]:
+    if provider not in {Provider.CODEX, Provider.CLAUDE}:
         return ()
     root = _resolved_path(default_cwd)
     if not root.exists() or not root.is_dir():

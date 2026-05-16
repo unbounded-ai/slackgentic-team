@@ -32,7 +32,7 @@ class LaunchRequest:
     slack_channel_id: str | None = None
     slack_thread_ts: str | None = None
     allowed_tools: tuple[str, ...] = ()
-    codex_writable_roots: tuple[Path, ...] = ()
+    safe_auto_extra_roots: tuple[Path, ...] = ()
     codex_binary: str = "codex"
     claude_binary: str = "claude"
 
@@ -51,7 +51,7 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
         else:
             args.extend(["--json", "--color", "never", "--skip-git-repo-check"])
         args.extend(["-c", _codex_trust_override(request.cwd)])
-        codex_writable_roots = _codex_writable_roots(request)
+        extra_roots = _safe_auto_extra_roots(request)
         if mode == PermissionMode.DANGEROUS:
             args.append(dangerous_flag(Provider.CODEX))
         else:
@@ -59,16 +59,16 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             if sandbox is not None:
                 if request.resume_session_id:
                     args.extend(["-c", f"sandbox_mode={json.dumps(sandbox)}"])
-                    if codex_writable_roots:
+                    if extra_roots:
                         args.extend(
                             [
                                 "-c",
-                                _codex_workspace_writable_roots_override(codex_writable_roots),
+                                _codex_workspace_writable_roots_override(extra_roots),
                             ]
                         )
                 else:
                     args.extend(["--sandbox", sandbox])
-                    for root in codex_writable_roots:
+                    for root in extra_roots:
                         args.extend(["--add-dir", str(root)])
         if request.model:
             args.extend(["--model", request.model])
@@ -101,6 +101,8 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
         else:
             permission_flag = claude_permission_flag(mode)
             if permission_flag:
+                for root in _safe_auto_extra_roots(request):
+                    args.extend(["--add-dir", str(root)])
                 args.extend(["--permission-mode", permission_flag])
         if request.model:
             args.extend(["--model", request.model])
@@ -115,12 +117,12 @@ def _codex_trust_override(cwd: Path) -> str:
     return f"projects.{json.dumps(str(cwd))}.trust_level={json.dumps('trusted')}"
 
 
-def _codex_writable_roots(request: LaunchRequest) -> tuple[Path, ...]:
+def _safe_auto_extra_roots(request: LaunchRequest) -> tuple[Path, ...]:
     if request.permission_mode != PermissionMode.SAFE_AUTO:
         return ()
     roots: list[Path] = []
     seen: set[str] = set()
-    for root in request.codex_writable_roots:
+    for root in request.safe_auto_extra_roots:
         expanded = root.expanduser()
         key = str(expanded)
         if key in seen:

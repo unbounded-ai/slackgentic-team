@@ -735,7 +735,42 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
 
                 self.assertEqual(launched[0].cwd, project)
-                self.assertEqual(launched[0].codex_writable_roots, (root.resolve(),))
+                self.assertEqual(launched[0].safe_auto_extra_roots, (root.resolve(),))
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_passes_configured_repo_root_to_claude_safe_auto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repos"
+            project = root / "example-project"
+            project.mkdir(parents=True)
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                store.set_setting("slack.repo_root", str(root))
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "in example-project update docs", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=Path("/workspace/repos")),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].cwd, project)
+                self.assertEqual(launched[0].safe_auto_extra_roots, (root.resolve(),))
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
                 store.close()
