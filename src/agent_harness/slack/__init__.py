@@ -373,9 +373,10 @@ def build_channel_overview_blocks(
                     f"or run them as `{slash_command} <command>`\n"
                     f"`{slash_command} status`  usage and active sessions\n"
                     f"`{slash_command} show roster`  current team\n"
+                    f"`{slash_command} scheduled tasks`  active schedules\n"
                     f"`{slash_command} hire 3 agents`  add capacity\n"
                     f"`{slash_command} fire everyone`  clear the team\n"
-                    "`status`, `show roster`, `hire 3 agents` also work here"
+                    "`status`, `show roster`, `scheduled tasks`, `hire 3 agents` also work here"
                 ),
             },
         },
