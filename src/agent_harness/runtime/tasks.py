@@ -137,7 +137,8 @@ class ManagedTaskRuntime:
                 )
                 return False
         provider = agent.provider_preference or Provider.CODEX
-        cwd = _task_cwd(task, self._default_cwd())
+        default_cwd = self._default_cwd()
+        cwd = _task_cwd(task, default_cwd)
         tcc_issue = _macos_tcc_protected_cwd_issue(
             cwd,
             home=self.home,
@@ -184,6 +185,7 @@ class ManagedTaskRuntime:
             slack_channel_id=thread.channel_id,
             slack_thread_ts=thread.thread_ts,
             allowed_tools=launch_allowed_tools,
+            safe_auto_extra_roots=_safe_auto_extra_roots(provider, cwd, default_cwd),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
         )
@@ -1029,6 +1031,18 @@ def _task_cwd(task: AgentTask, default_cwd: Path) -> Path:
         if path.exists():
             return path
     return _requested_repo_cwd(task.prompt, default_cwd)
+
+
+def _safe_auto_extra_roots(provider: Provider, cwd: Path, default_cwd: Path) -> tuple[Path, ...]:
+    if provider not in {Provider.CODEX, Provider.CLAUDE}:
+        return ()
+    root = _resolved_path(default_cwd)
+    if not root.exists() or not root.is_dir():
+        return ()
+    resolved_cwd = _resolved_path(cwd)
+    if not (_path_is_relative_to(resolved_cwd, root) or _path_is_relative_to(root, resolved_cwd)):
+        return ()
+    return (root,)
 
 
 def _macos_tcc_protected_cwd_issue(

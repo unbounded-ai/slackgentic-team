@@ -93,6 +93,35 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("workspace-write", args)
         self.assertNotIn("--ask-for-approval", args)
 
+    def test_codex_command_adds_safe_auto_extra_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="fix it",
+                cwd=Path("/workspace/repos/example-project"),
+                safe_auto_extra_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertIn("--add-dir", args)
+        root_index = args.index("--add-dir")
+        self.assertEqual(args[root_index + 1], "/workspace/repos")
+
+    def test_codex_command_does_not_add_locked_extra_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="fix it",
+                cwd=Path("/workspace/repos/example-project"),
+                permission_mode=PermissionMode.LOCKED,
+                safe_auto_extra_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertNotIn("--add-dir", args)
+
     def test_codex_command_uses_read_only_sandbox_when_locked(self):
         command, args = build_command(
             LaunchRequest(
@@ -152,6 +181,23 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--allowedTools=Bash(gh pr view:*)", args)
         self.assertIn("--allowedTools=Bash(gh pr create:*)", args)
 
+    def test_claude_command_adds_safe_auto_extra_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="review pr",
+                cwd=Path("/workspace/repos/example-project"),
+                safe_auto_extra_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "claude")
+        self.assertIn("--add-dir", args)
+        root_index = args.index("--add-dir")
+        self.assertEqual(args[root_index + 1], "/workspace/repos")
+        self.assertIn("--permission-mode", args)
+        self.assertLess(root_index, args.index("--permission-mode"))
+
     def test_claude_safe_auto_allowlist_excludes_mutating_commands(self):
         command, args = build_command(
             LaunchRequest(
@@ -178,6 +224,7 @@ class RunnerTests(unittest.TestCase):
                 prompt="review pr",
                 cwd=Path("/tmp/repo"),
                 permission_mode=PermissionMode.LOCKED,
+                safe_auto_extra_roots=(Path("/workspace/repos"),),
             )
         )
 
@@ -185,6 +232,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("--permission-mode", args)
         self.assertNotIn("--dangerously-skip-permissions", args)
         self.assertNotIn("--allowedTools=Bash(git status:*)", args)
+        self.assertNotIn("--add-dir", args)
 
     def test_claude_command_can_load_slackgentic_channel(self):
         command, args = build_command(
@@ -232,6 +280,21 @@ class RunnerTests(unittest.TestCase):
         self.assertNotEqual(args[-1], "-")
         self.assertIn('sandbox_mode="workspace-write"', args)
 
+    def test_codex_resume_command_adds_safe_auto_extra_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="continue",
+                cwd=Path("/workspace/repos/example-project"),
+                resume_session_id="thread-1",
+                safe_auto_extra_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertNotIn("--add-dir", args)
+        self.assertIn('sandbox_workspace_write.writable_roots=["/workspace/repos"]', args)
+
     def test_codex_resume_command_enforces_locked_sandbox(self):
         command, args = build_command(
             LaunchRequest(
@@ -276,6 +339,24 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--resume", args)
         self.assertIn("session-1", args)
         self.assertEqual(args[-1], "continue")
+
+    def test_claude_resume_command_adds_safe_auto_extra_roots(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="continue",
+                cwd=Path("/workspace/repos/example-project"),
+                resume_session_id="session-1",
+                safe_auto_extra_roots=(Path("/workspace/repos"),),
+            )
+        )
+
+        self.assertEqual(command, "claude")
+        self.assertIn("--resume", args)
+        self.assertIn("--add-dir", args)
+        root_index = args.index("--add-dir")
+        self.assertEqual(args[root_index + 1], "/workspace/repos")
+        self.assertLess(root_index, args.index("--permission-mode"))
 
     def test_managed_process_read_available_keeps_eof_tail(self):
         process = ManagedAgentProcess(
