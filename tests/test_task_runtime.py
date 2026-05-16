@@ -1023,6 +1023,35 @@ class TaskRuntimeTests(unittest.TestCase):
         )
         self.assertIn("Bash(git log:*)", allowed_tools)
 
+    def test_claude_permission_denial_allows_git_pull_ff_only_exactly(self):
+        denial = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "git -C /workspace/repos/example-project pull --ff-only"},
+        }
+
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+
+        self.assertEqual(
+            _allowed_tool_for_claude_denial(denial),
+            "Bash(git -C /workspace/repos/example-project pull --ff-only)",
+        )
+        self.assertNotIn("Bash(git pull:*)", allowed_tools)
+
+    def test_claude_permission_denial_allows_gh_pr_create(self):
+        denial = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr create --title update --body summary"},
+        }
+
+        allowed_tools = _allowed_tools_for_claude_denial(denial)
+
+        self.assertEqual(
+            _allowed_tool_for_claude_denial(denial),
+            "Bash(gh pr create --title update --body summary)",
+        )
+        self.assertIn("Bash(gh pr create:*)", allowed_tools)
+        self.assertIn("Bash(gh pr create *)", allowed_tools)
+
     def test_claude_permission_denial_allows_file_edit_tools(self):
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Edit"}), "Edit")
         self.assertEqual(_allowed_tool_for_claude_denial({"tool_name": "Write"}), "Write")

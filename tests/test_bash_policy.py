@@ -31,7 +31,10 @@ class BashPolicyTests(unittest.TestCase):
     def test_startup_allowlist_is_derived_from_policy_tables(self):
         self.assertIn("Bash(git blame:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertIn("Bash(gh issue list:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(git pull --ff-only:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertIn("Bash(gh pr create:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertNotIn("Bash(git fetch:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertNotIn("Bash(git pull:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
 
     def test_safe_auto_preserves_manual_approval_tool_for_multiline_commit(self):
         command = """git -C /workspace/repos/sample-app commit -m "$(cat <<'EOF'
