@@ -246,10 +246,15 @@ class FakeRuntime:
 class FakeSessionBridge:
     def __init__(self):
         self.sent = []
+        self.live_sent = []
         self.agent_request_actions = []
 
     def send_to_session(self, session, text, thread, slack_user=None):
         self.sent.append((session, text, thread, slack_user))
+        return True
+
+    def send_live_to_session(self, session, text, thread, slack_user=None):
+        self.live_sent.append((session, text, thread, slack_user))
         return True
 
     def handle_agent_request_block_action(self, payload, channel_id, message_ts):
@@ -2086,7 +2091,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_top_level_request_with_same_channel_link_redirects_into_linked_thread(self):
+    def test_top_level_request_with_same_channel_link_keeps_new_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2139,6 +2144,75 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(len(runtime.started), 1)
                 task = runtime.started[0][0]
+                self.assertEqual(task.thread_ts, "1712345680.000001")
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].thread_ts,
+                    "1712345680.000001",
+                )
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].message_ts,
+                    "1712345680.000001",
+                )
+                self.assertIn(
+                    "Original request kicked off here.",
+                    task.metadata["thread_context"],
+                )
+            finally:
+                store.close()
+
+    def test_top_level_request_with_route_intent_uses_linked_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                parent_ts = "1712345670.000001"
+                reply_ts = "1712345670.000002"
+                gateway.thread_history_messages[("C1", parent_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U2",
+                        "text": "Original request kicked off here.",
+                        "ts": parent_ts,
+                    },
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "username": "agent",
+                        "text": "Earlier reply from the agent.",
+                        "ts": reply_ts,
+                        "thread_ts": parent_ts,
+                    },
+                ]
+                linked_url = (
+                    "https://example.slack.com/archives/C1/"
+                    f"p{reply_ts.replace('.', '')}?thread_ts={parent_ts}&cid=C1"
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"somebody continue there and fix the threading bug {linked_url}",
+                            "ts": "1712345680.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task = runtime.started[0][0]
                 self.assertEqual(task.thread_ts, parent_ts)
                 self.assertEqual(
                     gateway.thread_replies[0]["thread"].thread_ts,
@@ -2151,7 +2225,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_top_level_request_resolves_reply_permalink_to_parent_thread(self):
+    def test_top_level_request_resolves_reply_permalink_context_to_parent_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2204,10 +2278,14 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(len(runtime.started), 1)
                 task = runtime.started[0][0]
-                self.assertEqual(task.thread_ts, parent_ts)
+                self.assertEqual(task.thread_ts, "1712345680.000001")
                 self.assertEqual(
                     gateway.thread_replies[0]["thread"].thread_ts,
-                    parent_ts,
+                    "1712345680.000001",
+                )
+                self.assertIn(
+                    "Original request kicked off here.",
+                    task.metadata["thread_context"],
                 )
             finally:
                 store.close()
@@ -2313,6 +2391,76 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(
                     gateway.thread_replies[0]["thread"].thread_ts,
                     "1712345680.000003",
+                )
+            finally:
+                store.close()
+
+    def test_thread_work_request_with_original_thread_link_routes_to_linked_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(2, 0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                current_parent = "1712345680.000003"
+                original_parent = "1712345670.000004"
+                parent_task = replace(
+                    create_agent_task(agents[0], "triage the stuck thread", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts=current_parent,
+                    parent_message_ts=current_parent,
+                )
+                store.upsert_agent_task(parent_task)
+                gateway.thread_history_messages[("C1", original_parent)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U2",
+                        "text": "Original vendor analysis thread.",
+                        "ts": original_parent,
+                    }
+                ]
+                linked_url = (
+                    "https://example.slack.com/archives/C1/"
+                    f"p{original_parent.replace('.', '')}?thread_ts={original_parent}&cid=C1"
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "thread_ts": current_parent,
+                            "text": (
+                                "somebody figure out why this unrelated thread got replies "
+                                f"instead of the original {linked_url} one"
+                            ),
+                            "ts": "1712345680.000004",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task, _, thread = runtime.started[0]
+                self.assertEqual(task.thread_ts, original_parent)
+                self.assertEqual(thread.thread_ts, original_parent)
+                self.assertEqual(
+                    gateway.thread_replies[0]["thread"].thread_ts,
+                    original_parent,
+                )
+                self.assertIn(
+                    "Original vendor analysis thread.",
+                    task.metadata["thread_context"],
                 )
             finally:
                 store.close()
@@ -6257,6 +6405,85 @@ class SlackAppTests(unittest.TestCase):
                 self.assertNotIn("active_thread_followup_message_ts", current_task.metadata)
                 self.assertNotIn("active_thread_followup_message_ts_values", current_task.metadata)
                 self.assertNotIn("queued_thread_followups", current_task.metadata)
+            finally:
+                store.close()
+
+    def test_same_thread_specific_mention_live_delivers_to_running_managed_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                parent_agent, target_agent = build_initial_model_team(1, 1)
+                target_agent = replace(
+                    target_agent,
+                    handle="livia",
+                    full_name="Livia Singh",
+                    provider_preference=Provider.CLAUDE,
+                )
+                store.upsert_team_agent(parent_agent)
+                store.upsert_team_agent(target_agent)
+                parent_task = replace(
+                    create_agent_task(parent_agent, "initial task", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                target_task = replace(
+                    create_agent_task(target_agent, "take this over", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.livia",
+                    session_provider=Provider.CLAUDE,
+                    session_id="claude-live-1",
+                )
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="claude-live-1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.MANAGED,
+                )
+                store.upsert_agent_task(parent_task)
+                store.upsert_agent_task(target_task)
+                store.upsert_session(session)
+                runtime = DetachedRuntime()
+                runtime.running_task_ids.add(target_task.task_id)
+                bridge = FakeSessionBridge()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                    session_bridge=bridge,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "@livia look above",
+                            "ts": "171.user",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(bridge.live_sent), 1)
+                sent_session, sent_text, sent_thread, sent_user = bridge.live_sent[0]
+                self.assertEqual(sent_session.session_id, "claude-live-1")
+                self.assertEqual(sent_text, "look above")
+                self.assertEqual(sent_thread, SlackThreadRef("C1", "171.thread"))
+                self.assertEqual(sent_user, "U1")
+                current_task = store.get_agent_task(target_task.task_id)
+                assert current_task is not None
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+                self.assertEqual(current_task.metadata.get("request_message_ts"), "171.user")
+                self.assertEqual(runtime.started, [])
+                self.assertIn(("C1", "171.user", "hourglass_flowing_sand"), gateway.reactions)
             finally:
                 store.close()
 

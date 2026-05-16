@@ -192,6 +192,15 @@ THREAD_CONTEXT_DELEGATE_VISIBLE_PROMPT = "continue using the thread context abov
 QUEUED_THREAD_FOLLOWUPS_METADATA_KEY = "queued_thread_followups"
 ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY = "active_thread_followup_message_ts"
 ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY = "active_thread_followup_message_ts_values"
+LINKED_THREAD_ROUTE_INTENT_RE = re.compile(
+    r"\b(?:this|the)\s+unrelated\s+thread\b"
+    r"|\binstead\s+of\s+(?:this|the\s+current|current)\s+(?:thread|one)\b"
+    r"|\boriginal\b.{0,120}\b(?:thread|one)\b"
+    r"|\b(?:correct|right|target|linked)\s+(?:thread|one)\b"
+    r"|\b(?:reply|respond|continue|post|route|move|send|put)\b.{0,80}"
+    r"\b(?:there|(?:that|the|this|original|linked|correct|right)\s+(?:thread|one))\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -1471,10 +1480,19 @@ class SlackTeamController:
         active_task = self._active_thread_task_for_agent(task, channel_id, thread_ts)
         target_task = active_task or task
         if _is_stop_command(text):
+            thread = SlackThreadRef(channel_id, thread_ts, task.parent_message_ts)
+            if self._stop_multiple_active_thread_tasks(
+                channel_id,
+                thread_ts,
+                thread,
+                message_ts,
+                event.get("user"),
+            ):
+                return True
             self._interrupt_thread_task(
                 target_task,
                 agent,
-                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                thread,
                 message_ts,
             )
             return True
@@ -1540,6 +1558,80 @@ class SlackTeamController:
                 "No active run is currently running for this task.",
             )
         self.refresh_or_post_roster(thread.channel_id)
+
+    def _stop_multiple_active_thread_tasks(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        thread: SlackThreadRef,
+        message_ts: str | None,
+        slack_user: str | None,
+    ) -> bool:
+        thread_tasks = [
+            item
+            for item in self.store.list_agent_tasks(include_done=True)
+            if item.channel_id == channel_id
+            and item.thread_ts == thread_ts
+            and item.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
+        ]
+        if len(thread_tasks) <= 1:
+            return False
+        stopped = 0
+        for thread_task in thread_tasks:
+            if self._stop_thread_task(thread_task, thread, slack_user):
+                stopped += 1
+            self._mark_task_complete(thread_task, thread, include_thread=False)
+        self._mark_message_complete(channel_id, message_ts)
+        if stopped:
+            self.gateway.post_thread_reply(
+                thread,
+                f"Stopped {stopped} active runs in this thread.",
+            )
+        else:
+            self.gateway.post_thread_reply(
+                thread,
+                "No active run is currently running in this thread.",
+            )
+        self.refresh_or_post_roster(channel_id)
+        return True
+
+    def _stop_thread_task(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+        slack_user: str | None,
+    ) -> bool:
+        stopped = False
+        if self.runtime is not None:
+            try:
+                stopped = bool(self.runtime.stop_task(task.task_id, AgentTaskStatus.CANCELLED))
+            except Exception:
+                LOGGER.debug("failed to stop thread task %s", task.task_id, exc_info=True)
+        if (
+            not stopped
+            and self.session_bridge is not None
+            and task.session_provider is not None
+            and task.session_id
+        ):
+            session = self.store.get_session(task.session_provider, task.session_id)
+            if session is not None:
+                try:
+                    stopped = bool(
+                        self.session_bridge.send_to_session(
+                            session,
+                            "/exit",
+                            thread,
+                            slack_user=slack_user,
+                        )
+                    )
+                except Exception:
+                    LOGGER.debug(
+                        "failed to stop external session for thread task %s",
+                        task.task_id,
+                        exc_info=True,
+                    )
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        return stopped or task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
 
     def _handle_external_session_thread_reply(
         self,
@@ -1712,6 +1804,14 @@ class SlackTeamController:
         active_agents = self.store.list_team_agents()
         channel_id = event["channel"]
         thread_ts = event["thread_ts"]
+        current_thread = SlackThreadRef(channel_id, thread_ts)
+        target_thread = (
+            self._linked_thread_route_target(
+                text,
+                SlackThreadRef(channel_id, thread_ts, event.get("ts")),
+            )
+            or current_thread
+        )
         multi_requests = _multi_specific_work_requests(text, active_agents)
         if multi_requests:
             extra_metadata = self._thread_task_metadata(parent_task, channel_id, thread_ts)
@@ -1719,11 +1819,11 @@ class SlackTeamController:
             extra_metadata = self._with_linked_thread_context(
                 extra_metadata,
                 text,
-                current_thread=SlackThreadRef(channel_id, thread_ts),
+                current_thread=current_thread,
             )
             return self._start_specific_requests_in_thread(
                 multi_requests,
-                SlackThreadRef(channel_id, thread_ts),
+                target_thread,
                 requested_by_slack_user=event.get("user"),
                 author_agent=parent_agent,
                 extra_metadata=extra_metadata,
@@ -1737,14 +1837,18 @@ class SlackTeamController:
         extra_metadata = self._with_linked_thread_context(
             extra_metadata,
             request.prompt,
-            current_thread=SlackThreadRef(channel_id, thread_ts),
+            current_thread=current_thread,
         )
-        same_thread_agent = self._same_thread_requested_agent(request, channel_id, thread_ts)
+        same_thread_agent = self._same_thread_requested_agent(
+            request,
+            target_thread.channel_id,
+            target_thread.thread_ts,
+        )
         if same_thread_agent is not None:
             started = self._start_same_thread_agent_followup(
                 request,
                 same_thread_agent,
-                SlackThreadRef(channel_id, thread_ts),
+                target_thread,
                 requested_by_slack_user=event.get("user"),
                 author_agent=parent_agent,
                 context_task=parent_task,
@@ -1769,7 +1873,7 @@ class SlackTeamController:
         result = assign_work_request(
             self.store,
             request,
-            channel_id,
+            target_thread.channel_id,
             requested_by_slack_user=event.get("user"),
             author_agent=parent_agent,
             extra_metadata=extra_metadata,
@@ -1777,7 +1881,10 @@ class SlackTeamController:
         )
         if result is None:
             self._post_assignment_unavailable(
-                SlackReplyTarget(channel_id=channel_id, thread_ts=thread_ts),
+                SlackReplyTarget(
+                    channel_id=target_thread.channel_id,
+                    thread_ts=target_thread.thread_ts,
+                ),
                 request,
                 requested_by_slack_user=event.get("user"),
                 author_agent=parent_agent,
@@ -1786,7 +1893,7 @@ class SlackTeamController:
             )
             return True
         posted = self.gateway.post_thread_reply(
-            SlackThreadRef(channel_id, thread_ts),
+            target_thread,
             format_agent_assignment(
                 result.agent,
                 result.request.prompt,
@@ -1796,9 +1903,13 @@ class SlackTeamController:
             persona=result.agent,
             icon_url=self._agent_icon_url(result.agent),
         )
-        self.store.update_agent_task_thread(result.task.task_id, thread_ts, posted.ts)
+        self.store.update_agent_task_thread(
+            result.task.task_id,
+            target_thread.thread_ts,
+            posted.ts,
+        )
         task = self.store.get_agent_task(result.task.task_id) or result.task
-        self._start_runtime_task(task, result.agent, SlackThreadRef(channel_id, thread_ts))
+        self._start_runtime_task(task, result.agent, target_thread)
         self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
 
@@ -2278,6 +2389,14 @@ class SlackTeamController:
             return True
         is_running = getattr(self.runtime, "is_task_running", None)
         if callable(is_running) and is_running(previous_task.task_id):
+            if self._send_live_managed_task_followup(
+                previous_task,
+                request.prompt,
+                thread,
+                requested_by_slack_user,
+            ):
+                self._remember_request_message_for_task(previous_task, request_message_ts)
+                return True
             LOGGER.debug(
                 "queueing same-thread continuation for task %s; worker is still running",
                 previous_task.task_id,
@@ -2312,6 +2431,27 @@ class SlackTeamController:
         self.store.upsert_agent_task(task)
         self._restore_task_action_buttons_if_active(task)
         return self._start_runtime_task(task, agent, thread)
+
+    def _send_live_managed_task_followup(
+        self,
+        task: AgentTask,
+        text: str,
+        thread: SlackThreadRef,
+        slack_user: str | None,
+    ) -> bool:
+        if self.session_bridge is None or not task.session_provider or not task.session_id:
+            return False
+        session = self.store.get_session(task.session_provider, task.session_id)
+        if session is None:
+            return False
+        send_live = getattr(self.session_bridge, "send_live_to_session", None)
+        if not callable(send_live):
+            return False
+        try:
+            return bool(send_live(session, text, thread, slack_user=slack_user))
+        except Exception:
+            LOGGER.debug("failed to send same-thread follow-up to live session", exc_info=True)
+            return False
 
     def _active_thread_task_for_agent(
         self,
@@ -2943,6 +3083,8 @@ class SlackTeamController:
         ):
             return None
         context = self._thread_context(ref.channel_id, ref.thread_ts)
+        if not context and ref.message_ts and ref.message_ts != ref.thread_ts:
+            context = self._thread_context(ref.channel_id, ref.message_ts)
         if not context:
             return None
         label = "Linked Slack thread from task prompt"
@@ -2959,22 +3101,48 @@ class SlackTeamController:
         message_ts = event.get("ts")
         user_thread_ts = event.get("thread_ts")
         if user_thread_ts:
+            current_thread = SlackThreadRef(
+                channel_id=channel_id,
+                thread_ts=user_thread_ts,
+                message_ts=message_ts,
+            )
+            routed = self._linked_thread_route_target(text, current_thread)
+            if routed is not None:
+                return routed
             return SlackThreadRef(
                 channel_id=channel_id,
                 thread_ts=user_thread_ts,
                 message_ts=message_ts,
             )
-        linked = self._resolve_linked_thread_ref(text)
-        if linked is not None and linked.channel_id == channel_id and linked.thread_ts:
-            return SlackThreadRef(
-                channel_id=channel_id,
-                thread_ts=linked.thread_ts,
-                message_ts=message_ts,
-            )
-        return SlackThreadRef(
+        current_thread = SlackThreadRef(
             channel_id=channel_id,
             thread_ts=message_ts,
             message_ts=message_ts,
+        )
+        routed = self._linked_thread_route_target(text, current_thread)
+        if routed is not None:
+            return routed
+        return current_thread
+
+    def _linked_thread_route_target(
+        self,
+        text: str,
+        current_thread: SlackThreadRef,
+    ) -> SlackThreadRef | None:
+        if not LINKED_THREAD_ROUTE_INTENT_RE.search(text):
+            return None
+        ref = self._resolve_linked_thread_ref(text)
+        if ref is None or not ref.thread_ts:
+            return None
+        if ref.channel_id != current_thread.channel_id:
+            return None
+        if ref.thread_ts == current_thread.thread_ts:
+            return None
+        return SlackThreadRef(
+            channel_id=ref.channel_id,
+            thread_ts=ref.thread_ts,
+            message_ts=current_thread.message_ts,
+            permalink=ref.permalink,
         )
 
     def _resolve_linked_thread_ref(self, text: str) -> SlackThreadRef | None:
