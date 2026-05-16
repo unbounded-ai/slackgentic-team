@@ -2410,8 +2410,11 @@ class SlackTeamController:
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
+        for key in ("request_message_ts", "request_message_ts_history"):
+            if key in previous_task.metadata:
+                metadata[key] = previous_task.metadata[key]
         if request_message_ts:
-            metadata["request_message_ts"] = request_message_ts
+            metadata = _metadata_with_request_message_ts(metadata, request_message_ts)
         metadata = self._with_linked_thread_context(
             metadata,
             request.prompt,
