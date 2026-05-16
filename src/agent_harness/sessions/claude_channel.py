@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -38,13 +40,19 @@ CHANNEL_INSTRUCTIONS = (
     "`request_user_input` when Slack should choose among multiple options; use "
     "`request_approval` only for one concrete yes/no approval. Before a large "
     "file edit that may require Slack approval, summarize the intended change "
-    "first because Claude may expose only a truncated native tool input preview."
+    "first because Claude may expose only a truncated native tool input preview. "
+    "When opening a GitHub pull request, prefer the Slackgentic `create_pull_request` "
+    "MCP tool; it runs the narrow `gh pr create` workflow through the channel so "
+    "PR creation still works when Claude Bash is sandboxed."
 )
 SLACKGENTIC_MCP_TOOL_NAMES = {
+    f"mcp__{CHANNEL_NAME}__create_pull_request",
     f"mcp__{CHANNEL_NAME}__request_approval",
     f"mcp__{CHANNEL_NAME}__request_user_input",
 }
 SLACKGENTIC_MCP_PERMISSION_ALLOW = tuple(sorted(SLACKGENTIC_MCP_TOOL_NAMES))
+CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
 
 
 class ClaudeChannelServer:
@@ -54,11 +62,13 @@ class ClaudeChannelServer:
         target_pid: int | None = None,
         poll_seconds: float = 0.2,
         request_handler: SlackAgentRequestHandler | None = None,
+        command_runner: CommandRunner | None = None,
     ):
         self.store = store
         self.target_pid = target_pid or os.getppid()
         self.poll_seconds = poll_seconds
         self.request_handler = request_handler
+        self.command_runner = command_runner or subprocess.run
         self._current_thread = _thread_from_env()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -182,7 +192,43 @@ class ClaudeChannelServer:
             return self._handle_request_user_input_tool(arguments)
         if name == "request_approval":
             return self._handle_request_approval_tool(arguments)
+        if name == "create_pull_request":
+            return self._handle_create_pull_request_tool(arguments)
         return _tool_result(f"Unknown Slackgentic tool: {name}", is_error=True)
+
+    def _handle_create_pull_request_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        title = _string_arg(arguments, "title")
+        if not title:
+            return _tool_result("create_pull_request requires a title.", is_error=True)
+        cwd = _cwd_arg(arguments)
+        if cwd is None:
+            return _tool_result(
+                "create_pull_request cwd must be an existing directory.", is_error=True
+            )
+        args = _pull_request_create_args(arguments, title)
+        try:
+            completed = self.command_runner(
+                args,
+                cwd=cwd,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return _tool_result("GitHub CLI `gh` was not found on PATH.", is_error=True)
+        except Exception as exc:
+            return _tool_result(f"Failed to create pull request: {exc}", is_error=True)
+
+        output = _command_output(completed)
+        url = _github_pr_url(output)
+        if completed.returncode == 0:
+            return _tool_result(url or output or "Pull request created.")
+        if url and "already exists" in output.lower():
+            return _tool_result(url)
+        detail = output or f"`gh pr create` exited with {completed.returncode}."
+        if url:
+            detail = f"{detail}\nExisting pull request: {url}"
+        return _tool_result(detail, is_error=True)
 
     def _handle_request_user_input_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.request_handler is None:
@@ -555,6 +601,32 @@ def _is_slackgentic_mcp_tool(tool_name: str) -> bool:
 def _tools() -> list[dict[str, Any]]:
     return [
         {
+            "name": "create_pull_request",
+            "description": (
+                "Create a GitHub pull request for a pushed branch using `gh pr create`. "
+                "Use this when a PR is ready or when Bash cannot reach GitHub from a sandbox."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "base": {"type": "string"},
+                    "head": {"type": "string"},
+                    "repo": {
+                        "type": "string",
+                        "description": "Optional owner/repo target for gh.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional local repository directory.",
+                    },
+                    "draft": {"type": "boolean"},
+                },
+                "required": ["title"],
+            },
+        },
+        {
             "name": "request_user_input",
             "description": (
                 "Ask the Slack thread to choose among multiple options and wait for the response."
@@ -613,6 +685,40 @@ def _tools() -> list[dict[str, Any]]:
             },
         },
     ]
+
+
+def _pull_request_create_args(arguments: dict[str, Any], title: str) -> list[str]:
+    args = ["gh", "pr", "create", "--title", title, "--body", _string_arg(arguments, "body")]
+    for key, flag in (("base", "--base"), ("head", "--head"), ("repo", "--repo")):
+        value = _string_arg(arguments, key)
+        if value:
+            args.extend([flag, value])
+    if _bool_arg(arguments, "draft"):
+        args.append("--draft")
+    return args
+
+
+def _cwd_arg(arguments: dict[str, Any]) -> Path | None:
+    raw = _string_arg(arguments, "cwd")
+    candidate = Path(raw).expanduser() if raw else Path.cwd()
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if not resolved.is_dir():
+        return None
+    return resolved
+
+
+def _command_output(completed: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(
+        value.strip() for value in (completed.stdout, completed.stderr) if value and value.strip()
+    )
+
+
+def _github_pr_url(text: str) -> str:
+    match = PR_URL_RE.search(text)
+    return match.group(0) if match else ""
 
 
 def _tool_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
@@ -694,6 +800,10 @@ def _string_arg(arguments: dict[str, Any], key: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return ""
+
+
+def _bool_arg(arguments: dict[str, Any], key: str) -> bool:
+    return arguments.get(key) is True
 
 
 def _string_param(params: dict[str, Any], key: str) -> str:
