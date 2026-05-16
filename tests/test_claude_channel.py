@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -107,7 +108,7 @@ class ClaudeChannelTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_tools_list_advertises_slack_input_and_approval_tools(self):
+    def test_tools_list_advertises_slack_input_approval_and_pr_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             output = io.StringIO()
@@ -120,8 +121,10 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 response = json.loads(output.getvalue())
                 tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+                self.assertIn("create_pull_request", tools)
                 self.assertIn("request_user_input", tools)
                 self.assertIn("request_approval", tools)
+                self.assertIn("GitHub pull request", tools["create_pull_request"]["description"])
                 self.assertIn("multiple options", tools["request_user_input"]["description"])
                 self.assertIn("one concrete action", tools["request_approval"]["description"])
             finally:
@@ -173,6 +176,126 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 self.assertIn("Claude requests approval", gateway.replies[0]["text"])
                 self.assertIn("abort", result["content"][0]["text"])
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_runs_gh_pr_create(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="https://github.com/example-org/example-repo/pull/12\n",
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(
+                    store,
+                    target_pid=123,
+                    command_runner=fake_run,
+                )
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {
+                            "title": "Update docs",
+                            "body": "Summary",
+                            "base": "main",
+                            "head": "feature/docs",
+                            "repo": "example-org/example-repo",
+                            "cwd": str(repo),
+                            "draft": True,
+                        },
+                    }
+                )
+
+                self.assertEqual(
+                    result["content"][0]["text"],
+                    "https://github.com/example-org/example-repo/pull/12",
+                )
+                self.assertEqual(
+                    calls[0][0],
+                    [
+                        "gh",
+                        "pr",
+                        "create",
+                        "--title",
+                        "Update docs",
+                        "--body",
+                        "Summary",
+                        "--base",
+                        "main",
+                        "--head",
+                        "feature/docs",
+                        "--repo",
+                        "example-org/example-repo",
+                        "--draft",
+                    ],
+                )
+                self.assertEqual(calls[0][1]["cwd"], repo.resolve())
+                self.assertTrue(calls[0][1]["capture_output"])
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_reports_missing_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123)
+
+                result = server._handle_tool_call(
+                    {"name": "create_pull_request", "arguments": {"body": "Summary"}}
+                )
+
+                self.assertTrue(result["isError"])
+                self.assertIn("requires a title", result["content"][0]["text"])
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_treats_existing_pr_url_as_success(self):
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout="",
+                stderr=(
+                    "a pull request for branch already exists: "
+                    "https://github.com/example-org/example-repo/pull/12\n"
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(
+                    store,
+                    target_pid=123,
+                    command_runner=fake_run,
+                )
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {"title": "Update docs", "cwd": tmp},
+                    }
+                )
+
+                self.assertNotIn("isError", result)
+                self.assertEqual(
+                    result["content"][0]["text"],
+                    "https://github.com/example-org/example-repo/pull/12",
+                )
             finally:
                 store.close()
 
@@ -254,10 +377,7 @@ class ClaudeChannelTests(unittest.TestCase):
                 server = ClaudeChannelServer(store, target_pid=123, request_handler=handler)
                 server._current_thread = SlackThreadRef("C1", "171.000001")
 
-                for tool_name in (
-                    "mcp__slackgentic__request_approval",
-                    "mcp__slackgentic__request_user_input",
-                ):
+                for tool_name in SLACKGENTIC_MCP_PERMISSION_ALLOW:
                     with redirect_stdout(output):
                         server._handle_message(
                             {

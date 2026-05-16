@@ -18,6 +18,7 @@ from agent_harness.bash_policy import (
     classify_bash_command,
 )
 from agent_harness.config import AgentCommandConfig
+from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.models import (
     AgentTask,
     AgentTaskStatus,
@@ -1147,6 +1148,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
         if normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
+        if normalized.startswith(AGENT_DEFERRED_SIGNAL_PREFIX):
+            signals.append(line.strip())
+            continue
         visible_lines.append(line)
     return "\n".join(visible_lines).strip(), signals
 
@@ -1786,6 +1790,8 @@ def _render_claude_json_line(line: str) -> str | None:
             return _format_claude_error(message)
         result = event.get("result")
         return _clean_terminal_output(str(result)) if result else None
+    if event_type == "assistant":
+        return _claude_assistant_message_text(event)
     if event_type == "error":
         message = event.get("message") or event.get("error")
         return _format_claude_error(message)

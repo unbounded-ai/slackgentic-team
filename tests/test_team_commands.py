@@ -8,6 +8,7 @@ from agent_harness.team.commands import (
     HireCommand,
     RepoRootCommand,
     RosterCommand,
+    ScheduledTasksCommand,
     parse_team_command,
 )
 
@@ -32,6 +33,10 @@ class TeamCommandTests(unittest.TestCase):
     def test_parse_roster(self):
         self.assertEqual(parse_team_command("show roster"), RosterCommand())
         self.assertEqual(parse_team_command("roster"), RosterCommand())
+
+    def test_parse_scheduled_tasks(self):
+        self.assertEqual(parse_team_command("scheduled tasks"), ScheduledTasksCommand())
+        self.assertEqual(parse_team_command("show schedules"), ScheduledTasksCommand())
 
     def test_parse_repo_root(self):
         self.assertEqual(parse_team_command("show repo root"), RepoRootCommand())

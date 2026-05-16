@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
+from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -954,7 +955,7 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(chunks, ["Final"])
         self.assertEqual(buffer, "")
 
-    def test_claude_json_output_ignores_assistant_text_and_artifacts_before_result(self):
+    def test_claude_json_output_renders_assistant_text_before_tool_result(self):
         chunks, buffer = _process_output_chunks(
             Provider.CLAUDE,
             (
@@ -966,7 +967,21 @@ class TaskRuntimeTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(chunks, ["Final"])
+        self.assertEqual(chunks, ["Interim artifact list", "Final"])
+        self.assertEqual(buffer, "")
+
+    def test_claude_json_output_renders_text_before_tool_use(self):
+        chunks, buffer = _process_output_chunks(
+            Provider.CLAUDE,
+            (
+                '{"type":"assistant","message":{"content":['
+                '{"type":"text","text":"Not stuck - continuing now."},'
+                '{"type":"tool_use","name":"Bash"}],'
+                '"stop_reason":"tool_use"}}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Not stuck - continuing now."])
         self.assertEqual(buffer, "")
 
     def test_codex_long_message_splits_at_paragraph_boundary(self):
@@ -1220,6 +1235,14 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Wakeup scheduled.")
         self.assertEqual(signals, [f"{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check CI."])
+
+    def test_agent_deferred_signal_is_stripped_from_visible_text(self):
+        signal = f'{AGENT_DEFERRED_SIGNAL_PREFIX}{{"task":"follow up","depends_on":[]}}'
+
+        visible, signals = _extract_agent_control_signals(f"Deferred.\n{signal}\n")
+
+        self.assertEqual(visible, "Deferred.")
+        self.assertEqual(signals, [signal])
 
     def test_parse_agent_timer_signal_accepts_delay(self):
         now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
@@ -2936,7 +2959,7 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_runtime_recovers_latest_claude_assistant_text_without_result(self):
+    def test_runtime_posts_claude_assistant_text_without_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             store = Store(home / "state.sqlite")
@@ -2995,12 +3018,14 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000002"))
                 deadline = time.monotonic() + 5
-                while (not gateway.replies or not done_callbacks) and time.monotonic() < deadline:
+                while (
+                    len(gateway.replies) < 2 or not done_callbacks
+                ) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
                 self.assertEqual(
                     gateway.replies,
-                    ["PR up: https://github.com/example/repo/pull/456"],
+                    ["Working on it", "PR up: https://github.com/example/repo/pull/456"],
                 )
                 self.assertEqual(done_callbacks, [task.task_id])
                 self.assertNotEqual(

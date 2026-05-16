@@ -50,6 +50,7 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    parse_timestamp,
     utc_now,
 )
 from agent_harness.providers import ClaudeProvider, CodexProvider
@@ -103,6 +104,7 @@ from agent_harness.slack import (
     build_task_thread_blocks,
     build_team_roster_blocks,
     decode_action_value,
+    encode_action_value,
     is_dependency_intent,
     parse_thread_ref,
     replace_slack_user_ids,
@@ -134,6 +136,7 @@ from agent_harness.team.commands import (
     HireCommand,
     RepoRootCommand,
     RosterCommand,
+    ScheduledTasksCommand,
     parse_team_command,
 )
 from agent_harness.team.routing import (
@@ -278,6 +281,8 @@ class SlackTeamController:
             self._fire_from_action(decoded, channel_id, message_ts)
         elif action_name.startswith("task."):
             self._task_from_action(decoded, channel_id, message_ts)
+        elif action_name.startswith("schedule."):
+            self._schedule_from_action(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name == "external.session.finish":
             self._external_session_finish_from_action(decoded, channel_id)
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
@@ -285,7 +290,10 @@ class SlackTeamController:
 
     def handle_view_submission(self, payload: dict) -> dict | None:
         view = payload.get("view") or {}
-        if view.get("callback_id") != "setup.initial":
+        callback_id = view.get("callback_id")
+        if callback_id == "schedule.change":
+            return self._handle_schedule_change_submission(payload)
+        if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
         channel_name = _view_plain_value(values, "channel_name", "value") or "agents"
@@ -459,7 +467,7 @@ class SlackTeamController:
             self.store.get_team_agent(request.author_handle) if request.author_handle else None
         )
         sticky_excluded_agent_ids = self._anyone_context_agent_ids(request, active_agents)
-        excluded_agent_ids = set(self._external_busy_agent_ids())
+        excluded_agent_ids = set(self._busy_agent_ids_for_assignment())
         excluded_agent_ids.update(sticky_excluded_agent_ids)
         result = assign_work_request(
             self.store,
@@ -507,7 +515,14 @@ class SlackTeamController:
 
     def handle_team_command(
         self,
-        command: HireCommand | FireCommand | FireEveryoneCommand | RepoRootCommand | RosterCommand,
+        command: (
+            HireCommand
+            | FireCommand
+            | FireEveryoneCommand
+            | RepoRootCommand
+            | RosterCommand
+            | ScheduledTasksCommand
+        ),
         target: SlackReplyTarget,
     ) -> None:
         if isinstance(command, HireCommand):
@@ -568,6 +583,9 @@ class SlackTeamController:
                 return
             self.store.set_setting(SETTING_REPO_ROOT, str(root))
             self._post_text(target, f"Repo root set to `{root}`.")
+            return
+        if isinstance(command, ScheduledTasksCommand):
+            self._post_scheduled_tasks(target)
             return
         self.post_roster(
             target.channel_id,
@@ -654,7 +672,12 @@ class SlackTeamController:
         if author_agent is None and pending.request.author_handle:
             author_agent = self.store.get_team_agent(pending.request.author_handle)
         exclude_agent_ids = set(pending.exclude_agent_ids)
-        exclude_agent_ids.update(self._external_busy_agent_ids())
+        scheduled_work_id = pending.extra_metadata.get("scheduled_work_id")
+        exclude_agent_ids.update(
+            self._busy_agent_ids_for_assignment(
+                ignore_schedule_id=scheduled_work_id if isinstance(scheduled_work_id, str) else None
+            )
+        )
         result = assign_work_request(
             self.store,
             pending.request,
@@ -706,6 +729,78 @@ class SlackTeamController:
         else:
             self.gateway.post_message(target.channel_id, text)
 
+    def _post_scheduled_tasks(self, target: SlackReplyTarget) -> None:
+        scheduled = self.store.list_scheduled_work(
+            statuses=(ScheduledWorkStatus.PENDING, ScheduledWorkStatus.CLAIMED),
+            channel_id=target.channel_id,
+            limit=20,
+        )
+        text = _scheduled_tasks_text(scheduled)
+        blocks = self._scheduled_tasks_blocks(scheduled)
+        if target.thread_ts:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(target.channel_id, target.thread_ts),
+                text,
+                blocks=blocks,
+            )
+        else:
+            self.gateway.post_message(target.channel_id, text, blocks=blocks)
+
+    def _scheduled_tasks_blocks(self, scheduled: list[ScheduledWork]) -> list[dict] | None:
+        if not scheduled:
+            return None
+        blocks: list[dict] = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Scheduled tasks*  {len(scheduled)} active",
+                },
+            }
+        ]
+        for item in scheduled:
+            thread_url = self._thread_permalink(item.channel_id, item.thread_ts)
+            blocks.append(
+                {
+                    "type": "section",
+                    "block_id": f"schedule.item.{item.schedule_id}",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": _scheduled_work_block_text(item),
+                    },
+                }
+            )
+            elements = [
+                _slack_button(
+                    "Deschedule",
+                    "schedule.cancel",
+                    encode_action_value("schedule.cancel", schedule_id=item.schedule_id),
+                    "danger",
+                ),
+                _slack_button(
+                    "Change schedule",
+                    "schedule.change",
+                    encode_action_value("schedule.change", schedule_id=item.schedule_id),
+                ),
+            ]
+            if thread_url:
+                elements.append(
+                    _slack_button(
+                        "Open thread",
+                        "thread.open",
+                        encode_action_value("thread.open"),
+                        url=thread_url,
+                    )
+                )
+            blocks.append(
+                {
+                    "type": "actions",
+                    "block_id": f"schedule.actions.{item.schedule_id}",
+                    "elements": elements,
+                }
+            )
+        return blocks
+
     def _assignment_unavailable_text(self, request: WorkRequest) -> str:
         if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
             agent = self.store.get_team_agent(request.requested_handle)
@@ -713,7 +808,7 @@ class SlackTeamController:
                 idle_ids = {item.agent_id for item in self.store.idle_team_agents()}
                 if (
                     agent.agent_id not in idle_ids
-                    or agent.agent_id in self._external_busy_agent_ids()
+                    or agent.agent_id in self._busy_agent_ids_for_assignment()
                 ):
                     return (
                         f"That specific agent is busy. Wait for @{agent.handle}, "
@@ -839,7 +934,7 @@ class SlackTeamController:
             channel_id,
             requested_by_slack_user=event.get("user"),
             extra_metadata=extra_metadata,
-            exclude_agent_ids=self._external_busy_agent_ids(),
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(),
         )
         if result is None:
             self._post_assignment_unavailable(
@@ -909,7 +1004,9 @@ class SlackTeamController:
                 requested_by_slack_user=claimed.requested_by_slack_user,
                 author_agent=author_agent,
                 extra_metadata=metadata,
-                exclude_agent_ids=self._external_busy_agent_ids(),
+                exclude_agent_ids=self._busy_agent_ids_for_assignment(
+                    ignore_schedule_id=claimed.schedule_id
+                ),
             )
             self.gateway.post_thread_reply(
                 thread,
@@ -979,6 +1076,26 @@ class SlackTeamController:
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,
             )
+        scheduled_by_agent = self._pending_scheduled_work_by_agent(agents)
+        for agent in agents:
+            if statuses[agent.agent_id].label != "Available":
+                continue
+            scheduled_items = scheduled_by_agent.get(agent.agent_id)
+            if not scheduled_items:
+                continue
+            scheduled = scheduled_items[0]
+            detail = (
+                f"Scheduled task: {_shorten(scheduled.prompt, 110)}; "
+                f"{_format_scheduled_work_schedule(scheduled)}; "
+                f"next run `{_format_schedule_timestamp(scheduled.next_run_at)}`"
+            )
+            if len(scheduled_items) > 1:
+                detail = f"{detail}; +{len(scheduled_items) - 1} more"
+            statuses[agent.agent_id] = AgentRosterStatus(
+                "Occupied",
+                detail,
+                thread_url=self._thread_permalink(scheduled.channel_id, scheduled.thread_ts),
+            )
         for agent_id, session in self._active_external_sessions_by_agent().items():
             if agent_id not in statuses:
                 continue
@@ -1002,6 +1119,21 @@ class SlackTeamController:
                 session_id=session.session_id,
             )
         return statuses
+
+    def _pending_scheduled_work_by_agent(self, agents) -> dict[str, list[ScheduledWork]]:
+        agents_by_handle = {agent.handle: agent for agent in agents}
+        scheduled_by_agent: dict[str, list[ScheduledWork]] = {}
+        for scheduled in self.store.list_scheduled_work(statuses=(ScheduledWorkStatus.PENDING,)):
+            if (
+                scheduled.assignment_mode != AssignmentMode.SPECIFIC
+                or not scheduled.requested_handle
+            ):
+                continue
+            agent = agents_by_handle.get(scheduled.requested_handle)
+            if agent is None:
+                continue
+            scheduled_by_agent.setdefault(agent.agent_id, []).append(scheduled)
+        return scheduled_by_agent
 
     def _running_managed_tasks(self):
         if self.runtime is None:
@@ -1037,6 +1169,23 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to get Slack permalink for %s:%s", channel_id, thread_ts)
             return None
+
+    def _busy_agent_ids_for_assignment(self, ignore_schedule_id: str | None = None) -> set[str]:
+        busy = set(self._external_busy_agent_ids())
+        busy.update(self._scheduled_busy_agent_ids(ignore_schedule_id=ignore_schedule_id))
+        return busy
+
+    def _scheduled_busy_agent_ids(self, ignore_schedule_id: str | None = None) -> set[str]:
+        agents_by_handle = {agent.handle: agent.agent_id for agent in self.store.list_team_agents()}
+        busy: set[str] = set()
+        for scheduled in self.store.list_scheduled_work(statuses=(ScheduledWorkStatus.PENDING,)):
+            if ignore_schedule_id and scheduled.schedule_id == ignore_schedule_id:
+                continue
+            if scheduled.assignment_mode == AssignmentMode.SPECIFIC and scheduled.requested_handle:
+                agent_id = agents_by_handle.get(scheduled.requested_handle)
+                if agent_id:
+                    busy.add(agent_id)
+        return busy
 
     def _external_busy_agent_ids(self) -> set[str]:
         return set(self._active_external_sessions_by_agent())
@@ -1148,8 +1297,9 @@ class SlackTeamController:
                     "Run commands by typing them directly in this channel, "
                     f"or as `{command} <command>`: "
                     f"`{command} status`, `{command} show roster`, "
-                    f"`{command} hire 3 agents`, or just `status`, "
-                    "`show roster`, `hire 3 agents`."
+                    f"`{command} scheduled tasks`, `{command} hire 3 agents`, "
+                    "or just `status`, `show roster`, `scheduled tasks`, "
+                    "`hire 3 agents`."
                 ),
                 f"Codex outside Slack: `{codex_command}` creates a tracking thread here.",
                 (
@@ -1544,6 +1694,138 @@ class SlackTeamController:
             self._resume_pending_work_requests(channel_id)
             self.refresh_or_post_roster(channel_id)
 
+    def _schedule_from_action(
+        self,
+        payload: dict,
+        channel_id: str,
+        message_ts: str | None,
+        trigger_id: str | None,
+    ) -> None:
+        schedule_id = str(payload.get("schedule_id") or "")
+        if not schedule_id:
+            return
+        action = payload.get("action")
+        if action == "schedule.cancel":
+            cancelled = self.store.cancel_scheduled_work(schedule_id)
+            if cancelled is None:
+                self.gateway.post_message(
+                    channel_id,
+                    f"I could not find an active schedule named `{schedule_id}`.",
+                )
+                return
+            self.gateway.post_thread_reply(
+                SlackThreadRef(cancelled.channel_id, cancelled.thread_ts),
+                f"Descheduled `{schedule_id}`.",
+            )
+            self._update_scheduled_tasks_message(channel_id, message_ts)
+            self.refresh_or_post_roster(channel_id)
+            return
+        if action == "schedule.change":
+            scheduled = self.store.get_scheduled_work(schedule_id)
+            if scheduled is None or scheduled.status not in {
+                ScheduledWorkStatus.PENDING,
+                ScheduledWorkStatus.CLAIMED,
+            }:
+                self.gateway.post_message(
+                    channel_id,
+                    f"I could not find an active schedule named `{schedule_id}`.",
+                )
+                return
+            if not trigger_id:
+                self.gateway.post_message(
+                    channel_id,
+                    f"Use `scheduled tasks` again to change `{schedule_id}` from Slack.",
+                )
+                return
+            self.gateway.open_view(
+                trigger_id,
+                _schedule_change_modal(scheduled, channel_id=channel_id, message_ts=message_ts),
+            )
+
+    def _handle_schedule_change_submission(self, payload: dict) -> dict | None:
+        view = payload.get("view") or {}
+        metadata = _decode_schedule_change_metadata(view.get("private_metadata"))
+        schedule_id = metadata.get("schedule_id")
+        if not schedule_id:
+            return None
+        scheduled = self.store.get_scheduled_work(schedule_id)
+        if scheduled is None or scheduled.status not in {
+            ScheduledWorkStatus.PENDING,
+            ScheduledWorkStatus.CLAIMED,
+        }:
+            return _view_errors("schedule_next_run", "That schedule is no longer active.")
+        values = view.get("state", {}).get("values", {})
+        next_run_text = (_view_plain_value(values, "schedule_next_run", "value") or "").strip()
+        next_run_at = parse_timestamp(next_run_text)
+        if next_run_at is None:
+            return _view_errors(
+                "schedule_next_run",
+                "Enter an ISO timestamp, for example 2026-05-16T17:00:00-05:00.",
+            )
+        if next_run_at <= utc_now():
+            return _view_errors("schedule_next_run", "Choose a future time.")
+        recurrence = None
+        timezone = scheduled.timezone
+        if scheduled.schedule_kind == ScheduledWorkKind.RECURRING:
+            recurrence_text = (
+                _view_plain_value(values, "schedule_recurrence", "value") or ""
+            ).strip()
+            if recurrence_text:
+                try:
+                    parsed_recurrence = json.loads(recurrence_text)
+                except json.JSONDecodeError:
+                    return _view_errors("schedule_recurrence", "Enter valid JSON.")
+                if not isinstance(parsed_recurrence, dict):
+                    return _view_errors("schedule_recurrence", "Recurrence must be a JSON object.")
+                if next_run_after(parsed_recurrence, after=next_run_at) is None:
+                    return _view_errors(
+                        "schedule_recurrence",
+                        "Use daily/weekly recurrence with time and timezone.",
+                    )
+                recurrence = parsed_recurrence
+                recurrence_timezone = parsed_recurrence.get("timezone")
+                if isinstance(recurrence_timezone, str) and recurrence_timezone.strip():
+                    timezone = recurrence_timezone.strip()
+        updated = self.store.reschedule_scheduled_work(
+            schedule_id,
+            next_run_at=next_run_at,
+            recurrence=recurrence,
+            timezone=timezone,
+        )
+        if updated is None:
+            return _view_errors("schedule_next_run", "That schedule could not be changed.")
+        self.gateway.post_thread_reply(
+            SlackThreadRef(updated.channel_id, updated.thread_ts),
+            (
+                f"Changed schedule `{schedule_id}`. "
+                f"Next run: `{_format_schedule_timestamp(updated.next_run_at)}`."
+            ),
+        )
+        channel_id = metadata.get("channel_id")
+        message_ts = metadata.get("message_ts")
+        if channel_id:
+            self._update_scheduled_tasks_message(channel_id, message_ts)
+            self.refresh_or_post_roster(channel_id)
+        return None
+
+    def _update_scheduled_tasks_message(self, channel_id: str, message_ts: str | None) -> None:
+        if not message_ts:
+            return
+        scheduled = self.store.list_scheduled_work(
+            statuses=(ScheduledWorkStatus.PENDING, ScheduledWorkStatus.CLAIMED),
+            channel_id=channel_id,
+            limit=20,
+        )
+        try:
+            self.gateway.update_message(
+                channel_id,
+                message_ts,
+                _scheduled_tasks_text(scheduled),
+                blocks=self._scheduled_tasks_blocks(scheduled),
+            )
+        except Exception:
+            LOGGER.debug("failed to update scheduled tasks message", exc_info=True)
+
     def _external_session_finish_from_action(self, payload: dict, channel_id: str) -> None:
         provider_text = str(payload.get("provider") or "")
         session_id = str(payload.get("session_id") or "")
@@ -1784,7 +2066,7 @@ class SlackTeamController:
             return True
         if session.status == SessionStatus.ACTIVE:
             return True
-        external_busy_agent_ids = self._external_busy_agent_ids()
+        external_busy_agent_ids = self._busy_agent_ids_for_assignment()
         available = [
             agent
             for agent in self.store.idle_team_agents()
@@ -1861,7 +2143,7 @@ class SlackTeamController:
             current_thread=SlackThreadRef(channel_id, thread_ts),
         )
         sticky_excluded_agent_ids = self._anyone_context_agent_ids(request, active_agents)
-        excluded_agent_ids = set(self._external_busy_agent_ids())
+        excluded_agent_ids = set(self._busy_agent_ids_for_assignment())
         excluded_agent_ids.update(sticky_excluded_agent_ids)
         result = assign_work_request(
             self.store,
@@ -1963,7 +2245,7 @@ class SlackTeamController:
                 self._mark_message_in_progress(channel_id, event.get("ts"))
             return started
         delegation = _thread_delegation_intent(request.prompt, parent_agent, active_agents)
-        excluded_agent_ids: set[str] = set(self._external_busy_agent_ids())
+        excluded_agent_ids: set[str] = set(self._busy_agent_ids_for_assignment())
         sticky_excluded_agent_ids: set[str] = set(
             self._anyone_context_agent_ids(request, active_agents, parent_agent)
         )
@@ -2065,7 +2347,7 @@ class SlackTeamController:
             extra_metadata=metadata,
             exclude_agent_ids={
                 *self._anyone_context_agent_ids(request, active_agents, agent),
-                *self._external_busy_agent_ids(),
+                *self._busy_agent_ids_for_assignment(),
             },
         )
         if result is None:
@@ -2191,7 +2473,7 @@ class SlackTeamController:
             requested_by_slack_user=task.requested_by_slack_user,
             author_agent=agent,
             extra_metadata=metadata,
-            exclude_agent_ids=self._external_busy_agent_ids(),
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(),
         )
         if result is None:
             self._post_assignment_unavailable(
@@ -2515,8 +2797,11 @@ class SlackTeamController:
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
+        for key in ("request_message_ts", "request_message_ts_history"):
+            if key in previous_task.metadata:
+                metadata[key] = previous_task.metadata[key]
         if request_message_ts:
-            metadata["request_message_ts"] = request_message_ts
+            metadata = _metadata_with_request_message_ts(metadata, request_message_ts)
         metadata = self._with_linked_thread_context(
             metadata,
             request.prompt,
@@ -2792,7 +3077,7 @@ class SlackTeamController:
             return
         if target_agent.agent_id == agent.agent_id:
             return
-        if target_agent.agent_id in self._external_busy_agent_ids():
+        if target_agent.agent_id in self._busy_agent_ids_for_assignment():
             return
         visible_prompt = task.metadata.get("delegate_visible_prompt")
         if not isinstance(visible_prompt, str) or not visible_prompt.strip():
@@ -5003,6 +5288,53 @@ def _format_scheduled_work_ack(
     )
 
 
+def _scheduled_tasks_text(scheduled: list[ScheduledWork]) -> str:
+    if not scheduled:
+        return "Scheduled tasks: none."
+    lines = [f"Scheduled tasks: {len(scheduled)} active"]
+    for item in scheduled:
+        lines.append(
+            f"- `{item.schedule_id}` {_scheduled_work_target_text(item)} "
+            f"`{_shorten(item.prompt, 80)}`; {_format_scheduled_work_schedule(item)}; "
+            f"next run `{_format_schedule_timestamp(item.next_run_at)}`"
+        )
+    return "\n".join(lines)
+
+
+def _scheduled_work_block_text(scheduled: ScheduledWork) -> str:
+    return "\n".join(
+        [
+            f"*`{scheduled.schedule_id}`*  {_scheduled_work_target_text(scheduled)}",
+            f"*Task:* {_shorten(scheduled.prompt, 220)}",
+            f"*Schedule:* {_format_scheduled_work_schedule(scheduled)}",
+            f"*Next run:* `{_format_schedule_timestamp(scheduled.next_run_at)}`",
+            f"*Status:* {scheduled.status.value}",
+        ]
+    )
+
+
+def _scheduled_work_target_text(scheduled: ScheduledWork) -> str:
+    if scheduled.assignment_mode == AssignmentMode.SPECIFIC and scheduled.requested_handle:
+        return f"@{scheduled.requested_handle}"
+    return "somebody"
+
+
+def _format_scheduled_work_schedule(scheduled: ScheduledWork) -> str:
+    if scheduled.schedule_kind == ScheduledWorkKind.ONE_OFF:
+        return "one-off"
+    recurrence = scheduled.recurrence
+    frequency = recurrence.get("frequency")
+    time_text = recurrence.get("time")
+    timezone = recurrence.get("timezone") or scheduled.timezone
+    if frequency == "weekly":
+        weekday = _weekday_label(recurrence.get("weekday"))
+        if weekday and time_text and timezone:
+            return f"weekly on {weekday} at {time_text} {timezone}"
+    if frequency == "daily" and time_text and timezone:
+        return f"daily at {time_text} {timezone}"
+    return "recurring"
+
+
 def _format_schedule_timestamp(value) -> str:
     return value.isoformat(timespec="minutes")
 
@@ -5054,6 +5386,112 @@ def _format_deferred_ready_message(deferred: DeferredWork) -> str:
         f"Dependencies for deferred `{deferred.deferred_id}` are satisfied. "
         f"Starting at `{fire_at}` UTC."
     )
+
+
+def _weekday_label(value) -> str | None:
+    weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+    if isinstance(value, int) and 0 <= value < len(weekdays):
+        return weekdays[value]
+    return None
+
+
+def _slack_button(
+    text: str,
+    action_id: str,
+    value: str,
+    style: str | None = None,
+    url: str | None = None,
+) -> dict:
+    button: dict[str, object] = {
+        "type": "button",
+        "text": {"type": "plain_text", "text": text},
+        "action_id": action_id,
+        "value": value,
+    }
+    if style:
+        button["style"] = style
+    if url:
+        button["url"] = url
+    return button
+
+
+def _schedule_change_modal(
+    scheduled: ScheduledWork,
+    *,
+    channel_id: str,
+    message_ts: str | None,
+) -> dict:
+    metadata = json.dumps(
+        {
+            "schedule_id": scheduled.schedule_id,
+            "channel_id": channel_id,
+            "message_ts": message_ts,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{scheduled.schedule_id}*  {_scheduled_work_target_text(scheduled)}\n"
+                    f"*Task:* {_shorten(scheduled.prompt, 180)}"
+                ),
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "schedule_next_run",
+            "label": {"type": "plain_text", "text": "Next run"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "value",
+                "initial_value": _format_schedule_timestamp(scheduled.next_run_at),
+                "placeholder": {"type": "plain_text", "text": "2026-05-16T17:00:00-05:00"},
+            },
+        },
+    ]
+    if scheduled.schedule_kind == ScheduledWorkKind.RECURRING:
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": "schedule_recurrence",
+                "label": {"type": "plain_text", "text": "Recurrence JSON"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "multiline": True,
+                    "initial_value": json.dumps(scheduled.recurrence, indent=2, sort_keys=True),
+                },
+            }
+        )
+    return {
+        "type": "modal",
+        "callback_id": "schedule.change",
+        "private_metadata": metadata,
+        "title": {"type": "plain_text", "text": "Change schedule"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": blocks,
+    }
+
+
+def _decode_schedule_change_metadata(value) -> dict[str, str]:
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _view_errors(block_id: str, message: str) -> dict:
+    return {"response_action": "errors", "errors": {block_id: message}}
 
 
 def _parse_work_request_for_agents(

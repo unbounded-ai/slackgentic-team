@@ -1562,6 +1562,46 @@ class Store:
             ).fetchall()
         return [_scheduled_work_from_row(row) for row in rows]
 
+    def list_scheduled_work(
+        self,
+        *,
+        statuses: tuple[ScheduledWorkStatus, ...] | None = None,
+        channel_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ScheduledWork]:
+        selected_statuses = statuses or (
+            ScheduledWorkStatus.PENDING,
+            ScheduledWorkStatus.CLAIMED,
+        )
+        if not selected_statuses:
+            return []
+        where = [f"status IN ({', '.join('?' for _ in selected_statuses)})"]
+        params: list[object] = [status.value for status in selected_statuses]
+        if channel_id:
+            where.append("channel_id = ?")
+            params.append(channel_id)
+        params.append(limit)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT *
+                FROM scheduled_work_requests
+                WHERE {" AND ".join(where)}
+                ORDER BY next_run_at, created_at, schedule_id
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_scheduled_work_from_row(row) for row in rows]
+
+    def get_scheduled_work(self, schedule_id: str) -> ScheduledWork | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM scheduled_work_requests WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return _scheduled_work_from_row(row) if row else None
+
     def claim_scheduled_work(self, schedule_id: str) -> ScheduledWork | None:
         updated_at = utc_now().isoformat()
         with self._lock:
@@ -1650,6 +1690,57 @@ class Store:
                 (status.value, utc_now().isoformat(), schedule_id),
             )
             self.conn.commit()
+
+    def reschedule_scheduled_work(
+        self,
+        schedule_id: str,
+        *,
+        next_run_at,
+        recurrence: dict[str, object] | None = None,
+        timezone: str | None = None,
+    ) -> ScheduledWork | None:
+        existing = self.get_scheduled_work(schedule_id)
+        if existing is None or existing.status not in {
+            ScheduledWorkStatus.PENDING,
+            ScheduledWorkStatus.CLAIMED,
+        }:
+            return None
+        recurrence_json = json.dumps(recurrence, sort_keys=True) if recurrence is not None else None
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET next_run_at = ?,
+                    recurrence_json = COALESCE(?, recurrence_json),
+                    timezone = COALESCE(?, timezone),
+                    status = ?,
+                    updated_at = ?
+                WHERE schedule_id = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    next_run_at.isoformat(),
+                    recurrence_json,
+                    timezone,
+                    ScheduledWorkStatus.PENDING.value,
+                    utc_now().isoformat(),
+                    schedule_id,
+                    ScheduledWorkStatus.PENDING.value,
+                    ScheduledWorkStatus.CLAIMED.value,
+                ),
+            )
+            self.conn.commit()
+        return self.get_scheduled_work(schedule_id)
+
+    def cancel_scheduled_work(self, schedule_id: str) -> ScheduledWork | None:
+        existing = self.get_scheduled_work(schedule_id)
+        if existing is None or existing.status not in {
+            ScheduledWorkStatus.PENDING,
+            ScheduledWorkStatus.CLAIMED,
+        }:
+            return None
+        self.update_scheduled_work_status(schedule_id, ScheduledWorkStatus.CANCELLED)
+        return self.get_scheduled_work(schedule_id)
 
     def cancel_scheduled_work_for_thread(self, channel_id: str, thread_ts: str) -> int:
         with self._lock:
