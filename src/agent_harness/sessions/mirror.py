@@ -328,7 +328,12 @@ class SessionMirror:
         )
         max_line = cursor
         chunks: list[RenderedSessionEvent] = []
-        for event in provider.iter_events(session.transcript_path):
+        iter_events_after = getattr(provider, "iter_events_after", None)
+        if callable(iter_events_after):
+            events = iter_events_after(session.transcript_path, cursor)
+        else:
+            events = provider.iter_events(session.transcript_path)
+        for event in events:
             line_number = event.line_number or 0
             if line_number <= cursor:
                 continue
@@ -769,9 +774,13 @@ class SessionMirror:
             )
 
     def _mark_session_seen(self, provider: AgentProvider, session: AgentSession) -> None:
-        last_line = 0
-        for event in provider.iter_events(session.transcript_path):
-            last_line = max(last_line, event.line_number or 0)
+        last_event_line_number = getattr(provider, "last_event_line_number", None)
+        if callable(last_event_line_number):
+            last_line = last_event_line_number(session.transcript_path)
+        else:
+            last_line = 0
+            for event in provider.iter_events(session.transcript_path):
+                last_line = max(last_line, event.line_number or 0)
         self.store.set_session_mirror_cursor(session.provider, session.session_id, last_line)
 
     def _channel_id(self) -> str | None:

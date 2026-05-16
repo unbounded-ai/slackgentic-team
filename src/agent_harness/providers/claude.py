@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,7 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
-from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_records
+from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_line_number, tail_jsonl_records
 
 CLAUDE_LOCAL_EXIT_MARKERS = (
     "<command-name>/exit</command-name>",
@@ -29,6 +31,7 @@ class ClaudeProvider:
     def __init__(self, home: Path | None = None, active_within_seconds: int = 900):
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
+        self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
 
     @property
     def projects_root(self) -> Path:
@@ -38,26 +41,53 @@ class ClaudeProvider:
         if not self.projects_root.exists():
             return []
         sessions_by_id: dict[str, AgentSession] = {}
+        seen_paths: set[Path] = set()
+        now = datetime.now(UTC)
         for path in sorted(self.projects_root.rglob("*.jsonl")):
-            session = self._session_from_path(path)
+            seen_paths.add(path)
+            session = self._cached_session_from_path(path, now)
             if not session:
                 continue
             existing = sessions_by_id.get(session.session_id)
             if existing is None or _prefer_session_discovery(session, existing):
                 sessions_by_id[session.session_id] = session
+        self._drop_deleted_cache_entries(seen_paths)
         return sorted(
             sessions_by_id.values(),
             key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
 
-    def _session_from_path(self, path: Path) -> AgentSession | None:
-        session_id = path.stem
+    def _cached_session_from_path(self, path: Path, now: datetime) -> AgentSession | None:
         stat = path.stat()
+        signature = _stat_signature(stat)
+        cached = self._session_cache.get(path)
+        if cached and cached[0] == signature:
+            return _refresh_observed_status(cached[1], self.active_within_seconds, now)
+        session = self._session_from_path(path, stat=stat, now=now)
+        self._session_cache[path] = (signature, session)
+        return session
+
+    def _drop_deleted_cache_entries(self, seen_paths: set[Path]) -> None:
+        for path in list(self._session_cache):
+            if path not in seen_paths:
+                self._session_cache.pop(path, None)
+
+    def _session_from_path(
+        self,
+        path: Path,
+        *,
+        stat: os.stat_result | None = None,
+        now: datetime | None = None,
+    ) -> AgentSession | None:
+        session_id = path.stem
+        stat = stat or path.stat()
+        now = now or datetime.now(UTC)
         last_seen = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-        age = (datetime.now(UTC) - last_seen).total_seconds()
+        age = (now - last_seen).total_seconds()
         status = SessionStatus.ACTIVE if age <= self.active_within_seconds else SessionStatus.IDLE
-        if _session_ended_by_exit(path):
+        tail_records = tail_jsonl_records(path, limit=80)
+        if _session_ended_by_exit(tail_records):
             status = SessionStatus.DONE
         metadata: dict[str, Any] = {}
         started = _first_timestamp(path)
@@ -66,7 +96,7 @@ class ClaudeProvider:
         git_branch: str | None = None
         permission_mode: str | None = None
         entrypoint: str | None = None
-        for _, record in last_jsonl_records(path, limit=50):
+        for record in tail_records[-50:]:
             session_id = str(record.get("sessionId") or session_id)
             if isinstance(record.get("cwd"), str):
                 cwd = Path(record["cwd"])
@@ -99,8 +129,15 @@ class ClaudeProvider:
         )
 
     def iter_events(self, transcript_path: Path) -> Iterator[AgentEvent]:
+        yield from self.iter_events_after(transcript_path, 0)
+
+    def iter_events_after(
+        self,
+        transcript_path: Path,
+        line_number: int,
+    ) -> Iterator[AgentEvent]:
         session_id = transcript_path.stem
-        for line_number, record in iter_jsonl(transcript_path):
+        for event_line_number, record in iter_jsonl(transcript_path, after_line=line_number):
             session_id = str(record.get("sessionId") or session_id)
             timestamp = parse_timestamp(record.get("timestamp"))
             record_type = str(record.get("type", "unknown"))
@@ -112,9 +149,12 @@ class ClaudeProvider:
                 event_type=record_type,
                 text=text,
                 source_path=transcript_path,
-                line_number=line_number,
+                line_number=event_line_number,
                 metadata=record,
             )
+
+    def last_event_line_number(self, transcript_path: Path) -> int:
+        return last_jsonl_line_number(transcript_path)
 
     def usage_for_day(self, transcript_paths: Iterable[Path], day: str) -> list[UsageSnapshot]:
         totals: dict[str, TokenUsage] = {}
@@ -169,11 +209,13 @@ def claude_usage_from_record(record: dict[str, Any]) -> TokenUsage | None:
     )
 
 
-def _first_timestamp(path: Path) -> datetime | None:
-    for _, record in iter_jsonl(path):
+def _first_timestamp(path: Path, *, max_records: int = 200) -> datetime | None:
+    for index, (_, record) in enumerate(iter_jsonl(path), start=1):
         timestamp = parse_timestamp(record.get("timestamp"))
         if timestamp is not None:
             return timestamp
+        if index >= max_records:
+            return None
     return None
 
 
@@ -222,9 +264,9 @@ def _record_text(record: dict[str, Any]) -> str | None:
     return "\n".join(text_parts) if text_parts else None
 
 
-def _session_ended_by_exit(path: Path) -> bool:
+def _session_ended_by_exit(records: Iterable[dict[str, Any]]) -> bool:
     exited = False
-    for _, record in last_jsonl_records(path, limit=80):
+    for record in records:
         text = _record_text(record) or ""
         if any(marker in text for marker in CLAUDE_LOCAL_EXIT_MARKERS) or text.strip() == "/exit":
             exited = True
@@ -274,3 +316,21 @@ def _is_local_command_text(text: str) -> bool:
             "<local-command-stderr>",
         )
     )
+
+
+def _stat_signature(stat: os.stat_result) -> tuple[int, int]:
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _refresh_observed_status(
+    session: AgentSession | None,
+    active_within_seconds: int,
+    now: datetime,
+) -> AgentSession | None:
+    if session is None or session.status == SessionStatus.DONE or session.last_seen_at is None:
+        return session
+    age = (now - session.last_seen_at).total_seconds()
+    status = SessionStatus.ACTIVE if age <= active_within_seconds else SessionStatus.IDLE
+    if status == session.status:
+        return session
+    return replace(session, status=status)
