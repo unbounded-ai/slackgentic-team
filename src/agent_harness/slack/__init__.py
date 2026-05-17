@@ -230,6 +230,16 @@ def build_team_roster_blocks(
                     "team.hire.claude",
                     encode_action_value("team.hire", count=1, provider=Provider.CLAUDE.value),
                 ),
+                _button(
+                    "Assign Work",
+                    "roster.work.assign",
+                    encode_action_value("roster.work.open", mode="now"),
+                ),
+                _button(
+                    "Schedule Work",
+                    "roster.work.schedule",
+                    encode_action_value("roster.work.open", mode="once"),
+                ),
             ],
         },
     ]
@@ -268,6 +278,30 @@ def build_team_roster_blocks(
                     url=status.thread_url,
                 )
             )
+        elements.append(
+            _button(
+                "Assign",
+                "roster.work.assign",
+                encode_action_value(
+                    "roster.work.open",
+                    mode="now",
+                    agent_id=agent.agent_id,
+                    handle=agent.handle,
+                ),
+            )
+        )
+        elements.append(
+            _button(
+                "Schedule",
+                "roster.work.schedule",
+                encode_action_value(
+                    "roster.work.open",
+                    mode="once",
+                    agent_id=agent.agent_id,
+                    handle=agent.handle,
+                ),
+            )
+        )
         elements.append(
             _button(
                 "Fire",

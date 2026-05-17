@@ -90,7 +90,17 @@ class SlackTests(unittest.TestCase):
             and str(block.get("block_id", "")).startswith("team.agent.")
             for element in block["elements"]
         ]
-        self.assertEqual(action_ids, ["team.fire", "team.fire"])
+        self.assertEqual(
+            action_ids,
+            [
+                "roster.work.assign",
+                "roster.work.schedule",
+                "team.fire",
+                "roster.work.assign",
+                "roster.work.schedule",
+                "team.fire",
+            ],
+        )
 
     def test_roster_blocks_include_free_up_before_fire_for_occupied_task(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
@@ -115,7 +125,7 @@ class SlackTests(unittest.TestCase):
         self.assertNotIn("https://example.slack.com/archives/C1/p171000001", status_text)
         self.assertEqual(
             [element["text"]["text"] for element in action_block["elements"]],
-            ["Free up", "Open thread", "Fire"],
+            ["Free up", "Open thread", "Assign", "Schedule", "Fire"],
         )
         self.assertEqual(
             decode_action_value(action_block["elements"][0]["value"]),
@@ -131,7 +141,16 @@ class SlackTests(unittest.TestCase):
         action_block = next(block for block in blocks if block.get("type") == "actions")
         action_ids = [element["action_id"] for element in action_block["elements"]]
 
-        self.assertEqual(action_ids, ["team.hire.auto", "team.hire.codex", "team.hire.claude"])
+        self.assertEqual(
+            action_ids,
+            [
+                "team.hire.auto",
+                "team.hire.codex",
+                "team.hire.claude",
+                "roster.work.assign",
+                "roster.work.schedule",
+            ],
+        )
         self.assertEqual(len(action_ids), len(set(action_ids)))
 
     def test_task_blocks_only_include_finish_button(self):
