@@ -158,6 +158,7 @@ Users can schedule future work directly from Slack too:
 schedule @riley to check CI tomorrow at 9am PT
 schedule somebody review the nightly report every day at 5pm ET
 schedule @riley inspect the deploy every Monday at 10:30am America/New_York
+schedule somebody check the deploy every 2 hours
 schedule @riley check the patio lights during tomorrow's sunset time in Waco
 ```
 

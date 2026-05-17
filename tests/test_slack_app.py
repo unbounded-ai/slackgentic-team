@@ -7198,6 +7198,37 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_scheduled_tasks_command_formats_interval_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=utc_now() + timedelta(hours=2),
+                    recurrence={
+                        "frequency": "interval",
+                        "interval": {"value": 2, "unit": "hours"},
+                    },
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    ScheduledTasksCommand(),
+                    SlackReplyTarget(channel_id="C1"),
+                )
+
+                self.assertIn("every 2 hours", gateway.posts[-1]["text"])
+                self.assertIn("every 2 hours", str(gateway.posts[-1]["blocks"]))
+            finally:
+                store.close()
+
     def test_schedule_cancel_button_deschedules_and_updates_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

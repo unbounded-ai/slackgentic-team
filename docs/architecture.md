@@ -202,8 +202,8 @@ a thread done cancels pending timers for that thread.
 
 Users can create one-off or recurring scheduled work from the agent channel with
 natural-language phrases such as `tomorrow at 9am PT`, `in 30 minutes`,
-`every day at 5pm ET`, `every Monday at 10:30am America/New_York`, or
-`during tomorrow's sunset time in Waco`.
+`every day at 5pm ET`, `every Monday at 10:30am America/New_York`,
+`every 2 hours`, or `during tomorrow's sunset time in Waco`.
 
 The Slack controller only detects that the message is asking to schedule work.
 It then starts a normal managed agent task whose prompt asks the LLM to resolve

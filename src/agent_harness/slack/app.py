@@ -85,6 +85,8 @@ from agent_harness.schedules import (
     SCHEDULE_RESOLUTION_METADATA_KEY,
     SCHEDULE_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
     build_schedule_resolution_prompt,
+    format_interval_seconds,
+    interval_seconds_from_recurrence,
     is_agent_schedule_signal,
     looks_like_schedule_request,
     next_run_after,
@@ -2160,7 +2162,7 @@ class SlackTeamController:
                 if next_run_after(parsed_recurrence, after=next_run_at) is None:
                     return _view_errors(
                         "schedule_recurrence",
-                        "Use daily/weekly recurrence with time and timezone.",
+                        "Use daily/weekly recurrence with time/timezone or interval recurrence.",
                     )
                 recurrence = parsed_recurrence
                 recurrence_timezone = parsed_recurrence.get("timezone")
@@ -5836,6 +5838,10 @@ def _format_scheduled_work_schedule(scheduled: ScheduledWork) -> str:
             return f"weekly on {weekday} at {time_text} {timezone}"
     if frequency == "daily" and time_text and timezone:
         return f"daily at {time_text} {timezone}"
+    if frequency == "interval":
+        interval_seconds = interval_seconds_from_recurrence(recurrence)
+        if interval_seconds is not None:
+            return format_interval_seconds(interval_seconds)
     return "recurring"
 
 
