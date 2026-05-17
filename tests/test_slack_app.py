@@ -1291,10 +1291,58 @@ class SlackAppTests(unittest.TestCase):
                     current.metadata[ROSTER_SUMMARY_METADATA_KEY],
                     "Roster UX fix: opening PR after E2E",
                 )
+                header_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.000001"
+                ]
+                self.assertEqual(len(header_updates), 1)
+                self.assertIn(
+                    "Roster UX fix: opening PR after E2E",
+                    header_updates[0]["text"],
+                )
+                self.assertIn(
+                    "Roster UX fix: opening PR after E2E",
+                    str(header_updates[0]["blocks"]),
+                )
+                roster_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.roster"
+                ]
+                self.assertEqual(len(roster_updates), 1)
                 self.assertIn(
                     "Slack task: Roster UX fix: opening PR after E2E",
-                    str(gateway.updates[-1]["blocks"]),
+                    str(roster_updates[0]["blocks"]),
                 )
+            finally:
+                store.close()
+
+    def test_roster_status_signal_refreshes_thread_header_when_summary_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                summary = "Roster UX fix: refreshing Priya's task thread header"
+                task = replace(
+                    create_agent_task(agent, "small follow-up", "C1"),
+                    metadata={ROSTER_SUMMARY_METADATA_KEY: summary},
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.000001"),
+                    f"{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}{summary}",
+                )
+
+                self.assertTrue(handled)
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertEqual(gateway.updates[0]["ts"], "171.000001")
+                self.assertIn(summary, gateway.updates[0]["text"])
+                self.assertIn(summary, str(gateway.updates[0]["blocks"]))
             finally:
                 store.close()
 

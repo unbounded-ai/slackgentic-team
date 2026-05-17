@@ -1,6 +1,7 @@
 import unittest
+from dataclasses import replace
 
-from agent_harness.models import Provider
+from agent_harness.models import ROSTER_SUMMARY_METADATA_KEY, Provider
 from agent_harness.slack import (
     AgentRosterStatus,
     build_external_session_capacity_blocks,
@@ -181,6 +182,24 @@ class SlackTests(unittest.TestCase):
             [item["text"]["text"] for item in elements], ["Finish and free up this agent"]
         )
         self.assertEqual([item["action_id"] for item in elements], ["task.done"])
+
+    def test_task_blocks_use_roster_summary_when_present(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = replace(
+            create_agent_task(agent, "tiny latest prompt", "C1"),
+            metadata={
+                ROSTER_SUMMARY_METADATA_KEY: (
+                    "Roster UX fix: refreshing Priya's task thread header"
+                )
+            },
+        )
+
+        rendered = str(build_task_thread_blocks(task, agent))
+
+        self.assertIn("Roster UX fix: refreshing Priya's task thread header", rendered)
+        self.assertNotIn("tiny latest prompt", rendered)
 
     def test_resolved_task_blocks_omit_finish_button(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

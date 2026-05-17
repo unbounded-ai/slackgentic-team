@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from agent_harness.models import (
+    ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    ROSTER_SUMMARY_METADATA_KEY,
     AgentTask,
     Provider,
     SlackThreadRef,
@@ -477,7 +479,7 @@ def build_task_thread_blocks(
                 "text": (
                     f"*{agent.full_name}* `@{agent.handle}` picked up a {task_label}.\n"
                     f"{dangerous_line}"
-                    f"*Task:* {task.prompt}"
+                    f"*Task:* {_task_display_prompt(task)}"
                 ),
             },
         },
@@ -498,6 +500,14 @@ def build_task_thread_blocks(
             }
         )
     return blocks
+
+
+def _task_display_prompt(task: AgentTask) -> str:
+    for key in (ROSTER_SUMMARY_METADATA_KEY, ASSIGNMENT_PROMPT_METADATA_KEY):
+        value = task.metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return task.prompt
 
 
 def normalize_slack_mrkdwn(text: str) -> str:
