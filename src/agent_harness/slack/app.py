@@ -1102,10 +1102,10 @@ class SlackTeamController:
             task = self.store.active_task_for_agent(agent.agent_id)
             if task is None:
                 continue
-            label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Occupied"
+            label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Working"
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
-                f"Slack task: {_shorten(_task_roster_summary(task), 140)}",
+                _shorten(_task_roster_summary(task), 140),
                 dangerous_mode=_task_dangerous_mode(task),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
                 task_id=task.task_id,
@@ -1120,8 +1120,8 @@ class SlackTeamController:
                 continue
             task = self.store.get_agent_task(task.task_id) or task
             statuses[agent.agent_id] = AgentRosterStatus(
-                "Occupied",
-                f"Slack task: {_shorten(_task_roster_summary(task), 140)}",
+                "Working",
+                _shorten(_task_roster_summary(task), 140),
                 dangerous_mode=_task_dangerous_mode(task),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,

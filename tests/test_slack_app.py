@@ -1040,7 +1040,8 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIn("1 available, 1 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Queued: Slack task: investigate flaky tests", blocks)
+                self.assertIn("Queued: investigate flaky tests", blocks)
+                self.assertNotIn("Slack task:", blocks)
                 self.assertNotIn("<https://example.slack.com/archives/C1/p", blocks)
                 self.assertIn("'text': {'type': 'plain_text', 'text': 'Open thread'}", blocks)
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
@@ -1073,10 +1074,10 @@ class SlackAppTests(unittest.TestCase):
 
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn(
-                    "Queued: Slack task: Roster UX fix: validating E2E before PR merge",
+                    "Queued: Roster UX fix: validating E2E before PR merge",
                     blocks,
                 )
-                self.assertNotIn("Slack task: rerun tests", blocks)
+                self.assertNotIn("Slack task:", blocks)
             finally:
                 store.close()
 
@@ -1104,10 +1105,10 @@ class SlackAppTests(unittest.TestCase):
 
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn(
-                    ("Queued: Slack task: Improve roster summaries and dangerous-mode display"),
+                    ("Queued: Improve roster summaries and dangerous-mode display"),
                     blocks,
                 )
-                self.assertNotIn("Slack task: rerun tests", blocks)
+                self.assertNotIn("Slack task:", blocks)
             finally:
                 store.close()
 
@@ -1239,7 +1240,9 @@ class SlackAppTests(unittest.TestCase):
                 controller.post_roster("C1")
 
                 self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
-                self.assertIn("Occupied: Slack task: drive PR 23", str(gateway.posts[-1]["blocks"]))
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("Working: drive PR 23", blocks)
+                self.assertNotIn("Occupied: Slack task:", blocks)
             finally:
                 store.close()
 
@@ -1262,7 +1265,8 @@ class SlackAppTests(unittest.TestCase):
                 controller.post_roster("C1")
 
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Queued: Slack task: rewrite installer", blocks)
+                self.assertIn("Queued: rewrite installer", blocks)
+                self.assertNotIn("Slack task:", blocks)
                 self.assertIn("Mode: :zap: Dangerous", blocks)
             finally:
                 store.close()
@@ -1312,9 +1316,10 @@ class SlackAppTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(roster_updates), 1)
                 self.assertIn(
-                    "Slack task: Roster UX fix: opening PR after E2E",
+                    "Queued: Roster UX fix: opening PR after E2E",
                     str(roster_updates[0]["blocks"]),
                 )
+                self.assertNotIn("Slack task:", str(roster_updates[0]["blocks"]))
             finally:
                 store.close()
 
