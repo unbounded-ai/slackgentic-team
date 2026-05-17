@@ -296,12 +296,14 @@ class PropertyTests(unittest.TestCase):
         for kind, block in zip(kinds, action_blocks, strict=True):
             labels = [element["text"]["text"] for element in block["elements"]]
             if kind in {"task", "external"}:
-                self.assertEqual(labels, ["Free up", "Open thread", "Assign", "Schedule", "Fire"])
+                self.assertEqual(labels, ["Free up", "Open thread", "Fire"])
                 open_thread = block["elements"][1]
                 self.assertEqual(open_thread["action_id"], "thread.open")
                 self.assertIn("/archives/C1/p", open_thread["url"])
+            elif kind == "available":
+                self.assertEqual(labels, ["Assign", "Fire"])
             else:
-                self.assertEqual(labels, ["Assign", "Schedule", "Fire"])
+                self.assertEqual(labels, ["Fire"])
 
     @settings(max_examples=PROPERTY_MAX_EXAMPLES, deadline=None)
     @given(external_capacity_cases())
