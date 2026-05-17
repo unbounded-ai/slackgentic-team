@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
@@ -42,6 +43,29 @@ WEEKDAYS = {
     "sat": 5,
     "sunday": 6,
     "sun": 6,
+}
+INTERVAL_UNIT_SECONDS = {
+    "second": 1,
+    "seconds": 1,
+    "sec": 1,
+    "secs": 1,
+    "s": 1,
+    "minute": 60,
+    "minutes": 60,
+    "min": 60,
+    "mins": 60,
+    "m": 60,
+    "hour": 3600,
+    "hours": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "h": 3600,
+    "day": 86400,
+    "days": 86400,
+    "d": 86400,
+    "week": 604800,
+    "weeks": 604800,
+    "w": 604800,
 }
 
 
@@ -129,11 +153,30 @@ def build_schedule_resolution_prompt(
             indent=2,
         ),
         "",
+        "For interval recurring schedules such as 'every 2 hours' or 'every 15 minutes', use:",
+        json.dumps(
+            {
+                "task": "task for the future agent to run",
+                "target": "somebody",
+                "task_kind": "work",
+                "schedule": {
+                    "kind": "recurring",
+                    "frequency": "interval",
+                    "interval_seconds": 7200,
+                    "next_run_at": "2026-05-15T22:00:00Z",
+                    "description": "every 2 hours",
+                },
+            },
+            indent=2,
+        ),
+        "",
         "Weekly recurring schedules must set frequency to weekly and include weekday as "
-        "0=Monday through 6=Sunday. The target must be either somebody/anyone or one of the "
-        "active handles listed above. If the request is ambiguous enough that no schedule can "
-        "be created, ask one concise Slack-visible clarification question and do not emit a "
-        "control line.",
+        "0=Monday through 6=Sunday. Interval recurring schedules must set frequency to interval "
+        "and include interval_seconds. For an interval schedule without a separate start time, "
+        "set next_run_at to one interval after the current UTC time. The target must be either "
+        "somebody/anyone or one of the active handles listed above. If the request is ambiguous "
+        "enough that no schedule can be created, ask one concise Slack-visible clarification "
+        "question and do not emit a control line.",
     ]
     if validation_error:
         lines.extend(
@@ -170,6 +213,12 @@ def parse_agent_schedule_signal(
 
 def next_run_after(recurrence: dict[str, object], *, after: datetime) -> datetime | None:
     frequency = recurrence.get("frequency")
+    if frequency == "interval":
+        interval_seconds = interval_seconds_from_recurrence(recurrence)
+        if interval_seconds is None:
+            return None
+        return after.astimezone(_utc_zone()) + timedelta(seconds=interval_seconds)
+
     timezone = recurrence.get("timezone")
     time_text = recurrence.get("time")
     if not isinstance(frequency, str) or not isinstance(timezone, str):
@@ -301,8 +350,12 @@ def _parse_recurring_schedule(
     now: datetime,
 ) -> AgentScheduleParseResult:
     frequency = schedule.get("frequency")
-    if frequency not in {"daily", "weekly"}:
-        return AgentScheduleParseResult(error="recurring frequency must be daily or weekly")
+    if frequency not in {"daily", "weekly", "interval"}:
+        return AgentScheduleParseResult(
+            error="recurring frequency must be daily, weekly, or interval"
+        )
+    if frequency == "interval":
+        return _parse_interval_recurring_schedule(schedule, request, now=now)
     timezone = _timezone(schedule.get("timezone"))
     if timezone is None:
         return AgentScheduleParseResult(error="recurring schedule must include IANA timezone")
@@ -329,6 +382,46 @@ def _parse_recurring_schedule(
     if next_run_at <= now:
         return AgentScheduleParseResult(error="next_run_at must be in the future")
     description = _description(schedule, fallback=f"{frequency} at {time_text} {timezone}")
+    return AgentScheduleParseResult(
+        schedule=ParsedAgentSchedule(
+            request=request,
+            schedule_kind=ScheduledWorkKind.RECURRING,
+            next_run_at=next_run_at,
+            recurrence=recurrence,
+            timezone=timezone,
+            description=description,
+        )
+    )
+
+
+def _parse_interval_recurring_schedule(
+    schedule: dict[str, object],
+    request: WorkRequest,
+    *,
+    now: datetime,
+) -> AgentScheduleParseResult:
+    interval_seconds = interval_seconds_from_recurrence(schedule)
+    if interval_seconds is None:
+        return AgentScheduleParseResult(
+            error="interval recurring schedule must include a positive interval"
+        )
+    recurrence: dict[str, object] = {
+        "frequency": "interval",
+        "interval_seconds": _json_number(interval_seconds),
+    }
+    timezone = _timezone(schedule.get("timezone"))
+    if schedule.get("timezone") is not None and timezone is None:
+        return AgentScheduleParseResult(error="timezone must be an IANA timezone name")
+    if timezone:
+        recurrence["timezone"] = timezone
+    next_run_at = parse_timestamp(schedule.get("next_run_at"))
+    if next_run_at is None:
+        next_run_at = next_run_after(recurrence, after=now)
+    if next_run_at is None:
+        return AgentScheduleParseResult(error="could not compute recurring next_run_at")
+    if next_run_at <= now:
+        return AgentScheduleParseResult(error="next_run_at must be in the future")
+    description = _description(schedule, fallback=format_interval_seconds(interval_seconds))
     return AgentScheduleParseResult(
         schedule=ParsedAgentSchedule(
             request=request,
@@ -378,6 +471,100 @@ def _description(schedule: dict[str, object], *, fallback: str) -> str:
     if isinstance(description, str) and description.strip():
         return description.strip()
     return fallback
+
+
+def interval_seconds_from_recurrence(recurrence: dict[str, object]) -> float | None:
+    seconds = _positive_number(recurrence.get("interval_seconds"))
+    if seconds is not None:
+        return seconds
+    for key, multiplier in (
+        ("interval_minutes", 60),
+        ("interval_hours", 3600),
+        ("interval_days", 86400),
+        ("interval_weeks", 604800),
+    ):
+        amount = _positive_number(recurrence.get(key))
+        if amount is not None:
+            return amount * multiplier
+    interval = recurrence.get("interval")
+    if isinstance(interval, str):
+        return _parse_interval_text(interval)
+    if isinstance(interval, dict):
+        amount = _positive_number(interval.get("value"))
+        if amount is None:
+            amount = _positive_number(interval.get("amount"))
+        unit = interval.get("unit")
+        if amount is not None and isinstance(unit, str):
+            multiplier = INTERVAL_UNIT_SECONDS.get(unit.strip().lower())
+            if multiplier is not None:
+                return amount * multiplier
+    return None
+
+
+def _parse_interval_text(text: str) -> float | None:
+    normalized = text.strip().lower()
+    if normalized.startswith("every "):
+        normalized = normalized[6:].strip()
+    total_seconds = 0.0
+    position = 0
+    matches = list(
+        re.finditer(
+            r"(?P<amount>\d+(?:\.\d+)?)\s*"
+            r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)\b",
+            normalized,
+        )
+    )
+    if not matches:
+        return None
+    for match in matches:
+        gap = normalized[position : match.start()]
+        if gap.strip() and gap.strip() not in {"and", ","}:
+            return None
+        amount = float(match.group("amount"))
+        multiplier = INTERVAL_UNIT_SECONDS.get(match.group("unit"))
+        if multiplier is None:
+            return None
+        total_seconds += amount * multiplier
+        position = match.end()
+    if normalized[position:].strip():
+        return None
+    return total_seconds if total_seconds > 0 else None
+
+
+def _positive_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _json_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
+
+
+def format_interval_seconds(seconds: float) -> str:
+    for unit_seconds, unit_name in (
+        (604800, "week"),
+        (86400, "day"),
+        (3600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ):
+        if seconds % unit_seconds == 0:
+            amount = int(seconds / unit_seconds)
+            suffix = unit_name if amount == 1 else f"{unit_name}s"
+            return f"every {amount} {suffix}"
+    return f"every {seconds:g} seconds"
 
 
 def _utc_zone() -> ZoneInfo:
