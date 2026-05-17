@@ -20,8 +20,10 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
     ensure_claude_mcp_permissions,
+    ensure_codex_mcp_server_registered,
     install_claude_mcp_server,
     install_codex_mcp_server,
+    is_codex_mcp_server_configured,
     is_slackgentic_mcp_server_configured,
     mcp_config,
     session_transcript_has_slackgentic_mcp,
@@ -771,6 +773,60 @@ class ClaudeChannelTests(unittest.TestCase):
             )
 
             self.assertTrue(is_slackgentic_mcp_server_configured(home))
+
+    def test_detects_configured_codex_mcp_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                '[mcp_servers.slackgentic]\ncommand = "slackgentic"\nargs = ["codex-mcp"]\n',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(is_codex_mcp_server_configured(home))
+
+    def test_ensure_codex_mcp_server_registers_when_missing(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "agent_harness.sessions.claude_channel.shutil.which",
+                return_value="/usr/bin/codex-custom",
+            ),
+            patch("agent_harness.sessions.claude_channel.install_codex_mcp_server") as install,
+        ):
+            home = Path(tmp)
+
+            registered = ensure_codex_mcp_server_registered(
+                "/opt/slackgentic",
+                home,
+                codex_binary="codex-custom",
+            )
+
+        self.assertTrue(registered)
+        install.assert_called_once_with(
+            "/opt/slackgentic",
+            home,
+            codex_binary="codex-custom",
+        )
+
+    def test_ensure_codex_mcp_server_skips_when_configured(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("agent_harness.sessions.claude_channel.install_codex_mcp_server") as install,
+        ):
+            home = Path(tmp)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                '[mcp_servers.slackgentic]\ncommand = "slackgentic"\nargs = ["codex-mcp"]\n',
+                encoding="utf-8",
+            )
+
+            registered = ensure_codex_mcp_server_registered(home=home)
+
+        self.assertFalse(registered)
+        install.assert_not_called()
 
     def test_detects_loaded_slackgentic_mcp_tools_in_transcript(self):
         with tempfile.TemporaryDirectory() as tmp:

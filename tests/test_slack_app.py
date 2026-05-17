@@ -596,6 +596,48 @@ class SlackAppTests(unittest.TestCase):
                     if block.get("block_id") == "roster_work_timing"
                 )
                 self.assertEqual(timing["element"]["initial_option"]["value"], "now")
+                timezone = next(
+                    block
+                    for block in view["blocks"]
+                    if block.get("block_id") == "roster_work_timezone"
+                )
+                self.assertTrue(timezone["element"].get("initial_value"))
+                self.assertIn("Required for daily or weekly", timezone["hint"]["text"])
+            finally:
+                store.close()
+
+    def test_roster_work_button_for_stale_occupied_agent_does_not_open_modal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_agent_task(create_agent_task(agent, "already busy", "C1"))
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.roster"},
+                        "trigger_id": "T1",
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "roster.work.open",
+                                    mode="now",
+                                    agent_id=agent.agent_id,
+                                    handle=agent.handle,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(gateway.views, [])
+                self.assertIn("already occupied", gateway.thread_replies[-1]["text"])
             finally:
                 store.close()
 
@@ -663,6 +705,70 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(scheduled[0].recurrence["frequency"], "daily")
                 self.assertIn("Scheduled `schedule_", gateway.updates[-1]["text"])
                 self.assertIn("daily at 17:00 America/Chicago", gateway.updates[-1]["text"])
+            finally:
+                store.close()
+
+    def test_roster_work_submission_for_busy_specific_agent_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_agent_task(create_agent_task(agent, "busy", "C1"))
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        agent,
+                        prompt="check CI",
+                        timing="daily",
+                        repeat_time="17:00",
+                        timezone="America/Chicago",
+                    )
+                )
+
+                self.assertEqual(response["response_action"], "errors")
+                self.assertIn("already occupied", response["errors"]["roster_work_prompt"])
+                self.assertEqual(store.list_scheduled_work(), [])
+            finally:
+                store.close()
+
+    def test_roster_work_success_can_run_after_view_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                callbacks = []
+                controller._run_after_view_ack = lambda label, callback: callbacks.append(
+                    (label, callback)
+                )
+                run_at = (utc_now() + timedelta(hours=1)).isoformat()
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        agent,
+                        prompt="check CI later",
+                        timing="once",
+                        run_at=run_at,
+                    ),
+                    async_success=True,
+                )
+
+                self.assertIsNone(response)
+                self.assertEqual(store.list_scheduled_work(), [])
+                self.assertEqual(callbacks[0][0], "roster-work-scheduled")
+
+                callbacks[0][1]()
+
+                scheduled = store.list_scheduled_work()
+                self.assertEqual(len(scheduled), 1)
+                self.assertEqual(scheduled[0].requested_handle, agent.handle)
             finally:
                 store.close()
 
@@ -1524,7 +1630,7 @@ class SlackAppTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [action["text"]["text"] for action in action_block["elements"]],
-                    ["Free up", "Open thread", "Assign", "Schedule", "Fire"],
+                    ["Free up", "Open thread", "Fire"],
                 )
             finally:
                 store.close()
@@ -1573,8 +1679,6 @@ class SlackAppTests(unittest.TestCase):
                     [
                         "Free up",
                         "Open thread",
-                        "Assign",
-                        "Schedule",
                         "Fire",
                     ],
                 )
@@ -1616,8 +1720,6 @@ class SlackAppTests(unittest.TestCase):
                     [action["text"]["text"] for action in actions],
                     [
                         "Free up",
-                        "Assign",
-                        "Schedule",
                         "Fire",
                     ],
                 )

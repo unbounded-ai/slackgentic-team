@@ -231,14 +231,9 @@ def build_team_roster_blocks(
                     encode_action_value("team.hire", count=1, provider=Provider.CLAUDE.value),
                 ),
                 _button(
-                    "Assign Work",
+                    "Add Work",
                     "roster.work.assign",
                     encode_action_value("roster.work.open", mode="now"),
-                ),
-                _button(
-                    "Schedule Work",
-                    "roster.work.schedule",
-                    encode_action_value("roster.work.open", mode="once"),
                 ),
             ],
         },
@@ -278,30 +273,19 @@ def build_team_roster_blocks(
                     url=status.thread_url,
                 )
             )
-        elements.append(
-            _button(
-                "Assign",
-                "roster.work.assign",
-                encode_action_value(
-                    "roster.work.open",
-                    mode="now",
-                    agent_id=agent.agent_id,
-                    handle=agent.handle,
-                ),
+        if _agent_accepts_new_work(status):
+            elements.append(
+                _button(
+                    "Assign",
+                    "roster.work.assign",
+                    encode_action_value(
+                        "roster.work.open",
+                        mode="now",
+                        agent_id=agent.agent_id,
+                        handle=agent.handle,
+                    ),
+                )
             )
-        )
-        elements.append(
-            _button(
-                "Schedule",
-                "roster.work.schedule",
-                encode_action_value(
-                    "roster.work.open",
-                    mode="once",
-                    agent_id=agent.agent_id,
-                    handle=agent.handle,
-                ),
-            )
-        )
         elements.append(
             _button(
                 "Fire",
@@ -328,6 +312,10 @@ def build_team_roster_blocks(
             }
         )
     return blocks
+
+
+def _agent_accepts_new_work(status: AgentRosterStatus | None) -> bool:
+    return status is None or status.label == "Available"
 
 
 def _agent_status_text(status: AgentRosterStatus | None) -> str:

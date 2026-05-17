@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -436,13 +437,18 @@ def install_claude_mcp_server(command: str | None = None, home: Path | None = No
     ensure_claude_mcp_permissions(home)
 
 
-def install_codex_mcp_server(command: str | None = None, home: Path | None = None) -> None:
+def install_codex_mcp_server(
+    command: str | None = None,
+    home: Path | None = None,
+    *,
+    codex_binary: str = "codex",
+) -> None:
     if command is None:
         resolved, command_args = _current_slackgentic_invocation()
     else:
         resolved, command_args = command, []
     add_command = [
-        "codex",
+        codex_binary,
         "mcp",
         "add",
         CHANNEL_NAME,
@@ -470,7 +476,7 @@ def install_codex_mcp_server(command: str | None = None, home: Path | None = Non
             stderr=completed.stderr,
         )
     subprocess.run(
-        ["codex", "mcp", "remove", CHANNEL_NAME],
+        [codex_binary, "mcp", "remove", CHANNEL_NAME],
         check=False,
         capture_output=True,
         text=True,
@@ -490,6 +496,20 @@ def install_codex_mcp_server(command: str | None = None, home: Path | None = Non
             output=completed.stdout,
             stderr=completed.stderr,
         )
+
+
+def ensure_codex_mcp_server_registered(
+    command: str | None = None,
+    home: Path | None = None,
+    *,
+    codex_binary: str = "codex",
+) -> bool:
+    if is_codex_mcp_server_configured(home):
+        return False
+    if shutil.which(codex_binary) is None:
+        return False
+    install_codex_mcp_server(command, home, codex_binary=codex_binary)
+    return True
 
 
 def _codex_mcp_env(home: Path | None) -> dict[str, str] | None:
@@ -554,6 +574,19 @@ def is_slackgentic_mcp_server_configured(home: Path | None = None) -> bool:
         if _contains_slackgentic_mcp_config(value):
             return True
     return False
+
+
+def is_codex_mcp_server_configured(home: Path | None = None) -> bool:
+    home = home or Path.home()
+    try:
+        with (home / ".codex" / "config.toml").open("rb") as config:
+            value = tomllib.load(config)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    servers = value.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return False
+    return _valid_mcp_server_config(servers.get(CHANNEL_NAME))
 
 
 def session_transcript_has_slackgentic_mcp(

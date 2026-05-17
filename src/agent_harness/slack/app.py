@@ -93,6 +93,7 @@ from agent_harness.schedules import (
     parse_agent_schedule_signal,
 )
 from agent_harness.sessions.bridge import ExternalSessionBridge
+from agent_harness.sessions.claude_channel import ensure_codex_mcp_server_registered
 from agent_harness.sessions.mirror import (
     EXTERNAL_SESSION_AGENT_PREFIX,
     EXTERNAL_SESSION_IGNORED_PREFIX,
@@ -274,6 +275,19 @@ class SlackTeamController:
         self._slack_message_lock = threading.Lock()
         self._normalize_existing_agents()
 
+    def _run_after_view_ack(self, label: str, callback: Callable[[], None]) -> None:
+        def run() -> None:
+            try:
+                callback()
+            except Exception:
+                LOGGER.exception("failed to complete Slack view submission: %s", label)
+
+        threading.Thread(
+            target=run,
+            name=f"slack-view-{label}",
+            daemon=True,
+        ).start()
+
     def handle_block_action(self, payload: dict) -> None:
         action = _first_action(payload)
         if action is None:
@@ -300,13 +314,18 @@ class SlackTeamController:
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
             self.session_bridge.handle_agent_request_block_action(decoded, channel_id, message_ts)
 
-    def handle_view_submission(self, payload: dict) -> dict | None:
+    def handle_view_submission(
+        self,
+        payload: dict,
+        *,
+        async_success: bool = False,
+    ) -> dict | None:
         view = payload.get("view") or {}
         callback_id = view.get("callback_id")
         if callback_id == "schedule.change":
-            return self._handle_schedule_change_submission(payload)
+            return self._handle_schedule_change_submission(payload, async_success=async_success)
         if callback_id == "roster.work":
-            return self._handle_roster_work_submission(payload)
+            return self._handle_roster_work_submission(payload, async_success=async_success)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -1203,6 +1222,11 @@ class SlackTeamController:
         busy.update(self._scheduled_busy_agent_ids(ignore_schedule_id=ignore_schedule_id))
         return busy
 
+    def _busy_agent_ids_for_roster_work_target(self) -> set[str]:
+        busy = {task.agent_id for task in self.store.list_agent_tasks()}
+        busy.update(self._busy_agent_ids_for_assignment())
+        return busy
+
     def _scheduled_busy_agent_ids(self, ignore_schedule_id: str | None = None) -> set[str]:
         agents_by_handle = {agent.handle: agent.agent_id for agent in self.store.list_team_agents()}
         busy: set[str] = set()
@@ -1735,6 +1759,13 @@ class SlackTeamController:
                 )
                 self.refresh_or_post_roster(channel_id)
                 return
+            if agent.agent_id in self._busy_agent_ids_for_roster_work_target():
+                self._post_text(
+                    SlackReplyTarget(channel_id=channel_id, thread_ts=roster_ts),
+                    f"@{agent.handle} is already occupied. Choose an available agent.",
+                )
+                self.refresh_or_post_roster(channel_id)
+                return
         self.gateway.open_view(
             trigger_id,
             _roster_work_modal(
@@ -1746,7 +1777,12 @@ class SlackTeamController:
             ),
         )
 
-    def _handle_roster_work_submission(self, payload: dict) -> dict | None:
+    def _handle_roster_work_submission(
+        self,
+        payload: dict,
+        *,
+        async_success: bool = False,
+    ) -> dict | None:
         view = payload.get("view") or {}
         metadata = _decode_roster_work_metadata(view.get("private_metadata"))
         channel_id = metadata.get("channel_id") or self._configured_agent_channel_id()
@@ -1757,6 +1793,9 @@ class SlackTeamController:
         if request_error is not None:
             return _view_errors(*request_error)
         assert request is not None
+        target_error = self._specific_target_busy_error(request)
+        if target_error is not None:
+            return _view_errors("roster_work_prompt", target_error)
 
         timing = _view_selected_value(values, "roster_work_timing", "value") or "now"
         dependency, dependency_error = self._roster_work_dependency_from_values(values)
@@ -1782,40 +1821,61 @@ class SlackTeamController:
             run_at, run_at_error = _optional_future_timestamp(run_at_text)
             if run_at_error:
                 return _view_errors("roster_work_run_at", run_at_error)
-            self._create_roster_deferred_work(
-                channel_id,
-                request,
-                dependency,
-                run_at=run_at,
-                delay_seconds=delay_seconds,
-                requested_by_slack_user=requested_by,
-            )
+
+            def callback() -> None:
+                self._create_roster_deferred_work(
+                    channel_id,
+                    request,
+                    dependency,
+                    run_at=run_at,
+                    delay_seconds=delay_seconds,
+                    requested_by_slack_user=requested_by,
+                )
+
+            if async_success:
+                self._run_after_view_ack("roster-work-deferred", callback)
+            else:
+                callback()
             return None
 
         if timing == "now":
             if run_at_text:
                 return _view_errors("roster_work_timing", "Choose once to use a run-at time.")
-            self._start_roster_work_now(
-                request,
-                channel_id,
-                requested_by_slack_user=requested_by,
-            )
+
+            def callback() -> None:
+                self._start_roster_work_now(
+                    request,
+                    channel_id,
+                    requested_by_slack_user=requested_by,
+                )
+
+            if async_success:
+                self._run_after_view_ack("roster-work-now", callback)
+            else:
+                callback()
             return None
 
         if timing == "once":
             run_at, run_at_error = _required_future_timestamp(run_at_text)
             if run_at_error:
                 return _view_errors("roster_work_run_at", run_at_error)
-            self._create_roster_scheduled_work(
-                channel_id,
-                request,
-                schedule_kind=ScheduledWorkKind.ONE_OFF,
-                next_run_at=run_at,
-                recurrence={},
-                timezone=None,
-                description=f"once at {_format_schedule_timestamp(run_at)}",
-                requested_by_slack_user=requested_by,
-            )
+
+            def callback() -> None:
+                self._create_roster_scheduled_work(
+                    channel_id,
+                    request,
+                    schedule_kind=ScheduledWorkKind.ONE_OFF,
+                    next_run_at=run_at,
+                    recurrence={},
+                    timezone=None,
+                    description=f"once at {_format_schedule_timestamp(run_at)}",
+                    requested_by_slack_user=requested_by,
+                )
+
+            if async_success:
+                self._run_after_view_ack("roster-work-scheduled", callback)
+            else:
+                callback()
             return None
 
         if timing in {"daily", "weekly"}:
@@ -1831,16 +1891,23 @@ class SlackTeamController:
                 description = f"weekly on {weekday} at {recurrence['time']} {timezone}"
             else:
                 description = f"daily at {recurrence['time']} {timezone}"
-            self._create_roster_scheduled_work(
-                channel_id,
-                request,
-                schedule_kind=ScheduledWorkKind.RECURRING,
-                next_run_at=next_run_at,
-                recurrence=recurrence,
-                timezone=timezone,
-                description=description,
-                requested_by_slack_user=requested_by,
-            )
+
+            def callback() -> None:
+                self._create_roster_scheduled_work(
+                    channel_id,
+                    request,
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=next_run_at,
+                    recurrence=recurrence,
+                    timezone=timezone,
+                    description=description,
+                    requested_by_slack_user=requested_by,
+                )
+
+            if async_success:
+                self._run_after_view_ack("roster-work-scheduled", callback)
+            else:
+                callback()
             return None
 
         return _view_errors("roster_work_timing", "Choose when this work should run.")
@@ -1880,6 +1947,16 @@ class SlackTeamController:
             ),
             None,
         )
+
+    def _specific_target_busy_error(self, request: WorkRequest) -> str | None:
+        if request.assignment_mode != AssignmentMode.SPECIFIC or not request.requested_handle:
+            return None
+        agent = self.store.get_team_agent(request.requested_handle)
+        if agent is None:
+            return "That target agent is no longer active."
+        if agent.agent_id in self._busy_agent_ids_for_roster_work_target():
+            return f"@{agent.handle} is already occupied. Choose an available agent."
+        return None
 
     def _roster_work_dependency_from_values(
         self,
@@ -2124,7 +2201,12 @@ class SlackTeamController:
                 _schedule_change_modal(scheduled, channel_id=channel_id, message_ts=message_ts),
             )
 
-    def _handle_schedule_change_submission(self, payload: dict) -> dict | None:
+    def _handle_schedule_change_submission(
+        self,
+        payload: dict,
+        *,
+        async_success: bool = False,
+    ) -> dict | None:
         view = payload.get("view") or {}
         metadata = _decode_schedule_change_metadata(view.get("private_metadata"))
         schedule_id = metadata.get("schedule_id")
@@ -2176,18 +2258,25 @@ class SlackTeamController:
         )
         if updated is None:
             return _view_errors("schedule_next_run", "That schedule could not be changed.")
-        self.gateway.post_thread_reply(
-            SlackThreadRef(updated.channel_id, updated.thread_ts),
-            (
-                f"Changed schedule `{schedule_id}`. "
-                f"Next run: `{_format_schedule_timestamp(updated.next_run_at)}`."
-            ),
-        )
-        channel_id = metadata.get("channel_id")
-        message_ts = metadata.get("message_ts")
-        if channel_id:
-            self._update_scheduled_tasks_message(channel_id, message_ts)
-            self.refresh_or_post_roster(channel_id)
+
+        def notify() -> None:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(updated.channel_id, updated.thread_ts),
+                (
+                    f"Changed schedule `{schedule_id}`. "
+                    f"Next run: `{_format_schedule_timestamp(updated.next_run_at)}`."
+                ),
+            )
+            channel_id = metadata.get("channel_id")
+            message_ts = metadata.get("message_ts")
+            if channel_id:
+                self._update_scheduled_tasks_message(channel_id, message_ts)
+                self.refresh_or_post_roster(channel_id)
+
+        if async_success:
+            self._run_after_view_ack("schedule-change", notify)
+        else:
+            notify()
         return None
 
     def _update_scheduled_tasks_message(self, channel_id: str, message_ts: str | None) -> None:
@@ -5110,6 +5199,7 @@ class SocketModeSlackApp:
         self.store.init_schema()
         self.gateway = SlackGateway(config.slack.bot_token)
         auth = self.gateway.auth_test()
+        _ensure_codex_mcp_for_slack_app(config)
         self.codex_app_server = None
         codex_app_server_url = config.commands.codex_app_server_url
         if config.commands.codex_app_server_autostart and codex_app_server_url:
@@ -5313,13 +5403,26 @@ class SocketModeSlackApp:
             if payload_type == "block_actions":
                 self.controller.handle_block_action(payload)
             elif payload_type == "view_submission":
-                return self.controller.handle_view_submission(payload)
+                return self.controller.handle_view_submission(payload, async_success=True)
             return None
         if request.type == "events_api":
             self.controller.handle_event(request.payload)
         elif request.type == "slash_commands":
             self.controller.handle_slash_command(request.payload)
         return None
+
+
+def _ensure_codex_mcp_for_slack_app(config: AppConfig) -> None:
+    try:
+        registered = ensure_codex_mcp_server_registered(
+            home=config.home,
+            codex_binary=config.commands.codex_binary,
+        )
+    except Exception:
+        LOGGER.warning("failed to register Codex MCP server", exc_info=True)
+        return
+    if registered:
+        LOGGER.info("registered Codex MCP server: slackgentic")
 
 
 def run_slack_app(config: AppConfig | None = None) -> int:
@@ -6036,7 +6139,12 @@ def _roster_work_modal(
             "element": {
                 "type": "plain_text_input",
                 "action_id": "value",
+                "initial_value": _default_roster_work_timezone(),
                 "placeholder": {"type": "plain_text", "text": "America/Chicago"},
+            },
+            "hint": {
+                "type": "plain_text",
+                "text": "Required for daily or weekly repeats. Unused for now or once.",
             },
         },
         {
@@ -6109,7 +6217,7 @@ def _roster_work_modal(
         "callback_id": "roster.work",
         "private_metadata": json.dumps(metadata, separators=(",", ":"), sort_keys=True),
         "title": {"type": "plain_text", "text": "Roster work"},
-        "submit": {"type": "plain_text", "text": "Start"},
+        "submit": {"type": "plain_text", "text": "Create"},
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": blocks,
     }
@@ -6132,6 +6240,29 @@ def _roster_dependency_options(occupied_handles: list[tuple[str, str]]) -> list[
         if len(options) >= 100:
             break
     return options
+
+
+def _default_roster_work_timezone() -> str:
+    candidates: list[str] = []
+    env_tz = os.environ.get("TZ")
+    if env_tz:
+        candidates.append(env_tz.lstrip(":"))
+    try:
+        localtime = str(Path("/etc/localtime").resolve(strict=False))
+    except OSError:
+        localtime = ""
+    marker = "/zoneinfo/"
+    if marker in localtime:
+        candidates.append(localtime.split(marker, 1)[1])
+    for candidate in candidates:
+        if candidate and _valid_roster_work_timezone(candidate):
+            return candidate
+    return "America/Chicago"
+
+
+def _valid_roster_work_timezone(value: str) -> bool:
+    recurrence = {"frequency": "daily", "time": "00:00", "timezone": value}
+    return next_run_after(recurrence, after=utc_now()) is not None
 
 
 def _modal_option(text: str, value: str, description: str | None = None) -> dict:

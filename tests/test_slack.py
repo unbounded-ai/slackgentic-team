@@ -94,10 +94,8 @@ class SlackTests(unittest.TestCase):
             action_ids,
             [
                 "roster.work.assign",
-                "roster.work.schedule",
                 "team.fire",
                 "roster.work.assign",
-                "roster.work.schedule",
                 "team.fire",
             ],
         )
@@ -125,7 +123,7 @@ class SlackTests(unittest.TestCase):
         self.assertNotIn("https://example.slack.com/archives/C1/p171000001", status_text)
         self.assertEqual(
             [element["text"]["text"] for element in action_block["elements"]],
-            ["Free up", "Open thread", "Assign", "Schedule", "Fire"],
+            ["Free up", "Open thread", "Fire"],
         )
         self.assertEqual(
             decode_action_value(action_block["elements"][0]["value"]),
@@ -148,7 +146,6 @@ class SlackTests(unittest.TestCase):
                 "team.hire.codex",
                 "team.hire.claude",
                 "roster.work.assign",
-                "roster.work.schedule",
             ],
         )
         self.assertEqual(len(action_ids), len(set(action_ids)))
