@@ -24,6 +24,7 @@ class ScheduleControlTests(unittest.TestCase):
         self.assertIn("tomorrow's sunset time in Waco", prompt)
         self.assertIn("location-dependent wording such as sunset", prompt)
         self.assertIn(AGENT_SCHEDULE_SIGNAL_PREFIX, prompt)
+        self.assertIn("emit no Slack-visible prose", prompt)
         self.assertIn('"run_at"', prompt)
 
     def test_one_off_schedule_signal_validates_structured_json(self):

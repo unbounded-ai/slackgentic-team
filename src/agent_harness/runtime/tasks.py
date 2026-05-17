@@ -529,6 +529,8 @@ class ManagedTaskRuntime:
     def _post_agent_chunk(self, running: RunningTask, chunk: str) -> None:
         visible_text, control_signals = _extract_agent_control_signals(chunk)
         running.control_signals.extend(control_signals)
+        if any(_is_schedule_control_signal(signal) for signal in control_signals):
+            visible_text = ""
         if not visible_text:
             return
         normalized = visible_text.strip()
@@ -1194,6 +1196,11 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
             continue
         visible_lines.append(line)
     return "\n".join(visible_lines).strip(), signals
+
+
+def _is_schedule_control_signal(signal: str) -> bool:
+    normalized = re.sub(r"\s+", " ", signal.strip()).upper()
+    return normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX)
 
 
 def _process_output_chunks(
