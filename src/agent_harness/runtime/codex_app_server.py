@@ -43,7 +43,16 @@ class CodexAppServerClient:
         self.server_request_handler = server_request_handler
         self.listener_idle_timeout_seconds = listener_idle_timeout_seconds
 
-    def send_to_thread(self, thread_id: str, text: str, cwd: Path | None = None) -> bool:
+    def send_to_thread(
+        self,
+        thread_id: str,
+        text: str,
+        cwd: Path | None = None,
+        *,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+        sandbox_policy: dict[str, Any] | None = None,
+    ) -> bool:
         if not thread_id or not text.strip():
             return False
         rpc = _JsonRpcWebSocket(self.url, timeout_seconds=self.timeout_seconds)
@@ -79,23 +88,32 @@ class CodexAppServerClient:
             }
             if cwd is not None:
                 resume_params["cwd"] = str(cwd)
+            if approval_policy is not None:
+                resume_params["approvalPolicy"] = approval_policy
+            if sandbox is not None:
+                resume_params["sandbox"] = sandbox
             rpc.request(
                 "thread/resume",
                 resume_params,
                 server_request_handler=self.server_request_handler,
             )
+            turn_params: dict[str, Any] = {
+                "threadId": thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": text,
+                        "text_elements": [],
+                    }
+                ],
+            }
+            if approval_policy is not None:
+                turn_params["approvalPolicy"] = approval_policy
+            if sandbox_policy is not None:
+                turn_params["sandboxPolicy"] = sandbox_policy
             rpc.request(
                 "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": text,
-                            "text_elements": [],
-                        }
-                    ],
-                },
+                turn_params,
                 server_request_handler=self.server_request_handler,
             )
         except Exception:

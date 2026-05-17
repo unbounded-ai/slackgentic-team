@@ -43,7 +43,16 @@ SESSION_EXIT_COMMAND = "/exit"
 
 
 class CodexLiveClient(Protocol):
-    def send_to_thread(self, thread_id: str, text: str, cwd: Path | None = None) -> bool: ...
+    def send_to_thread(
+        self,
+        thread_id: str,
+        text: str,
+        cwd: Path | None = None,
+        *,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+        sandbox_policy: dict[str, object] | None = None,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -170,7 +179,12 @@ class ExternalSessionBridge:
             self.terminal_notifier.notify_user_message(send.session, send.slack_text)
             try:
                 completed = self.command_runner(
-                    _resume_command(send.session, send.prompt, self.commands),
+                    _resume_command(
+                        send.session,
+                        send.prompt,
+                        self.commands,
+                        dangerous=self._codex_session_uses_dangerous_mode(send.session),
+                    ),
                     cwd=_command_cwd(send.session),
                     text=True,
                     capture_output=True,
@@ -251,11 +265,32 @@ class ExternalSessionBridge:
                     )
 
             client = CodexAppServerClient(url, server_request_handler=server_request_handler)
+        approval_policy = None
+        sandbox = None
+        sandbox_policy = None
+        if self._codex_session_uses_dangerous_mode(session):
+            approval_policy = "never"
+            sandbox = "danger-full-access"
+            sandbox_policy = {"type": "dangerFullAccess"}
         try:
-            return client.send_to_thread(session.session_id, prompt, _command_cwd(session))
+            return client.send_to_thread(
+                session.session_id,
+                prompt,
+                _command_cwd(session),
+                approval_policy=approval_policy,
+                sandbox=sandbox,
+                sandbox_policy=sandbox_policy,
+            )
         except Exception:
             LOGGER.debug("failed to send Codex prompt through app-server", exc_info=True)
             return False
+
+    def _codex_session_uses_dangerous_mode(self, session: AgentSession) -> bool:
+        return _codex_session_uses_dangerous_mode(
+            session,
+            self.commands,
+            self.terminal_notifier,
+        )
 
     def _send_to_claude_channel(
         self,
@@ -477,6 +512,8 @@ def _resume_command(
     session: AgentSession,
     prompt: str,
     commands: AgentCommandConfig,
+    *,
+    dangerous: bool = False,
 ) -> list[str]:
     if session.provider == Provider.CODEX:
         args = [
@@ -489,7 +526,7 @@ def _resume_command(
         cwd = _command_cwd(session)
         if cwd:
             args.extend(["-c", _codex_trust_override(cwd)])
-        if commands.dangerous_by_default:
+        if commands.dangerous_by_default or dangerous:
             args.append(dangerous_flag(Provider.CODEX))
         args.extend([session.session_id, prompt])
         return args
@@ -509,6 +546,59 @@ def _resume_command(
         args.append(prompt)
         return args
     raise ValueError(f"unsupported provider: {session.provider}")
+
+
+def _codex_session_uses_dangerous_mode(
+    session: AgentSession,
+    commands: AgentCommandConfig,
+    terminal_notifier: SessionTerminalNotifier,
+) -> bool:
+    if session.provider != Provider.CODEX:
+        return False
+    if commands.dangerous_by_default:
+        return True
+    if session.permission_mode == PermissionMode.DANGEROUS.value:
+        return True
+    metadata_mode = session.metadata.get("permission_mode")
+    if metadata_mode == PermissionMode.DANGEROUS.value:
+        return True
+    if session.metadata.get("dangerous_mode") is True:
+        return True
+    try:
+        targets = terminal_notifier.targets_for_session(session)
+    except Exception:
+        LOGGER.debug("failed to inspect Codex terminal targets", exc_info=True)
+        return False
+    return any(
+        _target_start_matches_session(session, target)
+        and _codex_command_uses_dangerous_mode(target.command)
+        for target in targets
+    )
+
+
+def _codex_command_uses_dangerous_mode(command: str) -> bool:
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        args = command.split()
+    dangerous_arg = dangerous_flag(Provider.CODEX)
+    if dangerous_arg in args:
+        return True
+    approval_never = False
+    sandbox_danger = False
+    for index, arg in enumerate(args):
+        if arg in {"-a", "--ask-for-approval"} and index + 1 < len(args):
+            approval_never = approval_never or args[index + 1] == "never"
+            continue
+        if arg.startswith("--ask-for-approval="):
+            approval_never = approval_never or arg.split("=", 1)[1] == "never"
+            continue
+        if arg in {"-s", "--sandbox"} and index + 1 < len(args):
+            sandbox_danger = sandbox_danger or args[index + 1] == "danger-full-access"
+            continue
+        if arg.startswith("--sandbox="):
+            sandbox_danger = sandbox_danger or arg.split("=", 1)[1] == "danger-full-access"
+    return approval_never and sandbox_danger
 
 
 def _command_cwd(session: AgentSession) -> Path | None:

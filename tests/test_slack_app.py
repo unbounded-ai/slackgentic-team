@@ -285,6 +285,52 @@ class DetachedRuntime(FakeRuntime):
         return False
 
 
+def _roster_work_submission_payload(
+    agent=None,
+    *,
+    prompt: str,
+    timing: str,
+    dangerous: bool = False,
+    repeat_time: str = "",
+    timezone: str = "",
+    weekday: str | None = None,
+    run_at: str = "",
+    dependency: str = "none",
+    delay: str = "",
+):
+    metadata = {"channel_id": "C1", "message_ts": "171.roster"}
+    if agent is not None:
+        metadata["agent_id"] = agent.agent_id
+        metadata["handle"] = agent.handle
+    values = {
+        "roster_work_prompt": {"value": {"value": prompt}},
+        "roster_work_kind": {"value": {"selected_option": {"value": "work"}}},
+        "roster_work_timing": {"value": {"selected_option": {"value": timing}}},
+        "roster_work_run_at": {"value": {"value": run_at}},
+        "roster_work_time": {"value": {"value": repeat_time}},
+        "roster_work_timezone": {"value": {"value": timezone}},
+        "roster_work_weekday": {
+            "value": {"selected_option": {"value": weekday} if weekday is not None else None}
+        },
+        "roster_work_dependency": {"value": {"selected_option": {"value": dependency}}},
+        "roster_work_delay": {"value": {"value": delay}},
+        "roster_work_permissions": {
+            "dangerous": {
+                "selected_options": [{"value": "dangerous"}] if dangerous else [],
+            }
+        },
+    }
+    return {
+        "type": "view_submission",
+        "user": {"id": "U1"},
+        "view": {
+            "callback_id": "roster.work",
+            "private_metadata": json.dumps(metadata),
+            "state": {"values": values},
+        },
+    }
+
+
 class SlackAppTests(unittest.TestCase):
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -508,6 +554,155 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(len(bridge.agent_request_actions), 1)
                 self.assertEqual(bridge.agent_request_actions[0][1:], ("C1", "171.000001"))
+            finally:
+                store.close()
+
+    def test_roster_assign_button_opens_work_modal_for_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.roster"},
+                        "trigger_id": "T1",
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "roster.work.open",
+                                    mode="now",
+                                    agent_id=agent.agent_id,
+                                    handle=agent.handle,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(gateway.views[0][0], "T1")
+                view = gateway.views[0][1]
+                self.assertEqual(view["callback_id"], "roster.work")
+                self.assertIn(f'"handle":"{agent.handle}"', view["private_metadata"])
+                timing = next(
+                    block
+                    for block in view["blocks"]
+                    if block.get("block_id") == "roster_work_timing"
+                )
+                self.assertEqual(timing["element"]["initial_option"]["value"], "now")
+            finally:
+                store.close()
+
+    def test_roster_work_submission_starts_dangerous_specific_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        agent,
+                        prompt="repair the deploy script",
+                        timing="now",
+                        dangerous=True,
+                    )
+                )
+
+                self.assertIsNone(response)
+                self.assertEqual(len(runtime.started), 1)
+                task, started_agent, thread = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                self.assertEqual(task.prompt, "repair the deploy script")
+                self.assertTrue(task.metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertEqual(thread.thread_ts, gateway.posts[0]["ts"])
+                self.assertIn("*Dangerous mode:* enabled", gateway.posts[0]["text"])
+            finally:
+                store.close()
+
+    def test_roster_work_submission_creates_recurring_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        agent,
+                        prompt="check CI",
+                        timing="daily",
+                        repeat_time="17:00",
+                        timezone="America/Chicago",
+                    )
+                )
+
+                self.assertIsNone(response)
+                scheduled = store.list_scheduled_work()
+                self.assertEqual(len(scheduled), 1)
+                self.assertEqual(scheduled[0].requested_handle, agent.handle)
+                self.assertEqual(scheduled[0].schedule_kind, ScheduledWorkKind.RECURRING)
+                self.assertEqual(scheduled[0].recurrence["frequency"], "daily")
+                self.assertIn("Scheduled `schedule_", gateway.updates[-1]["text"])
+                self.assertIn("daily at 17:00 America/Chicago", gateway.updates[-1]["text"])
+            finally:
+                store.close()
+
+    def test_roster_work_submission_defers_until_busy_agent_finishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                blocker, target = build_initial_model_team(2, 0)
+                store.upsert_team_agent(blocker)
+                store.upsert_team_agent(target)
+                active_task = create_agent_task(blocker, "finish blocker", "C1")
+                store.upsert_agent_task(active_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        target,
+                        prompt="follow up afterward",
+                        timing="now",
+                        dependency=blocker.handle,
+                    )
+                )
+
+                self.assertIsNone(response)
+                self.assertEqual(runtime.started, [])
+                deferred = store.list_deferred_work()
+                self.assertEqual(len(deferred), 1)
+                self.assertEqual(deferred[0].status, DeferredWorkStatus.WAITING_DEPS)
+                self.assertEqual(deferred[0].requested_handle, target.handle)
+                self.assertEqual(deferred[0].depends_on[0].handle, blocker.handle)
+                self.assertEqual(deferred[0].depends_on[0].task_id, active_task.task_id)
+                self.assertIn("Waiting on", gateway.updates[-1]["text"])
             finally:
                 store.close()
 
@@ -1322,8 +1517,15 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("Free up", blocks)
                 self.assertIn("Open thread", blocks)
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
-                self.assertLess(blocks.index("Free up"), blocks.index("Open thread"))
-                self.assertLess(blocks.index("Open thread"), blocks.index("Fire"))
+                action_block = next(
+                    block
+                    for block in gateway.posts[-1]["blocks"]
+                    if block.get("block_id") == f"team.agent.actions.{agents[0].agent_id}"
+                )
+                self.assertEqual(
+                    [action["text"]["text"] for action in action_block["elements"]],
+                    ["Free up", "Open thread", "Assign", "Schedule", "Fire"],
+                )
             finally:
                 store.close()
 
@@ -1371,6 +1573,8 @@ class SlackAppTests(unittest.TestCase):
                     [
                         "Free up",
                         "Open thread",
+                        "Assign",
+                        "Schedule",
                         "Fire",
                     ],
                 )
@@ -1412,6 +1616,8 @@ class SlackAppTests(unittest.TestCase):
                     [action["text"]["text"] for action in actions],
                     [
                         "Free up",
+                        "Assign",
+                        "Schedule",
                         "Fire",
                     ],
                 )
@@ -6989,6 +7195,37 @@ class SlackAppTests(unittest.TestCase):
                     [element["action_id"] for element in action_block["elements"]],
                     ["schedule.cancel", "schedule.change", "thread.open"],
                 )
+            finally:
+                store.close()
+
+    def test_scheduled_tasks_command_formats_interval_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.create_scheduled_work_request(
+                    SlackThreadRef("C1", "171.thread", "171.schedule"),
+                    WorkRequest(
+                        prompt="check CI",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    schedule_kind=ScheduledWorkKind.RECURRING,
+                    next_run_at=utc_now() + timedelta(hours=2),
+                    recurrence={
+                        "frequency": "interval",
+                        "interval": {"value": 2, "unit": "hours"},
+                    },
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    ScheduledTasksCommand(),
+                    SlackReplyTarget(channel_id="C1"),
+                )
+
+                self.assertIn("every 2 hours", gateway.posts[-1]["text"])
+                self.assertIn("every 2 hours", str(gateway.posts[-1]["blocks"]))
             finally:
                 store.close()
 

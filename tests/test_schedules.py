@@ -80,6 +80,34 @@ class ScheduleControlTests(unittest.TestCase):
         )
         self.assertEqual(parsed.schedule.request.assignment_mode, AssignmentMode.ANYONE)
 
+    def test_interval_recurring_schedule_signal_can_compute_next_run_when_missing(self):
+        payload = {
+            "task": "check CI",
+            "target": "somebody",
+            "schedule": {
+                "kind": "recurring",
+                "frequency": "interval",
+                "interval_seconds": 7200,
+            },
+        }
+
+        parsed = parse_agent_schedule_signal(
+            f"{AGENT_SCHEDULE_SIGNAL_PREFIX}{json.dumps(payload)}",
+            known_handles=["avery", "jordan"],
+            now=datetime(2026, 5, 15, 20, 0, tzinfo=UTC),
+        )
+
+        self.assertIsNone(parsed.error)
+        assert parsed.schedule is not None
+        self.assertEqual(parsed.schedule.schedule_kind, ScheduledWorkKind.RECURRING)
+        self.assertEqual(
+            parsed.schedule.next_run_at,
+            datetime(2026, 5, 15, 22, 0, tzinfo=UTC),
+        )
+        self.assertEqual(parsed.schedule.recurrence["frequency"], "interval")
+        self.assertEqual(parsed.schedule.recurrence["interval_seconds"], 7200)
+        self.assertEqual(parsed.schedule.description, "every 2 hours")
+
     def test_schedule_signal_rejects_unknown_target(self):
         payload = {
             "task": "check CI",
@@ -113,6 +141,19 @@ class ScheduleControlTests(unittest.TestCase):
         )
 
         self.assertEqual(next_run, datetime(2026, 5, 18, 13, 30, tzinfo=UTC))
+
+    def test_next_run_after_returns_next_interval_occurrence(self):
+        after = datetime(2026, 5, 15, 20, 0, tzinfo=UTC)
+
+        next_run = next_run_after(
+            {
+                "frequency": "interval",
+                "interval": {"value": 90, "unit": "minutes"},
+            },
+            after=after,
+        )
+
+        self.assertEqual(next_run, datetime(2026, 5, 15, 21, 30, tzinfo=UTC))
 
 
 if __name__ == "__main__":

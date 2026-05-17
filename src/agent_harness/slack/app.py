@@ -85,6 +85,8 @@ from agent_harness.schedules import (
     SCHEDULE_RESOLUTION_METADATA_KEY,
     SCHEDULE_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
     build_schedule_resolution_prompt,
+    format_interval_seconds,
+    interval_seconds_from_recurrence,
     is_agent_schedule_signal,
     looks_like_schedule_request,
     next_run_after,
@@ -131,6 +133,7 @@ from agent_harness.team import (
     format_agent_handoff_request,
     format_agent_introduction,
     hire_team_agents,
+    normalize_handle,
 )
 from agent_harness.team.assignment import assign_work_request
 from agent_harness.team.commands import (
@@ -286,6 +289,8 @@ class SlackTeamController:
             self._hire_from_action(decoded, channel_id, message_ts)
         elif action_name == "team.fire":
             self._fire_from_action(decoded, channel_id, message_ts)
+        elif action_name == "roster.work.open":
+            self._open_roster_work_modal(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name.startswith("task."):
             self._task_from_action(decoded, channel_id, message_ts)
         elif action_name.startswith("schedule."):
@@ -300,6 +305,8 @@ class SlackTeamController:
         callback_id = view.get("callback_id")
         if callback_id == "schedule.change":
             return self._handle_schedule_change_submission(payload)
+        if callback_id == "roster.work":
+            return self._handle_roster_work_submission(payload)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -1702,6 +1709,322 @@ class SlackTeamController:
         if handle:
             self.gateway.post_thread_reply(thread, f"Removed @{str(handle).lstrip('@')}.")
 
+    def _open_roster_work_modal(
+        self,
+        payload: dict,
+        channel_id: str,
+        roster_ts: str | None,
+        trigger_id: str | None,
+    ) -> None:
+        if not trigger_id:
+            thread_ts = roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
+            self._post_text(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=thread_ts),
+                "Use `show roster` again to open the work form from Slack.",
+            )
+            return
+        agent = None
+        agent_id = str(payload.get("agent_id") or "")
+        handle = str(payload.get("handle") or "")
+        if agent_id or handle:
+            agent = self.store.get_team_agent(agent_id or handle)
+            if agent is None:
+                self._post_text(
+                    SlackReplyTarget(channel_id=channel_id, thread_ts=roster_ts),
+                    "That agent is no longer active.",
+                )
+                self.refresh_or_post_roster(channel_id)
+                return
+        self.gateway.open_view(
+            trigger_id,
+            _roster_work_modal(
+                agent,
+                channel_id=channel_id,
+                message_ts=roster_ts,
+                initial_timing=str(payload.get("mode") or "now"),
+                occupied_handles=self._occupied_handle_task_ids(),
+            ),
+        )
+
+    def _handle_roster_work_submission(self, payload: dict) -> dict | None:
+        view = payload.get("view") or {}
+        metadata = _decode_roster_work_metadata(view.get("private_metadata"))
+        channel_id = metadata.get("channel_id") or self._configured_agent_channel_id()
+        if not channel_id:
+            return None
+        values = view.get("state", {}).get("values", {})
+        request, request_error = self._roster_work_request_from_values(values, metadata)
+        if request_error is not None:
+            return _view_errors(*request_error)
+        assert request is not None
+
+        timing = _view_selected_value(values, "roster_work_timing", "value") or "now"
+        dependency, dependency_error = self._roster_work_dependency_from_values(values)
+        if dependency_error is not None:
+            return _view_errors("roster_work_dependency", dependency_error)
+
+        run_at_text = (_view_plain_value(values, "roster_work_run_at", "value") or "").strip()
+        delay_seconds, delay_error = _optional_delay_seconds(
+            _view_plain_value(values, "roster_work_delay", "value")
+        )
+        if delay_error:
+            return _view_errors("roster_work_delay", delay_error)
+        if delay_seconds is not None and dependency is None:
+            return _view_errors("roster_work_dependency", "Delay only applies after a dependency.")
+
+        requested_by = (payload.get("user") or {}).get("id")
+        if dependency is not None:
+            if timing in {"daily", "weekly"}:
+                return _view_errors(
+                    "roster_work_timing",
+                    "Repeating schedules cannot wait on an agent yet. Use now or once.",
+                )
+            run_at, run_at_error = _optional_future_timestamp(run_at_text)
+            if run_at_error:
+                return _view_errors("roster_work_run_at", run_at_error)
+            self._create_roster_deferred_work(
+                channel_id,
+                request,
+                dependency,
+                run_at=run_at,
+                delay_seconds=delay_seconds,
+                requested_by_slack_user=requested_by,
+            )
+            return None
+
+        if timing == "now":
+            if run_at_text:
+                return _view_errors("roster_work_timing", "Choose once to use a run-at time.")
+            self._start_roster_work_now(
+                request,
+                channel_id,
+                requested_by_slack_user=requested_by,
+            )
+            return None
+
+        if timing == "once":
+            run_at, run_at_error = _required_future_timestamp(run_at_text)
+            if run_at_error:
+                return _view_errors("roster_work_run_at", run_at_error)
+            self._create_roster_scheduled_work(
+                channel_id,
+                request,
+                schedule_kind=ScheduledWorkKind.ONE_OFF,
+                next_run_at=run_at,
+                recurrence={},
+                timezone=None,
+                description=f"once at {_format_schedule_timestamp(run_at)}",
+                requested_by_slack_user=requested_by,
+            )
+            return None
+
+        if timing in {"daily", "weekly"}:
+            recurrence, recurrence_error = _recurrence_from_roster_work_values(values, timing)
+            if recurrence_error is not None:
+                return _view_errors(*recurrence_error)
+            next_run_at = next_run_after(recurrence, after=utc_now())
+            if next_run_at is None:
+                return _view_errors("roster_work_time", "Could not compute the next run.")
+            timezone = str(recurrence["timezone"])
+            if timing == "weekly":
+                weekday = _weekday_label(recurrence.get("weekday")) or "selected day"
+                description = f"weekly on {weekday} at {recurrence['time']} {timezone}"
+            else:
+                description = f"daily at {recurrence['time']} {timezone}"
+            self._create_roster_scheduled_work(
+                channel_id,
+                request,
+                schedule_kind=ScheduledWorkKind.RECURRING,
+                next_run_at=next_run_at,
+                recurrence=recurrence,
+                timezone=timezone,
+                description=description,
+                requested_by_slack_user=requested_by,
+            )
+            return None
+
+        return _view_errors("roster_work_timing", "Choose when this work should run.")
+
+    def _roster_work_request_from_values(
+        self,
+        values: dict,
+        metadata: dict[str, str],
+    ) -> tuple[WorkRequest | None, tuple[str, str] | None]:
+        prompt = (_view_plain_value(values, "roster_work_prompt", "value") or "").strip()
+        if not prompt:
+            return None, ("roster_work_prompt", "Enter the work to assign.")
+        kind_value = _view_selected_value(values, "roster_work_kind", "value") or "work"
+        try:
+            task_kind = AgentTaskKind(kind_value)
+        except ValueError:
+            return None, ("roster_work_kind", "Choose work or review.")
+        dangerous = "dangerous" in _view_checked_values(
+            values, "roster_work_permissions", "dangerous"
+        )
+        agent = None
+        handle = metadata.get("handle")
+        agent_id = metadata.get("agent_id")
+        if handle or agent_id:
+            agent = self.store.get_team_agent(agent_id or handle or "")
+            if agent is None:
+                return None, ("roster_work_prompt", "That target agent is no longer active.")
+        return (
+            WorkRequest(
+                prompt=prompt,
+                assignment_mode=AssignmentMode.SPECIFIC if agent else AssignmentMode.ANYONE,
+                requested_handle=agent.handle if agent else None,
+                task_kind=task_kind,
+                permission_mode=(
+                    PermissionMode.DANGEROUS if dangerous else DEFAULT_PERMISSION_MODE
+                ),
+            ),
+            None,
+        )
+
+    def _roster_work_dependency_from_values(
+        self,
+        values: dict,
+    ) -> tuple[WorkDependency | None, str | None]:
+        selected = _view_selected_value(values, "roster_work_dependency", "value") or "none"
+        if selected == "none":
+            return None, None
+        try:
+            handle = normalize_handle(selected)
+        except ValueError:
+            return None, "Choose an occupied agent."
+        occupied = dict(self._occupied_handle_task_ids())
+        task_id = occupied.get(handle)
+        if not task_id:
+            return None, f"@{handle} is not currently occupied."
+        return (
+            WorkDependency(
+                kind=WorkDependencyKind.AGENT_BUSY,
+                handle=handle,
+                task_id=task_id,
+            ),
+            None,
+        )
+
+    def _start_roster_work_now(
+        self,
+        request: WorkRequest,
+        channel_id: str,
+        *,
+        requested_by_slack_user: str | None,
+    ) -> bool:
+        result = assign_work_request(
+            self.store,
+            request,
+            channel_id,
+            requested_by_slack_user=requested_by_slack_user,
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(),
+        )
+        if result is None:
+            self._post_assignment_unavailable(
+                SlackReplyTarget(channel_id=channel_id),
+                request,
+                requested_by_slack_user=requested_by_slack_user,
+            )
+            self.refresh_or_post_roster(channel_id)
+            return False
+        blocks = build_task_thread_blocks(result.task, result.agent)
+        text = format_agent_assignment(
+            result.agent,
+            result.request.prompt,
+            requested_by_slack_user,
+            dangerous_mode=_task_dangerous_mode(result.task),
+        )
+        thread = self.gateway.post_task_parent(
+            channel_id,
+            text,
+            result.agent,
+            blocks=blocks,
+            icon_url=self._agent_icon_url(result.agent),
+        )
+        self.store.update_agent_task_thread(
+            result.task.task_id,
+            thread.thread_ts,
+            thread.message_ts,
+        )
+        task = self.store.get_agent_task(result.task.task_id) or result.task
+        self._start_runtime_task(task, result.agent, thread)
+        self.refresh_or_post_roster(channel_id)
+        return True
+
+    def _create_roster_scheduled_work(
+        self,
+        channel_id: str,
+        request: WorkRequest,
+        *,
+        schedule_kind: ScheduledWorkKind,
+        next_run_at,
+        recurrence: dict[str, object],
+        timezone: str | None,
+        description: str,
+        requested_by_slack_user: str | None,
+    ) -> ScheduledWork:
+        thread = self._create_roster_work_parent(channel_id, request, "Scheduling work")
+        scheduled = self.store.create_scheduled_work_request(
+            thread,
+            request,
+            schedule_kind=schedule_kind,
+            next_run_at=next_run_at,
+            recurrence=recurrence,
+            timezone=timezone,
+            requested_by_slack_user=requested_by_slack_user,
+        )
+        text = _format_scheduled_work_ack(scheduled, description, request)
+        if not self._try_update_message(thread.channel_id, thread.thread_ts, text):
+            self.gateway.post_thread_reply(thread, text)
+        self.refresh_or_post_roster(channel_id)
+        return scheduled
+
+    def _create_roster_deferred_work(
+        self,
+        channel_id: str,
+        request: WorkRequest,
+        dependency: WorkDependency,
+        *,
+        run_at,
+        delay_seconds: int | None,
+        requested_by_slack_user: str | None,
+    ) -> DeferredWork:
+        thread = self._create_roster_work_parent(channel_id, request, "Deferring work")
+        deferred = self.store.create_deferred_work_request(
+            thread,
+            request,
+            depends_on=(dependency,),
+            after_dep_delay_seconds=delay_seconds,
+            run_at=run_at,
+            description=f"after @{dependency.handle} finishes",
+            requested_by_slack_user=requested_by_slack_user,
+        )
+        text = _format_deferred_work_ack(
+            deferred,
+            deferred.description or f"after @{dependency.handle} finishes",
+            request,
+        )
+        if not self._try_update_message(thread.channel_id, thread.thread_ts, text):
+            self.gateway.post_thread_reply(thread, text)
+        self.evaluate_pending_deferred_work(deferred.deferred_id)
+        self.refresh_or_post_roster(channel_id)
+        return deferred
+
+    def _create_roster_work_parent(
+        self,
+        channel_id: str,
+        request: WorkRequest,
+        label: str,
+    ) -> SlackThreadRef:
+        target = "somebody"
+        if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
+            target = f"@{request.requested_handle}"
+        posted = self.gateway.post_message(
+            channel_id,
+            f"{label} for {target}: `{_shorten(request.prompt, 180)}`",
+        )
+        return SlackThreadRef(channel_id, posted.ts, posted.ts)
+
     def _task_from_action(
         self,
         payload: dict,
@@ -1839,7 +2162,7 @@ class SlackTeamController:
                 if next_run_after(parsed_recurrence, after=next_run_at) is None:
                     return _view_errors(
                         "schedule_recurrence",
-                        "Use daily/weekly recurrence with time and timezone.",
+                        "Use daily/weekly recurrence with time/timezone or interval recurrence.",
                     )
                 recurrence = parsed_recurrence
                 recurrence_timezone = parsed_recurrence.get("timezone")
@@ -5061,6 +5384,16 @@ def _view_selected_value(values: dict, block_id: str, action_id: str) -> str | N
     return selected.get("value")
 
 
+def _view_checked_values(values: dict, block_id: str, action_id: str) -> set[str]:
+    item = values.get(block_id, {}).get(action_id, {})
+    selected = item.get("selected_options") or []
+    return {
+        option["value"]
+        for option in selected
+        if isinstance(option, dict) and isinstance(option.get("value"), str)
+    }
+
+
 def _view_int_value(values: dict, block_id: str, action_id: str, default: int) -> int:
     value = _view_plain_value(values, block_id, action_id)
     if value is None:
@@ -5505,6 +5838,10 @@ def _format_scheduled_work_schedule(scheduled: ScheduledWork) -> str:
             return f"weekly on {weekday} at {time_text} {timezone}"
     if frequency == "daily" and time_text and timezone:
         return f"daily at {time_text} {timezone}"
+    if frequency == "interval":
+        interval_seconds = interval_seconds_from_recurrence(recurrence)
+        if interval_seconds is not None:
+            return format_interval_seconds(interval_seconds)
     return "recurring"
 
 
@@ -5594,6 +5931,290 @@ def _slack_button(
     if url:
         button["url"] = url
     return button
+
+
+def _roster_work_modal(
+    agent,
+    *,
+    channel_id: str,
+    message_ts: str | None,
+    initial_timing: str,
+    occupied_handles: list[tuple[str, str]],
+) -> dict:
+    timing_options = [
+        _modal_option("Now", "now", "Start as soon as capacity is available."),
+        _modal_option("Once", "once", "Run once at the Run at timestamp."),
+        _modal_option("Daily", "daily", "Repeat every day at a local time."),
+        _modal_option("Weekly", "weekly", "Repeat weekly at a local time."),
+    ]
+    timing_by_value = {option["value"]: option for option in timing_options}
+    initial_timing_option = timing_by_value.get(initial_timing) or timing_by_value["now"]
+    target_label = f"@{agent.handle}" if agent is not None else "somebody"
+    metadata = {
+        "channel_id": channel_id,
+        "message_ts": message_ts,
+    }
+    if agent is not None:
+        metadata["agent_id"] = agent.agent_id
+        metadata["handle"] = agent.handle
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Target:* {target_label}",
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_prompt",
+            "label": {"type": "plain_text", "text": "Work"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "value",
+                "multiline": True,
+                "placeholder": {"type": "plain_text", "text": "Describe the task"},
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_kind",
+            "label": {"type": "plain_text", "text": "Kind"},
+            "element": {
+                "type": "static_select",
+                "action_id": "value",
+                "initial_option": _modal_option("Work", AgentTaskKind.WORK.value),
+                "options": [
+                    _modal_option("Work", AgentTaskKind.WORK.value),
+                    _modal_option("Review", AgentTaskKind.REVIEW.value),
+                ],
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_timing",
+            "label": {"type": "plain_text", "text": "Timing"},
+            "element": {
+                "type": "static_select",
+                "action_id": "value",
+                "initial_option": initial_timing_option,
+                "options": timing_options,
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_run_at",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Run at"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "value",
+                "placeholder": {"type": "plain_text", "text": "2026-05-16T17:00:00-05:00"},
+            },
+            "hint": {
+                "type": "plain_text",
+                "text": "Required for once. Optional no-earlier-than time when waiting on an agent.",
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_time",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Repeat time"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "value",
+                "placeholder": {"type": "plain_text", "text": "17:00"},
+            },
+            "hint": {"type": "plain_text", "text": "HH:MM, required for daily or weekly."},
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_timezone",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Repeat timezone"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "value",
+                "placeholder": {"type": "plain_text", "text": "America/Chicago"},
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_weekday",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Repeat weekday"},
+            "element": {
+                "type": "static_select",
+                "action_id": "value",
+                "placeholder": {"type": "plain_text", "text": "Choose for weekly"},
+                "options": [
+                    _modal_option("Monday", "0"),
+                    _modal_option("Tuesday", "1"),
+                    _modal_option("Wednesday", "2"),
+                    _modal_option("Thursday", "3"),
+                    _modal_option("Friday", "4"),
+                    _modal_option("Saturday", "5"),
+                    _modal_option("Sunday", "6"),
+                ],
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_dependency",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Wait for agent"},
+            "element": {
+                "type": "static_select",
+                "action_id": "value",
+                "initial_option": _modal_option("No dependency", "none"),
+                "options": _roster_dependency_options(occupied_handles),
+            },
+            "hint": {
+                "type": "plain_text",
+                "text": "Optional: start after the selected agent's current task or session finishes.",
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_delay",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Delay after dependency"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "value",
+                "placeholder": {"type": "plain_text", "text": "seconds"},
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "roster_work_permissions",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Permissions"},
+            "element": {
+                "type": "checkboxes",
+                "action_id": "dangerous",
+                "options": [
+                    _modal_option(
+                        "Dangerous mode",
+                        "dangerous",
+                        "Bypass Codex sandbox/approvals or Claude permissions.",
+                    )
+                ],
+            },
+        },
+    ]
+    return {
+        "type": "modal",
+        "callback_id": "roster.work",
+        "private_metadata": json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+        "title": {"type": "plain_text", "text": "Roster work"},
+        "submit": {"type": "plain_text", "text": "Start"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": blocks,
+    }
+
+
+def _roster_dependency_options(occupied_handles: list[tuple[str, str]]) -> list[dict]:
+    options = [_modal_option("No dependency", "none")]
+    seen: set[str] = set()
+    for handle, task_id in occupied_handles:
+        if handle in seen:
+            continue
+        seen.add(handle)
+        options.append(
+            _modal_option(
+                f"@{handle}",
+                handle,
+                _format_agent_busy_dependency(task_id),
+            )
+        )
+        if len(options) >= 100:
+            break
+    return options
+
+
+def _modal_option(text: str, value: str, description: str | None = None) -> dict:
+    option: dict[str, object] = {
+        "text": {"type": "plain_text", "text": text[:75]},
+        "value": value[:75],
+    }
+    if description:
+        option["description"] = {"type": "plain_text", "text": description[:75]}
+    return option
+
+
+def _decode_roster_work_metadata(value) -> dict[str, str]:
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _required_future_timestamp(value: str) -> tuple[object | None, str | None]:
+    if not value.strip():
+        return None, "Enter a future ISO timestamp."
+    return _optional_future_timestamp(value)
+
+
+def _optional_future_timestamp(value: str) -> tuple[object | None, str | None]:
+    if not value.strip():
+        return None, None
+    parsed = parse_timestamp(value.strip())
+    if parsed is None:
+        return None, "Enter an ISO timestamp, for example 2026-05-16T17:00:00-05:00."
+    if parsed <= utc_now():
+        return None, "Choose a future time."
+    return parsed, None
+
+
+def _optional_delay_seconds(value: str | None) -> tuple[int | None, str | None]:
+    text = (value or "").strip()
+    if not text:
+        return None, None
+    try:
+        parsed = int(text)
+    except ValueError:
+        return None, "Enter a whole number of seconds."
+    if parsed < 0:
+        return None, "Delay must be zero or greater."
+    return parsed, None
+
+
+def _recurrence_from_roster_work_values(
+    values: dict,
+    timing: str,
+) -> tuple[dict[str, object] | None, tuple[str, str] | None]:
+    time_text = (_view_plain_value(values, "roster_work_time", "value") or "").strip()
+    if re.fullmatch(r"\d{2}:\d{2}", time_text) is None:
+        return None, ("roster_work_time", "Use HH:MM, for example 17:00.")
+    timezone = (_view_plain_value(values, "roster_work_timezone", "value") or "").strip()
+    if not timezone:
+        return None, ("roster_work_timezone", "Enter an IANA timezone.")
+    recurrence: dict[str, object] = {
+        "frequency": timing,
+        "time": time_text,
+        "timezone": timezone,
+    }
+    if timing == "weekly":
+        weekday_value = _view_selected_value(values, "roster_work_weekday", "value")
+        if weekday_value is None:
+            return None, ("roster_work_weekday", "Choose a weekday.")
+        try:
+            weekday = int(weekday_value)
+        except ValueError:
+            return None, ("roster_work_weekday", "Choose a weekday.")
+        if weekday < 0 or weekday > 6:
+            return None, ("roster_work_weekday", "Choose a weekday.")
+        recurrence["weekday"] = weekday
+    if next_run_after(recurrence, after=utc_now()) is None:
+        return None, ("roster_work_timezone", "Use a valid IANA timezone.")
+    return recurrence, None
 
 
 def _schedule_change_modal(

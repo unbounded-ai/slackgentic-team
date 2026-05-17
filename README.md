@@ -106,6 +106,11 @@ Slackgentic reacts right away, replies in your thread, launches the selected
 provider, and streams the visible result back. Thread replies continue from the
 same Slack context.
 
+The roster also has `Assign Work` and `Schedule Work` buttons. They open a
+Slack form for a task, work/review kind, timing, dangerous mode, repeat cadence,
+and an optional dependency on a currently busy agent finishing its active task or
+external session.
+
 In the main channel, write anything to hand it to an available agent. Use
 `@agentname ...` when you want a specific agent. Inside a task thread, reply
 with `somebody ...` to bring in another agent for a subtask; the original agent
@@ -153,6 +158,7 @@ Users can schedule future work directly from Slack too:
 schedule @riley to check CI tomorrow at 9am PT
 schedule somebody review the nightly report every day at 5pm ET
 schedule @riley inspect the deploy every Monday at 10:30am America/New_York
+schedule somebody check the deploy every 2 hours
 schedule @riley check the patio lights during tomorrow's sunset time in Waco
 ```
 
