@@ -1,15 +1,19 @@
 import random
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 from agent_harness.models import (
+    ASSIGNMENT_PROMPT_METADATA_KEY,
+    ROSTER_SUMMARY_METADATA_KEY,
     AgentTaskKind,
     AssignmentMode,
     Provider,
     TeamAgentStatus,
     WorkRequest,
 )
+from agent_harness.storage.store import Store
 from agent_harness.team import (
     AGENT_LIMIT_MESSAGE,
     AVATAR_IDENTITY_BANK,
@@ -25,6 +29,7 @@ from agent_harness.team import (
     least_represented_provider,
     pick_idle_agent,
 )
+from agent_harness.team.assignment import assign_work_request
 
 
 class TeamTests(unittest.TestCase):
@@ -126,6 +131,37 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(least_represented_provider(agents), Provider.CLAUDE)
         hired = hire_team_agents(agents, 1)
         self.assertEqual(hired[0].provider_preference, Provider.CLAUDE)
+
+    def test_assignment_seeds_roster_summary_from_assignment_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+
+                result = assign_work_request(
+                    store,
+                    WorkRequest(
+                        prompt="Which PR should I look at first",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    "C1",
+                    extra_metadata={
+                        ASSIGNMENT_PROMPT_METADATA_KEY: (
+                            "tell me what are my open PRs in talos repo"
+                        )
+                    },
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result.task.metadata[ROSTER_SUMMARY_METADATA_KEY],
+                    "tell me what are my open PRs in talos repo",
+                )
+            finally:
+                store.close()
 
     def test_randomized_hire_draws_unused_identity_from_bank(self):
         agents = build_initial_model_team(codex_count=2, claude_count=1)

@@ -675,6 +675,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(started_agent.agent_id, agent.agent_id)
                 self.assertEqual(task.prompt, "repair the deploy script")
                 self.assertTrue(task.metadata[DANGEROUS_MODE_METADATA_KEY])
+                self.assertEqual(
+                    task.metadata[ROSTER_SUMMARY_METADATA_KEY],
+                    "repair the deploy script",
+                )
                 self.assertEqual(thread.thread_ts, gateway.posts[0]["ts"])
                 self.assertIn("*:zap: Dangerous mode*", gateway.posts[0]["text"])
             finally:
