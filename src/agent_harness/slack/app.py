@@ -3632,7 +3632,7 @@ class SlackTeamController:
     ) -> bool:
         roster_summary = parse_agent_roster_status_signal(signal)
         if roster_summary is not None:
-            return self._update_task_roster_summary(task, thread, roster_summary)
+            return self._update_task_roster_summary(task, agent, thread, roster_summary)
         if signal == AGENT_THREAD_DONE_SIGNAL:
             return self._complete_task_thread(thread.channel_id, thread.thread_ts)
         if is_agent_timer_signal(signal):
@@ -3646,6 +3646,7 @@ class SlackTeamController:
     def _update_task_roster_summary(
         self,
         task: AgentTask,
+        agent,
         thread: SlackThreadRef,
         summary: str,
     ) -> bool:
@@ -3654,13 +3655,33 @@ class SlackTeamController:
             return False
         current = self.store.get_agent_task(task.task_id) or task
         metadata = dict(current.metadata)
-        if metadata.get(ROSTER_SUMMARY_METADATA_KEY) == summary:
-            return True
-        metadata[ROSTER_SUMMARY_METADATA_KEY] = summary
-        self.store.upsert_agent_task(replace(current, metadata=metadata, updated_at=utc_now()))
+        if metadata.get(ROSTER_SUMMARY_METADATA_KEY) != summary:
+            metadata[ROSTER_SUMMARY_METADATA_KEY] = summary
+            current = replace(current, metadata=metadata, updated_at=utc_now())
+            self.store.upsert_agent_task(current)
+        self._refresh_task_thread_header(current, agent)
         if thread.channel_id:
             self.refresh_or_post_roster(thread.channel_id)
         return True
+
+    def _refresh_task_thread_header(self, task: AgentTask, agent) -> None:
+        if not task.channel_id or not task.parent_message_ts:
+            return
+        include_actions = task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
+        try:
+            self.gateway.update_message(
+                task.channel_id,
+                task.parent_message_ts,
+                format_agent_assignment(
+                    agent,
+                    _task_roster_summary(task),
+                    task.requested_by_slack_user,
+                    dangerous_mode=_task_dangerous_mode(task),
+                ),
+                blocks=build_task_thread_blocks(task, agent, include_actions=include_actions),
+            )
+        except Exception:
+            LOGGER.debug("failed to refresh task thread header", exc_info=True)
 
     def _schedule_agent_timer(
         self,
@@ -4676,7 +4697,7 @@ class SlackTeamController:
                 task.parent_message_ts,
                 format_agent_assignment(
                     agent,
-                    _task_assignment_prompt(task),
+                    _task_roster_summary(task),
                     task.requested_by_slack_user,
                     dangerous_mode=_task_dangerous_mode(task),
                 ),
@@ -4699,7 +4720,7 @@ class SlackTeamController:
                 task.parent_message_ts,
                 format_agent_assignment(
                     agent,
-                    _task_assignment_prompt(task),
+                    _task_roster_summary(task),
                     task.requested_by_slack_user,
                     dangerous_mode=_task_dangerous_mode(task),
                 ),
