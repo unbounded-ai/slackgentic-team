@@ -36,6 +36,7 @@ SLACK_USER_AUTHOR_RE = re.compile(r"(?m)^(?P<user_id>[UW][A-Z0-9]{8,})(?=:)")
 class AgentRosterStatus:
     label: str
     detail: str | None = None
+    dangerous_mode: bool = False
     thread_url: str | None = None
     task_id: str | None = None
     session_provider: Provider | None = None
@@ -324,7 +325,10 @@ def _agent_status_text(status: AgentRosterStatus | None) -> str:
     parts = [status.label]
     if status.detail:
         parts.append(status.detail)
-    return ": ".join(parts)
+    lines = [": ".join(parts)]
+    if status.dangerous_mode:
+        lines.append("Mode: :zap: Dangerous")
+    return "\n".join(lines)
 
 
 def _provider_breakdown_text(agents: list[TeamAgent]) -> str:
@@ -463,9 +467,7 @@ def build_task_thread_blocks(
 ) -> list[dict[str, Any]]:
     task_label = "PR review" if task.kind.value == "review" else "task"
     dangerous_line = (
-        "*Dangerous mode:* enabled for this task.\n"
-        if task.metadata.get(DANGEROUS_MODE_METADATA_KEY)
-        else ""
+        "*:zap: Dangerous mode*\n" if task.metadata.get(DANGEROUS_MODE_METADATA_KEY) else ""
     )
     blocks = [
         {
