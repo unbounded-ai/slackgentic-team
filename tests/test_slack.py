@@ -134,6 +134,23 @@ class SlackTests(unittest.TestCase):
             "https://example.slack.com/archives/C1/p171000001",
         )
 
+    def test_roster_blocks_show_dangerous_mode_as_separate_field(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        blocks = build_team_roster_blocks(
+            [agent],
+            {
+                agent.agent_id: AgentRosterStatus(
+                    "Occupied",
+                    "Slack task: repair the installer",
+                    dangerous_mode=True,
+                )
+            },
+        )
+
+        rendered = str(blocks)
+        self.assertIn("Occupied: Slack task: repair the installer", rendered)
+        self.assertIn("Mode: :zap: Dangerous", rendered)
+
     def test_roster_action_block_has_unique_action_ids(self):
         blocks = build_team_roster_blocks(build_initial_model_team(codex_count=1, claude_count=1))
         action_block = next(block for block in blocks if block.get("type") == "actions")

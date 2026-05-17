@@ -21,6 +21,7 @@ from agent_harness.models import (
     SlackThreadRef,
 )
 from agent_harness.runtime.tasks import (
+    AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
     AGENT_THREAD_DONE_SIGNAL,
     MANAGED_RUN_MAX_RESUME_AGE,
     MANAGED_RUN_MAX_RESUMES,
@@ -43,6 +44,7 @@ from agent_harness.runtime.tasks import (
     _session_id_from_output,
     build_task_prompt,
     managed_run_resume_attempts,
+    parse_agent_roster_status_signal,
     should_resume_managed_run,
 )
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
@@ -447,6 +449,18 @@ class ScheduleSignalProcess(OneShotProcess):
         return ""
 
 
+class RosterStatusSignalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                '{"type":"item.completed","item":{"type":"agent_message",'
+                f'"text":"Still testing.\\n{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}'
+                'PR merge and daemon restart: running E2E."}}\n'
+            )
+        return ""
+
+
 class SilentProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         self.reads += 1
@@ -586,6 +600,8 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertIn("at least every 5 minutes", prompt)
         self.assertIn("Slack-visible progress update", prompt)
+        self.assertIn(AGENT_ROSTER_STATUS_SIGNAL_PREFIX, prompt)
+        self.assertIn("broader goal and current phase", prompt)
 
     def test_build_task_prompt_instructs_direct_question_handling(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
@@ -1269,6 +1285,18 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Wakeup scheduled.")
         self.assertEqual(signals, [f"{AGENT_TIMER_SIGNAL_PREFIX}10m | Re-check CI."])
+
+    def test_agent_roster_status_signal_is_stripped_from_visible_text(self):
+        signal = f"{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}PR merge and daemon restart: running E2E"
+
+        visible, signals = _extract_agent_control_signals(f"Still testing.\n{signal}\n")
+
+        self.assertEqual(visible, "Still testing.")
+        self.assertEqual(signals, [signal])
+        self.assertEqual(
+            parse_agent_roster_status_signal(signal),
+            "PR merge and daemon restart: running E2E",
+        )
 
     def test_agent_deferred_signal_is_stripped_from_visible_text(self):
         signal = f'{AGENT_DEFERRED_SIGNAL_PREFIX}{{"task":"follow up","depends_on":[]}}'
@@ -2858,6 +2886,47 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(gateway.replies, [])
                 self.assertEqual(len(seen_controls), 1)
                 self.assertTrue(seen_controls[0].startswith(AGENT_SCHEDULE_SIGNAL_PREFIX))
+            finally:
+                store.close()
+
+    def test_runtime_handles_roster_status_signal_immediately_without_deferring_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "ship the roster update", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=RosterStatusSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(signal) or True
+                    ),
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if done_callbacks:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Still testing."])
+                self.assertEqual(
+                    seen_controls,
+                    [
+                        f"{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}PR merge and daemon restart: running E2E."
+                    ],
+                )
+                self.assertEqual(done_callbacks, [task.task_id])
             finally:
                 store.close()
 

@@ -48,6 +48,7 @@ from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
 AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
+AGENT_ROSTER_STATUS_SIGNAL_PREFIX = "SLACKGENTIC: ROSTER "
 MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_MAX_RESUMES = 3
@@ -528,8 +529,17 @@ class ManagedTaskRuntime:
 
     def _post_agent_chunk(self, running: RunningTask, chunk: str) -> None:
         visible_text, control_signals = _extract_agent_control_signals(chunk)
-        running.control_signals.extend(control_signals)
-        if any(_is_schedule_control_signal(signal) for signal in control_signals):
+        hide_visible_text = False
+        deferred_signals: list[str] = []
+        for signal in control_signals:
+            if is_agent_roster_status_signal(signal):
+                self._handle_immediate_agent_control_signal(running, signal)
+            else:
+                deferred_signals.append(signal)
+                if _is_schedule_control_signal(signal):
+                    hide_visible_text = True
+        running.control_signals.extend(deferred_signals)
+        if hide_visible_text:
             visible_text = ""
         if not visible_text:
             return
@@ -560,6 +570,14 @@ class ManagedTaskRuntime:
             )
         except Exception:
             LOGGER.exception("failed to handle agent-authored Slack message")
+
+    def _handle_immediate_agent_control_signal(self, running: RunningTask, signal: str) -> None:
+        if self.on_agent_control is None:
+            return
+        try:
+            self.on_agent_control(running.task, running.agent, running.thread, signal)
+        except Exception:
+            LOGGER.exception("failed to handle immediate agent control signal")
 
     def _handle_agent_control_signals(self, running: RunningTask, task: AgentTask) -> bool:
         if self.on_agent_control is None:
@@ -986,6 +1004,13 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "5 minutes, and sooner for meaningful progress, blockers, or decisions."
         ),
         (
+            "When a progress update changes what the roster should say you are working on, "
+            "add a hidden roster line on its own line in the exact form "
+            f"`{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}<one-line summary>`. The summary should "
+            "name the broader goal and current phase, not just the latest tiny step. "
+            "Slackgentic hides that line and updates the roster."
+        ),
+        (
             "Direct Slack questions are not optional. If a Slack reply asks a question, "
             "answer it explicitly in Slack before continuing implementation work, opening "
             "a PR, or scheduling a delayed follow-up."
@@ -1188,6 +1213,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
         if normalized.startswith(AGENT_TIMER_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
+        if normalized.startswith(AGENT_ROSTER_STATUS_SIGNAL_PREFIX):
+            signals.append(line.strip())
+            continue
         if normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
@@ -1201,6 +1229,17 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
 def _is_schedule_control_signal(signal: str) -> bool:
     normalized = re.sub(r"\s+", " ", signal.strip()).upper()
     return normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX)
+
+
+def is_agent_roster_status_signal(signal: str) -> bool:
+    return re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_ROSTER_STATUS_SIGNAL_PREFIX)
+
+
+def parse_agent_roster_status_signal(signal: str) -> str | None:
+    if not is_agent_roster_status_signal(signal):
+        return None
+    summary = signal.strip()[len(AGENT_ROSTER_STATUS_SIGNAL_PREFIX) :].strip()
+    return summary or None
 
 
 def _process_output_chunks(

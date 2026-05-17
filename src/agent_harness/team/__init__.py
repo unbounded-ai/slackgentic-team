@@ -809,7 +809,7 @@ def format_agent_assignment(
     opener = _assignment_opener(agent)
     lines = [f"{opener}{requester_text}."]
     if dangerous_mode:
-        lines.append("*Dangerous mode:* enabled for this task.")
+        lines.append("*:zap: Dangerous mode*")
     lines.append(f"*Task:* {prompt.strip()}")
     return "\n\n".join(lines)
 
@@ -823,7 +823,7 @@ def format_agent_handoff_assignment(
 ) -> str:
     lines = [f"Got it, @{sender.handle}. I'll handle it."]
     if dangerous_mode:
-        lines.append("*Dangerous mode:* enabled for this task.")
+        lines.append("*:zap: Dangerous mode*")
     lines.append(f"*Task:* {prompt.strip()}")
     return "\n\n".join(lines)
 

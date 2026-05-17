@@ -29,6 +29,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    ROSTER_SUMMARY_METADATA_KEY,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
@@ -74,6 +75,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     managed_run_resume_attempts,
+    parse_agent_roster_status_signal,
     should_resume_managed_run,
 )
 from agent_harness.runtime.tasks import (
@@ -1101,10 +1103,10 @@ class SlackTeamController:
             if task is None:
                 continue
             label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Occupied"
-            detail_prefix = "Dangerous mode: " if _task_dangerous_mode(task) else ""
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
-                f"{detail_prefix}Slack task: {_shorten(task.prompt, 140)}",
+                f"Slack task: {_shorten(_task_roster_summary(task), 140)}",
+                dangerous_mode=_task_dangerous_mode(task),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
                 task_id=task.task_id,
             )
@@ -1116,10 +1118,11 @@ class SlackTeamController:
                 continue
             if agent.agent_id not in statuses:
                 continue
-            detail_prefix = "Dangerous mode: " if _task_dangerous_mode(task) else ""
+            task = self.store.get_agent_task(task.task_id) or task
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Occupied",
-                f"{detail_prefix}Slack task: {_shorten(task.prompt, 140)}",
+                f"Slack task: {_shorten(_task_roster_summary(task), 140)}",
+                dangerous_mode=_task_dangerous_mode(task),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,
             )
@@ -1161,6 +1164,7 @@ class SlackTeamController:
             statuses[agent_id] = AgentRosterStatus(
                 "Occupied",
                 ": ".join(detail_parts),
+                dangerous_mode=_external_session_dangerous_mode(session),
                 thread_url=self._external_session_permalink(session),
                 session_provider=session.provider,
                 session_id=session.session_id,
@@ -3626,6 +3630,9 @@ class SlackTeamController:
         thread: SlackThreadRef,
         signal: str,
     ) -> bool:
+        roster_summary = parse_agent_roster_status_signal(signal)
+        if roster_summary is not None:
+            return self._update_task_roster_summary(task, thread, roster_summary)
         if signal == AGENT_THREAD_DONE_SIGNAL:
             return self._complete_task_thread(thread.channel_id, thread.thread_ts)
         if is_agent_timer_signal(signal):
@@ -3635,6 +3642,25 @@ class SlackTeamController:
         if is_agent_deferred_signal(signal):
             return self._create_deferred_work_from_agent(task, agent, thread, signal)
         return False
+
+    def _update_task_roster_summary(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+        summary: str,
+    ) -> bool:
+        summary = _roster_summary_line(summary)
+        if not summary:
+            return False
+        current = self.store.get_agent_task(task.task_id) or task
+        metadata = dict(current.metadata)
+        if metadata.get(ROSTER_SUMMARY_METADATA_KEY) == summary:
+            return True
+        metadata[ROSTER_SUMMARY_METADATA_KEY] = summary
+        self.store.upsert_agent_task(replace(current, metadata=metadata, updated_at=utc_now()))
+        if thread.channel_id:
+            self.refresh_or_post_roster(thread.channel_id)
+        return True
 
     def _schedule_agent_timer(
         self,
@@ -5855,6 +5881,23 @@ def _history_message_event(
 
 def _task_dangerous_mode(task: AgentTask) -> bool:
     return bool(task.metadata.get(DANGEROUS_MODE_METADATA_KEY))
+
+
+def _task_roster_summary(task: AgentTask) -> str:
+    summary = task.metadata.get(ROSTER_SUMMARY_METADATA_KEY)
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    return _task_assignment_prompt(task)
+
+
+def _roster_summary_line(value: str) -> str:
+    return _shorten(value, 160)
+
+
+def _external_session_dangerous_mode(session) -> bool:
+    if str(session.permission_mode or "") == PermissionMode.DANGEROUS.value:
+        return True
+    return bool(session.metadata.get(DANGEROUS_MODE_METADATA_KEY))
 
 
 def _task_assignment_prompt(task: AgentTask) -> str:

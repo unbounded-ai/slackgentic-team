@@ -12,7 +12,9 @@ from agent_harness.deferred import (
     DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY,
 )
 from agent_harness.models import (
+    ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
     AgentTaskKind,
     AgentTaskStatus,
@@ -31,6 +33,7 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.runtime.tasks import (
+    AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
     AGENT_THREAD_DONE_SIGNAL,
     MANAGED_RUN_MAX_RESUME_AGE,
     MANAGED_RUN_MAX_RESUMES,
@@ -673,7 +676,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(task.prompt, "repair the deploy script")
                 self.assertTrue(task.metadata[DANGEROUS_MODE_METADATA_KEY])
                 self.assertEqual(thread.thread_ts, gateway.posts[0]["ts"])
-                self.assertIn("*Dangerous mode:* enabled", gateway.posts[0]["text"])
+                self.assertIn("*:zap: Dangerous mode*", gateway.posts[0]["text"])
             finally:
                 store.close()
 
@@ -1042,6 +1045,68 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_prefers_agent_roster_summary_over_latest_task_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "rerun tests", "C1"),
+                    metadata={
+                        ROSTER_SUMMARY_METADATA_KEY: (
+                            "Roster UX fix: validating E2E before PR merge"
+                        )
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn(
+                    "Queued: Slack task: Roster UX fix: validating E2E before PR merge",
+                    blocks,
+                )
+                self.assertNotIn("Slack task: rerun tests", blocks)
+            finally:
+                store.close()
+
+    def test_roster_falls_back_to_original_assignment_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "rerun tests", "C1"),
+                    metadata={
+                        ASSIGNMENT_PROMPT_METADATA_KEY: (
+                            "Improve roster summaries and dangerous-mode display"
+                        )
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn(
+                    ("Queued: Slack task: Improve roster summaries and dangerous-mode display"),
+                    blocks,
+                )
+                self.assertNotIn("Slack task: rerun tests", blocks)
+            finally:
+                store.close()
+
     def test_channel_task_assignment_refreshes_existing_roster_to_occupied(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1193,7 +1258,43 @@ class SlackAppTests(unittest.TestCase):
                 controller.post_roster("C1")
 
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Queued: Dangerous mode: Slack task: rewrite installer", blocks)
+                self.assertIn("Queued: Slack task: rewrite installer", blocks)
+                self.assertIn("Mode: :zap: Dangerous", blocks)
+            finally:
+                store.close()
+
+    def test_roster_status_signal_updates_active_task_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "small follow-up", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.000001"),
+                    f"{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}Roster UX fix: opening PR after E2E",
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertTrue(handled)
+                self.assertEqual(
+                    current.metadata[ROSTER_SUMMARY_METADATA_KEY],
+                    "Roster UX fix: opening PR after E2E",
+                )
+                self.assertIn(
+                    "Slack task: Roster UX fix: opening PR after E2E",
+                    str(gateway.updates[-1]["blocks"]),
+                )
             finally:
                 store.close()
 
@@ -3304,11 +3405,11 @@ class SlackAppTests(unittest.TestCase):
                 self.assertTrue(started_task.metadata[DANGEROUS_MODE_METADATA_KEY])
                 self.assertNotIn("#dangerous-mode", gateway.thread_replies[0]["text"])
                 self.assertIn(
-                    "*Dangerous mode:* enabled for this task.",
+                    "*:zap: Dangerous mode*",
                     gateway.thread_replies[0]["text"],
                 )
                 self.assertIn(
-                    "*Dangerous mode:* enabled for this task.",
+                    "*:zap: Dangerous mode*",
                     gateway.thread_replies[0]["blocks"][0]["text"]["text"],
                 )
             finally:
