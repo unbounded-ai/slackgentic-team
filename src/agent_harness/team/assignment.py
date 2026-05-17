@@ -7,6 +7,7 @@ from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
     PERMISSION_MODE_METADATA_KEY,
+    ROSTER_SUMMARY_METADATA_KEY,
     AgentTask,
     AssignmentMode,
     TeamAgent,
@@ -94,7 +95,13 @@ def assign_work_request(
         metadata["pr_url"] = request.pr_url
     if extra_metadata:
         metadata.update(extra_metadata)
-    metadata.setdefault(ASSIGNMENT_PROMPT_METADATA_KEY, request.prompt)
+    assignment_prompt = metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
+    if not isinstance(assignment_prompt, str) or not assignment_prompt.strip():
+        assignment_prompt = request.prompt
+        metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = assignment_prompt
+    roster_summary = metadata.get(ROSTER_SUMMARY_METADATA_KEY)
+    if not isinstance(roster_summary, str) or not roster_summary.strip():
+        metadata[ROSTER_SUMMARY_METADATA_KEY] = assignment_prompt
     if request.permission_mode != DEFAULT_PERMISSION_MODE:
         metadata[PERMISSION_MODE_METADATA_KEY] = request.permission_mode.value
     if request.dangerous_mode:
