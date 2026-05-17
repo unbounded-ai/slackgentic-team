@@ -107,8 +107,8 @@ class SlackTests(unittest.TestCase):
             [agent],
             {
                 agent.agent_id: AgentRosterStatus(
-                    "Occupied",
-                    "Slack task: do the thing",
+                    "Working",
+                    "do the thing",
                     thread_url="https://example.slack.com/archives/C1/p171000001",
                     task_id="task_1",
                 )
@@ -141,15 +141,16 @@ class SlackTests(unittest.TestCase):
             [agent],
             {
                 agent.agent_id: AgentRosterStatus(
-                    "Occupied",
-                    "Slack task: repair the installer",
+                    "Working",
+                    "repair the installer",
                     dangerous_mode=True,
                 )
             },
         )
 
         rendered = str(blocks)
-        self.assertIn("Occupied: Slack task: repair the installer", rendered)
+        self.assertIn("Working: repair the installer", rendered)
+        self.assertNotIn("Occupied: Slack task:", rendered)
         self.assertIn("Mode: :zap: Dangerous", rendered)
 
     def test_roster_action_block_has_unique_action_ids(self):
