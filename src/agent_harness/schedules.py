@@ -117,6 +117,9 @@ def build_schedule_resolution_prompt(
         "",
         "Emit exactly one hidden control line on its own final line:",
         f"{AGENT_SCHEDULE_SIGNAL_PREFIX}<json>",
+        "For successful schedules, emit no Slack-visible prose; Slackgentic will post the "
+        "confirmation after validating the control line. If clarification is needed, ask one "
+        "concise Slack-visible question and do not emit a control line.",
         "",
         "The JSON object must have this shape:",
         json.dumps(
@@ -174,9 +177,7 @@ def build_schedule_resolution_prompt(
         "0=Monday through 6=Sunday. Interval recurring schedules must set frequency to interval "
         "and include interval_seconds. For an interval schedule without a separate start time, "
         "set next_run_at to one interval after the current UTC time. The target must be either "
-        "somebody/anyone or one of the active handles listed above. If the request is ambiguous "
-        "enough that no schedule can be created, ask one concise Slack-visible clarification "
-        "question and do not emit a control line.",
+        "somebody/anyone or one of the active handles listed above.",
     ]
     if validation_error:
         lines.extend(

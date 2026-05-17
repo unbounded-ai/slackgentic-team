@@ -993,7 +993,7 @@ class SlackTeamController:
             return True
         posted = self.gateway.post_thread_reply(
             thread,
-            (f"@{result.agent.handle} is creating this schedule: `{_shorten(schedule_text, 180)}`"),
+            f"@{result.agent.handle} scheduling.",
             persona=result.agent,
             icon_url=self._agent_icon_url(result.agent),
         )
@@ -5891,9 +5891,8 @@ def _format_scheduled_work_ack(
     if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
         target = f"@{request.requested_handle}"
     return (
-        f"Scheduled `{scheduled.schedule_id}`: {target} will run "
-        f"`{request.prompt}` {description}. "
-        f"Next run: `{_format_schedule_timestamp(scheduled.next_run_at)}`."
+        f"Scheduled: {target} `{_shorten(request.prompt, 120)}`; {description}; "
+        f"next `{_format_schedule_timestamp(scheduled.next_run_at)}`."
     )
 
 

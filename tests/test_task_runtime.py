@@ -45,6 +45,7 @@ from agent_harness.runtime.tasks import (
     managed_run_resume_attempts,
     should_resume_managed_run,
 )
+from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import SLACKGENTIC_MCP_PERMISSION_ALLOW
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
@@ -418,6 +419,30 @@ class TimerSignalProcess(OneShotProcess):
                 '{"type":"item.completed","item":{"type":"agent_message",'
                 f'"text":"Wakeup scheduled.\\n{AGENT_TIMER_SIGNAL_PREFIX}'
                 '2s | Re-check the PR feedback."}}\n'
+            )
+        return ""
+
+
+class ScheduleSignalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            signal = (
+                f"{AGENT_SCHEDULE_SIGNAL_PREFIX}"
+                '{"task":"check CI","target":"somebody","schedule":{"kind":"one_off",'
+                '"run_at":"2026-05-16T01:20:00Z"}}'
+            )
+            return (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": f"Schedule created.\n{signal}",
+                        },
+                    }
+                )
+                + "\n"
             )
         return ""
 
@@ -2799,6 +2824,40 @@ class TaskRuntimeTests(unittest.TestCase):
                     seen_controls,
                     [f"{AGENT_TIMER_SIGNAL_PREFIX}2s | Re-check the PR feedback."],
                 )
+            finally:
+                store.close()
+
+    def test_runtime_hides_schedule_success_text_and_notifies_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "schedule work", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ScheduleSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(signal) or True
+                    ),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if seen_controls:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(len(seen_controls), 1)
+                self.assertTrue(seen_controls[0].startswith(AGENT_SCHEDULE_SIGNAL_PREFIX))
             finally:
                 store.close()
 

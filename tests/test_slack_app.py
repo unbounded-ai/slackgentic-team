@@ -703,8 +703,9 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(scheduled[0].requested_handle, agent.handle)
                 self.assertEqual(scheduled[0].schedule_kind, ScheduledWorkKind.RECURRING)
                 self.assertEqual(scheduled[0].recurrence["frequency"], "daily")
-                self.assertIn("Scheduled `schedule_", gateway.updates[-1]["text"])
+                self.assertIn(f"Scheduled: @{agent.handle} `check CI`", gateway.updates[-1]["text"])
                 self.assertIn("daily at 17:00 America/Chicago", gateway.updates[-1]["text"])
+                self.assertNotIn("schedule_", gateway.updates[-1]["text"])
             finally:
                 store.close()
 
@@ -7127,7 +7128,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn(AGENT_SCHEDULE_SIGNAL_PREFIX, task.prompt)
                 self.assertIn("schedule @avery to check CI every day at 5pm ET", task.prompt)
                 self.assertTrue(task.metadata[SCHEDULE_RESOLUTION_METADATA_KEY])
-                self.assertIn("is creating this schedule", gateway.thread_replies[-1]["text"])
+                self.assertEqual(gateway.thread_replies[-1]["text"], f"@{agent.handle} scheduling.")
                 self.assertIn(("C1", "171.schedule", "eyes"), gateway.reactions)
                 self.assertIn(("C1", "171.schedule", "hourglass_flowing_sand"), gateway.reactions)
             finally:
@@ -7176,8 +7177,80 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(rows[0]["requested_handle"], agent.handle)
                 self.assertEqual(rows[0]["schedule_kind"], "one_off")
                 self.assertEqual(rows[0]["status"], "pending")
-                self.assertIn("tomorrow at sunset in Waco", gateway.thread_replies[-1]["text"])
+                self.assertIn(
+                    f"Scheduled: @{agent.handle} `check the patio lights`; "
+                    "tomorrow at sunset in Waco",
+                    gateway.thread_replies[-1]["text"],
+                )
+                self.assertIn("next `", gateway.thread_replies[-1]["text"])
+                self.assertNotIn("schedule_", gateway.thread_replies[-1]["text"])
                 self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+            finally:
+                store.close()
+
+    def test_user_schedule_request_e2e_posts_concise_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "schedule @avery to check CI tomorrow at 9am UTC",
+                            "ts": "171.schedule",
+                        }
+                    }
+                )
+
+                task, started_agent, thread = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                self.assertEqual(gateway.thread_replies[-1]["text"], f"@{agent.handle} scheduling.")
+
+                run_at = utc_now() + timedelta(hours=1)
+                payload = {
+                    "task": "check CI",
+                    "target": agent.handle,
+                    "schedule": {
+                        "kind": "one_off",
+                        "run_at": run_at.isoformat(),
+                        "timezone": "UTC",
+                        "description": "tomorrow at 9am UTC",
+                    },
+                }
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    thread,
+                    f"{AGENT_SCHEDULE_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+
+                self.assertTrue(handled)
+                rows = store.conn.execute("SELECT * FROM scheduled_work_requests").fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["prompt"], "check CI")
+                self.assertEqual(rows[0]["requested_handle"], agent.handle)
+                self.assertEqual(
+                    gateway.thread_replies[-1]["text"],
+                    (
+                        f"Scheduled: @{agent.handle} `check CI`; tomorrow at 9am UTC; "
+                        f"next `{run_at.isoformat(timespec='minutes')}`."
+                    ),
+                )
             finally:
                 store.close()
 
