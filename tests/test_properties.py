@@ -293,7 +293,12 @@ class PropertyTests(unittest.TestCase):
             if str(block.get("block_id", "")).startswith("team.agent.actions.")
         ]
         self.assertEqual(len(action_blocks), count)
-        for kind, block in zip(kinds, action_blocks, strict=True):
+        action_blocks_by_agent_id = {
+            str(block["block_id"]).removeprefix("team.agent.actions."): block
+            for block in action_blocks
+        }
+        for agent, kind in zip(agents, kinds, strict=True):
+            block = action_blocks_by_agent_id[agent.agent_id]
             labels = [element["text"]["text"] for element in block["elements"]]
             if kind in {"task", "external"}:
                 self.assertEqual(labels, ["Free up", "Open thread", "Fire"])

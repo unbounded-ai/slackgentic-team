@@ -153,6 +153,36 @@ class SlackTests(unittest.TestCase):
         self.assertNotIn("Occupied: Slack task:", rendered)
         self.assertIn("Mode: :zap: Dangerous", rendered)
 
+    def test_roster_blocks_sort_occupied_then_provider_then_name(self):
+        agents = build_initial_model_team(codex_count=2, claude_count=2)
+        shuffled = [agents[3], agents[2], agents[1], agents[0]]
+
+        blocks = build_team_roster_blocks(
+            shuffled,
+            {agent.agent_id: AgentRosterStatus("Available") for agent in agents}
+            | {
+                agents[1].agent_id: AgentRosterStatus("Working", "codex work"),
+                agents[2].agent_id: AgentRosterStatus("Working", "claude work"),
+            },
+        )
+
+        roster_section_ids = [
+            block["block_id"]
+            for block in blocks
+            if str(block.get("block_id", "")).startswith("team.agent.")
+            and not str(block.get("block_id", "")).startswith("team.agent.actions.")
+        ]
+
+        self.assertEqual(
+            roster_section_ids,
+            [
+                f"team.agent.{agents[1].agent_id}",
+                f"team.agent.{agents[2].agent_id}",
+                f"team.agent.{agents[0].agent_id}",
+                f"team.agent.{agents[3].agent_id}",
+            ],
+        )
+
     def test_roster_action_block_has_unique_action_ids(self):
         blocks = build_team_roster_blocks(build_initial_model_team(codex_count=1, claude_count=1))
         action_block = next(block for block in blocks if block.get("type") == "actions")
