@@ -91,6 +91,7 @@ class RunningTask:
     missing_resume_session: bool = False
     observed_agent_messages: set[str] | None = None
     control_signals: list[str] = field(default_factory=list)
+    terminal_control_signal_handled: bool = False
     visible_message_count: int = 0
     started_monotonic: float = field(default_factory=time.monotonic)
     stop_requested: bool = False
@@ -386,6 +387,9 @@ class ManagedTaskRuntime:
                 )
             for chunk in chunks:
                 self._post_agent_chunk(running, chunk)
+            if running.stop_requested:
+                self._remove_running_task(task_id, running)
+                return
             if self._codex_thread_start_timed_out(running):
                 self._handle_codex_thread_start_timeout(running)
                 return
@@ -421,7 +425,11 @@ class ManagedTaskRuntime:
                 recovered_message = self._recover_unseen_visible_message(completed_task, running)
                 if recovered_message:
                     self._post_agent_chunk(running, recovered_message)
-                if running.visible_message_count == 0 and not running.control_signals:
+                if (
+                    running.visible_message_count == 0
+                    and not running.control_signals
+                    and not running.terminal_control_signal_handled
+                ):
                     self.gateway.post_thread_reply(
                         running.thread,
                         (
@@ -436,6 +444,8 @@ class ManagedTaskRuntime:
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
                 completed_task = self._clear_managed_run_started(task_id) or completed_task
+                if running.terminal_control_signal_handled:
+                    return
                 if self._handle_agent_control_signals(running, completed_task):
                     return
                 if self.on_task_done:
@@ -534,6 +544,11 @@ class ManagedTaskRuntime:
         for signal in control_signals:
             if is_agent_roster_status_signal(signal):
                 self._handle_immediate_agent_control_signal(running, signal)
+            elif signal == AGENT_THREAD_DONE_SIGNAL:
+                if self._handle_immediate_agent_control_signal(running, signal):
+                    running.terminal_control_signal_handled = True
+                else:
+                    deferred_signals.append(signal)
             else:
                 deferred_signals.append(signal)
                 if _is_schedule_control_signal(signal):
@@ -571,13 +586,14 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.exception("failed to handle agent-authored Slack message")
 
-    def _handle_immediate_agent_control_signal(self, running: RunningTask, signal: str) -> None:
+    def _handle_immediate_agent_control_signal(self, running: RunningTask, signal: str) -> bool:
         if self.on_agent_control is None:
-            return
+            return False
         try:
-            self.on_agent_control(running.task, running.agent, running.thread, signal)
+            return bool(self.on_agent_control(running.task, running.agent, running.thread, signal))
         except Exception:
             LOGGER.exception("failed to handle immediate agent control signal")
+            return False
 
     def _handle_agent_control_signals(self, running: RunningTask, task: AgentTask) -> bool:
         if self.on_agent_control is None:
