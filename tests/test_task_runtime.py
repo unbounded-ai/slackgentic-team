@@ -631,6 +631,17 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("create_pull_request", prompt)
         self.assertIn("MCP tool", prompt)
 
+    def test_build_task_prompt_instructs_dangerous_mode_no_approval_requests(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "merge and deploy", "C1")
+        task = _with_permission_mode(task, PermissionMode.DANGEROUS)
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("Dangerous mode is enabled", prompt)
+        self.assertIn("Do not request Slack approval or host-tool escalation", prompt)
+        self.assertIn("no-approval permissions", prompt)
+
     def test_build_task_prompt_instructs_thread_done_signal(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         task = create_agent_task(agent, "work carefully", "C1")

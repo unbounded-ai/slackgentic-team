@@ -1067,9 +1067,20 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "creation workflow through Slackgentic so PR creation still works when "
             "ordinary shell networking or sandbox policy gets in the way."
         ),
-        f"Task kind: {task.kind.value}",
-        f"Task: {task.prompt}",
     ]
+    if _task_dangerous_mode(task):
+        lines.append(
+            "Dangerous mode is enabled for this task. Do not request Slack approval or "
+            "host-tool escalation for command, file, network, or sandbox access; this "
+            "run is already launched with no-approval permissions. Only ask Slack when "
+            "you need an actual user decision."
+        )
+    lines.extend(
+        [
+            f"Task kind: {task.kind.value}",
+            f"Task: {task.prompt}",
+        ]
+    )
     pr_url = task.metadata.get("pr_url")
     if pr_url:
         lines.append(f"Pull request URL: {pr_url}")

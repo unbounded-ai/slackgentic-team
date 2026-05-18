@@ -238,6 +238,7 @@ class ExternalSessionBridge:
         url = self.codex_app_server_url
         if not url or url.lower() == "off":
             return False
+        dangerous = self._codex_session_uses_dangerous_mode(session)
         if self.codex_live_client is not None:
             client = self.codex_live_client
         else:
@@ -245,6 +246,14 @@ class ExternalSessionBridge:
             if thread is not None:
 
                 def server_request_handler(request):
+                    if dangerous:
+                        response = _codex_dangerous_server_request_response(request)
+                        if response is not None:
+                            LOGGER.info(
+                                "auto-approved Codex app-server request in dangerous mode: %s",
+                                request.get("method"),
+                            )
+                            return response
                     return self.agent_request_handler.handle_server_request(
                         request,
                         thread,
@@ -255,7 +264,7 @@ class ExternalSessionBridge:
         approval_policy = None
         sandbox = None
         sandbox_policy = None
-        if self._codex_session_uses_dangerous_mode(session):
+        if dangerous:
             approval_policy = "never"
             sandbox = "danger-full-access"
             sandbox_policy = {"type": "dangerFullAccess"}
@@ -561,6 +570,20 @@ def _codex_session_uses_dangerous_mode(
         and _codex_command_uses_dangerous_mode(target.command)
         for target in targets
     )
+
+
+def _codex_dangerous_server_request_response(request: dict[str, object]) -> object | None:
+    method = str(request.get("method") or "")
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+        return {"decision": "acceptForSession"}
+    if method in {"execCommandApproval", "applyPatchApproval"}:
+        return {"decision": "approved_for_session"}
+    if method == "item/permissions/requestApproval":
+        return {"permissions": params.get("permissions") or {}, "scope": "session"}
+    return None
 
 
 def _codex_command_uses_dangerous_mode(command: str) -> bool:

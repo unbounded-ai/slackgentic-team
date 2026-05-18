@@ -5,9 +5,16 @@ import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
-from agent_harness.models import AgentSession, Provider, SessionStatus, SlackThreadRef
+from agent_harness.models import (
+    AgentSession,
+    PermissionMode,
+    Provider,
+    SessionStatus,
+    SlackThreadRef,
+)
 from agent_harness.sessions.bridge import (
     ExternalSessionBridge,
     _codex_remote_enabled,
@@ -1167,6 +1174,87 @@ class SessionBridgeTests(unittest.TestCase):
                         }
                     ],
                 )
+            finally:
+                store.close()
+
+    def test_dangerous_codex_app_server_approval_requests_auto_allow(self):
+        responses = []
+
+        class RequestingCodexClient:
+            def __init__(self, url, server_request_handler=None):
+                self.server_request_handler = server_request_handler
+
+            def send_to_thread(
+                self,
+                thread_id,
+                text,
+                cwd=None,
+                *,
+                approval_policy=None,
+                sandbox=None,
+                sandbox_policy=None,
+            ):
+                responses.append(
+                    self.server_request_handler(
+                        {
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {"command": "gh pr checks 60"},
+                        }
+                    )
+                )
+                responses.append(
+                    self.server_request_handler(
+                        {
+                            "method": "item/permissions/requestApproval",
+                            "params": {"permissions": {"network": {"enabled": True}}},
+                        }
+                    )
+                )
+                return True
+
+        class FailingAgentRequestHandler:
+            def handle_server_request(self, request, thread, *, provider_label=None):
+                raise AssertionError("dangerous Codex approval should not reach Slack")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    agent_request_handler=FailingAgentRequestHandler(),
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    permission_mode=PermissionMode.DANGEROUS.value,
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient",
+                    RequestingCodexClient,
+                ):
+                    handled = bridge._send_to_codex_app_server(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                self.assertEqual(
+                    responses,
+                    [
+                        {"decision": "acceptForSession"},
+                        {"permissions": {"network": {"enabled": True}}, "scope": "session"},
+                    ],
+                )
+                self.assertEqual(gateway.replies, [])
             finally:
                 store.close()
 
