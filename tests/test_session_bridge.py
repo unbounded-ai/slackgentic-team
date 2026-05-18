@@ -1406,6 +1406,8 @@ class SessionBridgeTests(unittest.TestCase):
                 self.assertTrue(handled)
                 self.assertTrue(ran.wait(timeout=1))
                 self.assertIn("--dangerously-bypass-approvals-and-sandbox", calls[0])
+                self.assertIn('sandbox_mode="danger-full-access"', calls[0])
+                self.assertIn('approval_policy="never"', calls[0])
             finally:
                 store.close()
 

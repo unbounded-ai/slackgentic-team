@@ -75,6 +75,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("never", args)
         self.assertNotIn("--ephemeral", args)
         self.assertIn('projects."/tmp/repo".trust_level="trusted"', args)
+        self.assertIn('sandbox_mode="danger-full-access"', args)
+        self.assertIn('approval_policy="never"', args)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", args)
         self.assertEqual(args[-3:], ["-C", "/tmp/repo", "-"])
         self.assertNotIn("fix it", args)
@@ -310,7 +312,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('sandbox_mode="read-only"', args)
         self.assertNotIn("--sandbox", args)
 
-    def test_codex_resume_command_omits_sandbox_when_dangerous(self):
+    def test_codex_resume_command_forces_dangerous_policy(self):
         command, args = build_command(
             LaunchRequest(
                 provider=Provider.CODEX,
@@ -323,7 +325,8 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(command, "codex")
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", args)
-        self.assertFalse(any(arg.startswith("sandbox_mode=") for arg in args))
+        self.assertIn('sandbox_mode="danger-full-access"', args)
+        self.assertIn('approval_policy="never"', args)
 
     def test_claude_resume_command_uses_existing_session(self):
         command, args = build_command(
