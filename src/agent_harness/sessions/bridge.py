@@ -31,6 +31,10 @@ from agent_harness.runtime.codex_app_server import (
 from agent_harness.runtime.runner import _codex_dangerous_overrides, _codex_trust_override
 from agent_harness.runtime.tasks import _process_output_chunks
 from agent_harness.sessions.claude_channel import claude_session_has_slackgentic_mcp
+from agent_harness.sessions.managed_session import (
+    clear_managed_session,
+    managed_session_is_dangerous,
+)
 from agent_harness.sessions.terminal import SessionTerminalNotifier, TerminalTarget
 from agent_harness.slack import dangerous_flag
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
@@ -290,9 +294,9 @@ class ExternalSessionBridge:
         ):
             return True
         task = self.store.get_active_task_by_session(session.provider, session.session_id)
-        if task is None:
-            return False
-        return task.metadata.get(DANGEROUS_MODE_METADATA_KEY) is True
+        if task is not None and task.metadata.get(DANGEROUS_MODE_METADATA_KEY) is True:
+            return True
+        return managed_session_is_dangerous(self.store, session.provider, session.session_id)
 
     def _send_to_claude_channel(
         self,
@@ -376,6 +380,7 @@ class ExternalSessionBridge:
             session.session_id,
             channel_id=thread.channel_id,
         )
+        clear_managed_session(self.store, session.provider, session.session_id)
         self.store.set_setting(
             f"external_session_ignored.{session.provider.value}.{session.session_id}",
             utc_now().isoformat(),
