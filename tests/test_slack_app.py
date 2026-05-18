@@ -1050,6 +1050,90 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_keeps_agent_busy_when_managed_session_outlives_task(self):
+        from agent_harness.sessions.managed_session import record_managed_session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(1, 0)
+                store.upsert_team_agent(agents[0])
+                # Simulate: a managed task was launched in dangerous mode, the
+                # session was recorded, then the task got orphan-cancelled but
+                # the codex session is still alive.
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-orphan",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    started_at=utc_now(),
+                    last_seen_at=utc_now(),
+                    status=SessionStatus.IDLE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                store.upsert_session(session)
+                record_managed_session(
+                    store,
+                    Provider.CODEX,
+                    "codex-orphan",
+                    agents[0].agent_id,
+                    dangerous_mode=True,
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("session not yet released", blocks)
+            finally:
+                store.close()
+
+    def test_roster_clears_managed_session_after_task_done(self):
+        from agent_harness.sessions.managed_session import (
+            managed_session_agent_key,
+            record_managed_session,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(1, 0)
+                store.upsert_team_agent(agents[0])
+                task = create_agent_task(agents[0], "ship it", "C1")
+                task = replace(
+                    task,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-finished",
+                )
+                store.upsert_agent_task(task)
+                record_managed_session(
+                    store,
+                    Provider.CODEX,
+                    "codex-finished",
+                    agents[0].agent_id,
+                    dangerous_mode=True,
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agents[0],
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                self.assertIsNone(
+                    store.get_setting(
+                        managed_session_agent_key(Provider.CODEX, "codex-finished")
+                    )
+                )
+            finally:
+                store.close()
+
     def test_roster_prefers_agent_roster_summary_over_latest_task_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

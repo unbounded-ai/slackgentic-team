@@ -2039,6 +2039,52 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_records_managed_session_on_capture(self):
+        from agent_harness.sessions.managed_session import (
+            managed_session_agent_key,
+            managed_session_dangerous_key,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "remember this", "C1")
+                task = replace(task, metadata={DANGEROUS_MODE_METADATA_KEY: True})
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=SessionIdProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if store.get_setting(
+                        managed_session_agent_key(Provider.CODEX, "codex-thread-1")
+                    ):
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(
+                    store.get_setting(
+                        managed_session_agent_key(Provider.CODEX, "codex-thread-1")
+                    ),
+                    agent.agent_id,
+                )
+                self.assertEqual(
+                    store.get_setting(
+                        managed_session_dangerous_key(Provider.CODEX, "codex-thread-1")
+                    ),
+                    "1",
+                )
+            finally:
+                store.close()
+
     def test_runtime_ignores_claude_permission_denials_in_dangerous_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

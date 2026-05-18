@@ -1258,6 +1258,88 @@ class SessionBridgeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_managed_session_dangerous_flag_triggers_auto_approval(self):
+        from agent_harness.sessions.managed_session import record_managed_session
+
+        responses = []
+
+        class RequestingCodexClient:
+            def __init__(self, url, server_request_handler=None):
+                self.server_request_handler = server_request_handler
+
+            def send_to_thread(
+                self,
+                thread_id,
+                text,
+                cwd=None,
+                *,
+                approval_policy=None,
+                sandbox=None,
+                sandbox_policy=None,
+            ):
+                responses.append(approval_policy)
+                responses.append(
+                    self.server_request_handler(
+                        {
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {"command": "git add ."},
+                        }
+                    )
+                )
+                return True
+
+        class FailingAgentRequestHandler:
+            def handle_server_request(self, request, thread, *, provider_label=None):
+                raise AssertionError(
+                    "dangerous managed Codex approval should not reach Slack"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                record_managed_session(
+                    store,
+                    Provider.CODEX,
+                    "codex-managed",
+                    "agent-eli",
+                    dangerous_mode=True,
+                )
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    agent_request_handler=FailingAgentRequestHandler(),
+                )
+                # Session metadata has no dangerous_mode flag, but the managed
+                # session setting should still drive the bridge into dangerous
+                # mode so codex approvals never reach Slack.
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-managed",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient",
+                    RequestingCodexClient,
+                ):
+                    handled = bridge._send_to_codex_app_server(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0], "never")
+                self.assertEqual(responses[1], {"decision": "acceptForSession"})
+                self.assertEqual(gateway.replies, [])
+            finally:
+                store.close()
+
     def test_codex_slash_text_uses_regular_app_server_send(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

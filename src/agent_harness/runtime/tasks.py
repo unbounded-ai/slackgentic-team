@@ -39,6 +39,7 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     is_slackgentic_mcp_server_configured,
 )
+from agent_harness.sessions.managed_session import record_managed_session
 from agent_harness.slack import replace_slack_user_ids
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
@@ -212,6 +213,14 @@ class ManagedTaskRuntime:
         task = self._mark_managed_run_started(task)
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
         self.store.update_agent_task_session(task.task_id, provider, task.session_id)
+        if task.session_id:
+            record_managed_session(
+                self.store,
+                provider,
+                task.session_id,
+                agent.agent_id,
+                dangerous_mode=mode == PermissionMode.DANGEROUS,
+            )
         self.store.upsert_managed_thread_task(task, thread)
         worker = threading.Thread(
             target=self._stream_task,
@@ -667,6 +676,13 @@ class ManagedTaskRuntime:
             return
         provider = _provider_for_running(running)
         self.store.update_agent_task_session(running.task.task_id, provider, session_id)
+        record_managed_session(
+            self.store,
+            provider,
+            session_id,
+            running.agent.agent_id,
+            dangerous_mode=running.process.request.dangerous,
+        )
         running.task = replace(
             running.task,
             session_provider=provider,
