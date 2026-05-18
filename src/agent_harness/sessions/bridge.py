@@ -27,7 +27,7 @@ from agent_harness.models import (
 from agent_harness.runtime.codex_app_server import (
     CodexAppServerClient,
 )
-from agent_harness.runtime.runner import _codex_trust_override
+from agent_harness.runtime.runner import _codex_dangerous_overrides, _codex_trust_override
 from agent_harness.runtime.tasks import _process_output_chunks
 from agent_harness.sessions.claude_channel import claude_session_has_slackgentic_mcp
 from agent_harness.sessions.terminal import SessionTerminalNotifier, TerminalTarget
@@ -523,6 +523,7 @@ def _resume_command(
         if cwd:
             args.extend(["-c", _codex_trust_override(cwd)])
         if commands.dangerous_by_default or dangerous:
+            args.extend(_codex_dangerous_overrides())
             args.append(dangerous_flag(Provider.CODEX))
         args.extend([session.session_id, prompt])
         return args

@@ -53,6 +53,7 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
         args.extend(["-c", _codex_trust_override(request.cwd)])
         extra_roots = _safe_auto_extra_roots(request)
         if mode == PermissionMode.DANGEROUS:
+            args.extend(_codex_dangerous_overrides())
             args.append(dangerous_flag(Provider.CODEX))
         else:
             sandbox = codex_sandbox_for(mode)
@@ -115,6 +116,15 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
 
 def _codex_trust_override(cwd: Path) -> str:
     return f"projects.{json.dumps(str(cwd))}.trust_level={json.dumps('trusted')}"
+
+
+def _codex_dangerous_overrides() -> list[str]:
+    return [
+        "-c",
+        f"sandbox_mode={json.dumps('danger-full-access')}",
+        "-c",
+        f"approval_policy={json.dumps('never')}",
+    ]
 
 
 def _safe_auto_extra_roots(request: LaunchRequest) -> tuple[Path, ...]:
