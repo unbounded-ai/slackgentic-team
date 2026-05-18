@@ -45,6 +45,12 @@ class AgentRosterStatus:
     session_id: str | None = None
 
 
+PROVIDER_SORT_ORDER = {
+    Provider.CODEX: 0,
+    Provider.CLAUDE: 1,
+}
+
+
 def build_setup_modal(
     callback_id: str = "setup.initial",
     default_repo_root: str | Path | None = None,
@@ -241,7 +247,7 @@ def build_team_roster_blocks(
             ],
         },
     ]
-    for agent in agents:
+    for agent in _sorted_roster_agents(agents, statuses):
         status = statuses.get(agent.agent_id) if statuses else None
         status_text = _agent_status_text(status)
         elements = []
@@ -315,6 +321,24 @@ def build_team_roster_blocks(
             }
         )
     return blocks
+
+
+def _sorted_roster_agents(
+    agents: list[TeamAgent],
+    statuses: dict[str, AgentRosterStatus] | None,
+) -> list[TeamAgent]:
+    def sort_key(agent: TeamAgent) -> tuple[int, int, str, str]:
+        status = statuses.get(agent.agent_id) if statuses else None
+        availability_rank = 1 if _agent_accepts_new_work(status) else 0
+        provider_rank = PROVIDER_SORT_ORDER.get(agent.provider_preference, len(PROVIDER_SORT_ORDER))
+        return (
+            availability_rank,
+            provider_rank,
+            agent.full_name.casefold(),
+            agent.handle.casefold(),
+        )
+
+    return sorted(agents, key=sort_key)
 
 
 def _agent_accepts_new_work(status: AgentRosterStatus | None) -> bool:
