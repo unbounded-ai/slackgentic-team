@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
@@ -411,6 +412,23 @@ class ThreadDoneSignalProcess(OneShotProcess):
                 "}}\n"
             )
         return ""
+
+
+class LiveThreadDoneSignalProcess(ThreadDoneSignalProcess):
+    instances: ClassVar[list] = []
+
+    def __init__(self, request):
+        super().__init__(request)
+        self.alive = True
+        self.terminated = False
+        self.__class__.instances.append(self)
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminated = True
+        self.alive = False
 
 
 class TimerSignalProcess(OneShotProcess):
@@ -2828,6 +2846,56 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(done_callbacks, [])
             finally:
+                store.close()
+
+    def test_runtime_handles_thread_done_signal_before_live_process_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            runtime = None
+            LiveThreadDoneSignalProcess.instances = []
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "close the thread", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                done_callbacks = []
+
+                def handle_control(task, agent, thread, signal):
+                    seen_controls.append((task.task_id, agent.agent_id, thread.thread_ts, signal))
+                    assert runtime is not None
+                    runtime.stop_task(task.task_id, AgentTaskStatus.DONE)
+                    return True
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=LiveThreadDoneSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=handle_control,
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if seen_controls and not runtime.has_running_tasks():
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Sounds good."])
+                self.assertEqual(
+                    seen_controls,
+                    [(task.task_id, agent.agent_id, "171.000001", AGENT_THREAD_DONE_SIGNAL)],
+                )
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertEqual(done_callbacks, [])
+                self.assertTrue(LiveThreadDoneSignalProcess.instances[0].terminated)
+            finally:
+                if runtime is not None:
+                    runtime.stop_all_running_tasks()
                 store.close()
 
     def test_runtime_hides_agent_timer_signal_and_notifies_callback(self):
