@@ -40,7 +40,7 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     is_slackgentic_mcp_server_configured,
 )
-from agent_harness.sessions.managed_session import record_managed_session
+from agent_harness.sessions.managed_session import clear_managed_session, record_managed_session
 from agent_harness.slack import replace_slack_user_ids
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
@@ -275,6 +275,7 @@ class ManagedTaskRuntime:
         if running is None:
             if status is not None:
                 self._clear_managed_run_started(task_id)
+                self._clear_managed_session_for_task(task_id)
                 self.store.update_agent_task_status(task_id, status)
             return False
         running.stop_requested = True
@@ -282,6 +283,7 @@ class ManagedTaskRuntime:
         running.process.terminate()
         if status is not None:
             self._clear_managed_run_started(task_id)
+            self._clear_managed_session_for_task(task_id)
             self.store.update_agent_task_status(task_id, status)
         if running.worker is threading.current_thread():
             self._remove_running_task(task_id, running)
@@ -328,6 +330,7 @@ class ManagedTaskRuntime:
                 running.process.terminate()
                 if status is not None:
                     self._clear_managed_run_started(task_id)
+                    self._clear_managed_session_for_task(task_id)
                     self.store.update_agent_task_status(task_id, status)
             except Exception:
                 LOGGER.debug(
@@ -477,6 +480,7 @@ class ManagedTaskRuntime:
                         icon_url=self._agent_icon_url(running.agent),
                     )
                     self._clear_managed_run_started(task_id)
+                    self._clear_managed_session_for_task(task_id)
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
                 completed_task = self._clear_managed_run_started(task_id) or completed_task
@@ -519,6 +523,7 @@ class ManagedTaskRuntime:
         with self._lock:
             self._running.pop(task_id, None)
         self._clear_managed_run_started(task_id)
+        self._clear_managed_session_for_task(task_id)
         self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
         self.store.delete_managed_thread_task(task_id)
         self.gateway.post_thread_reply(
@@ -556,6 +561,7 @@ class ManagedTaskRuntime:
             AgentTaskStatus.ACTIVE,
         }:
             self._clear_managed_run_started(task_id)
+            self._clear_managed_session_for_task(task_id)
             self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
             self.store.delete_managed_thread_task(task_id)
         if running is None:
@@ -929,6 +935,19 @@ class ManagedTaskRuntime:
         updated = replace(task, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
         return updated
+
+    def _clear_managed_session_for_task(self, task_id: str) -> None:
+        try:
+            current = self.store.get_agent_task(task_id)
+        except Exception:
+            LOGGER.debug("failed to load task before clearing managed session", exc_info=True)
+            return
+        if current is None or current.session_provider is None or not current.session_id:
+            return
+        try:
+            clear_managed_session(self.store, current.session_provider, current.session_id)
+        except Exception:
+            LOGGER.debug("failed to clear managed session for task %s", task_id, exc_info=True)
 
     def _clear_managed_run_started(self, task_id: str) -> AgentTask | None:
         try:

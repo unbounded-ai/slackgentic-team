@@ -1169,8 +1169,11 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_roster_keeps_agent_busy_when_managed_session_outlives_task(self):
-        from agent_harness.sessions.managed_session import record_managed_session
+    def test_roster_frees_agent_and_prunes_stale_managed_session_without_active_task(self):
+        from agent_harness.sessions.managed_session import (
+            managed_session_agent_key,
+            record_managed_session,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1179,9 +1182,11 @@ class SlackAppTests(unittest.TestCase):
                 store.init_schema()
                 agents = build_initial_model_team(1, 0)
                 store.upsert_team_agent(agents[0])
-                # Simulate: a managed task was launched in dangerous mode, the
-                # session was recorded, then the task got orphan-cancelled but
-                # the codex session is still alive.
+                # A previous task left a managed_session record behind even
+                # though every task for the agent is now in a terminal state.
+                # The roster must not surface this as "Occupied" — every
+                # Occupied slot has to be backed by a real deferred or
+                # active task — and the stale record should be cleaned up.
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="codex-orphan",
@@ -1204,9 +1209,12 @@ class SlackAppTests(unittest.TestCase):
 
                 controller.post_roster("C1")
 
-                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                self.assertIn("1 available, 0 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("session not yet released", blocks)
+                self.assertNotIn("session not yet released", blocks)
+                self.assertIsNone(
+                    store.get_setting(managed_session_agent_key(Provider.CODEX, "codex-orphan"))
+                )
             finally:
                 store.close()
 
