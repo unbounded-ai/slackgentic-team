@@ -16,6 +16,7 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgent,
 )
+from agent_harness.pr_links import pr_urls_from_metadata, slack_pr_links
 from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
@@ -39,6 +40,7 @@ class AgentRosterStatus:
     label: str
     detail: str | None = None
     dangerous_mode: bool = False
+    pr_urls: tuple[str, ...] = ()
     thread_url: str | None = None
     task_id: str | None = None
     session_provider: Provider | None = None
@@ -305,11 +307,21 @@ def build_team_roster_blocks(
         )
         blocks.append(
             {
-                "type": "section",
+                "type": "header",
                 "block_id": f"team.agent.{agent.agent_id}",
                 "text": {
+                    "type": "plain_text",
+                    "text": _plain_text_header(agent_identity_label(agent)),
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "section",
+                "block_id": f"team.status.{agent.agent_id}",
+                "text": {
                     "type": "mrkdwn",
-                    "text": f"*{agent_identity_label(agent)}*\n{status_text}",
+                    "text": status_text,
                 },
             }
         )
@@ -348,13 +360,22 @@ def _agent_accepts_new_work(status: AgentRosterStatus | None) -> bool:
 def _agent_status_text(status: AgentRosterStatus | None) -> str:
     if status is None:
         return "Available"
-    parts = [status.label]
-    if status.detail:
-        parts.append(status.detail)
-    lines = [": ".join(parts)]
+    detail = _bold_roster_detail_prefixes(status.detail) if status.detail else None
+    lines = [f"*{status.label}:* {detail}"] if detail else [status.label]
+    if status.pr_urls:
+        label = "PRs" if len(status.pr_urls) > 1 else "PR"
+        lines.append(f"*{label}:* {slack_pr_links(status.pr_urls, limit=3)}")
     if status.dangerous_mode:
-        lines.append("Mode: :zap: Dangerous")
+        lines.append("*Mode:* :zap: Dangerous")
     return "\n".join(lines)
+
+
+def _bold_roster_detail_prefixes(value: str) -> str:
+    return re.sub(r"(?<!\*)\b(PRs):", r"*\1:*", value)
+
+
+def _plain_text_header(value: str) -> str:
+    return value[:150]
 
 
 def _provider_breakdown_text(agents: list[TeamAgent]) -> str:
@@ -495,6 +516,11 @@ def build_task_thread_blocks(
     dangerous_line = (
         "*:zap: Dangerous mode*\n" if task.metadata.get(DANGEROUS_MODE_METADATA_KEY) else ""
     )
+    pr_urls = pr_urls_from_metadata(task.metadata)
+    pr_line = ""
+    if pr_urls:
+        label = "PRs" if len(pr_urls) > 1 else "PR"
+        pr_line = f"\n*{label}:* {slack_pr_links(pr_urls)}"
     blocks = [
         {
             "type": "section",
@@ -504,6 +530,7 @@ def build_task_thread_blocks(
                     f"*{agent.full_name}* `@{agent.handle}` picked up a {task_label}.\n"
                     f"{dangerous_line}"
                     f"*Task:* {_task_display_prompt(task)}"
+                    f"{pr_line}"
                 ),
             },
         },

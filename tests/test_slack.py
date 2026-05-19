@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import replace
 
-from agent_harness.models import ROSTER_SUMMARY_METADATA_KEY, Provider
+from agent_harness.models import PR_URLS_METADATA_KEY, ROSTER_SUMMARY_METADATA_KEY, Provider
 from agent_harness.slack import (
     AgentRosterStatus,
     build_external_session_capacity_blocks,
@@ -120,7 +120,10 @@ class SlackTests(unittest.TestCase):
             if block.get("block_id") == f"team.agent.actions.{agent.agent_id}"
         )
 
-        status_text = str(blocks[2])
+        status_block = next(
+            block for block in blocks if block.get("block_id") == f"team.status.{agent.agent_id}"
+        )
+        status_text = str(status_block)
         self.assertNotIn("https://example.slack.com/archives/C1/p171000001", status_text)
         self.assertEqual(
             [element["text"]["text"] for element in action_block["elements"]],
@@ -149,9 +152,60 @@ class SlackTests(unittest.TestCase):
         )
 
         rendered = str(blocks)
-        self.assertIn("Working: repair the installer", rendered)
+        self.assertIn("*Working:* repair the installer", rendered)
         self.assertNotIn("Occupied: Slack task:", rendered)
-        self.assertIn("Mode: :zap: Dangerous", rendered)
+        self.assertIn("*Mode:* :zap: Dangerous", rendered)
+
+    def test_roster_blocks_render_name_as_header_and_bold_status_prefixes(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        blocks = build_team_roster_blocks(
+            [agent],
+            {
+                agent.agent_id: AgentRosterStatus(
+                    "Working",
+                    "PRs: review the queue",
+                    dangerous_mode=True,
+                )
+            },
+        )
+
+        name_block = next(
+            block for block in blocks if block.get("block_id") == f"team.agent.{agent.agent_id}"
+        )
+        status_block = next(
+            block for block in blocks if block.get("block_id") == f"team.status.{agent.agent_id}"
+        )
+
+        self.assertEqual(name_block["type"], "header")
+        self.assertEqual(name_block["text"]["type"], "plain_text")
+        self.assertIn(agent.full_name, name_block["text"]["text"])
+        self.assertIn("*Working:* *PRs:* review the queue", status_block["text"]["text"])
+        self.assertIn("*Mode:* :zap: Dangerous", status_block["text"]["text"])
+
+    def test_roster_blocks_show_pr_links_separately_from_status_summary(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        blocks = build_team_roster_blocks(
+            [agent],
+            {
+                agent.agent_id: AgentRosterStatus(
+                    "Working",
+                    "shipping the status view",
+                    pr_urls=(
+                        "https://github.com/acme/app/pull/42",
+                        "https://github.com/acme/app/pull/43",
+                        "https://github.com/acme/app/pull/44",
+                        "https://github.com/acme/app/pull/45",
+                    ),
+                )
+            },
+        )
+
+        rendered = str(blocks)
+        self.assertIn("*Working:* shipping the status view", rendered)
+        self.assertIn("*PRs:*", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/42|acme/app#42>", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/44|acme/app#44>", rendered)
+        self.assertIn("+1 more", rendered)
 
     def test_roster_blocks_sort_occupied_then_provider_then_name(self):
         agents = build_initial_model_team(codex_count=2, claude_count=2)
@@ -231,6 +285,26 @@ class SlackTests(unittest.TestCase):
 
         self.assertIn("Roster UX fix: refreshing Priya's task thread header", rendered)
         self.assertNotIn("tiny latest prompt", rendered)
+
+    def test_task_blocks_show_pr_links_from_metadata(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = replace(
+            create_agent_task(agent, "ship the status view", "C1"),
+            metadata={
+                PR_URLS_METADATA_KEY: [
+                    "https://github.com/acme/app/pull/42",
+                    "https://github.com/acme/app/pull/43",
+                ]
+            },
+        )
+
+        rendered = str(build_task_thread_blocks(task, agent))
+
+        self.assertIn("*PRs:*", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/42|acme/app#42>", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/43|acme/app#43>", rendered)
 
     def test_resolved_task_blocks_omit_finish_button(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

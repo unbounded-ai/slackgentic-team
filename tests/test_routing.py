@@ -116,6 +116,16 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(request.author_handle, "riley")
         self.assertEqual(request.pr_url, "https://github.com/acme/app/pull/42")
 
+    def test_parse_pr_url_from_slack_formatted_link(self):
+        request = parse_work_request(
+            "Somebody review <https://github.com/acme/app/pull/42?foo=bar|PR 42>",
+            ["riley", "sage"],
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.pr_url, "https://github.com/acme/app/pull/42")
+
     def test_parse_non_pr_review_request_as_review_task(self):
         request = parse_work_request(
             "Somebody review the repo and suggest cleanup improvements",

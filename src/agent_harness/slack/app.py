@@ -29,8 +29,9 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    PR_URL_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
-    AgentSession,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
@@ -62,6 +63,7 @@ from agent_harness.models import (
     scheduled_work_dependency_id,
     utc_now,
 )
+from agent_harness.pr_links import metadata_with_pr_urls, pr_urls_from_metadata
 from agent_harness.providers import ClaudeProvider, CodexProvider
 from agent_harness.providers.usage import (
     collect_daily_usage,
@@ -1113,17 +1115,6 @@ class SlackTeamController:
                 )
             )
             seen_handles.add(agent.handle)
-        for agent_id, session in self._orphan_managed_sessions_by_agent().items():
-            agent = agents_by_id.get(agent_id)
-            if agent is None or agent.handle in seen_handles:
-                continue
-            occupied.append(
-                (
-                    agent.handle,
-                    external_session_dependency_id(session.provider, session.session_id),
-                )
-            )
-            seen_handles.add(agent.handle)
         for agent_id, deferred_items in self._pending_deferred_work_by_agent(agents).items():
             agent = agents_by_id.get(agent_id)
             if agent is None or agent.handle in seen_handles:
@@ -1148,20 +1139,81 @@ class SlackTeamController:
             seen_handles.add(agent.handle)
         return occupied
 
-    def _orphan_managed_sessions_by_agent(self):
-        sessions_by_agent: dict[str, AgentSession] = {}
-        for (provider, session_id), agent_id in managed_session_agents(self.store).items():
+    def _occupied_handle_dependency_labels(self) -> list[tuple[str, str, str]]:
+        return [
+            (handle, task_id, self._agent_busy_dependency_label(task_id))
+            for handle, task_id in self._occupied_handle_task_ids()
+        ]
+
+    def _agent_busy_dependency_label(self, task_id: str | None) -> str:
+        external_session = parse_external_session_dependency_id(task_id)
+        if external_session is not None:
+            provider, session_id = external_session
+            prefix = f"{provider.value} external session"
+            summary = self.store.get_setting(
+                f"{EXTERNAL_SESSION_SUMMARY_PREFIX}{provider.value}.{session_id}"
+            )
+            if summary and summary.strip():
+                return f"{prefix}: {_shorten(summary, 140)}"
             session = self.store.get_session(provider, session_id)
-            if session is None:
+            if session and session.cwd:
+                return f"{prefix}: {session.cwd.name or session.cwd}"
+            return prefix
+        deferred_id = parse_deferred_work_dependency_id(task_id)
+        if deferred_id is not None:
+            deferred = self.store.get_deferred_work(deferred_id)
+            if deferred is not None:
+                return _shorten(_deferred_work_roster_detail(deferred), 140)
+            return "deferred task"
+        schedule_id = parse_scheduled_work_dependency_id(task_id)
+        if schedule_id is not None:
+            scheduled = self.store.get_scheduled_work(schedule_id)
+            if scheduled is not None:
+                return _shorten(
+                    (
+                        f"Scheduled task: {scheduled.prompt}; "
+                        f"{_format_scheduled_work_schedule(scheduled)}; "
+                        f"next run `{_format_schedule_timestamp(scheduled.next_run_at)}`"
+                    ),
+                    140,
+                )
+            return "scheduled task"
+        if task_id:
+            task = self.store.get_agent_task(task_id)
+            if task is not None:
+                return _shorten(_task_roster_summary(task), 140)
+        return "current task"
+
+    def _prune_stale_managed_sessions(self, agents) -> None:
+        """Drop managed_session settings that no longer match an active task.
+
+        A managed session record only stays valid while the runtime is actively
+        driving a task on that session. Once the task moves to a terminal state
+        the record should be cleared; otherwise the roster has no honest way to
+        explain the agent's occupancy. Defensive cleanup keeps the invariant
+        "Occupied implies a current deferred or active task" intact even when
+        an upstream code path forgets to call clear_managed_session.
+        """
+        valid_keys: set[tuple[Provider, str]] = set()
+        for agent in agents:
+            task = self.store.active_task_for_agent(agent.agent_id)
+            if task is None:
                 continue
-            if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            if task.session_provider is None or not task.session_id:
                 continue
-            existing = sessions_by_agent.get(agent_id)
-            if existing is None or (
-                existing.status != SessionStatus.ACTIVE and session.status == SessionStatus.ACTIVE
-            ):
-                sessions_by_agent[agent_id] = session
-        return sessions_by_agent
+            valid_keys.add((task.session_provider, task.session_id))
+        for (provider, session_id), _agent_id in managed_session_agents(self.store).items():
+            if (provider, session_id) in valid_keys:
+                continue
+            try:
+                clear_managed_session(self.store, provider, session_id)
+            except Exception:
+                LOGGER.debug(
+                    "failed to clear stale managed session %s/%s",
+                    provider.value,
+                    session_id,
+                    exc_info=True,
+                )
 
     def _handle_scheduled_work_request(self, event: dict, channel_id: str, text: str) -> bool:
         schedule_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
@@ -1318,6 +1370,7 @@ class SlackTeamController:
         return True
 
     def _roster_statuses(self, agents) -> dict[str, AgentRosterStatus]:
+        self._prune_stale_managed_sessions(agents)
         statuses = {agent.agent_id: AgentRosterStatus("Available") for agent in agents}
         for agent in agents:
             task = self.store.active_task_for_agent(agent.agent_id)
@@ -1328,6 +1381,7 @@ class SlackTeamController:
                 label,
                 _shorten(_task_roster_summary(task), 140),
                 dangerous_mode=_task_dangerous_mode(task),
+                pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
                 task_id=task.task_id,
             )
@@ -1344,6 +1398,7 @@ class SlackTeamController:
                 "Working",
                 _shorten(_task_roster_summary(task), 140),
                 dangerous_mode=_task_dangerous_mode(task),
+                pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,
             )
@@ -1383,6 +1438,7 @@ class SlackTeamController:
                 "Occupied",
                 detail,
                 dangerous_mode=scheduled.dangerous_mode,
+                pr_urls=(scheduled.pr_url,) if scheduled.pr_url else (),
                 thread_url=self._thread_permalink(scheduled.channel_id, scheduled.thread_ts),
             )
         for agent_id, session in self._active_external_sessions_by_agent().items():
@@ -1397,26 +1453,6 @@ class SlackTeamController:
             if summary and summary.strip():
                 detail_parts.append(_shorten(summary, 100))
             elif session.cwd:
-                detail_parts.append(str(session.cwd.name or session.cwd))
-            else:
-                detail_parts.append(_shorten(session.session_id, 12))
-            statuses[agent_id] = AgentRosterStatus(
-                "Occupied",
-                ": ".join(detail_parts),
-                dangerous_mode=_external_session_dangerous_mode(session),
-                thread_url=self._external_session_permalink(session),
-                session_provider=session.provider,
-                session_id=session.session_id,
-            )
-        for agent_id, session in self._orphan_managed_sessions_by_agent().items():
-            if agent_id not in statuses:
-                continue
-            if statuses[agent_id].label != "Available":
-                continue
-            detail_parts = [
-                f"{session.provider.value} session not yet released",
-            ]
-            if session.cwd:
                 detail_parts.append(str(session.cwd.name or session.cwd))
             else:
                 detail_parts.append(_shorten(session.session_id, 12))
@@ -2104,7 +2140,7 @@ class SlackTeamController:
                 channel_id=channel_id,
                 message_ts=roster_ts,
                 initial_timing=str(payload.get("mode") or "now"),
-                occupied_handles=self._occupied_handle_task_ids(),
+                occupied_handles=self._occupied_handle_dependency_labels(),
             ),
         )
 
@@ -2411,6 +2447,7 @@ class SlackTeamController:
             deferred,
             deferred.description or f"after @{dependency.handle} finishes",
             request,
+            dependency_labeler=self._agent_busy_dependency_label,
         )
         if not self._try_update_message(thread.channel_id, thread.thread_ts, text):
             self.gateway.post_thread_reply(thread, text)
@@ -3115,6 +3152,7 @@ class SlackTeamController:
         if not thread.thread_ts:
             return False
         self._remember_agent_authored_message(task, agent, thread, message_ts, text)
+        task = self._record_task_pr_urls(task, agent, thread, text)
         if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
         active_agents = self.store.list_team_agents()
@@ -3181,6 +3219,25 @@ class SlackTeamController:
         elif message_ts:
             self._clear_message_status_reactions(thread.channel_id, message_ts)
         return True
+
+    def _record_task_pr_urls(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        *texts_or_urls: str | None,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        metadata = metadata_with_pr_urls(current.metadata, *texts_or_urls)
+        if metadata == current.metadata:
+            return current
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        updated = self.store.get_agent_task(updated.task_id) or updated
+        self._refresh_task_thread_header(updated, agent)
+        if thread.channel_id:
+            self._refresh_existing_roster(thread.channel_id)
+        return updated
 
     def _handle_agent_authored_specific_request(
         self,
@@ -3569,6 +3626,7 @@ class SlackTeamController:
         request_message_ts: str | None = None,
         try_live_send: bool = True,
     ) -> bool:
+        previous_task = self._record_task_pr_urls(previous_task, agent, thread, request.prompt)
         if (
             try_live_send
             and self.runtime
@@ -3602,6 +3660,7 @@ class SlackTeamController:
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
+        metadata = metadata_with_pr_urls(metadata, request.prompt)
         for key in ("request_message_ts", "request_message_ts_history"):
             if key in previous_task.metadata:
                 metadata[key] = previous_task.metadata[key]
@@ -3720,7 +3779,7 @@ class SlackTeamController:
         requested_by_slack_user: str | None,
         request_message_ts: str | None,
     ) -> AgentTask:
-        metadata = dict(task.metadata)
+        metadata = metadata_with_pr_urls(task.metadata, request.prompt)
         queued = _queued_thread_followups(metadata)
         queued.append(
             {
@@ -3781,6 +3840,7 @@ class SlackTeamController:
             self._mark_message_in_progress(thread.channel_id, message_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
         prompt = _queued_followup_prompt(prompts)
+        metadata = metadata_with_pr_urls(metadata, *prompts)
         metadata = self._with_linked_thread_context(
             metadata,
             prompt,
@@ -3831,6 +3891,7 @@ class SlackTeamController:
             metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = message_ts_values
             metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
+        metadata = metadata_with_pr_urls(metadata, *prompts)
         metadata = self._with_linked_thread_context(
             metadata,
             prompt,
@@ -3989,9 +4050,10 @@ class SlackTeamController:
         if not summary:
             return False
         current = self.store.get_agent_task(task.task_id) or task
-        metadata = dict(current.metadata)
+        metadata = metadata_with_pr_urls(current.metadata, summary)
         if metadata.get(ROSTER_SUMMARY_METADATA_KEY) != summary:
             metadata[ROSTER_SUMMARY_METADATA_KEY] = summary
+        if metadata != current.metadata:
             current = replace(current, metadata=metadata, updated_at=utc_now())
             self.store.upsert_agent_task(current)
         self._refresh_task_thread_header(current, agent)
@@ -4196,7 +4258,10 @@ class SlackTeamController:
         self.gateway.post_thread_reply(
             thread,
             _format_deferred_work_ack(
-                deferred, parsed.deferred.description, parsed.deferred.request
+                deferred,
+                parsed.deferred.description,
+                parsed.deferred.request,
+                dependency_labeler=self._agent_busy_dependency_label,
             ),
             persona=agent,
             icon_url=self._agent_icon_url(agent),
@@ -4451,7 +4516,7 @@ class SlackTeamController:
             self.gateway.post_thread_reply(
                 thread,
                 (
-                    f"Cancelled deferred `{claimed.deferred_id}` because "
+                    f"Cancelled deferred task `{_shorten(claimed.prompt, 140)}` because "
                     f"@{request.requested_handle} is not an active agent."
                 ),
             )
@@ -4485,7 +4550,8 @@ class SlackTeamController:
             self.gateway.post_thread_reply(
                 thread,
                 (
-                    f"Deferred `{claimed.deferred_id}` is ready, but no matching agent "
+                    f"Deferred task `{_shorten(claimed.prompt, 140)}` is ready, "
+                    "but no matching agent "
                     "is available. I queued it and will start it when capacity opens."
                 ),
             )
@@ -4495,7 +4561,7 @@ class SlackTeamController:
             )
             self.refresh_or_post_roster(claimed.channel_id)
             return True
-        text = f"Deferred `{claimed.deferred_id}` is ready now.\n\n" + format_agent_assignment(
+        text = "Deferred task is ready now.\n\n" + format_agent_assignment(
             result.agent,
             result.request.prompt,
             claimed.requested_by_slack_user,
@@ -4662,6 +4728,10 @@ class SlackTeamController:
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
+        parent_pr_urls = pr_urls_from_metadata(parent_task.metadata)
+        if parent_pr_urls:
+            metadata[PR_URL_METADATA_KEY] = parent_pr_urls[0]
+            metadata[PR_URLS_METADATA_KEY] = list(parent_pr_urls)
         context = self._thread_context(channel_id, thread_ts)
         prompt_context = f"Original task: {_task_assignment_prompt(parent_task)}"
         if context:
@@ -5813,7 +5883,6 @@ class SocketModeSlackApp:
                 LOGGER.exception("failed to handle Slack Socket Mode request")
 
         client.socket_mode_request_listeners.append(listener)
-        client.connect()
         shutdown = threading.Event()
 
         def _request_shutdown(_signum=None, _frame=None) -> None:
@@ -5829,6 +5898,19 @@ class SocketModeSlackApp:
             except (ValueError, OSError):
                 continue
         try:
+            connect_backoff = LoopBackoff(base_seconds=1.0, max_seconds=60.0)
+            while not shutdown.is_set():
+                try:
+                    client.connect()
+                    break
+                except Exception:
+                    log_loop_failure(
+                        LOGGER,
+                        "failed to connect Slack Socket Mode client",
+                        connect_backoff,
+                    )
+                    if connect_backoff.wait(shutdown):
+                        break
             while not shutdown.is_set():
                 if shutdown.wait(timeout=1.0):
                     break
@@ -6511,6 +6593,8 @@ def _format_deferred_work_ack(
     deferred: DeferredWork,
     description: str,
     request: WorkRequest,
+    *,
+    dependency_labeler: Callable[[str | None], str] | None = None,
 ) -> str:
     target = "somebody"
     if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
@@ -6521,7 +6605,8 @@ def _format_deferred_work_ack(
             label = dep.permalink or f"{dep.channel_id}/{dep.thread_ts}"
             dep_lines.append(f"- thread {label}")
         else:
-            dep_lines.append(f"- @{dep.handle} ({_format_agent_busy_dependency(dep.task_id)})")
+            label = _format_agent_busy_dependency(dep.task_id, dependency_labeler)
+            dep_lines.append(f"- @{dep.handle}: {label}")
     deps_text = "\n".join(dep_lines)
     timing = ""
     if deferred.after_dep_delay_seconds:
@@ -6529,29 +6614,36 @@ def _format_deferred_work_ack(
     elif deferred.run_at is not None:
         timing = f" then at {_format_schedule_timestamp(deferred.run_at)}"
     return (
-        f"Deferred `{deferred.deferred_id}`: {target} will run `{request.prompt}` "
+        f"Deferred: {target} will run `{request.prompt}` "
         f"{description}.{timing}\nWaiting on:\n{deps_text}"
     )
 
 
-def _format_agent_busy_dependency(task_id: str | None) -> str:
+def _format_agent_busy_dependency(
+    task_id: str | None,
+    dependency_labeler: Callable[[str | None], str] | None = None,
+) -> str:
+    if dependency_labeler is not None:
+        label = dependency_labeler(task_id)
+        if label:
+            return label
     external_session = parse_external_session_dependency_id(task_id)
     if external_session is not None:
-        provider, session_id = external_session
-        return f"{provider.value} external session `{session_id}`"
+        provider, _session_id = external_session
+        return f"{provider.value} external session"
     deferred_id = parse_deferred_work_dependency_id(task_id)
     if deferred_id is not None:
-        return f"deferred work `{deferred_id}`"
+        return "deferred task"
     schedule_id = parse_scheduled_work_dependency_id(task_id)
     if schedule_id is not None:
-        return f"scheduled work `{schedule_id}`"
-    return f"task `{task_id}`"
+        return "scheduled task"
+    return "current task"
 
 
 def _format_deferred_ready_message(deferred: DeferredWork) -> str:
     fire_at = _format_schedule_timestamp(deferred.fire_at) if deferred.fire_at else "shortly"
     return (
-        f"Dependencies for deferred `{deferred.deferred_id}` are satisfied. "
+        f"Dependencies for deferred task `{_shorten(deferred.prompt, 180)}` are satisfied. "
         f"Starting at `{fire_at}` UTC."
     )
 
@@ -6589,7 +6681,7 @@ def _roster_work_modal(
     channel_id: str,
     message_ts: str | None,
     initial_timing: str,
-    occupied_handles: list[tuple[str, str]],
+    occupied_handles: list[tuple[str, str, str]],
 ) -> dict:
     timing_options = [
         _modal_option("Now", "now", "Start as soon as capacity is available."),
@@ -6773,10 +6865,10 @@ def _roster_work_modal(
     }
 
 
-def _roster_dependency_options(occupied_handles: list[tuple[str, str]]) -> list[dict]:
+def _roster_dependency_options(occupied_handles: list[tuple[str, str, str]]) -> list[dict]:
     options = [_modal_option("No dependency", "none")]
     seen: set[str] = set()
-    for handle, task_id in occupied_handles:
+    for handle, _task_id, label in occupied_handles:
         if handle in seen:
             continue
         seen.add(handle)
@@ -6784,7 +6876,7 @@ def _roster_dependency_options(occupied_handles: list[tuple[str, str]]) -> list[
             _modal_option(
                 f"@{handle}",
                 handle,
-                _format_agent_busy_dependency(task_id),
+                label,
             )
         )
         if len(options) >= 100:

@@ -1,9 +1,12 @@
 import json
+import sys
 import tempfile
+import types
 import unittest
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.deferred import (
     AGENT_DEFERRED_SIGNAL_PREFIX,
@@ -14,6 +17,7 @@ from agent_harness.deferred import (
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
     AgentTaskKind,
@@ -63,6 +67,7 @@ from agent_harness.slack.app import (
     SlackMessageBackfill,
     SlackReplyTarget,
     SlackTeamController,
+    SocketModeSlackApp,
 )
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
@@ -338,6 +343,67 @@ def _roster_work_submission_payload(
 
 
 class SlackAppTests(unittest.TestCase):
+    def test_socket_mode_connect_retries_before_process_exit(self):
+        connect_calls = []
+        closed_clients = []
+        closed_apps = []
+
+        class FakeSocketModeClient:
+            def __init__(self, app_token, web_client):
+                self.app_token = app_token
+                self.web_client = web_client
+                self.socket_mode_request_listeners = []
+
+            def connect(self):
+                connect_calls.append("connect")
+                if len(connect_calls) == 1:
+                    raise RuntimeError("network unavailable")
+                raise KeyboardInterrupt()
+
+            def close(self):
+                closed_clients.append(True)
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id, payload=None):
+                self.envelope_id = envelope_id
+                self.payload = payload
+
+        class FakeBackoff:
+            def __init__(self, **kwargs):
+                self.failures = 0
+                self.next_delay = 0.0
+
+            def wait(self, stop_event):
+                self.failures += 1
+                return False
+
+        socket_mode_module = types.ModuleType("slack_sdk.socket_mode")
+        socket_mode_module.SocketModeClient = FakeSocketModeClient
+        response_module = types.ModuleType("slack_sdk.socket_mode.response")
+        response_module.SocketModeResponse = FakeSocketModeResponse
+        app = object.__new__(SocketModeSlackApp)
+        app.config = types.SimpleNamespace(slack=types.SimpleNamespace(app_token="xapp-test"))
+        app.gateway = types.SimpleNamespace(client=object())
+        app.close = lambda: closed_apps.append(True)
+        app.handle_request = lambda request: None
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "slack_sdk.socket_mode": socket_mode_module,
+                    "slack_sdk.socket_mode.response": response_module,
+                },
+            ),
+            patch("agent_harness.slack.app.LoopBackoff", FakeBackoff),
+            patch("agent_harness.slack.app.log_loop_failure"),
+        ):
+            app.run_forever()
+
+        self.assertEqual(connect_calls, ["connect", "connect"])
+        self.assertEqual(closed_clients, [True])
+        self.assertEqual(closed_apps, [True])
+
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -612,6 +678,55 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_work_modal_shows_dependency_task_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                blocker, target = build_initial_model_team(2, 0)
+                store.upsert_team_agent(blocker)
+                store.upsert_team_agent(target)
+                task = create_agent_task(blocker, "finish the blocker branch", "C1")
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.roster"},
+                        "trigger_id": "T1",
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "roster.work.open",
+                                    mode="now",
+                                    agent_id=target.agent_id,
+                                    handle=target.handle,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                dependency = next(
+                    block
+                    for block in gateway.views[0][1]["blocks"]
+                    if block.get("block_id") == "roster_work_dependency"
+                )
+                options = dependency["element"]["options"]
+                blocker_option = next(
+                    option for option in options if option["value"] == blocker.handle
+                )
+                self.assertEqual(
+                    blocker_option["description"]["text"],
+                    "finish the blocker branch",
+                )
+                self.assertNotIn(task.task_id, str(options))
+            finally:
+                store.close()
+
     def test_roster_work_button_for_stale_occupied_agent_does_not_open_modal(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -819,7 +934,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(deferred[0].requested_handle, target.handle)
                 self.assertEqual(deferred[0].depends_on[0].handle, blocker.handle)
                 self.assertEqual(deferred[0].depends_on[0].task_id, active_task.task_id)
-                self.assertIn("Waiting on", gateway.updates[-1]["text"])
+                ack = gateway.updates[-1]["text"]
+                self.assertIn("Waiting on", ack)
+                self.assertIn(f"- @{blocker.handle}: finish blocker", ack)
+                self.assertNotIn(active_task.task_id, ack)
             finally:
                 store.close()
 
@@ -1043,7 +1161,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIn("1 available, 1 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Queued: investigate flaky tests", blocks)
+                self.assertIn("*Queued:* investigate flaky tests", blocks)
                 self.assertNotIn("Slack task:", blocks)
                 self.assertNotIn("<https://example.slack.com/archives/C1/p", blocks)
                 self.assertIn("'text': {'type': 'plain_text', 'text': 'Open thread'}", blocks)
@@ -1053,8 +1171,11 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_roster_keeps_agent_busy_when_managed_session_outlives_task(self):
-        from agent_harness.sessions.managed_session import record_managed_session
+    def test_roster_frees_agent_and_prunes_stale_managed_session_without_active_task(self):
+        from agent_harness.sessions.managed_session import (
+            managed_session_agent_key,
+            record_managed_session,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1063,9 +1184,11 @@ class SlackAppTests(unittest.TestCase):
                 store.init_schema()
                 agents = build_initial_model_team(1, 0)
                 store.upsert_team_agent(agents[0])
-                # Simulate: a managed task was launched in dangerous mode, the
-                # session was recorded, then the task got orphan-cancelled but
-                # the codex session is still alive.
+                # A previous task left a managed_session record behind even
+                # though every task for the agent is now in a terminal state.
+                # The roster must not surface this as "Occupied" — every
+                # Occupied slot has to be backed by a real deferred or
+                # active task — and the stale record should be cleaned up.
                 session = AgentSession(
                     provider=Provider.CODEX,
                     session_id="codex-orphan",
@@ -1088,9 +1211,12 @@ class SlackAppTests(unittest.TestCase):
 
                 controller.post_roster("C1")
 
-                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                self.assertIn("1 available, 0 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("session not yet released", blocks)
+                self.assertNotIn("session not yet released", blocks)
+                self.assertIsNone(
+                    store.get_setting(managed_session_agent_key(Provider.CODEX, "codex-orphan"))
+                )
             finally:
                 store.close()
 
@@ -1159,7 +1285,7 @@ class SlackAppTests(unittest.TestCase):
 
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn(
-                    "Queued: Roster UX fix: validating E2E before PR merge",
+                    "*Queued:* Roster UX fix: validating E2E before PR merge",
                     blocks,
                 )
                 self.assertNotIn("Slack task:", blocks)
@@ -1190,7 +1316,7 @@ class SlackAppTests(unittest.TestCase):
 
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn(
-                    ("Queued: Improve roster summaries and dangerous-mode display"),
+                    ("*Queued:* Improve roster summaries and dangerous-mode display"),
                     blocks,
                 )
                 self.assertNotIn("Slack task:", blocks)
@@ -1459,7 +1585,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Working: drive PR 23", blocks)
+                self.assertIn("*Working:* drive PR 23", blocks)
                 self.assertNotIn("Occupied: Slack task:", blocks)
             finally:
                 store.close()
@@ -1483,9 +1609,9 @@ class SlackAppTests(unittest.TestCase):
                 controller.post_roster("C1")
 
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Queued: rewrite installer", blocks)
+                self.assertIn("*Queued:* rewrite installer", blocks)
                 self.assertNotIn("Slack task:", blocks)
-                self.assertIn("Mode: :zap: Dangerous", blocks)
+                self.assertIn("*Mode:* :zap: Dangerous", blocks)
             finally:
                 store.close()
 
@@ -1534,10 +1660,84 @@ class SlackAppTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(roster_updates), 1)
                 self.assertIn(
-                    "Queued: Roster UX fix: opening PR after E2E",
+                    "*Queued:* Roster UX fix: opening PR after E2E",
                     str(roster_updates[0]["blocks"]),
                 )
                 self.assertNotIn("Slack task:", str(roster_updates[0]["blocks"]))
+            finally:
+                store.close()
+
+    def test_runtime_agent_messages_update_task_and_roster_pr_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the task view", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.thread", "171.parent")
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller.post_roster("C1")
+                roster_ts = gateway.posts[-1]["ts"]
+
+                first = controller.handle_runtime_agent_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "PR up: https://github.com/acme/app/pull/42",
+                    "171.agent1",
+                )
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                second = controller.handle_runtime_agent_message(
+                    current,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "Second PR: https://github.com/acme/app/pull/43",
+                    "171.agent2",
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertFalse(first)
+                self.assertFalse(second)
+                self.assertEqual(
+                    current.metadata[PR_URLS_METADATA_KEY],
+                    [
+                        "https://github.com/acme/app/pull/42",
+                        "https://github.com/acme/app/pull/43",
+                    ],
+                )
+                header_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.parent"
+                ]
+                self.assertGreaterEqual(len(header_updates), 2)
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/42|acme/app#42>",
+                    str(header_updates[-1]["blocks"]),
+                )
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/43|acme/app#43>",
+                    str(header_updates[-1]["blocks"]),
+                )
+                roster_updates = [update for update in gateway.updates if update["ts"] == roster_ts]
+                self.assertGreaterEqual(len(roster_updates), 2)
+                self.assertIn("*PRs:*", str(roster_updates[-1]["blocks"]))
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/42|acme/app#42>",
+                    str(roster_updates[-1]["blocks"]),
+                )
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/43|acme/app#43>",
+                    str(roster_updates[-1]["blocks"]),
+                )
             finally:
                 store.close()
 
@@ -8593,6 +8793,9 @@ class DeferredWorkFlowTests(unittest.TestCase):
                     f"{AGENT_DEFERRED_SIGNAL_PREFIX}{json.dumps(payload)}",
                 )
                 self.assertTrue(handled)
+                ack = gateway.thread_replies[-1]["text"]
+                self.assertIn("- @eli: codex external session", ack)
+                self.assertNotIn(external_dep, ack)
                 deferred_rows = store.list_deferred_work()
                 self.assertEqual(len(deferred_rows), 1)
                 row = deferred_rows[0]

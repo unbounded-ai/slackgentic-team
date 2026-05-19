@@ -55,6 +55,7 @@ class ServiceSpec:
     label: str = MACOS_LABEL
     description: str = "Slackgentic Team Slack daemon"
     environment: dict[str, str] = field(default_factory=lambda: dict(SAFE_SERVICE_ENVIRONMENT))
+    exit_timeout_seconds: int = 30
 
     @property
     def stdout_path(self) -> Path:
@@ -228,6 +229,7 @@ def render_service(spec: ServiceSpec) -> tuple[Path, str | bytes]:
 def render_launchd_plist(spec: ServiceSpec) -> bytes:
     environment = {
         "PATH": service_environment_path(service_bin_dir=_service_python_shim_dir(spec)),
+        "PYTHONPATH": str(spec.working_directory / "src"),
         **spec.environment,
     }
     payload = {
@@ -239,6 +241,7 @@ def render_launchd_plist(spec: ServiceSpec) -> bytes:
         "StandardOutPath": str(spec.stdout_path),
         "StandardErrorPath": str(spec.stderr_path),
         "EnvironmentVariables": environment,
+        "ExitTimeOut": spec.exit_timeout_seconds,
     }
     return plistlib.dumps(payload, sort_keys=True)
 
@@ -250,6 +253,7 @@ def render_systemd_unit(spec: ServiceSpec) -> str:
             "PATH",
             service_environment_path(service_bin_dir=_service_python_shim_dir(spec)),
         ),
+        _systemd_environment_line("PYTHONPATH", str(spec.working_directory / "src")),
         *[
             _systemd_environment_line(name, value)
             for name, value in sorted(spec.environment.items())
@@ -268,6 +272,7 @@ def render_systemd_unit(spec: ServiceSpec) -> str:
             *environment_lines,
             "Restart=always",
             "RestartSec=5",
+            f"TimeoutStopSec={spec.exit_timeout_seconds}",
             f"StandardOutput=append:{spec.stdout_path}",
             f"StandardError=append:{spec.stderr_path}",
             "",

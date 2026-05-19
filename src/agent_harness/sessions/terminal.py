@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +18,7 @@ CwdResolver = Callable[[int], Path | None]
 StartResolver = Callable[[int], datetime | None]
 LogWriter = Callable[[Path, str], None]
 TtyWriter = Callable[[str, str], None]
+Clock = Callable[[], float]
 LOGGER = logging.getLogger(__name__)
 TERMINAL_KEYBOARD_MODE_RESET = "\x1b[<u"
 
@@ -40,6 +43,8 @@ class SessionTerminalNotifier:
         tty_writer: TtyWriter | None = None,
         write_tui_notice: bool = False,
         write_user_tui_notice: bool = False,
+        process_cache_seconds: float = 5.0,
+        clock: Clock = time.monotonic,
     ):
         # Process discovery is retained for diagnostics, but notifications are
         # kept short when written into live TUIs. Full content still goes to the
@@ -52,6 +57,10 @@ class SessionTerminalNotifier:
         self.tty_writer = tty_writer or _write_tty
         self.write_tui_notice = write_tui_notice
         self.write_user_tui_notice = write_user_tui_notice
+        self.process_cache_seconds = max(0.0, process_cache_seconds)
+        self.clock = clock
+        self._process_cache: dict[Provider, tuple[float, list[TerminalTarget]]] = {}
+        self._process_cache_lock = threading.RLock()
 
     def notify_user_message(self, session: AgentSession, text: str) -> int:
         return self._notify(
@@ -144,6 +153,31 @@ class SessionTerminalNotifier:
         *,
         require_tty: bool = True,
     ) -> list[TerminalTarget]:
+        targets = self._cached_provider_processes(provider)
+        if require_tty:
+            return [target for target in targets if target.tty != "??" and target.tty]
+        return list(targets)
+
+    def clear_process_cache(self) -> None:
+        with self._process_cache_lock:
+            self._process_cache.clear()
+
+    def _cached_provider_processes(self, provider: Provider) -> list[TerminalTarget]:
+        if self.process_cache_seconds > 0:
+            now = self.clock()
+            with self._process_cache_lock:
+                cached = self._process_cache.get(provider)
+                if cached is not None:
+                    cached_at, targets = cached
+                    if now - cached_at <= self.process_cache_seconds:
+                        return list(targets)
+        targets = self._scan_provider_processes(provider)
+        if self.process_cache_seconds > 0:
+            with self._process_cache_lock:
+                self._process_cache[provider] = (self.clock(), targets)
+        return list(targets)
+
+    def _scan_provider_processes(self, provider: Provider) -> list[TerminalTarget]:
         targets: list[TerminalTarget] = []
         for row in self.process_lister():
             parsed = _parse_process_row(row)
@@ -151,8 +185,6 @@ class SessionTerminalNotifier:
                 continue
             pid, tty, command = parsed
             if not _is_provider_process(provider, command):
-                continue
-            if require_tty and (tty == "??" or not tty):
                 continue
             cwd = self.cwd_resolver(pid)
             try:
