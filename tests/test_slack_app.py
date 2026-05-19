@@ -1819,7 +1819,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_runtime_task_exit_refreshes_roster_while_agent_stays_occupied(self):
+    def test_runtime_task_exit_refreshes_roster_and_frees_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -1844,13 +1844,13 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertEqual(gateway.updates[-1]["ts"], "171.000099")
-                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
-                self.assertNotIn(
+                self.assertIn("1 available, 0 occupied", gateway.updates[-1]["text"])
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertIn(
                     ("C1", "171.000001", "hourglass_flowing_sand"),
                     gateway.removed_reactions,
                 )
-                self.assertNotIn(("C1", "171.000001", "eyes"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.000001", "eyes"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.000001", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
@@ -1881,7 +1881,7 @@ class SlackAppTests(unittest.TestCase):
                     SlackThreadRef("C1", "171.thread", "171.bot"),
                 )
 
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
                 self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"),
@@ -1891,7 +1891,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_runtime_self_parented_followup_stays_occupied(self):
+    def test_runtime_self_parented_followup_frees_agent_after_run_exit(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -1923,12 +1923,12 @@ class SlackAppTests(unittest.TestCase):
                     SlackThreadRef("C1", "171.000001"),
                 )
 
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
-                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
-                self.assertNotIn(
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertIn("1 available, 0 occupied", gateway.updates[-1]["text"])
+                self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
-                self.assertNotIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
@@ -4359,6 +4359,72 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(task.session_id, "claude-mina")
                 self.assertEqual(task.metadata["parent_task_id"], requested_prior_task.task_id)
                 self.assertNotEqual(task.session_id, "codex-original")
+            finally:
+                store.close()
+
+    def test_same_thread_followup_waits_when_agent_is_busy_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                agent = replace(agent, handle="milo")
+                store.upsert_team_agent(agent)
+                prior_task = replace(
+                    create_agent_task(
+                        agent,
+                        "explain the first bug",
+                        "C1",
+                        requested_by_slack_user="U1",
+                    ),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-prior",
+                )
+                busy_task = replace(
+                    create_agent_task(
+                        agent,
+                        "ship another fix",
+                        "C1",
+                        requested_by_slack_user="U1",
+                    ),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="172.thread",
+                    parent_message_ts="172.parent",
+                )
+                store.upsert_agent_task(prior_task)
+                store.upsert_agent_task(busy_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "what happened next?",
+                            "ts": "171.followup",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.started, [])
+                pending = store.list_pending_work_requests(channel_id="C1")
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].thread_ts, "171.thread")
+                self.assertEqual(pending[0].request.requested_handle, "milo")
+                self.assertIn("what happened next?", pending[0].request.prompt)
+                self.assertIn("That specific agent is busy", gateway.thread_replies[-1]["text"])
             finally:
                 store.close()
 
@@ -6984,7 +7050,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_restarted_managed_run_exit_keeps_active_request_message_status(self):
+    def test_restarted_managed_run_exit_frees_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -7023,15 +7089,12 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertEqual(resumed, 1)
-                self.assertEqual(
-                    store.get_agent_task(task.task_id).status,
-                    AgentTaskStatus.ACTIVE,
-                )
-                self.assertNotIn(
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
-                self.assertNotIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
-                self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
@@ -8650,6 +8713,102 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(started_thread.thread_ts, "171.thread")
                 rows = store.conn.execute("SELECT status FROM scheduled_timers").fetchall()
                 self.assertEqual([row["status"] for row in rows], ["fired"])
+            finally:
+                store.close()
+
+    def test_due_timer_resumes_finished_same_thread_agent_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                )
+                store.upsert_agent_task(task)
+                store.create_scheduled_timer(
+                    task,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    prompt="Re-check the PR feedback.",
+                    due_at=utc_now() - timedelta(seconds=1),
+                )
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                runner = ScheduledTimerRunner(store, controller, poll_seconds=0.01)
+
+                fired = runner.sync_once()
+
+                self.assertEqual(fired, 1)
+                self.assertEqual(len(runtime.started), 1)
+                started_task, started_agent, started_thread = runtime.started[0]
+                self.assertEqual(started_task.task_id, task.task_id)
+                self.assertEqual(started_task.status, AgentTaskStatus.ACTIVE)
+                self.assertEqual(started_task.prompt, "Re-check the PR feedback.")
+                self.assertEqual(started_task.session_id, "codex-thread-1")
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                self.assertEqual(started_thread.thread_ts, "171.thread")
+                rows = store.conn.execute("SELECT status FROM scheduled_timers").fetchall()
+                self.assertEqual([row["status"] for row in rows], ["fired"])
+            finally:
+                store.close()
+
+    def test_due_timer_waits_when_agent_is_busy_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                timer_task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                )
+                busy_task = replace(
+                    create_agent_task(agent, "other work", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="172.thread",
+                    parent_message_ts="172.parent",
+                )
+                store.upsert_agent_task(timer_task)
+                store.upsert_agent_task(busy_task)
+                store.create_scheduled_timer(
+                    timer_task,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    prompt="Re-check the PR feedback.",
+                    due_at=utc_now() - timedelta(seconds=1),
+                )
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                runner = ScheduledTimerRunner(store, controller, poll_seconds=0.01)
+
+                fired = runner.sync_once()
+
+                self.assertEqual(fired, 0)
+                self.assertEqual(runtime.started, [])
+                rows = store.conn.execute("SELECT status FROM scheduled_timers").fetchall()
+                self.assertEqual([row["status"] for row in rows], ["pending"])
             finally:
                 store.close()
 

@@ -3525,6 +3525,44 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_timer_signal_does_not_suppress_task_done_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check later", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                done_callbacks = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=TimerSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(signal) or True
+                    ),
+                    on_task_done=lambda task, agent, thread: done_callbacks.append(task.task_id),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if seen_controls and done_callbacks:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(
+                    seen_controls,
+                    [f"{AGENT_TIMER_SIGNAL_PREFIX}2s | Re-check the PR feedback."],
+                )
+                self.assertEqual(done_callbacks, [task.task_id])
+            finally:
+                store.close()
+
     def test_runtime_hides_schedule_success_text_and_notifies_callback(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
