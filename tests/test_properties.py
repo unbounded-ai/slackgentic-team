@@ -300,8 +300,14 @@ class PropertyTests(unittest.TestCase):
         for agent, kind in zip(agents, kinds, strict=True):
             block = action_blocks_by_agent_id[agent.agent_id]
             labels = [element["text"]["text"] for element in block["elements"]]
-            if kind in {"task", "external"}:
+            if kind == "task":
                 self.assertEqual(labels, ["Free up", "Open thread", "Fire"])
+                open_thread = block["elements"][1]
+                self.assertEqual(open_thread["action_id"], "thread.open")
+                self.assertIn("/archives/C1/p", open_thread["url"])
+            elif kind == "external":
+                self.assertEqual(labels, ["Detach", "Open thread", "Fire"])
+                self.assertEqual(block["elements"][0]["action_id"], "external.session.detach")
                 open_thread = block["elements"][1]
                 self.assertEqual(open_thread["action_id"], "thread.open")
                 self.assertIn("/archives/C1/p", open_thread["url"])

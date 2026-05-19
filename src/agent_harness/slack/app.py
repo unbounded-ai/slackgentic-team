@@ -114,7 +114,6 @@ from agent_harness.sessions.mirror import (
     EXTERNAL_SESSION_SUMMARY_PREFIX,
     HUMAN_DISPLAY_NAME_SETTING,
     HUMAN_IMAGE_URL_SETTING,
-    PENDING_EXTERNAL_SESSION_PREFIX,
     SessionMirror,
 )
 from agent_harness.slack import (
@@ -327,8 +326,8 @@ class SlackTeamController:
             self._task_from_action(decoded, channel_id, message_ts)
         elif action_name.startswith("schedule."):
             self._schedule_from_action(decoded, channel_id, message_ts, payload.get("trigger_id"))
-        elif action_name == "external.session.finish":
-            self._external_session_finish_from_action(decoded, channel_id)
+        elif action_name in {"external.session.detach", "external.session.finish"}:
+            self._external_session_detach_from_action(decoded, channel_id)
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
             self.session_bridge.handle_agent_request_block_action(decoded, channel_id, message_ts)
 
@@ -1541,15 +1540,28 @@ class SlackTeamController:
         channel_id = self._configured_agent_channel_id()
         if channel_id is None:
             return None
-        thread = self.store.get_slack_thread_for_session(
-            session.provider,
-            session.session_id,
-            self.team_id,
-            channel_id,
+        thread = self._external_session_thread_for_channel(
+            session.provider, session.session_id, channel_id
         )
         if thread is None:
             return None
         return self._thread_permalink(thread.channel_id, thread.thread_ts)
+
+    def _external_session_thread_for_channel(
+        self,
+        provider: Provider,
+        session_id: str,
+        channel_id: str,
+    ) -> SlackThreadRef | None:
+        thread = self.store.get_slack_thread_for_session(
+            provider,
+            session_id,
+            self.team_id,
+            channel_id,
+        )
+        if thread is not None:
+            return thread
+        return self.store.find_slack_thread_for_session_channel(provider, session_id, channel_id)
 
     def _thread_permalink(self, channel_id: str, thread_ts: str | None) -> str | None:
         if not thread_ts:
@@ -1627,14 +1639,10 @@ class SlackTeamController:
         return sessions_by_agent
 
     def _session_for_external_agent_setting(self, key: str):
-        session_key = key.removeprefix(EXTERNAL_SESSION_AGENT_PREFIX)
-        provider_text, separator, session_id = session_key.partition(".")
-        if not separator or not session_id:
+        parsed = _parse_external_session_setting_key(key, EXTERNAL_SESSION_AGENT_PREFIX)
+        if parsed is None:
             return None
-        try:
-            provider = Provider(provider_text)
-        except ValueError:
-            return None
+        provider, session_id = parsed
         return self.store.get_session(provider, session_id)
 
     def _slash_command_target_channel_id(self, payload: dict) -> str | None:
@@ -2125,12 +2133,28 @@ class SlackTeamController:
         roster_ts: str | None,
     ) -> None:
         handle = payload.get("handle") or payload.get("agent_id")
+        detached_count = 0
+        if handle:
+            agent = self.store.get_team_agent(str(handle), include_fired=True)
+            if agent is not None:
+                detached_count = self._detach_external_sessions_for_agent(
+                    agent.agent_id,
+                    channel_id,
+                    post_thread_reply=False,
+                    refresh=False,
+                )
         if handle:
             self.store.fire_team_agent(str(handle))
         ts = self.refresh_or_post_roster(channel_id)
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=roster_ts or ts)
         if handle:
-            self.gateway.post_thread_reply(thread, f"Removed @{str(handle).lstrip('@')}.")
+            if detached_count:
+                self.gateway.post_thread_reply(
+                    thread,
+                    f"Detached external session and removed @{str(handle).lstrip('@')}.",
+                )
+            else:
+                self.gateway.post_thread_reply(thread, f"Removed @{str(handle).lstrip('@')}.")
 
     def _open_roster_work_modal(
         self,
@@ -2697,7 +2721,7 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to update scheduled tasks message", exc_info=True)
 
-    def _external_session_finish_from_action(self, payload: dict, channel_id: str) -> None:
+    def _external_session_detach_from_action(self, payload: dict, channel_id: str) -> None:
         provider_text = str(payload.get("provider") or "")
         session_id = str(payload.get("session_id") or "")
         try:
@@ -2706,22 +2730,72 @@ class SlackTeamController:
             return
         if not session_id:
             return
-        key_suffix = f"{provider.value}.{session_id}"
-        thread = self.store.get_slack_thread_for_session(
+        self._detach_external_session(
             provider,
             session_id,
-            self.team_id,
             channel_id,
+            post_thread_reply=True,
+            refresh=True,
         )
-        self.store.delete_setting(f"{EXTERNAL_SESSION_AGENT_PREFIX}{key_suffix}")
-        self.store.delete_setting(f"{PENDING_EXTERNAL_SESSION_PREFIX}{key_suffix}")
+
+    def _detach_external_sessions_for_agent(
+        self,
+        agent_id: str,
+        channel_id: str,
+        *,
+        post_thread_reply: bool,
+        refresh: bool,
+    ) -> int:
+        sessions = []
+        for key, assigned_agent_id in self.store.list_settings(
+            EXTERNAL_SESSION_AGENT_PREFIX
+        ).items():
+            if assigned_agent_id != agent_id:
+                continue
+            parsed = _parse_external_session_setting_key(key, EXTERNAL_SESSION_AGENT_PREFIX)
+            if parsed is not None:
+                sessions.append(parsed)
+        detached_count = 0
+        for provider, session_id in sessions:
+            if self._detach_external_session(
+                provider,
+                session_id,
+                channel_id,
+                post_thread_reply=post_thread_reply,
+                refresh=False,
+            ):
+                detached_count += 1
+        if refresh and sessions:
+            self.handle_external_session_occupancy_change(channel_id)
+        return detached_count
+
+    def _detach_external_session(
+        self,
+        provider: Provider,
+        session_id: str,
+        channel_id: str,
+        *,
+        post_thread_reply: bool,
+        refresh: bool,
+    ) -> bool:
+        thread = self._external_session_thread_for_channel(provider, session_id, channel_id)
+        key_suffix = f"{provider.value}.{session_id}"
+        ignored_key = f"{EXTERNAL_SESSION_IGNORED_PREFIX}{key_suffix}"
+        already_ignored = self.store.get_setting(ignored_key) is not None
         self.store.set_setting(
-            f"{EXTERNAL_SESSION_IGNORED_PREFIX}{key_suffix}",
+            ignored_key,
             utc_now().isoformat(),
         )
-        if thread is not None:
-            self.gateway.post_thread_reply(thread, "Finished and freed up this agent.")
-        self.handle_external_session_occupancy_change(channel_id)
+        changed = self.store.clear_external_session_tracking(provider, session_id)
+        if thread is not None and post_thread_reply:
+            self.gateway.post_thread_reply(
+                thread,
+                "Detached this agent from the external session. "
+                "This session will be ignored from now on.",
+            )
+        if refresh:
+            self.handle_external_session_occupancy_change(channel_id)
+        return changed or not already_ignored
 
     def _handle_task_thread_reply(self, event: dict, channel_id: str, text: str) -> bool:
         thread_ts = event.get("thread_ts")
@@ -7488,3 +7562,20 @@ def _is_external_thread_helper_task(task: AgentTask) -> bool:
 
 def _external_session_agent_setting_key(session) -> str:
     return f"{EXTERNAL_SESSION_AGENT_PREFIX}{session.provider.value}.{session.session_id}"
+
+
+def _parse_external_session_setting_key(
+    key: str,
+    prefix: str,
+) -> tuple[Provider, str] | None:
+    if not key.startswith(prefix):
+        return None
+    body = key.removeprefix(prefix)
+    provider_text, separator, session_id = body.partition(".")
+    if not separator or not session_id:
+        return None
+    try:
+        provider = Provider(provider_text)
+    except ValueError:
+        return None
+    return provider, session_id
