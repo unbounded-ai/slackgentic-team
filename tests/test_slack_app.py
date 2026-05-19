@@ -33,6 +33,7 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.runtime.tasks import (
+    AGENT_REACTION_SIGNAL_PREFIX,
     AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
     AGENT_THREAD_DONE_SIGNAL,
     MANAGED_RUN_MAX_RESUME_AGE,
@@ -1278,6 +1279,139 @@ class SlackAppTests(unittest.TestCase):
                     gateway.removed_reactions,
                     [("C1", "171.000001", "eyes")],
                 )
+            finally:
+                store.close()
+
+    def test_user_reaction_to_agent_message_is_relayed_to_active_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the fix", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.thread", "171.agent")
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller._remember_agent_authored_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.agent"),
+                    "171.agent",
+                    "Final status",
+                )
+                event = {
+                    "event": {
+                        "type": "reaction_added",
+                        "user": "U1",
+                        "reaction": "thumbsup",
+                        "item": {
+                            "type": "message",
+                            "channel": "C1",
+                            "ts": "171.agent",
+                        },
+                        "event_ts": "172.000001",
+                    }
+                }
+
+                controller.handle_event(event)
+                controller.handle_event(event)
+
+                self.assertEqual(len(runtime.sent), 1)
+                self.assertEqual(runtime.sent[0][0], task.task_id)
+                self.assertIn("reacted with :thumbsup:", runtime.sent[0][1])
+                self.assertIn("lightweight feedback", runtime.sent[0][1])
+            finally:
+                store.close()
+
+    def test_bot_reaction_to_agent_message_is_not_relayed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the fix", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.thread", "171.agent")
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller._remember_agent_authored_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.agent"),
+                    "171.agent",
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "reaction_added",
+                            "user": "UBOT",
+                            "reaction": "eyes",
+                            "item": {
+                                "type": "message",
+                                "channel": "C1",
+                                "ts": "171.agent",
+                            },
+                            "event_ts": "172.000002",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.sent, [])
+            finally:
+                store.close()
+
+    def test_agent_reaction_signal_reacts_to_latest_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the fix", "C1"),
+                    metadata={"request_message_ts": "171.user"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    f"{AGENT_REACTION_SIGNAL_PREFIX}:eyes:",
+                )
+
+                self.assertTrue(handled)
+                self.assertIn(("C1", "171.user", "eyes"), gateway.reactions)
             finally:
                 store.close()
 

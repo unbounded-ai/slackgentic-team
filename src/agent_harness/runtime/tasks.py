@@ -50,6 +50,7 @@ LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
 AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
 AGENT_ROSTER_STATUS_SIGNAL_PREFIX = "SLACKGENTIC: ROSTER "
+AGENT_REACTION_SIGNAL_PREFIX = "SLACKGENTIC: REACT "
 MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_MAX_RESUMES = 3
@@ -551,7 +552,7 @@ class ManagedTaskRuntime:
         hide_visible_text = False
         deferred_signals: list[str] = []
         for signal in control_signals:
-            if is_agent_roster_status_signal(signal):
+            if is_agent_roster_status_signal(signal) or is_agent_reaction_signal(signal):
                 self._handle_immediate_agent_control_signal(running, signal)
             elif signal == AGENT_THREAD_DONE_SIGNAL:
                 if self._handle_immediate_agent_control_signal(running, signal):
@@ -1062,6 +1063,13 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "table. If you need multiple tables, send separate messages."
         ),
         (
+            "When a lightweight acknowledgement is better than a message, you may react to "
+            "the Slack user's latest message by putting a hidden line on its own line in "
+            f"the exact form `{AGENT_REACTION_SIGNAL_PREFIX}<emoji-name>`, for example "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}thumbsup`. Use this sparingly, only when it "
+            "feels right; Slackgentic hides the line and adds the reaction."
+        ),
+        (
             "You may ask another agent for a review or second opinion by sending one "
             "separate Slack-visible message beginning exactly `somebody review ...` "
             "with the concrete item to review. After that message, stop and wait; "
@@ -1259,6 +1267,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
         if normalized.startswith(AGENT_ROSTER_STATUS_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
+        if normalized.startswith(AGENT_REACTION_SIGNAL_PREFIX):
+            signals.append(line.strip())
+            continue
         if normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
@@ -1276,6 +1287,19 @@ def _is_schedule_control_signal(signal: str) -> bool:
 
 def is_agent_roster_status_signal(signal: str) -> bool:
     return re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_ROSTER_STATUS_SIGNAL_PREFIX)
+
+
+def is_agent_reaction_signal(signal: str) -> bool:
+    return re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_REACTION_SIGNAL_PREFIX)
+
+
+def parse_agent_reaction_signal(signal: str) -> str | None:
+    if not is_agent_reaction_signal(signal):
+        return None
+    reaction = signal.strip()[len(AGENT_REACTION_SIGNAL_PREFIX) :].strip().strip(":")
+    if not re.fullmatch(r"[A-Za-z0-9_+-]+", reaction):
+        return None
+    return reaction.lower()
 
 
 def parse_agent_roster_status_signal(signal: str) -> str | None:
