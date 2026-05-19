@@ -29,6 +29,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_MAX_RESUME_AGE,
     MANAGED_RUN_MAX_RESUMES,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
+    MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     RunningTask,
@@ -507,6 +508,19 @@ class HoldingProcess(OneShotProcess):
         self.interrupts += 1
 
 
+class SessionThenHoldingProcess(HoldingProcess):
+    session_id = "codex-thread-1"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                f'{{"type":"thread.started","thread_id":"{self.session_id}"}}\n'
+                '{"type":"event_msg","payload":{"type":"agent_message","message":"Working"}}\n'
+            )
+        return ""
+
+
 class CrashingProcess(OneShotProcess):
     def __init__(self, request):
         super().__init__(request)
@@ -911,6 +925,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 "SLACKGENTIC_CLAUDE_BINARY": "/tmp/claude",
                 "SLACKGENTIC_DEFAULT_CWD": "/tmp",
                 "SLACKGENTIC_DANGEROUS_BY_DEFAULT": "true",
+                "SLACKGENTIC_AGENT_START_TIMEOUT_SECONDS": "5",
+                "SLACKGENTIC_AGENT_PROGRESS_TIMEOUT_SECONDS": "10",
+                "SLACKGENTIC_AGENT_STALL_TIMEOUT_SECONDS": "20",
+                "SLACKGENTIC_AGENT_STALL_RECOVERY_ATTEMPTS": "1",
             }
         )
 
@@ -918,6 +936,10 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(config.claude_binary, "/tmp/claude")
         self.assertEqual(config.default_cwd, Path("/tmp"))
         self.assertTrue(config.dangerous_by_default)
+        self.assertEqual(config.agent_start_timeout_seconds, 5)
+        self.assertEqual(config.agent_progress_timeout_seconds, 10)
+        self.assertEqual(config.agent_stall_timeout_seconds, 20)
+        self.assertEqual(config.agent_stall_recovery_attempts, 1)
 
     def test_terminal_output_cleanup_removes_osc_controls(self):
         cleaned = _clean_terminal_output("\x1b]10;?\x1b\\visible\x1b[31m red\x1b[0m")
@@ -1850,6 +1872,237 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
                 self.assertIsNone(store.get_managed_thread_task("C1", "171.000001"))
                 self.assertIn("did not finish starting Codex", gateway.replies[-1])
+            finally:
+                store.close()
+
+    def test_runtime_cancels_claude_run_that_never_starts_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "review a design", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                    agent_start_timeout=timedelta(seconds=0),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and current.status == AgentTaskStatus.CANCELLED:
+                        break
+                    time.sleep(0.01)
+
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertIn("did not finish starting Claude", gateway.replies[-1])
+            finally:
+                store.close()
+
+    def test_runtime_warns_without_interrupting_on_missing_visible_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            processes = []
+
+            def process_factory(request):
+                process = SessionThenHoldingProcess(request)
+                processes.append(process)
+                return process
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "run the long test suite", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    agent_progress_timeout=timedelta(seconds=0.01),
+                    agent_stall_timeout=timedelta(minutes=30),
+                    max_stall_recoveries=1,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if any("leaving the run active" in reply for reply in gateway.replies):
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(len(processes), 1)
+                self.assertTrue(processes[0].is_alive())
+                self.assertIn("Working", gateway.replies)
+                self.assertTrue(any("leaving the run active" in reply for reply in gateway.replies))
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+            finally:
+                if "runtime" in locals():
+                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                store.close()
+
+    def test_runtime_restarts_stalled_session_with_status_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            processes = []
+
+            def process_factory(request):
+                requests.append(request)
+                process = (
+                    SessionThenHoldingProcess(request)
+                    if len(requests) == 1
+                    else OneShotProcess(request)
+                )
+                processes.append(process)
+                return process
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "open the pull request", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    agent_progress_timeout=timedelta(minutes=30),
+                    agent_stall_timeout=timedelta(seconds=0),
+                    max_stall_recoveries=1,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(100):
+                    if len(requests) >= 2 and gateway.replies and gateway.replies[-1] == "Done":
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(len(requests), 2)
+                self.assertFalse(processes[0].is_alive())
+                self.assertEqual(requests[1].resume_session_id, "codex-thread-1")
+                self.assertIn("observed no activity", requests[1].prompt)
+                self.assertIn(
+                    "First post a concise Slack-visible status update", requests[1].prompt
+                )
+                self.assertIn("Original task: open the pull request", requests[1].prompt)
+                self.assertIn("Working", gateway.replies)
+                self.assertTrue(
+                    any("restarted it with a status request" in reply for reply in gateway.replies)
+                )
+            finally:
+                if "runtime" in locals():
+                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                store.close()
+
+    def test_runtime_treats_transcript_updates_as_activity_for_stall_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            transcript = (
+                home
+                / ".codex"
+                / "sessions"
+                / "2026"
+                / "05"
+                / "19"
+                / "rollout-codex-thread-activity.jsonl"
+            )
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n")
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                task = replace(
+                    create_agent_task(agent, "keep going", "C1"),
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-activity",
+                )
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    agent_stall_timeout=timedelta(seconds=5),
+                    home=home,
+                )
+                stale = time.monotonic() - 60
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=HoldingProcess(None),
+                    thread=SlackThreadRef("C1", "171.000001"),
+                    worker=threading.Thread(),
+                    started_monotonic=stale,
+                    last_output_monotonic=stale,
+                    last_activity_monotonic=stale,
+                    last_visible_message_monotonic=stale,
+                )
+
+                runtime._capture_transcript_activity(running)
+                running.last_activity_monotonic = stale
+                running.last_transcript_activity_check_monotonic = 0.0
+                transcript.write_text("{}\n{}\n")
+                runtime._capture_transcript_activity(running)
+
+                self.assertFalse(runtime._managed_task_stall_timed_out(running))
+            finally:
+                store.close()
+
+    def test_runtime_cancels_stalled_session_after_recovery_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "keep going", "C1"),
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                    metadata={MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY: 1},
+                )
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                    agent_progress_timeout=timedelta(minutes=30),
+                    agent_stall_timeout=timedelta(seconds=0),
+                    max_stall_recoveries=1,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    current = store.get_agent_task(task.task_id)
+                    if current and current.status == AgentTaskStatus.CANCELLED:
+                        break
+                    time.sleep(0.01)
+
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertIn("repeatedly had no observed activity", gateway.replies[-1])
+                self.assertNotIn(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY, persisted.metadata)
             finally:
                 store.close()
 

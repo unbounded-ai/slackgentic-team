@@ -54,11 +54,18 @@ AGENT_ROSTER_STATUS_SIGNAL_PREFIX = "SLACKGENTIC: ROSTER "
 AGENT_REACTION_SIGNAL_PREFIX = "SLACKGENTIC: REACT "
 MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
+MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY = "managed_run_stall_recoveries"
+MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY = "managed_run_original_prompt"
 MANAGED_RUN_MAX_RESUMES = 3
+MANAGED_RUN_MAX_STALL_RECOVERIES = 2
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
+MANAGED_RUN_PROGRESS_WARNING_TIMEOUT = timedelta(minutes=5)
+MANAGED_RUN_STALL_TIMEOUT = timedelta(minutes=15)
 FAST_STREAM_POLL_SECONDS = 0.1
 MIN_STREAM_POLL_SECONDS = 0.01
+TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS = 5.0
+TRANSCRIPT_ACTIVITY_DISCOVERY_INTERVAL_SECONDS = 30.0
 MACOS_TCC_PROTECTED_HOME_DIRS = (
     "Desktop",
     "Documents",
@@ -72,6 +79,8 @@ TaskDoneCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef], None]
 AgentMessageCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str, str | None], bool]
 AgentControlCallback = Callable[[AgentTask, TeamAgent, SlackThreadRef, str], bool]
 AgentIconUrlCallback = Callable[[TeamAgent], str | None]
+TranscriptActivitySignature = tuple[str, int, int]
+TranscriptActivitySnapshot = tuple[Path, TranscriptActivitySignature]
 
 
 @dataclass
@@ -97,6 +106,16 @@ class RunningTask:
     terminal_control_signal_handled: bool = False
     visible_message_count: int = 0
     started_monotonic: float = field(default_factory=time.monotonic)
+    last_output_monotonic: float = field(default_factory=time.monotonic)
+    last_activity_monotonic: float = field(default_factory=time.monotonic)
+    last_visible_message_monotonic: float | None = None
+    transcript_activity_session_id: str | None = None
+    transcript_activity_path: Path | None = None
+    transcript_activity_signature: TranscriptActivitySignature | None = None
+    transcript_activity_checked: bool = False
+    last_transcript_activity_check_monotonic: float = 0.0
+    last_transcript_discovery_monotonic: float = 0.0
+    progress_warning_monotonic: float | None = None
     stop_requested: bool = False
     wake_event: threading.Event = field(default_factory=threading.Event)
 
@@ -115,6 +134,10 @@ class ManagedTaskRuntime:
         agent_icon_url: AgentIconUrlCallback | None = None,
         home: Path | None = None,
         codex_thread_start_timeout: timedelta = CODEX_THREAD_START_TIMEOUT,
+        agent_start_timeout: timedelta | None = None,
+        agent_progress_timeout: timedelta | None = None,
+        agent_stall_timeout: timedelta | None = None,
+        max_stall_recoveries: int | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -126,7 +149,46 @@ class ManagedTaskRuntime:
         self.on_agent_control = on_agent_control
         self.agent_icon_url = agent_icon_url
         self.home = home or Path.home()
-        self.codex_thread_start_timeout = codex_thread_start_timeout
+        explicit_legacy_start_timeout = codex_thread_start_timeout != CODEX_THREAD_START_TIMEOUT
+        self.agent_start_timeout = (
+            agent_start_timeout
+            if agent_start_timeout is not None
+            else (
+                codex_thread_start_timeout
+                if explicit_legacy_start_timeout
+                else _seconds_config_timedelta(
+                    commands.agent_start_timeout_seconds,
+                    default=CODEX_THREAD_START_TIMEOUT,
+                )
+            )
+        )
+        self.codex_thread_start_timeout = self.agent_start_timeout
+        self.agent_progress_timeout = (
+            agent_progress_timeout
+            if agent_progress_timeout is not None
+            else _seconds_config_timedelta(
+                commands.agent_progress_timeout_seconds,
+                default=MANAGED_RUN_PROGRESS_WARNING_TIMEOUT,
+            )
+        )
+        self.agent_stall_timeout = (
+            agent_stall_timeout
+            if agent_stall_timeout is not None
+            else _seconds_config_timedelta(
+                commands.agent_stall_timeout_seconds,
+                default=MANAGED_RUN_STALL_TIMEOUT,
+            )
+        )
+        configured_recoveries = getattr(
+            commands,
+            "agent_stall_recovery_attempts",
+            MANAGED_RUN_MAX_STALL_RECOVERIES,
+        )
+        self.max_stall_recoveries = (
+            max_stall_recoveries
+            if max_stall_recoveries is not None
+            else max(0, configured_recoveries)
+        )
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
 
@@ -407,10 +469,15 @@ class ManagedTaskRuntime:
                 return
             output = running.process.read_available()
             had_output = bool(output)
+            if had_output:
+                now = time.monotonic()
+                running.last_output_monotonic = now
+                running.last_activity_monotonic = now
             if running.stop_requested:
                 self._remove_running_task(task_id, running)
                 return
             self._capture_session_id(running, output)
+            self._capture_transcript_activity(running)
             permission_denied = self._capture_permission_denials(running, output)
             self._capture_resume_errors(running, output)
             if permission_denied and running.process.is_alive():
@@ -431,8 +498,13 @@ class ManagedTaskRuntime:
             if running.stop_requested:
                 self._remove_running_task(task_id, running)
                 return
-            if self._codex_thread_start_timed_out(running):
-                self._handle_codex_thread_start_timeout(running)
+            if self._managed_task_start_timed_out(running):
+                self._handle_managed_task_start_timeout(running)
+                return
+            if self._managed_task_progress_warning_due(running):
+                self._handle_managed_task_progress_warning(running)
+            if self._managed_task_stall_timed_out(running):
+                self._handle_managed_task_stall_timeout(running)
                 return
             if not running.process.is_alive():
                 time.sleep(0.05)
@@ -501,25 +573,30 @@ class ManagedTaskRuntime:
                 sleep_seconds = _fast_stream_poll_seconds(self.poll_seconds)
 
     def _codex_thread_start_timed_out(self, running: RunningTask) -> bool:
-        if _provider_for_running(running) != Provider.CODEX:
-            return False
+        return self._managed_task_start_timed_out(running)
+
+    def _managed_task_start_timed_out(self, running: RunningTask) -> bool:
         if running.task.session_id:
             return False
         if running.visible_message_count or running.control_signals:
             return False
         if not running.process.is_alive():
             return False
-        timeout_seconds = self.codex_thread_start_timeout.total_seconds()
+        timeout_seconds = self.agent_start_timeout.total_seconds()
         if timeout_seconds <= 0:
             return True
         return time.monotonic() - running.started_monotonic >= timeout_seconds
 
     def _handle_codex_thread_start_timeout(self, running: RunningTask) -> None:
+        self._handle_managed_task_start_timeout(running)
+
+    def _handle_managed_task_start_timeout(self, running: RunningTask) -> None:
         task_id = running.task.task_id
+        provider = _provider_for_running(running)
         try:
             running.process.terminate()
         except Exception:
-            LOGGER.debug("failed to stop Codex after startup timeout", exc_info=True)
+            LOGGER.debug("failed to stop managed task after startup timeout", exc_info=True)
         with self._lock:
             self._running.pop(task_id, None)
         self._clear_managed_run_started(task_id)
@@ -529,12 +606,111 @@ class ManagedTaskRuntime:
         self.gateway.post_thread_reply(
             running.thread,
             (
-                f"{running.agent.full_name} did not finish starting Codex within "
-                f"{int(self.codex_thread_start_timeout.total_seconds())} seconds, "
+                f"{running.agent.full_name} did not finish starting {provider.value.capitalize()} "
+                f"within {int(self.agent_start_timeout.total_seconds())} seconds, "
                 "so I stopped this run instead of leaving it stuck."
             ),
             persona=running.agent,
             icon_url=self._agent_icon_url(running.agent),
+        )
+
+    def _managed_task_progress_warning_due(self, running: RunningTask) -> bool:
+        if not running.process.is_alive():
+            return False
+        if not running.task.session_id and running.visible_message_count <= 0:
+            return False
+        timeout_seconds = self.agent_progress_timeout.total_seconds()
+        if timeout_seconds <= 0:
+            return False
+        last_visible = running.last_visible_message_monotonic or running.started_monotonic
+        last_warning = running.progress_warning_monotonic
+        if last_warning is not None and last_warning >= last_visible:
+            return False
+        return time.monotonic() - last_visible >= timeout_seconds
+
+    def _handle_managed_task_progress_warning(self, running: RunningTask) -> None:
+        running.progress_warning_monotonic = time.monotonic()
+        self.gateway.post_thread_reply(
+            running.thread,
+            (
+                f"{running.agent.full_name} has not posted Slack-visible progress for "
+                f"{_format_timeout_duration(self.agent_progress_timeout)}. I am leaving "
+                "the run active, but will restart it if there is no observed activity "
+                "(provider output, transcript updates, or Slack-visible progress) for "
+                f"{_format_timeout_duration(self.agent_stall_timeout)}."
+            ),
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
+
+    def _managed_task_progress_timed_out(self, running: RunningTask) -> bool:
+        return self._managed_task_stall_timed_out(running)
+
+    def _managed_task_stall_timed_out(self, running: RunningTask) -> bool:
+        if not running.process.is_alive():
+            return False
+        if not running.task.session_id and running.visible_message_count <= 0:
+            return False
+        timeout_seconds = self.agent_stall_timeout.total_seconds()
+        if timeout_seconds < 0:
+            return False
+        if timeout_seconds == 0:
+            return True
+        return time.monotonic() - running.last_activity_monotonic >= timeout_seconds
+
+    def _handle_managed_task_progress_timeout(self, running: RunningTask) -> None:
+        self._handle_managed_task_stall_timeout(running)
+
+    def _handle_managed_task_stall_timeout(self, running: RunningTask) -> None:
+        task_id = running.task.task_id
+        provider = _provider_for_running(running)
+        try:
+            running.process.terminate()
+        except Exception:
+            LOGGER.debug("failed to stop managed task after stall timeout", exc_info=True)
+        with self._lock:
+            self._running.pop(task_id, None)
+        current = self.store.get_agent_task(task_id) or running.task
+        attempts = managed_run_stall_recoveries(current)
+        if not current.session_id or attempts >= self.max_stall_recoveries:
+            self._clear_managed_run_started(task_id)
+            self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+            self.store.delete_managed_thread_task(task_id)
+            self.gateway.post_thread_reply(
+                running.thread,
+                _progress_timeout_cancel_message(
+                    running.agent.full_name,
+                    provider,
+                    self.agent_stall_timeout,
+                    has_session=bool(current.session_id),
+                ),
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
+            return
+
+        recovery_task = _task_for_progress_stall_recovery(
+            current,
+            self.agent_stall_timeout,
+            attempts=attempts + 1,
+        )
+        self.store.upsert_agent_task(recovery_task)
+        self.gateway.post_thread_reply(
+            running.thread,
+            (
+                f"{running.agent.full_name} had no observed activity for "
+                f"{_format_timeout_duration(self.agent_stall_timeout)}: no provider output, "
+                "no transcript updates, and no Slack-visible progress. I stopped that "
+                "run and restarted it with a status request."
+            ),
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
+        self.start_task(
+            recovery_task,
+            running.agent,
+            running.thread,
+            allowed_tools=running.allowed_tools,
         )
 
     def _handle_task_worker_failure(self, task_id: str) -> None:
@@ -613,7 +789,11 @@ class ManagedTaskRuntime:
             persona=running.agent,
             icon_url=self._agent_icon_url(running.agent),
         )
+        now = time.monotonic()
         running.visible_message_count += 1
+        running.last_visible_message_monotonic = now
+        running.last_activity_monotonic = now
+        running.progress_warning_monotonic = None
         running.observed_agent_messages.add(normalized)
         if self.on_agent_message is None:
             return
@@ -721,6 +901,65 @@ class ManagedTaskRuntime:
             session_provider=provider,
             session_id=session_id,
         )
+
+    def _capture_transcript_activity(self, running: RunningTask) -> None:
+        session_id = running.task.session_id
+        if not session_id:
+            return
+        if running.transcript_activity_session_id != session_id:
+            running.transcript_activity_session_id = session_id
+            running.transcript_activity_path = None
+            running.transcript_activity_signature = None
+            running.transcript_activity_checked = False
+            running.last_transcript_discovery_monotonic = 0.0
+
+        now = time.monotonic()
+        if (
+            now - running.last_transcript_activity_check_monotonic
+            < TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS
+        ):
+            return
+        running.last_transcript_activity_check_monotonic = now
+
+        snapshot: TranscriptActivitySnapshot | None = None
+        if running.transcript_activity_path is not None:
+            signature = _transcript_activity_signature_for_path(running.transcript_activity_path)
+            if signature is None:
+                running.transcript_activity_path = None
+            else:
+                snapshot = (running.transcript_activity_path, signature)
+
+        if snapshot is None:
+            if (
+                now - running.last_transcript_discovery_monotonic
+                < TRANSCRIPT_ACTIVITY_DISCOVERY_INTERVAL_SECONDS
+            ):
+                running.transcript_activity_checked = True
+                return
+            running.last_transcript_discovery_monotonic = now
+            snapshot = _session_transcript_activity_snapshot(
+                _provider_for_running(running),
+                session_id,
+                self.home,
+            )
+
+        if snapshot is None:
+            running.transcript_activity_checked = True
+            return
+        path, signature = snapshot
+        running.transcript_activity_path = path
+        if running.transcript_activity_signature is None:
+            running.transcript_activity_signature = signature
+            if running.transcript_activity_checked:
+                running.last_activity_monotonic = now
+            running.transcript_activity_checked = True
+            return
+        if signature == running.transcript_activity_signature:
+            running.transcript_activity_checked = True
+            return
+        running.transcript_activity_signature = signature
+        running.transcript_activity_checked = True
+        running.last_activity_monotonic = now
 
     def _capture_permission_denials(
         self,
@@ -959,11 +1198,20 @@ class ManagedTaskRuntime:
             return current
         has_marker = MANAGED_RUN_STARTED_METADATA_KEY in current.metadata
         has_attempts = MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY in current.metadata
-        if not has_marker and not has_attempts:
+        has_stall_recoveries = MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY in current.metadata
+        has_original_prompt = MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY in current.metadata
+        if (
+            not has_marker
+            and not has_attempts
+            and not has_stall_recoveries
+            and not has_original_prompt
+        ):
             return current
         metadata = dict(current.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY, None)
         updated = replace(current, metadata=metadata, updated_at=utc_now())
         try:
             self.store.upsert_agent_task(updated)
@@ -1004,6 +1252,91 @@ def managed_run_resume_attempts(task: AgentTask) -> int:
     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         return max(0, int(value.strip()))
     return 0
+
+
+def managed_run_stall_recoveries(task: AgentTask) -> int:
+    value = task.metadata.get(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY)
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return max(0, int(value.strip()))
+    return 0
+
+
+def _task_for_progress_stall_recovery(
+    task: AgentTask,
+    timeout: timedelta,
+    *,
+    attempts: int,
+) -> AgentTask:
+    metadata = dict(task.metadata)
+    original_prompt = metadata.get(MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY)
+    if not isinstance(original_prompt, str) or not original_prompt.strip():
+        original_prompt = task.prompt
+    metadata[MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY] = original_prompt
+    metadata[MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY] = attempts
+    return replace(
+        task,
+        prompt=_progress_stall_recovery_prompt(original_prompt, timeout),
+        status=AgentTaskStatus.ACTIVE,
+        metadata=metadata,
+        updated_at=utc_now(),
+    )
+
+
+def _progress_stall_recovery_prompt(original_prompt: str, timeout: timedelta) -> str:
+    return (
+        "The previous managed run was stopped because Slackgentic observed no activity "
+        f"for {_format_timeout_duration(timeout)}: no provider output, no transcript "
+        "updates, and no Slack-visible progress. First post a concise Slack-visible "
+        "status update in the thread explaining what you know so far, then continue "
+        "the task. Do not redo completed work; inspect the local repo/session state "
+        "and continue from there. If you are blocked, say exactly what is blocking "
+        "progress.\n\n"
+        f"Original task: {original_prompt}"
+    )
+
+
+def _progress_timeout_cancel_message(
+    agent_name: str,
+    provider: Provider,
+    timeout: timedelta,
+    *,
+    has_session: bool,
+) -> str:
+    duration = _format_timeout_duration(timeout)
+    if not has_session:
+        return (
+            f"{agent_name} had no observed activity for {duration}, and Slackgentic does "
+            f"not have a {provider.value} session id to resume safely. I stopped this "
+            "run instead of leaving it stuck."
+        )
+    return (
+        f"{agent_name} repeatedly had no observed activity for {duration}. I stopped this "
+        "run instead of restarting it again."
+    )
+
+
+def _format_timeout_duration(timeout: timedelta) -> str:
+    seconds = max(0, int(timeout.total_seconds()))
+    if seconds % 60 == 0 and seconds >= 60:
+        minutes = seconds // 60
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {unit}"
+    unit = "second" if seconds == 1 else "seconds"
+    return f"{seconds} {unit}"
+
+
+def _seconds_config_timedelta(value: float, *, default: timedelta) -> timedelta:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if seconds < 0:
+        return default
+    return timedelta(seconds=seconds)
 
 
 def _fast_stream_poll_seconds(configured_poll_seconds: float) -> float:
@@ -1834,6 +2167,46 @@ def _render_codex_response_item(payload: dict) -> str | None:
             if cleaned:
                 parts.append(cleaned)
     return "\n\n".join(parts) if parts else None
+
+
+def _transcript_activity_signature_for_path(path: Path) -> TranscriptActivitySignature | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _session_transcript_activity_snapshot(
+    provider: Provider,
+    session_id: str | None,
+    home: Path,
+) -> TranscriptActivitySnapshot | None:
+    if not session_id:
+        return None
+    if provider == Provider.CODEX:
+        root = home / ".codex" / "sessions"
+        pattern = f"*{session_id}.jsonl"
+    elif provider == Provider.CLAUDE:
+        root = home / ".claude" / "projects"
+        pattern = f"{session_id}.jsonl"
+    else:
+        return None
+    if not root.exists():
+        return None
+    latest: tuple[int, int, str, TranscriptActivitySnapshot] | None = None
+    try:
+        for path in root.rglob(pattern):
+            signature = _transcript_activity_signature_for_path(path)
+            if signature is None:
+                continue
+            _, mtime_ns, size = signature
+            candidate = (mtime_ns, size, str(path), (path, signature))
+            if latest is None or candidate[:3] > latest[:3]:
+                latest = candidate
+    except OSError:
+        return None
+    return latest[3] if latest is not None else None
 
 
 def _latest_codex_transcript_message(

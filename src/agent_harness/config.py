@@ -50,6 +50,22 @@ class AgentCommandConfig(BaseModel):
         default=False,
         validation_alias="SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS",
     )
+    agent_start_timeout_seconds: float = Field(
+        default=120.0,
+        validation_alias="SLACKGENTIC_AGENT_START_TIMEOUT_SECONDS",
+    )
+    agent_progress_timeout_seconds: float = Field(
+        default=300.0,
+        validation_alias="SLACKGENTIC_AGENT_PROGRESS_TIMEOUT_SECONDS",
+    )
+    agent_stall_timeout_seconds: float = Field(
+        default=900.0,
+        validation_alias="SLACKGENTIC_AGENT_STALL_TIMEOUT_SECONDS",
+    )
+    agent_stall_recovery_attempts: int = Field(
+        default=2,
+        validation_alias="SLACKGENTIC_AGENT_STALL_RECOVERY_ATTEMPTS",
+    )
 
 
 class TeamConfig(BaseModel):
