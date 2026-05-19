@@ -1598,6 +1598,36 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_shows_idle_active_task_as_open_thread_not_working(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "waiting for follow-up", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=DetachedRuntime(),
+                )
+
+                controller.post_roster("C1")
+
+                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("*Occupied:* Open thread: waiting for follow-up", blocks)
+                self.assertNotIn("*Working:* waiting for follow-up", blocks)
+            finally:
+                store.close()
+
     def test_roster_ignores_terminal_runtime_running_task(self):
         class RuntimeWithRunningTask(FakeRuntime):
             def __init__(self, running):

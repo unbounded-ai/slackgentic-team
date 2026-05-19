@@ -1378,10 +1378,18 @@ class SlackTeamController:
             task = self.store.active_task_for_agent(agent.agent_id)
             if task is None:
                 continue
-            label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Working"
+            if task.status == AgentTaskStatus.QUEUED:
+                label = "Queued"
+                detail = _shorten(_task_roster_summary(task), 140)
+            elif self._task_is_runtime_running(task.task_id):
+                label = "Working"
+                detail = _shorten(_task_roster_summary(task), 140)
+            else:
+                label = "Occupied"
+                detail = _shorten(f"Open thread: {_task_roster_summary(task)}", 140)
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
-                _shorten(_task_roster_summary(task), 140),
+                detail,
                 dangerous_mode=_task_dangerous_mode(task),
                 pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
@@ -1516,6 +1524,18 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to read running managed tasks for roster", exc_info=True)
             return []
+
+    def _task_is_runtime_running(self, task_id: str) -> bool:
+        if self.runtime is None:
+            return False
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if not callable(is_running):
+            return False
+        try:
+            return bool(is_running(task_id))
+        except Exception:
+            LOGGER.debug("failed to read managed task runtime state", exc_info=True)
+            return False
 
     def _external_session_permalink(self, session) -> str | None:
         channel_id = self._configured_agent_channel_id()

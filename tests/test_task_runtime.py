@@ -1897,7 +1897,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
                 for _ in range(50):
                     current = store.get_agent_task(task.task_id)
-                    if current and current.status == AgentTaskStatus.CANCELLED:
+                    if current and current.status == AgentTaskStatus.CANCELLED and gateway.replies:
                         break
                     time.sleep(0.01)
 
