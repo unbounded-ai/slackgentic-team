@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import replace
 
-from agent_harness.models import ROSTER_SUMMARY_METADATA_KEY, Provider
+from agent_harness.models import PR_URLS_METADATA_KEY, ROSTER_SUMMARY_METADATA_KEY, Provider
 from agent_harness.slack import (
     AgentRosterStatus,
     build_external_session_capacity_blocks,
@@ -182,6 +182,31 @@ class SlackTests(unittest.TestCase):
         self.assertIn("*Working:* *PRs:* review the queue", status_block["text"]["text"])
         self.assertIn("*Mode:* :zap: Dangerous", status_block["text"]["text"])
 
+    def test_roster_blocks_show_pr_links_separately_from_status_summary(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        blocks = build_team_roster_blocks(
+            [agent],
+            {
+                agent.agent_id: AgentRosterStatus(
+                    "Working",
+                    "shipping the status view",
+                    pr_urls=(
+                        "https://github.com/acme/app/pull/42",
+                        "https://github.com/acme/app/pull/43",
+                        "https://github.com/acme/app/pull/44",
+                        "https://github.com/acme/app/pull/45",
+                    ),
+                )
+            },
+        )
+
+        rendered = str(blocks)
+        self.assertIn("*Working:* shipping the status view", rendered)
+        self.assertIn("*PRs:*", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/42|acme/app#42>", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/44|acme/app#44>", rendered)
+        self.assertIn("+1 more", rendered)
+
     def test_roster_blocks_sort_occupied_then_provider_then_name(self):
         agents = build_initial_model_team(codex_count=2, claude_count=2)
         shuffled = [agents[3], agents[2], agents[1], agents[0]]
@@ -260,6 +285,26 @@ class SlackTests(unittest.TestCase):
 
         self.assertIn("Roster UX fix: refreshing Priya's task thread header", rendered)
         self.assertNotIn("tiny latest prompt", rendered)
+
+    def test_task_blocks_show_pr_links_from_metadata(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = replace(
+            create_agent_task(agent, "ship the status view", "C1"),
+            metadata={
+                PR_URLS_METADATA_KEY: [
+                    "https://github.com/acme/app/pull/42",
+                    "https://github.com/acme/app/pull/43",
+                ]
+            },
+        )
+
+        rendered = str(build_task_thread_blocks(task, agent))
+
+        self.assertIn("*PRs:*", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/42|acme/app#42>", rendered)
+        self.assertIn("<https://github.com/acme/app/pull/43|acme/app#43>", rendered)
 
     def test_resolved_task_blocks_omit_finish_button(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

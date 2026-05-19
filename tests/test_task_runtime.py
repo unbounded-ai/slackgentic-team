@@ -15,6 +15,7 @@ from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
     AgentTaskKind,
     AgentTaskStatus,
     PermissionMode,
@@ -591,6 +592,26 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn(f"@{agent.handle}", prompt)
         self.assertIn("review the PR", prompt)
         self.assertIn("https://github.com/acme/app/pull/42", prompt)
+
+    def test_build_task_prompt_includes_multiple_pr_contexts(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "review the PRs", "C1", kind=AgentTaskKind.REVIEW)
+        task = replace(
+            task,
+            metadata={
+                PR_URLS_METADATA_KEY: [
+                    "https://github.com/acme/app/pull/42",
+                    "https://github.com/acme/app/pull/43",
+                ]
+            },
+        )
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("Pull request URLs:", prompt)
+        self.assertIn("- https://github.com/acme/app/pull/42", prompt)
+        self.assertIn("- https://github.com/acme/app/pull/43", prompt)
+        self.assertIn("Review the PR(s)", prompt)
 
     def test_build_task_prompt_includes_thread_context(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

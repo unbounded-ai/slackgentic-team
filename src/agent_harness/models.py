@@ -10,6 +10,8 @@ DANGEROUS_MODE_METADATA_KEY = "dangerous_mode"
 PERMISSION_MODE_METADATA_KEY = "permission_mode"
 ASSIGNMENT_PROMPT_METADATA_KEY = "assignment_prompt"
 ROSTER_SUMMARY_METADATA_KEY = "roster_summary"
+PR_URL_METADATA_KEY = "pr_url"
+PR_URLS_METADATA_KEY = "pr_urls"
 EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
 
 
