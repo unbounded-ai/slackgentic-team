@@ -558,7 +558,8 @@ class ManagedTaskRuntime:
                 completed_task = self._clear_managed_run_started(task_id) or completed_task
                 if running.terminal_control_signal_handled:
                     return
-                if self._handle_agent_control_signals(running, completed_task):
+                handled_signals = self._handle_agent_control_signals(running, completed_task)
+                if AGENT_THREAD_DONE_SIGNAL in handled_signals:
                     return
                 if self.on_task_done:
                     self.on_task_done(completed_task, running.agent, running.thread)
@@ -830,15 +831,14 @@ class ManagedTaskRuntime:
             LOGGER.exception("failed to handle immediate agent control signal")
             return False
 
-    def _handle_agent_control_signals(self, running: RunningTask, task: AgentTask) -> bool:
+    def _handle_agent_control_signals(self, running: RunningTask, task: AgentTask) -> set[str]:
         if self.on_agent_control is None:
-            return False
-        handled = False
+            return set()
+        handled: set[str] = set()
         for signal in dict.fromkeys(running.control_signals):
             try:
-                handled = (
-                    self.on_agent_control(task, running.agent, running.thread, signal) or handled
-                )
+                if self.on_agent_control(task, running.agent, running.thread, signal):
+                    handled.add(signal)
             except Exception:
                 LOGGER.exception("failed to handle agent control signal")
         return handled

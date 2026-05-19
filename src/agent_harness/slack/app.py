@@ -3936,6 +3936,7 @@ class SlackTeamController:
         self._clear_completed_run_pending_reactions(task, thread)
         if self._resume_queued_thread_followups(task, agent, thread):
             return
+        task = self._finish_completed_runtime_task(task, thread)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
@@ -4017,6 +4018,42 @@ class SlackTeamController:
         self.store.update_agent_task_thread(delegated_task.task_id, thread.thread_ts, posted.ts)
         delegated_task = self.store.get_agent_task(delegated_task.task_id) or delegated_task
         self._start_runtime_task(delegated_task, target_agent, thread)
+
+    def _finish_completed_runtime_task(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        if current.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return current
+        self.store.update_agent_task_status(current.task_id, AgentTaskStatus.DONE)
+        finished = self.store.get_agent_task(current.task_id) or replace(
+            current,
+            status=AgentTaskStatus.DONE,
+            updated_at=utc_now(),
+        )
+        if self._has_continuing_thread_work(finished, thread):
+            self._remove_task_action_buttons_if_resolved(finished)
+        else:
+            self._mark_task_complete(finished, thread, include_thread=False)
+        return finished
+
+    def _has_continuing_thread_work(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> bool:
+        if isinstance(task.metadata.get("delegate_to_agent_id"), str) or isinstance(
+            task.metadata.get("delegate_prompt"), str
+        ):
+            return True
+        for thread_task in self.store.list_thread_agent_tasks(thread.channel_id, thread.thread_ts):
+            if thread_task.task_id == task.task_id:
+                continue
+            if thread_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+                return True
+        return False
 
     def handle_runtime_agent_control(
         self,
@@ -4597,15 +4634,15 @@ class SlackTeamController:
             )
             return True
         previous_task = self.store.get_agent_task(timer.task_id)
-        if previous_task is None or previous_task.status in {
-            AgentTaskStatus.DONE,
-            AgentTaskStatus.CANCELLED,
-        }:
+        if previous_task is None or previous_task.status == AgentTaskStatus.CANCELLED:
             self.store.update_scheduled_timer_status(
                 timer.timer_id,
                 ScheduledTimerStatus.CANCELLED,
             )
             return True
+        active_task = self.store.active_task_for_agent(agent.agent_id)
+        if active_task is not None and active_task.task_id != previous_task.task_id:
+            return False
         is_running = getattr(self.runtime, "is_task_running", None)
         if callable(is_running) and is_running(previous_task.task_id):
             return False
@@ -4708,6 +4745,18 @@ class SlackTeamController:
             assignment_mode=AssignmentMode.SPECIFIC,
             requested_handle=agent.handle,
         )
+        active_task = self.store.active_task_for_agent(agent.agent_id)
+        if active_task is not None and active_task.task_id != parent_task.task_id:
+            metadata = self._thread_task_metadata(parent_task, channel_id, thread_ts)
+            metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(parent_task)
+            metadata["request_message_ts"] = event.get("ts")
+            self._post_assignment_unavailable(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=thread_ts),
+                request,
+                requested_by_slack_user=event.get("user"),
+                extra_metadata=metadata,
+            )
+            return True
         return self._continue_same_thread_agent_task(
             request,
             parent_task,
