@@ -759,54 +759,67 @@ class ManagedTaskRuntime:
         visible_text, control_signals = _extract_agent_control_signals(chunk)
         hide_visible_text = False
         deferred_signals: list[str] = []
+        terminal_signals: list[str] = []
         for signal in control_signals:
             if is_agent_roster_status_signal(signal) or is_agent_reaction_signal(signal):
                 self._handle_immediate_agent_control_signal(running, signal)
             elif signal == AGENT_THREAD_DONE_SIGNAL:
-                if self._handle_immediate_agent_control_signal(running, signal):
-                    running.terminal_control_signal_handled = True
-                else:
-                    deferred_signals.append(signal)
+                terminal_signals.append(signal)
             else:
                 deferred_signals.append(signal)
                 if _is_schedule_control_signal(signal):
                     hide_visible_text = True
         running.control_signals.extend(deferred_signals)
+
+        def handle_terminal_signals() -> None:
+            for signal in terminal_signals:
+                if self._handle_immediate_agent_control_signal(running, signal):
+                    running.terminal_control_signal_handled = True
+                else:
+                    running.control_signals.append(signal)
+
         if hide_visible_text:
             visible_text = ""
         if not visible_text:
+            handle_terminal_signals()
             return
         normalized = visible_text.strip()
         if not normalized:
+            handle_terminal_signals()
             return
         if running.observed_agent_messages is None:
             running.observed_agent_messages = set()
         if normalized in running.observed_agent_messages:
+            handle_terminal_signals()
             return
-        posted = self.gateway.post_thread_reply(
-            running.thread,
-            visible_text,
-            persona=running.agent,
-            icon_url=self._agent_icon_url(running.agent),
-        )
+        try:
+            posted = self.gateway.post_thread_reply(
+                running.thread,
+                visible_text,
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
+        except Exception:
+            handle_terminal_signals()
+            raise
         now = time.monotonic()
         running.visible_message_count += 1
         running.last_visible_message_monotonic = now
         running.last_activity_monotonic = now
         running.progress_warning_monotonic = None
         running.observed_agent_messages.add(normalized)
-        if self.on_agent_message is None:
-            return
-        try:
-            self.on_agent_message(
-                running.task,
-                running.agent,
-                running.thread,
-                normalized,
-                posted.ts,
-            )
-        except Exception:
-            LOGGER.exception("failed to handle agent-authored Slack message")
+        if self.on_agent_message is not None:
+            try:
+                self.on_agent_message(
+                    running.task,
+                    running.agent,
+                    running.thread,
+                    normalized,
+                    posted.ts,
+                )
+            except Exception:
+                LOGGER.exception("failed to handle agent-authored Slack message")
+        handle_terminal_signals()
 
     def _handle_immediate_agent_control_signal(self, running: RunningTask, signal: str) -> bool:
         if self.on_agent_control is None:
