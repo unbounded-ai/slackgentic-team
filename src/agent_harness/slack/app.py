@@ -29,6 +29,8 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    PR_URL_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
     AgentTask,
@@ -58,6 +60,7 @@ from agent_harness.models import (
     parse_timestamp,
     utc_now,
 )
+from agent_harness.pr_links import metadata_with_pr_urls, pr_urls_from_metadata
 from agent_harness.providers import ClaudeProvider, CodexProvider
 from agent_harness.providers.usage import (
     collect_daily_usage,
@@ -1307,6 +1310,7 @@ class SlackTeamController:
                 label,
                 _shorten(_task_roster_summary(task), 140),
                 dangerous_mode=_task_dangerous_mode(task),
+                pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
                 task_id=task.task_id,
             )
@@ -1323,6 +1327,7 @@ class SlackTeamController:
                 "Working",
                 _shorten(_task_roster_summary(task), 140),
                 dangerous_mode=_task_dangerous_mode(task),
+                pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,
             )
@@ -1344,6 +1349,7 @@ class SlackTeamController:
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Occupied",
                 detail,
+                pr_urls=(scheduled.pr_url,) if scheduled.pr_url else (),
                 thread_url=self._thread_permalink(scheduled.channel_id, scheduled.thread_ts),
             )
         for agent_id, session in self._active_external_sessions_by_agent().items():
@@ -3025,6 +3031,7 @@ class SlackTeamController:
         if not thread.thread_ts:
             return False
         self._remember_agent_authored_message(task, agent, thread, message_ts, text)
+        task = self._record_task_pr_urls(task, agent, thread, text)
         if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
         active_agents = self.store.list_team_agents()
@@ -3091,6 +3098,25 @@ class SlackTeamController:
         elif message_ts:
             self._clear_message_status_reactions(thread.channel_id, message_ts)
         return True
+
+    def _record_task_pr_urls(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        *texts_or_urls: str | None,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        metadata = metadata_with_pr_urls(current.metadata, *texts_or_urls)
+        if metadata == current.metadata:
+            return current
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        updated = self.store.get_agent_task(updated.task_id) or updated
+        self._refresh_task_thread_header(updated, agent)
+        if thread.channel_id:
+            self._refresh_existing_roster(thread.channel_id)
+        return updated
 
     def _handle_agent_authored_specific_request(
         self,
@@ -3479,6 +3505,7 @@ class SlackTeamController:
         request_message_ts: str | None = None,
         try_live_send: bool = True,
     ) -> bool:
+        previous_task = self._record_task_pr_urls(previous_task, agent, thread, request.prompt)
         if (
             try_live_send
             and self.runtime
@@ -3512,6 +3539,7 @@ class SlackTeamController:
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
+        metadata = metadata_with_pr_urls(metadata, request.prompt)
         for key in ("request_message_ts", "request_message_ts_history"):
             if key in previous_task.metadata:
                 metadata[key] = previous_task.metadata[key]
@@ -3630,7 +3658,7 @@ class SlackTeamController:
         requested_by_slack_user: str | None,
         request_message_ts: str | None,
     ) -> AgentTask:
-        metadata = dict(task.metadata)
+        metadata = metadata_with_pr_urls(task.metadata, request.prompt)
         queued = _queued_thread_followups(metadata)
         queued.append(
             {
@@ -3691,6 +3719,7 @@ class SlackTeamController:
             self._mark_message_in_progress(thread.channel_id, message_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
         prompt = _queued_followup_prompt(prompts)
+        metadata = metadata_with_pr_urls(metadata, *prompts)
         metadata = self._with_linked_thread_context(
             metadata,
             prompt,
@@ -3741,6 +3770,7 @@ class SlackTeamController:
             metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = message_ts_values
             metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
+        metadata = metadata_with_pr_urls(metadata, *prompts)
         metadata = self._with_linked_thread_context(
             metadata,
             prompt,
@@ -3899,9 +3929,10 @@ class SlackTeamController:
         if not summary:
             return False
         current = self.store.get_agent_task(task.task_id) or task
-        metadata = dict(current.metadata)
+        metadata = metadata_with_pr_urls(current.metadata, summary)
         if metadata.get(ROSTER_SUMMARY_METADATA_KEY) != summary:
             metadata[ROSTER_SUMMARY_METADATA_KEY] = summary
+        if metadata != current.metadata:
             current = replace(current, metadata=metadata, updated_at=utc_now())
             self.store.upsert_agent_task(current)
         self._refresh_task_thread_header(current, agent)
@@ -4525,6 +4556,10 @@ class SlackTeamController:
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
+        parent_pr_urls = pr_urls_from_metadata(parent_task.metadata)
+        if parent_pr_urls:
+            metadata[PR_URL_METADATA_KEY] = parent_pr_urls[0]
+            metadata[PR_URLS_METADATA_KEY] = list(parent_pr_urls)
         context = self._thread_context(channel_id, thread_ts)
         prompt_context = f"Original task: {_task_assignment_prompt(parent_task)}"
         if context:

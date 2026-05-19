@@ -33,6 +33,7 @@ from agent_harness.permissions import (
     claude_safe_auto_permission_request_allowed,
     task_permission_mode,
 )
+from agent_harness.pr_links import pr_urls_from_metadata
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
@@ -1148,10 +1149,14 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             f"Task: {task.prompt}",
         ]
     )
-    pr_url = task.metadata.get("pr_url")
-    if pr_url:
-        lines.append(f"Pull request URL: {pr_url}")
-        lines.append("Review the PR and report findings with concrete file or diff references.")
+    pr_urls = pr_urls_from_metadata(task.metadata)
+    if pr_urls:
+        if len(pr_urls) == 1:
+            lines.append(f"Pull request URL: {pr_urls[0]}")
+        else:
+            lines.append("Pull request URLs:")
+            lines.extend(f"- {url}" for url in pr_urls)
+        lines.append("Review the PR(s) and report findings with concrete file or diff references.")
     thread_context = task.metadata.get("thread_context")
     if isinstance(thread_context, str) and thread_context.strip():
         sanitized_thread_context = replace_slack_user_ids(thread_context.strip())

@@ -7,12 +7,14 @@ from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
     PERMISSION_MODE_METADATA_KEY,
+    PR_URL_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentTask,
     AssignmentMode,
     TeamAgent,
     WorkRequest,
 )
+from agent_harness.pr_links import metadata_with_pr_urls
 from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent
 from agent_harness.team.routing import canonicalize_agent_mentions, parse_work_request
@@ -92,9 +94,10 @@ def assign_work_request(
     if request.author_handle:
         metadata["author_handle"] = request.author_handle
     if request.pr_url:
-        metadata["pr_url"] = request.pr_url
+        metadata[PR_URL_METADATA_KEY] = request.pr_url
     if extra_metadata:
         metadata.update(extra_metadata)
+    metadata = metadata_with_pr_urls(metadata, request.prompt, request.pr_url)
     assignment_prompt = metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
     if not isinstance(assignment_prompt, str) or not assignment_prompt.strip():
         assignment_prompt = request.prompt

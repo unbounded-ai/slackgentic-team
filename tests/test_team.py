@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentTaskKind,
     AssignmentMode,
@@ -159,6 +160,64 @@ class TeamTests(unittest.TestCase):
                 self.assertEqual(
                     result.task.metadata[ROSTER_SUMMARY_METADATA_KEY],
                     "tell me what are my open PRs in talos repo",
+                )
+            finally:
+                store.close()
+
+    def test_assignment_seeds_pr_urls_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+
+                result = assign_work_request(
+                    store,
+                    WorkRequest(
+                        prompt="review https://github.com/acme/app/pull/42",
+                        assignment_mode=AssignmentMode.ANYONE,
+                        pr_url="https://github.com/acme/app/pull/42",
+                    ),
+                    "C1",
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result.task.metadata[PR_URLS_METADATA_KEY],
+                    ["https://github.com/acme/app/pull/42"],
+                )
+            finally:
+                store.close()
+
+    def test_assignment_merges_request_and_context_pr_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+
+                result = assign_work_request(
+                    store,
+                    WorkRequest(
+                        prompt="review https://github.com/acme/app/pull/43",
+                        assignment_mode=AssignmentMode.ANYONE,
+                        pr_url="https://github.com/acme/app/pull/43",
+                    ),
+                    "C1",
+                    extra_metadata={PR_URLS_METADATA_KEY: ["https://github.com/acme/app/pull/42"]},
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result.task.metadata[PR_URLS_METADATA_KEY],
+                    [
+                        "https://github.com/acme/app/pull/43",
+                        "https://github.com/acme/app/pull/42",
+                    ],
                 )
             finally:
                 store.close()

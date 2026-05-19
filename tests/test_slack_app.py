@@ -17,6 +17,7 @@ from agent_harness.deferred import (
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
     AgentTaskKind,
@@ -1653,6 +1654,80 @@ class SlackAppTests(unittest.TestCase):
                     str(roster_updates[0]["blocks"]),
                 )
                 self.assertNotIn("Slack task:", str(roster_updates[0]["blocks"]))
+            finally:
+                store.close()
+
+    def test_runtime_agent_messages_update_task_and_roster_pr_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the task view", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.thread", "171.parent")
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller.post_roster("C1")
+                roster_ts = gateway.posts[-1]["ts"]
+
+                first = controller.handle_runtime_agent_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "PR up: https://github.com/acme/app/pull/42",
+                    "171.agent1",
+                )
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                second = controller.handle_runtime_agent_message(
+                    current,
+                    agent,
+                    SlackThreadRef("C1", "171.thread"),
+                    "Second PR: https://github.com/acme/app/pull/43",
+                    "171.agent2",
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertFalse(first)
+                self.assertFalse(second)
+                self.assertEqual(
+                    current.metadata[PR_URLS_METADATA_KEY],
+                    [
+                        "https://github.com/acme/app/pull/42",
+                        "https://github.com/acme/app/pull/43",
+                    ],
+                )
+                header_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.parent"
+                ]
+                self.assertGreaterEqual(len(header_updates), 2)
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/42|acme/app#42>",
+                    str(header_updates[-1]["blocks"]),
+                )
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/43|acme/app#43>",
+                    str(header_updates[-1]["blocks"]),
+                )
+                roster_updates = [update for update in gateway.updates if update["ts"] == roster_ts]
+                self.assertGreaterEqual(len(roster_updates), 2)
+                self.assertIn("*PRs:*", str(roster_updates[-1]["blocks"]))
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/42|acme/app#42>",
+                    str(roster_updates[-1]["blocks"]),
+                )
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/43|acme/app#43>",
+                    str(roster_updates[-1]["blocks"]),
+                )
             finally:
                 store.close()
 

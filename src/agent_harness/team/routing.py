@@ -10,13 +10,13 @@ from agent_harness.models import (
     TeamAgent,
     WorkRequest,
 )
+from agent_harness.pr_links import extract_github_pr_urls
 from agent_harness.team import normalize_handle
 
 ANYONE_WORDS = ("somebody", "someone", "anyone", "any agent", "whoever")
 TASK_VERBS = ("do", "handle", "take", "work on", "start", "pick up", "review")
 BOT_MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*")
 AGENT_MENTION_RE = re.compile(r"(?<![\w.-])@([a-zA-Z][a-zA-Z0-9_-]{1,31})\b")
-PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
 DANGEROUS_MODE_TAG_RE = re.compile(r"(?<![\w.-])#dangerous-mode\b", re.IGNORECASE)
 
 
@@ -250,8 +250,8 @@ def _task_kind_for(verb: str, prompt: str, pr_url: str | None) -> AgentTaskKind:
 
 
 def _extract_pr_url(prompt: str) -> str | None:
-    match = PR_URL_RE.search(prompt)
-    return match.group(0) if match else None
+    urls = extract_github_pr_urls(prompt)
+    return urls[0] if urls else None
 
 
 def _extract_author_handle(prompt: str, known_handles: list[str] | tuple[str, ...]) -> str | None:
