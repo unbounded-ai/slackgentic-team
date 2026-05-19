@@ -1376,10 +1376,18 @@ class SlackTeamController:
             task = self.store.active_task_for_agent(agent.agent_id)
             if task is None:
                 continue
-            label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Working"
+            if task.status == AgentTaskStatus.QUEUED:
+                label = "Queued"
+                detail = _shorten(_task_roster_summary(task), 140)
+            elif self._task_is_runtime_running(task.task_id):
+                label = "Working"
+                detail = _shorten(_task_roster_summary(task), 140)
+            else:
+                label = "Occupied"
+                detail = _shorten(f"Open thread: {_task_roster_summary(task)}", 140)
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
-                _shorten(_task_roster_summary(task), 140),
+                detail,
                 dangerous_mode=_task_dangerous_mode(task),
                 pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
@@ -1514,6 +1522,18 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to read running managed tasks for roster", exc_info=True)
             return []
+
+    def _task_is_runtime_running(self, task_id: str) -> bool:
+        if self.runtime is None:
+            return False
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if not callable(is_running):
+            return False
+        try:
+            return bool(is_running(task_id))
+        except Exception:
+            LOGGER.debug("failed to read managed task runtime state", exc_info=True)
+            return False
 
     def _external_session_permalink(self, session) -> str | None:
         channel_id = self._configured_agent_channel_id()
@@ -3653,11 +3673,17 @@ class SlackTeamController:
                 "queueing same-thread continuation for task %s; worker is still running",
                 previous_task.task_id,
             )
-            self._queue_running_task_followup(
+            queued_count = self._queue_running_task_followup(
                 previous_task,
                 request,
                 requested_by_slack_user=requested_by_slack_user,
                 request_message_ts=request_message_ts,
+            )
+            self._post_queued_followup_notice(
+                agent,
+                thread,
+                request.prompt,
+                queued_count,
             )
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
@@ -3780,8 +3806,9 @@ class SlackTeamController:
         *,
         requested_by_slack_user: str | None,
         request_message_ts: str | None,
-    ) -> AgentTask:
-        metadata = metadata_with_pr_urls(task.metadata, request.prompt)
+    ) -> int:
+        latest = self.store.get_agent_task(task.task_id) or task
+        metadata = metadata_with_pr_urls(latest.metadata, request.prompt)
         queued = _queued_thread_followups(metadata)
         queued.append(
             {
@@ -3792,9 +3819,26 @@ class SlackTeamController:
             }
         )
         metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued[-20:]
-        updated = replace(task, metadata=metadata, updated_at=utc_now())
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
-        return self.store.get_agent_task(task.task_id) or updated
+        return len(queued)
+
+    def _post_queued_followup_notice(
+        self,
+        agent,
+        thread: SlackThreadRef,
+        prompt: str,
+        queued_count: int,
+    ) -> None:
+        if queued_count > 1 and not _looks_like_direct_question(prompt):
+            return
+        try:
+            self.gateway.post_thread_reply(
+                thread,
+                _queued_followup_notice(agent.handle, prompt, queued_count),
+            )
+        except Exception:
+            LOGGER.debug("failed to post queued follow-up notice", exc_info=True)
 
     def _complete_active_thread_followup(
         self,
@@ -6344,12 +6388,24 @@ def _live_thread_followup_prompt(prompt: str) -> str:
     )
 
 
+def _queued_followup_notice(handle: str, prompt: str, queued_count: int) -> str:
+    kind = "question" if _looks_like_direct_question(prompt) else "follow-up"
+    count = "" if queued_count <= 1 else f" There are now {queued_count} queued follow-ups."
+    return (
+        f"@{handle} is still in a running turn, and I could not deliver that {kind} live, "
+        "so I queued it. It will be sent when the run finishes; say `stop` here to "
+        f"interrupt the run and send queued follow-ups now.{count}"
+    )
+
+
 def _looks_like_direct_question(text: str) -> bool:
     compact = " ".join(text.strip().lower().split())
     if not compact:
         return False
     if "?" in compact:
         return True
+    if compact.startswith(("do not ", "don't ")):
+        return False
     starters = (
         "are ",
         "can ",
