@@ -265,14 +265,13 @@ def build_team_roster_blocks(
         elif status and status.session_provider and status.session_id:
             elements.append(
                 _button(
-                    "Free up",
-                    "external.session.finish",
+                    "Detach",
+                    "external.session.detach",
                     encode_action_value(
-                        "external.session.finish",
+                        "external.session.detach",
                         provider=status.session_provider.value,
                         session_id=status.session_id,
                     ),
-                    "primary",
                 )
             )
         if status and status.thread_url:

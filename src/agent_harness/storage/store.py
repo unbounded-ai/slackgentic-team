@@ -896,6 +896,30 @@ class Store:
             message_ts=row["parent_ts"],
         )
 
+    def find_slack_thread_for_session_channel(
+        self,
+        provider: Provider,
+        session_id: str,
+        channel_id: str,
+    ) -> SlackThreadRef | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM slack_threads
+            WHERE provider = ? AND session_id = ? AND channel_id = ?
+            ORDER BY thread_ts DESC
+            LIMIT 1
+            """,
+            (provider.value, session_id, channel_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return SlackThreadRef(
+            channel_id=row["channel_id"],
+            thread_ts=row["thread_ts"],
+            message_ts=row["parent_ts"],
+        )
+
     def get_session_for_slack_thread(
         self,
         team_id: str,

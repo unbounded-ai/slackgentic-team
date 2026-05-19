@@ -565,6 +565,67 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_fire_button_detaches_external_session_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_agent.codex.s1", agent.agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.set_setting("external_session_summary.codex.s1", "update the docs")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "local",
+                    SlackThreadRef("C1", "171.000010", "171.000010"),
+                )
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.000001"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.fire", agent_id=agent.agent_id, handle=agent.handle
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(store.list_team_agents(), [])
+                fired = store.get_team_agent(agent.agent_id, include_fired=True)
+                self.assertIsNotNone(fired)
+                self.assertEqual(fired.status if fired else None, TeamAgentStatus.FIRED)
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_live_target.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_summary.codex.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "local", "C1")
+                )
+                self.assertIn(
+                    f"Detached external session and removed @{agent.handle}.",
+                    gateway.thread_replies[-1]["text"],
+                )
+            finally:
+                store.close()
+
     def test_hiring_reclaims_fired_agent_handle_for_active_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -2272,7 +2333,7 @@ class SlackAppTests(unittest.TestCase):
                 store.upsert_slack_thread_for_session(
                     Provider.CODEX,
                     "s1",
-                    "local",
+                    "T1",
                     SlackThreadRef("C1", "171.000001", "171.000001"),
                 )
                 controller = SlackTeamController(store, gateway, default_channel_id="C1")
@@ -2284,7 +2345,7 @@ class SlackAppTests(unittest.TestCase):
                     "codex session outside Slack: update the docs", str(gateway.posts[-1]["blocks"])
                 )
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Free up", blocks)
+                self.assertIn("Detach", blocks)
                 self.assertIn("Open thread", blocks)
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
                 action_block = next(
@@ -2294,7 +2355,10 @@ class SlackAppTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [action["text"]["text"] for action in action_block["elements"]],
-                    ["Free up", "Open thread", "Fire"],
+                    ["Detach", "Open thread", "Fire"],
+                )
+                self.assertEqual(
+                    action_block["elements"][0]["action_id"], "external.session.detach"
                 )
             finally:
                 store.close()
@@ -2341,17 +2405,17 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(
                     [action["text"]["text"] for action in actions],
                     [
-                        "Free up",
+                        "Detach",
                         "Open thread",
                         "Fire",
                     ],
                 )
-                self.assertEqual(actions[0]["action_id"], "external.session.finish")
+                self.assertEqual(actions[0]["action_id"], "external.session.detach")
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
             finally:
                 store.close()
 
-    def test_roster_shows_external_session_free_up_without_thread_link(self):
+    def test_roster_shows_external_session_detach_without_thread_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2383,15 +2447,15 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(
                     [action["text"]["text"] for action in actions],
                     [
-                        "Free up",
+                        "Detach",
                         "Fire",
                     ],
                 )
-                self.assertEqual(actions[0]["action_id"], "external.session.finish")
+                self.assertEqual(actions[0]["action_id"], "external.session.detach")
             finally:
                 store.close()
 
-    def test_external_session_free_up_button_ignores_session_and_refreshes_roster(self):
+    def test_external_session_detach_button_ignores_session_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2408,6 +2472,10 @@ class SlackAppTests(unittest.TestCase):
                     )
                 )
                 store.set_setting("external_session_agent.codex.s1", agent.agent_id)
+                store.set_setting("external_session_pending.codex.s1", "now")
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.set_setting("external_session_missing_target.codex.s1", "123")
+                store.set_setting("external_session_summary.codex.s1", "update the docs")
                 store.upsert_slack_thread_for_session(
                     Provider.CODEX,
                     "s1",
@@ -2424,7 +2492,7 @@ class SlackAppTests(unittest.TestCase):
                         "actions": [
                             {
                                 "value": encode_action_value(
-                                    "external.session.finish",
+                                    "external.session.detach",
                                     provider=Provider.CODEX.value,
                                     session_id="s1",
                                 )
@@ -2434,9 +2502,17 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_live_target.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_missing_target.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_summary.codex.s1"))
                 self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "local", "C1")
+                )
                 self.assertIn(
-                    "Finished and freed up this agent.", gateway.thread_replies[-1]["text"]
+                    "Detached this agent from the external session.",
+                    gateway.thread_replies[-1]["text"],
                 )
                 self.assertIn("1 available, 0 occupied", gateway.posts[-1]["text"])
             finally:
@@ -2542,7 +2618,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_external_session_free_up_button_resumes_pending_specific_request(self):
+    def test_external_session_detach_button_resumes_pending_specific_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2596,7 +2672,7 @@ class SlackAppTests(unittest.TestCase):
                         "actions": [
                             {
                                 "value": encode_action_value(
-                                    "external.session.finish",
+                                    "external.session.detach",
                                     provider=Provider.CLAUDE.value,
                                     session_id="s1",
                                 )
