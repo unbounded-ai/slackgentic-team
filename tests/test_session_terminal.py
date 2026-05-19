@@ -73,6 +73,41 @@ class SessionTerminalNotifierTests(unittest.TestCase):
 
         self.assertEqual(notifier.targets_for_session(session), [])
 
+    def test_provider_processes_reuses_cached_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            now = [100.0]
+
+            def process_lister():
+                calls.append("scan")
+                return ["101 ttys002 claude --dangerously-skip-permissions"]
+
+            notifier = SessionTerminalNotifier(
+                process_lister=process_lister,
+                cwd_resolver=lambda pid: Path(tmp),
+                start_resolver=lambda pid: datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+                process_cache_seconds=10.0,
+                clock=lambda: now[0],
+            )
+            session = AgentSession(
+                provider=Provider.CLAUDE,
+                session_id="abcdef123456",
+                transcript_path=Path(tmp) / "session.jsonl",
+                cwd=Path(tmp),
+            )
+
+            self.assertEqual(
+                [target.pid for target in notifier.targets_for_session(session)], [101]
+            )
+            self.assertEqual(
+                [target.pid for target in notifier.provider_processes(Provider.CLAUDE)], [101]
+            )
+            self.assertEqual(calls, ["scan"])
+
+            now[0] += 11.0
+            notifier.provider_processes(Provider.CLAUDE)
+            self.assertEqual(calls, ["scan", "scan"])
+
     def test_provider_process_for_pid_matches_provider_without_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
             starts = {101: datetime(2026, 4, 27, 12, 0, tzinfo=UTC)}

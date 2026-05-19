@@ -318,16 +318,39 @@ class ManagedTaskRuntime:
         join_timeout: float = 2.0,
     ) -> int:
         with self._lock:
-            task_ids = list(self._running.keys())
+            running_tasks = list(self._running.items())
         stopped = 0
-        for task_id in task_ids:
+        for task_id, running in running_tasks:
             try:
-                if self.stop_task(task_id, status, join_timeout=join_timeout):
-                    stopped += 1
+                running.stop_requested = True
+                running.wake_event.set()
+                running.process.terminate()
+                if status is not None:
+                    self._clear_managed_run_started(task_id)
+                    self.store.update_agent_task_status(task_id, status)
             except Exception:
                 LOGGER.debug(
-                    "failed to stop running task %s during shutdown", task_id, exc_info=True
+                    "failed to request stop for running task %s during shutdown",
+                    task_id,
+                    exc_info=True,
                 )
+        deadline = time.monotonic() + max(0.0, join_timeout)
+        for task_id, running in running_tasks:
+            current = self._get_running(task_id)
+            if current is not running:
+                stopped += 1
+                continue
+            if running.worker is threading.current_thread():
+                self._remove_running_task(task_id, running)
+                stopped += 1
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            running.worker.join(timeout=remaining)
+            if running.worker.is_alive():
+                LOGGER.warning("managed task worker did not stop for %s", task_id)
+                continue
+            self._remove_running_task(task_id, running)
+            stopped += 1
         return stopped
 
     def running_task_for_thread(self, channel_id: str, thread_ts: str) -> RunningTask | None:
@@ -367,6 +390,10 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.exception("managed task worker failed for %s", task_id)
             self._handle_task_worker_failure(task_id)
+        finally:
+            running = self._get_running(task_id)
+            if running is not None and running.worker is threading.current_thread():
+                self._remove_running_task(task_id, running)
 
     def _stream_task_loop(self, task_id: str) -> None:
         sleep_seconds = _fast_stream_poll_seconds(self.poll_seconds)
@@ -420,8 +447,6 @@ class ManagedTaskRuntime:
                     )
                 for chunk in chunks:
                     self._post_agent_chunk(running, chunk)
-                with self._lock:
-                    self._running.pop(task_id, None)
                 try:
                     completed_task = self.store.get_agent_task(task_id) or running.task
                 except Exception:
@@ -760,6 +785,7 @@ class ManagedTaskRuntime:
             updated_at=utc_now(),
         )
         self.store.upsert_agent_task(retry_task)
+        self._remove_running_task(completed_task.task_id, running)
         self.start_task(
             retry_task,
             running.agent,
@@ -847,6 +873,7 @@ class ManagedTaskRuntime:
             updated_at=utc_now(),
         )
         self.store.upsert_agent_task(retry_task)
+        self._remove_running_task(completed_task.task_id, running)
         self.start_task(
             retry_task,
             running.agent,

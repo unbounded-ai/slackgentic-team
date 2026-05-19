@@ -5676,7 +5676,6 @@ class SocketModeSlackApp:
                 LOGGER.exception("failed to handle Slack Socket Mode request")
 
         client.socket_mode_request_listeners.append(listener)
-        client.connect()
         shutdown = threading.Event()
 
         def _request_shutdown(_signum=None, _frame=None) -> None:
@@ -5692,6 +5691,19 @@ class SocketModeSlackApp:
             except (ValueError, OSError):
                 continue
         try:
+            connect_backoff = LoopBackoff(base_seconds=1.0, max_seconds=60.0)
+            while not shutdown.is_set():
+                try:
+                    client.connect()
+                    break
+                except Exception:
+                    log_loop_failure(
+                        LOGGER,
+                        "failed to connect Slack Socket Mode client",
+                        connect_backoff,
+                    )
+                    if connect_backoff.wait(shutdown):
+                        break
             while not shutdown.is_set():
                 if shutdown.wait(timeout=1.0):
                     break
