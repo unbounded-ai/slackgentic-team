@@ -11,6 +11,8 @@ PERMISSION_MODE_METADATA_KEY = "permission_mode"
 ASSIGNMENT_PROMPT_METADATA_KEY = "assignment_prompt"
 ROSTER_SUMMARY_METADATA_KEY = "roster_summary"
 EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
+DEFERRED_WORK_DEPENDENCY_PREFIX = "deferred_work:"
+SCHEDULED_WORK_DEPENDENCY_PREFIX = "scheduled_work:"
 
 
 class Provider(StrEnum):
@@ -340,6 +342,14 @@ def external_session_dependency_id(provider: Provider, session_id: str) -> str:
     return f"{EXTERNAL_SESSION_DEPENDENCY_PREFIX}{provider.value}:{session_id}"
 
 
+def deferred_work_dependency_id(deferred_id: str) -> str:
+    return f"{DEFERRED_WORK_DEPENDENCY_PREFIX}{deferred_id}"
+
+
+def scheduled_work_dependency_id(schedule_id: str) -> str:
+    return f"{SCHEDULED_WORK_DEPENDENCY_PREFIX}{schedule_id}"
+
+
 def parse_external_session_dependency_id(value: str | None) -> tuple[Provider, str] | None:
     if not value or not value.startswith(EXTERNAL_SESSION_DEPENDENCY_PREFIX):
         return None
@@ -352,6 +362,20 @@ def parse_external_session_dependency_id(value: str | None) -> tuple[Provider, s
     except ValueError:
         return None
     return provider, session_id
+
+
+def parse_deferred_work_dependency_id(value: str | None) -> str | None:
+    if not value or not value.startswith(DEFERRED_WORK_DEPENDENCY_PREFIX):
+        return None
+    deferred_id = value.removeprefix(DEFERRED_WORK_DEPENDENCY_PREFIX)
+    return deferred_id or None
+
+
+def parse_scheduled_work_dependency_id(value: str | None) -> str | None:
+    if not value or not value.startswith(SCHEDULED_WORK_DEPENDENCY_PREFIX):
+        return None
+    schedule_id = value.removeprefix(SCHEDULED_WORK_DEPENDENCY_PREFIX)
+    return schedule_id or None
 
 
 def utc_now() -> datetime:

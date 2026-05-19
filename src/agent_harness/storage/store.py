@@ -35,7 +35,9 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    parse_deferred_work_dependency_id,
     parse_external_session_dependency_id,
+    parse_scheduled_work_dependency_id,
     parse_timestamp,
     utc_now,
 )
@@ -1678,6 +1680,18 @@ class Store:
             )
             self.conn.commit()
 
+    def update_scheduled_work_last_task(self, schedule_id: str, *, last_task_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE scheduled_work_requests
+                SET last_task_id = ?, updated_at = ?
+                WHERE schedule_id = ?
+                """,
+                (last_task_id, utc_now().isoformat(), schedule_id),
+            )
+            self.conn.commit()
+
     def release_scheduled_work(self, schedule_id: str, *, next_run_at=None) -> None:
         with self._lock:
             self.conn.execute(
@@ -1970,6 +1984,19 @@ class Store:
             )
             self.conn.commit()
 
+    def update_deferred_work_last_task(self, deferred_id: str, *, last_task_id: str) -> None:
+        now = utc_now()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET last_task_id = ?, updated_at = ?
+                WHERE deferred_id = ?
+                """,
+                (last_task_id, now.isoformat(), deferred_id),
+            )
+            self.conn.commit()
+
     def release_deferred_work(self, deferred_id: str) -> None:
         now = utc_now()
         with self._lock:
@@ -2047,11 +2074,49 @@ class Store:
             if external_session is not None:
                 provider, session_id = external_session
                 return not self._external_session_is_occupying_agent(provider, session_id)
+            deferred_id = parse_deferred_work_dependency_id(dep.task_id)
+            if deferred_id is not None:
+                return self._deferred_work_dependency_is_satisfied(deferred_id)
+            schedule_id = parse_scheduled_work_dependency_id(dep.task_id)
+            if schedule_id is not None:
+                return self._scheduled_work_dependency_is_satisfied(schedule_id)
             task = self.get_agent_task(dep.task_id)
             if task is None:
                 return False
             return task.status in terminal
         return False
+
+    def _deferred_work_dependency_is_satisfied(self, deferred_id: str) -> bool:
+        deferred = self.get_deferred_work(deferred_id)
+        if deferred is None:
+            return False
+        if deferred.status == DeferredWorkStatus.CANCELLED:
+            return True
+        if deferred.status != DeferredWorkStatus.DONE:
+            return False
+        return self._last_task_dependency_is_satisfied(deferred.last_task_id)
+
+    def _scheduled_work_dependency_is_satisfied(self, schedule_id: str) -> bool:
+        scheduled = self.get_scheduled_work(schedule_id)
+        if scheduled is None:
+            return False
+        if scheduled.status == ScheduledWorkStatus.CANCELLED:
+            return True
+        if scheduled.schedule_kind == ScheduledWorkKind.RECURRING:
+            return False
+        if scheduled.status != ScheduledWorkStatus.DONE:
+            return False
+        return self._last_task_dependency_is_satisfied(scheduled.last_task_id)
+
+    def _last_task_dependency_is_satisfied(self, last_task_id: str | None) -> bool:
+        if not last_task_id:
+            return True
+        if last_task_id.startswith("pending_"):
+            return False
+        task = self.get_agent_task(last_task_id)
+        if task is None:
+            return False
+        return task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}
 
     def _external_session_is_occupying_agent(self, provider: Provider, session_id: str) -> bool:
         agent_id = self.get_setting(f"external_session_agent.{provider.value}.{session_id}")

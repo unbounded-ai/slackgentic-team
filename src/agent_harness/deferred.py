@@ -163,7 +163,8 @@ def build_deferred_resolution_prompt(
             "Resolve which threads and which busy agents this request depends on. Use the "
             "Slack permalinks the user pasted to identify thread dependencies. Use the "
             "occupied agents list to record agent-busy dependencies as the agent's current "
-            "task_id or external_session dependency id (snapshot it now)."
+            "task_id, external_session dependency id, deferred_work dependency id, or "
+            "scheduled_work dependency id (snapshot it now)."
         ),
         "",
         "Emit exactly one hidden control line on its own final line:",
