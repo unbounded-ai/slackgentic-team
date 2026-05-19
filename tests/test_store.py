@@ -21,6 +21,7 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    deferred_work_dependency_id,
     utc_now,
 )
 from agent_harness.storage.store import Store
@@ -144,6 +145,58 @@ class StoreTests(unittest.TestCase):
                 assert stored is not None
                 self.assertEqual(stored.status, DeferredWorkStatus.DONE)
                 self.assertEqual(stored.last_task_id, "task_xyz")
+            finally:
+                store.close()
+
+    def test_deferred_dependency_waits_for_launched_task_to_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                launched_task = create_agent_task(agent, "first deferred task", "C1")
+                store.upsert_agent_task(launched_task)
+                first = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.first", "171.first"),
+                    WorkRequest(
+                        prompt="first deferred task",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.THREAD,
+                            channel_id="C1",
+                            thread_ts="171.blocker",
+                        ),
+                    ),
+                )
+                store.complete_deferred_work(first.deferred_id, last_task_id=launched_task.task_id)
+                second = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.second", "171.second"),
+                    WorkRequest(
+                        prompt="second deferred task", assignment_mode=AssignmentMode.ANYONE
+                    ),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.AGENT_BUSY,
+                            handle=agent.handle,
+                            task_id=deferred_work_dependency_id(first.deferred_id),
+                        ),
+                    ),
+                )
+
+                satisfied, missing = store.evaluate_deferred_dependencies(second)
+
+                self.assertFalse(satisfied)
+                self.assertEqual(missing[0].task_id, deferred_work_dependency_id(first.deferred_id))
+
+                store.update_agent_task_status(launched_task.task_id, AgentTaskStatus.DONE)
+                satisfied, missing = store.evaluate_deferred_dependencies(second)
+
+                self.assertTrue(satisfied)
+                self.assertEqual(missing, [])
             finally:
                 store.close()
 

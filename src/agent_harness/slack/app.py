@@ -54,9 +54,13 @@ from agent_harness.models import (
     WorkDependency,
     WorkDependencyKind,
     WorkRequest,
+    deferred_work_dependency_id,
     external_session_dependency_id,
+    parse_deferred_work_dependency_id,
     parse_external_session_dependency_id,
+    parse_scheduled_work_dependency_id,
     parse_timestamp,
+    scheduled_work_dependency_id,
     utc_now,
 )
 from agent_harness.pr_links import metadata_with_pr_urls, pr_urls_from_metadata
@@ -858,9 +862,13 @@ class SlackTeamController:
             author_agent = self.store.get_team_agent(pending.request.author_handle)
         exclude_agent_ids = set(pending.exclude_agent_ids)
         scheduled_work_id = pending.extra_metadata.get("scheduled_work_id")
+        deferred_work_id = pending.extra_metadata.get("deferred_work_id")
         exclude_agent_ids.update(
             self._busy_agent_ids_for_assignment(
-                ignore_schedule_id=scheduled_work_id if isinstance(scheduled_work_id, str) else None
+                ignore_schedule_id=scheduled_work_id
+                if isinstance(scheduled_work_id, str)
+                else None,
+                ignore_deferred_id=deferred_work_id if isinstance(deferred_work_id, str) else None,
             )
         )
         result = assign_work_request(
@@ -899,11 +907,24 @@ class SlackTeamController:
             pending.pending_id,
             PendingWorkRequestStatus.ASSIGNED,
         )
+        self._record_pending_work_started_task(pending, result.task.task_id)
         task = self.store.get_agent_task(result.task.task_id) or result.task
         self._start_runtime_task(task, result.agent, thread)
         if request_message_ts:
             self._mark_message_in_progress(pending.channel_id, request_message_ts)
         return True
+
+    def _record_pending_work_started_task(
+        self,
+        pending: PendingWorkRequest,
+        task_id: str,
+    ) -> None:
+        scheduled_work_id = pending.extra_metadata.get("scheduled_work_id")
+        if isinstance(scheduled_work_id, str) and scheduled_work_id:
+            self.store.update_scheduled_work_last_task(scheduled_work_id, last_task_id=task_id)
+        deferred_work_id = pending.extra_metadata.get("deferred_work_id")
+        if isinstance(deferred_work_id, str) and deferred_work_id:
+            self.store.update_deferred_work_last_task(deferred_work_id, last_task_id=task_id)
 
     def _post_text(self, target: SlackReplyTarget, text: str) -> None:
         if target.thread_ts:
@@ -1044,7 +1065,7 @@ class SlackTeamController:
             channel_id,
             requested_by_slack_user=event.get("user"),
             extra_metadata=extra_metadata,
-            exclude_agent_ids=self._external_busy_agent_ids(),
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(),
         )
         if result is None:
             self._post_assignment_unavailable(
@@ -1073,7 +1094,9 @@ class SlackTeamController:
     def _occupied_handle_task_ids(self) -> list[tuple[str, str]]:
         occupied: list[tuple[str, str]] = []
         seen_handles: set[str] = set()
-        for agent in self.store.list_team_agents():
+        agents = self.store.list_team_agents()
+        agents_by_id = {agent.agent_id: agent for agent in agents}
+        for agent in agents:
             task = self.store.active_task_for_agent(agent.agent_id)
             if task is not None and task.status in {
                 AgentTaskStatus.QUEUED,
@@ -1081,7 +1104,6 @@ class SlackTeamController:
             }:
                 occupied.append((agent.handle, task.task_id))
                 seen_handles.add(agent.handle)
-        agents_by_id = {agent.agent_id: agent for agent in self.store.list_team_agents()}
         for agent_id, session in self._active_external_sessions_by_agent().items():
             agent = agents_by_id.get(agent_id)
             if agent is None or agent.handle in seen_handles:
@@ -1090,6 +1112,28 @@ class SlackTeamController:
                 (
                     agent.handle,
                     external_session_dependency_id(session.provider, session.session_id),
+                )
+            )
+            seen_handles.add(agent.handle)
+        for agent_id, deferred_items in self._pending_deferred_work_by_agent(agents).items():
+            agent = agents_by_id.get(agent_id)
+            if agent is None or agent.handle in seen_handles:
+                continue
+            occupied.append(
+                (
+                    agent.handle,
+                    deferred_work_dependency_id(deferred_items[0].deferred_id),
+                )
+            )
+            seen_handles.add(agent.handle)
+        for agent_id, scheduled_items in self._pending_scheduled_work_by_agent(agents).items():
+            agent = agents_by_id.get(agent_id)
+            if agent is None or agent.handle in seen_handles:
+                continue
+            occupied.append(
+                (
+                    agent.handle,
+                    scheduled_work_dependency_id(scheduled_items[0].schedule_id),
                 )
             )
             seen_handles.add(agent.handle)
@@ -1115,6 +1159,25 @@ class SlackTeamController:
             if session and session.cwd:
                 return f"{prefix}: {session.cwd.name or session.cwd}"
             return prefix
+        deferred_id = parse_deferred_work_dependency_id(task_id)
+        if deferred_id is not None:
+            deferred = self.store.get_deferred_work(deferred_id)
+            if deferred is not None:
+                return _shorten(_deferred_work_roster_detail(deferred), 140)
+            return "deferred task"
+        schedule_id = parse_scheduled_work_dependency_id(task_id)
+        if schedule_id is not None:
+            scheduled = self.store.get_scheduled_work(schedule_id)
+            if scheduled is not None:
+                return _shorten(
+                    (
+                        f"Scheduled task: {scheduled.prompt}; "
+                        f"{_format_scheduled_work_schedule(scheduled)}; "
+                        f"next run `{_format_schedule_timestamp(scheduled.next_run_at)}`"
+                    ),
+                    140,
+                )
+            return "scheduled task"
         if task_id:
             task = self.store.get_agent_task(task_id)
             if task is not None:
@@ -1250,7 +1313,9 @@ class SlackTeamController:
             requested_by_slack_user=claimed.requested_by_slack_user,
             author_agent=author_agent,
             extra_metadata=metadata,
-            exclude_agent_ids=self._external_busy_agent_ids(),
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(
+                ignore_schedule_id=claimed.schedule_id
+            ),
         )
         next_run_at = _next_scheduled_work_run(claimed)
         if result is None:
@@ -1276,6 +1341,7 @@ class SlackTeamController:
                 last_task_id=pending.pending_id,
                 next_run_at=next_run_at,
             )
+            self.refresh_or_post_roster(claimed.channel_id)
             return True
         text = f"Scheduled task `{claimed.schedule_id}` is due now.\n\n" + format_agent_assignment(
             result.agent,
@@ -1336,6 +1402,23 @@ class SlackTeamController:
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,
             )
+        deferred_by_agent = self._pending_deferred_work_by_agent(agents)
+        for agent in agents:
+            if statuses[agent.agent_id].label != "Available":
+                continue
+            deferred_items = deferred_by_agent.get(agent.agent_id)
+            if not deferred_items:
+                continue
+            deferred = deferred_items[0]
+            detail = _deferred_work_roster_detail(deferred)
+            if len(deferred_items) > 1:
+                detail = f"{detail}; +{len(deferred_items) - 1} more"
+            statuses[agent.agent_id] = AgentRosterStatus(
+                "Occupied",
+                detail,
+                dangerous_mode=deferred.dangerous_mode,
+                thread_url=self._thread_permalink(deferred.channel_id, deferred.thread_ts),
+            )
         scheduled_by_agent = self._pending_scheduled_work_by_agent(agents)
         for agent in agents:
             if statuses[agent.agent_id].label != "Available":
@@ -1354,6 +1437,7 @@ class SlackTeamController:
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Occupied",
                 detail,
+                dangerous_mode=scheduled.dangerous_mode,
                 pr_urls=(scheduled.pr_url,) if scheduled.pr_url else (),
                 thread_url=self._thread_permalink(scheduled.channel_id, scheduled.thread_ts),
             )
@@ -1382,10 +1466,30 @@ class SlackTeamController:
             )
         return statuses
 
+    def _pending_deferred_work_by_agent(self, agents) -> dict[str, list[DeferredWork]]:
+        agents_by_handle = {agent.handle: agent for agent in agents}
+        deferred_by_agent: dict[str, list[DeferredWork]] = {}
+        for deferred in self.store.list_deferred_work(
+            statuses=(
+                DeferredWorkStatus.WAITING_DEPS,
+                DeferredWorkStatus.READY,
+                DeferredWorkStatus.CLAIMED,
+            )
+        ):
+            if deferred.assignment_mode != AssignmentMode.SPECIFIC or not deferred.requested_handle:
+                continue
+            agent = agents_by_handle.get(deferred.requested_handle)
+            if agent is None:
+                continue
+            deferred_by_agent.setdefault(agent.agent_id, []).append(deferred)
+        return deferred_by_agent
+
     def _pending_scheduled_work_by_agent(self, agents) -> dict[str, list[ScheduledWork]]:
         agents_by_handle = {agent.handle: agent for agent in agents}
         scheduled_by_agent: dict[str, list[ScheduledWork]] = {}
-        for scheduled in self.store.list_scheduled_work(statuses=(ScheduledWorkStatus.PENDING,)):
+        for scheduled in self.store.list_scheduled_work(
+            statuses=(ScheduledWorkStatus.PENDING, ScheduledWorkStatus.CLAIMED)
+        ):
             if (
                 scheduled.assignment_mode != AssignmentMode.SPECIFIC
                 or not scheduled.requested_handle
@@ -1432,9 +1536,14 @@ class SlackTeamController:
             LOGGER.debug("failed to get Slack permalink for %s:%s", channel_id, thread_ts)
             return None
 
-    def _busy_agent_ids_for_assignment(self, ignore_schedule_id: str | None = None) -> set[str]:
+    def _busy_agent_ids_for_assignment(
+        self,
+        ignore_schedule_id: str | None = None,
+        ignore_deferred_id: str | None = None,
+    ) -> set[str]:
         busy = set(self._external_busy_agent_ids())
         busy.update(self._scheduled_busy_agent_ids(ignore_schedule_id=ignore_schedule_id))
+        busy.update(self._deferred_busy_agent_ids(ignore_deferred_id=ignore_deferred_id))
         return busy
 
     def _busy_agent_ids_for_roster_work_target(self) -> set[str]:
@@ -1445,11 +1554,31 @@ class SlackTeamController:
     def _scheduled_busy_agent_ids(self, ignore_schedule_id: str | None = None) -> set[str]:
         agents_by_handle = {agent.handle: agent.agent_id for agent in self.store.list_team_agents()}
         busy: set[str] = set()
-        for scheduled in self.store.list_scheduled_work(statuses=(ScheduledWorkStatus.PENDING,)):
+        for scheduled in self.store.list_scheduled_work(
+            statuses=(ScheduledWorkStatus.PENDING, ScheduledWorkStatus.CLAIMED)
+        ):
             if ignore_schedule_id and scheduled.schedule_id == ignore_schedule_id:
                 continue
             if scheduled.assignment_mode == AssignmentMode.SPECIFIC and scheduled.requested_handle:
                 agent_id = agents_by_handle.get(scheduled.requested_handle)
+                if agent_id:
+                    busy.add(agent_id)
+        return busy
+
+    def _deferred_busy_agent_ids(self, ignore_deferred_id: str | None = None) -> set[str]:
+        agents_by_handle = {agent.handle: agent.agent_id for agent in self.store.list_team_agents()}
+        busy: set[str] = set()
+        for deferred in self.store.list_deferred_work(
+            statuses=(
+                DeferredWorkStatus.WAITING_DEPS,
+                DeferredWorkStatus.READY,
+                DeferredWorkStatus.CLAIMED,
+            )
+        ):
+            if ignore_deferred_id and deferred.deferred_id == ignore_deferred_id:
+                continue
+            if deferred.assignment_mode == AssignmentMode.SPECIFIC and deferred.requested_handle:
+                agent_id = agents_by_handle.get(deferred.requested_handle)
                 if agent_id:
                     busy.add(agent_id)
         return busy
@@ -1718,6 +1847,13 @@ class SlackTeamController:
         self.store.set_setting(discovery_key, utc_now().isoformat())
 
     def handle_external_session_occupancy_change(self, channel_id: str) -> None:
+        try:
+            self.evaluate_pending_deferred_work()
+        except Exception:
+            LOGGER.debug(
+                "failed to evaluate deferred work after external session occupancy changed",
+                exc_info=True,
+            )
         self._resume_pending_work_requests(channel_id)
         self.refresh_or_post_roster(channel_id)
 
@@ -3280,7 +3416,7 @@ class SlackTeamController:
                 requested_by_slack_user=requested_by_slack_user,
                 author_agent=author_agent,
                 extra_metadata=dict(extra_metadata or {}),
-                exclude_agent_ids=self._external_busy_agent_ids(),
+                exclude_agent_ids=self._busy_agent_ids_for_assignment(),
             )
             if result is None:
                 self._post_assignment_unavailable(
@@ -4265,6 +4401,48 @@ class SlackTeamController:
                 if parse_external_session_dependency_id(dep.task_id) is not None:
                     resolved.append(dep)
                     continue
+                deferred_id = parse_deferred_work_dependency_id(dep.task_id)
+                if deferred_id is not None:
+                    deferred = self.store.get_deferred_work(deferred_id)
+                    if deferred is None:
+                        return (
+                            [],
+                            f"deferred_work dependency {deferred_id} for @{dep.handle} not found",
+                        )
+                    if (
+                        deferred.assignment_mode != AssignmentMode.SPECIFIC
+                        or deferred.requested_handle != dep.handle
+                    ):
+                        return (
+                            [],
+                            (
+                                f"deferred_work dependency {deferred_id} is not assigned "
+                                f"to @{dep.handle}"
+                            ),
+                        )
+                    resolved.append(dep)
+                    continue
+                schedule_id = parse_scheduled_work_dependency_id(dep.task_id)
+                if schedule_id is not None:
+                    scheduled = self.store.get_scheduled_work(schedule_id)
+                    if scheduled is None:
+                        return (
+                            [],
+                            f"scheduled_work dependency {schedule_id} for @{dep.handle} not found",
+                        )
+                    if (
+                        scheduled.assignment_mode != AssignmentMode.SPECIFIC
+                        or scheduled.requested_handle != dep.handle
+                    ):
+                        return (
+                            [],
+                            (
+                                f"scheduled_work dependency {schedule_id} is not assigned "
+                                f"to @{dep.handle}"
+                            ),
+                        )
+                    resolved.append(dep)
+                    continue
                 task = self.store.get_agent_task(dep.task_id)
                 if task is None:
                     return (
@@ -4281,6 +4459,7 @@ class SlackTeamController:
 
     def evaluate_pending_deferred_work(self, deferred_id: str | None = None) -> int:
         promoted = 0
+        promoted_channels: set[str] = set()
         if deferred_id is not None:
             row = self.store.get_deferred_work(deferred_id)
             rows = [row] if row is not None else []
@@ -4311,6 +4490,9 @@ class SlackTeamController:
                 SlackThreadRef(row.channel_id, row.thread_ts),
                 _format_deferred_ready_message(updated),
             )
+            promoted_channels.add(row.channel_id)
+        for channel_id in promoted_channels:
+            self._refresh_existing_roster(channel_id)
         return promoted
 
     def fire_due_deferred_work(self, deferred: DeferredWork) -> bool:
@@ -4350,7 +4532,9 @@ class SlackTeamController:
             requested_by_slack_user=claimed.requested_by_slack_user,
             author_agent=author_agent,
             extra_metadata=metadata,
-            exclude_agent_ids=self._external_busy_agent_ids(),
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(
+                ignore_deferred_id=claimed.deferred_id
+            ),
         )
         if result is None:
             pending = self.store.create_pending_work_request(
@@ -4359,7 +4543,9 @@ class SlackTeamController:
                 requested_by_slack_user=claimed.requested_by_slack_user,
                 author_agent=author_agent,
                 extra_metadata=metadata,
-                exclude_agent_ids=self._external_busy_agent_ids(),
+                exclude_agent_ids=self._busy_agent_ids_for_assignment(
+                    ignore_deferred_id=claimed.deferred_id
+                ),
             )
             self.gateway.post_thread_reply(
                 thread,
@@ -4373,6 +4559,7 @@ class SlackTeamController:
                 claimed.deferred_id,
                 last_task_id=pending.pending_id,
             )
+            self.refresh_or_post_roster(claimed.channel_id)
             return True
         text = "Deferred task is ready now.\n\n" + format_agent_assignment(
             result.agent,
@@ -6385,6 +6572,23 @@ def _work_request_from_deferred_work(deferred: DeferredWork) -> WorkRequest:
     )
 
 
+def _deferred_work_roster_detail(deferred: DeferredWork) -> str:
+    if deferred.status == DeferredWorkStatus.READY:
+        status_text = (
+            f"ready; starts `{_format_schedule_timestamp(deferred.fire_at)}`"
+            if deferred.fire_at is not None
+            else "ready"
+        )
+    elif deferred.status == DeferredWorkStatus.CLAIMED:
+        status_text = "starting"
+    else:
+        status_text = "waiting"
+    detail = f"Deferred task: {_shorten(deferred.prompt, 110)}; {status_text}"
+    if deferred.description:
+        detail = f"{detail}; {_shorten(deferred.description, 90)}"
+    return detail
+
+
 def _format_deferred_work_ack(
     deferred: DeferredWork,
     description: str,
@@ -6427,6 +6631,12 @@ def _format_agent_busy_dependency(
     if external_session is not None:
         provider, _session_id = external_session
         return f"{provider.value} external session"
+    deferred_id = parse_deferred_work_dependency_id(task_id)
+    if deferred_id is not None:
+        return "deferred task"
+    schedule_id = parse_scheduled_work_dependency_id(task_id)
+    if schedule_id is not None:
+        return "scheduled task"
     return "current task"
 
 
@@ -6609,7 +6819,10 @@ def _roster_work_modal(
             },
             "hint": {
                 "type": "plain_text",
-                "text": "Optional: start after the selected agent's current task or session finishes.",
+                "text": (
+                    "Optional: start after the selected agent's current, deferred, or "
+                    "scheduled work finishes."
+                ),
             },
         },
         {
