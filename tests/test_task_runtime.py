@@ -3403,6 +3403,42 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_posts_visible_thread_done_text_before_control_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "close the thread", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                control_order = []
+
+                def handle_control(task, agent, thread, signal):
+                    control_order.append((signal, list(gateway.replies)))
+                    return True
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ThreadDoneSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=handle_control,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if control_order:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, ["Sounds good."])
+                self.assertEqual(control_order, [(AGENT_THREAD_DONE_SIGNAL, ["Sounds good."])])
+            finally:
+                store.close()
+
     def test_runtime_handles_thread_done_signal_before_live_process_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

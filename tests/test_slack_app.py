@@ -1561,10 +1561,9 @@ class SlackAppTests(unittest.TestCase):
                 store.upsert_team_agent(agent)
                 task = replace(
                     create_agent_task(agent, "drive PR 23", "C1"),
-                    status=AgentTaskStatus.DONE,
+                    status=AgentTaskStatus.ACTIVE,
                     thread_ts="171.thread",
                 )
-                store.upsert_agent_task(task)
                 running = type(
                     "Running",
                     (),
@@ -1587,6 +1586,53 @@ class SlackAppTests(unittest.TestCase):
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn("*Working:* drive PR 23", blocks)
                 self.assertNotIn("Occupied: Slack task:", blocks)
+            finally:
+                store.close()
+
+    def test_roster_ignores_terminal_runtime_running_task(self):
+        class RuntimeWithRunningTask(FakeRuntime):
+            def __init__(self, running):
+                super().__init__()
+                self._running = running
+
+            def running_tasks(self):
+                return self._running
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "closing cleanup", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                )
+                store.upsert_agent_task(task)
+                running = type(
+                    "Running",
+                    (),
+                    {
+                        "agent": agent,
+                        "task": task,
+                        "thread": SlackThreadRef("C1", "171.thread"),
+                    },
+                )()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=RuntimeWithRunningTask([running]),
+                )
+
+                controller.post_roster("C1")
+
+                self.assertIn("1 available, 0 occupied", gateway.posts[-1]["text"])
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("Available", blocks)
+                self.assertNotIn("closing cleanup", blocks)
             finally:
                 store.close()
 

@@ -1394,6 +1394,8 @@ class SlackTeamController:
             if agent.agent_id not in statuses:
                 continue
             task = self.store.get_agent_task(task.task_id) or task
+            if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+                continue
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Working",
                 _shorten(_task_roster_summary(task), 140),
