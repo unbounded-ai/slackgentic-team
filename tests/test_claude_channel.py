@@ -216,6 +216,8 @@ class ClaudeChannelTests(unittest.TestCase):
 
         def fake_run(args, **kwargs):
             calls.append((args, kwargs))
+            if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="not a git repo")
             return subprocess.CompletedProcess(
                 args,
                 0,
@@ -255,7 +257,7 @@ class ClaudeChannelTests(unittest.TestCase):
                     "https://github.com/example-org/example-repo/pull/12",
                 )
                 self.assertEqual(
-                    calls[0][0],
+                    calls[-1][0],
                     [
                         "gh",
                         "pr",
@@ -273,8 +275,308 @@ class ClaudeChannelTests(unittest.TestCase):
                         "--draft",
                     ],
                 )
-                self.assertEqual(calls[0][1]["cwd"], repo.resolve())
-                self.assertTrue(calls[0][1]["capture_output"])
+                self.assertEqual(calls[-1][1]["cwd"], repo.resolve())
+                self.assertTrue(calls[-1][1]["capture_output"])
+                self.assertEqual(calls[-1][1]["timeout"], 120)
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_pushes_unpushed_current_branch(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                return subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+            if args == ["git", "branch", "--show-current"]:
+                return subprocess.CompletedProcess(args, 0, stdout="feature/docs\n", stderr="")
+            if args == ["git", "remote"]:
+                return subprocess.CompletedProcess(args, 0, stdout="origin\n", stderr="")
+            if args[:5] == [
+                "git",
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "feature/docs@{upstream}",
+            ]:
+                return subprocess.CompletedProcess(args, 128, stdout="", stderr="no upstream")
+            if args[:3] == ["git", "push", "--set-upstream"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="https://github.com/example-org/example-repo/pull/12\n",
+                    stderr="",
+                )
+            self.fail(f"unexpected command: {args}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123, command_runner=fake_run)
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {
+                            "title": "Update docs",
+                            "body": "Summary",
+                            "base": "main",
+                            "cwd": str(repo),
+                        },
+                    }
+                )
+
+                self.assertEqual(
+                    result["content"][0]["text"],
+                    "https://github.com/example-org/example-repo/pull/12",
+                )
+                self.assertIn(
+                    (
+                        [
+                            "git",
+                            "push",
+                            "--set-upstream",
+                            "origin",
+                            "refs/heads/feature/docs:refs/heads/feature/docs",
+                        ],
+                        {
+                            "cwd": repo.resolve(),
+                            "text": True,
+                            "capture_output": True,
+                            "check": False,
+                            "timeout": 120,
+                        },
+                    ),
+                    calls,
+                )
+                self.assertIn("--head", calls[-1][0])
+                self.assertIn("feature/docs", calls[-1][0])
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_pushes_requested_local_head(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                return subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+            if args == [
+                "git",
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/docs",
+            ]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args == ["git", "remote"]:
+                return subprocess.CompletedProcess(args, 0, stdout="origin\n", stderr="")
+            if args[:5] == [
+                "git",
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "feature/docs@{upstream}",
+            ]:
+                return subprocess.CompletedProcess(args, 128, stdout="", stderr="no upstream")
+            if args[:3] == ["git", "push", "--set-upstream"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="https://github.com/example-org/example-repo/pull/12\n",
+                    stderr="",
+                )
+            self.fail(f"unexpected command: {args}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123, command_runner=fake_run)
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {
+                            "title": "Update docs",
+                            "head": "feature/docs",
+                            "cwd": str(repo),
+                        },
+                    }
+                )
+
+                self.assertNotIn("isError", result)
+                self.assertEqual(
+                    calls[-2][0],
+                    [
+                        "git",
+                        "push",
+                        "--set-upstream",
+                        "origin",
+                        "refs/heads/feature/docs:refs/heads/feature/docs",
+                    ],
+                )
+                self.assertEqual(
+                    calls[-1][0],
+                    [
+                        "gh",
+                        "pr",
+                        "create",
+                        "--title",
+                        "Update docs",
+                        "--body",
+                        "",
+                        "--head",
+                        "feature/docs",
+                    ],
+                )
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_uses_upstream_head_name_after_push(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                return subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+            if args == ["git", "branch", "--show-current"]:
+                return subprocess.CompletedProcess(args, 0, stdout="feature/docs\n", stderr="")
+            if args == ["git", "remote"]:
+                return subprocess.CompletedProcess(args, 0, stdout="origin\n", stderr="")
+            if args[:5] == [
+                "git",
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "feature/docs@{upstream}",
+            ]:
+                return subprocess.CompletedProcess(
+                    args, 0, stdout="origin/review/feature-docs\n", stderr=""
+                )
+            if args[:3] == ["git", "push", "--set-upstream"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="https://github.com/example-org/example-repo/pull/12\n",
+                    stderr="",
+                )
+            self.fail(f"unexpected command: {args}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123, command_runner=fake_run)
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {
+                            "title": "Update docs",
+                            "body": "Summary",
+                            "base": "main",
+                            "cwd": str(repo),
+                        },
+                    }
+                )
+
+                self.assertNotIn("isError", result)
+                self.assertEqual(
+                    calls[-2][0],
+                    [
+                        "git",
+                        "push",
+                        "--set-upstream",
+                        "origin",
+                        "refs/heads/feature/docs:refs/heads/review/feature-docs",
+                    ],
+                )
+                self.assertIn("--head", calls[-1][0])
+                self.assertIn("review/feature-docs", calls[-1][0])
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_reports_branch_push_failure(self):
+        def fake_run(args, **kwargs):
+            if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                return subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+            if args == ["git", "branch", "--show-current"]:
+                return subprocess.CompletedProcess(args, 0, stdout="feature/docs\n", stderr="")
+            if args == ["git", "remote"]:
+                return subprocess.CompletedProcess(args, 0, stdout="origin\n", stderr="")
+            if args[:5] == [
+                "git",
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "feature/docs@{upstream}",
+            ]:
+                return subprocess.CompletedProcess(args, 128, stdout="", stderr="no upstream")
+            if args[:3] == ["git", "push", "--set-upstream"]:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="rejected\n")
+            self.fail(f"unexpected command: {args}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123, command_runner=fake_run)
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {"title": "Update docs", "cwd": str(repo)},
+                    }
+                )
+
+                self.assertTrue(result["isError"])
+                self.assertIn("Failed to push branch", result["content"][0]["text"])
+                self.assertIn("rejected", result["content"][0]["text"])
+            finally:
+                store.close()
+
+    def test_create_pull_request_tool_times_out_instead_of_hanging(self):
+        def fake_run(args, **kwargs):
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(store, target_pid=123, command_runner=fake_run)
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "create_pull_request",
+                        "arguments": {
+                            "title": "Update docs",
+                            "head": "example-org:feature/docs",
+                            "cwd": str(repo),
+                        },
+                    }
+                )
+
+                self.assertTrue(result["isError"])
+                self.assertIn("gh pr create", result["content"][0]["text"])
+                self.assertIn("timed out after 120 seconds", result["content"][0]["text"])
             finally:
                 store.close()
 
