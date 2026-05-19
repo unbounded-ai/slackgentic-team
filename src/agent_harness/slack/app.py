@@ -180,10 +180,12 @@ SETTING_HUMAN_USER_ID = "slack.human_user_id"
 SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
 TASK_REACTION_ACKNOWLEDGED = "eyes"
+TASK_REACTION_QUEUED = "inbox_tray"
 TASK_REACTION_IN_PROGRESS = "hourglass_flowing_sand"
 TASK_REACTION_DONE = "white_check_mark"
 TASK_STATUS_REACTIONS = (
     TASK_REACTION_ACKNOWLEDGED,
+    TASK_REACTION_QUEUED,
     TASK_REACTION_IN_PROGRESS,
     TASK_REACTION_DONE,
     "thumbsup",
@@ -1376,10 +1378,18 @@ class SlackTeamController:
             task = self.store.active_task_for_agent(agent.agent_id)
             if task is None:
                 continue
-            label = "Queued" if task.status == AgentTaskStatus.QUEUED else "Working"
+            if task.status == AgentTaskStatus.QUEUED:
+                label = "Queued"
+                detail = _shorten(_task_roster_summary(task), 140)
+            elif self._task_is_runtime_running(task.task_id):
+                label = "Working"
+                detail = _shorten(_task_roster_summary(task), 140)
+            else:
+                label = "Occupied"
+                detail = _shorten(f"Open thread: {_task_roster_summary(task)}", 140)
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
-                _shorten(_task_roster_summary(task), 140),
+                detail,
                 dangerous_mode=_task_dangerous_mode(task),
                 pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(task.channel_id, task.thread_ts),
@@ -1514,6 +1524,18 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to read running managed tasks for roster", exc_info=True)
             return []
+
+    def _task_is_runtime_running(self, task_id: str) -> bool:
+        if self.runtime is None:
+            return False
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if not callable(is_running):
+            return False
+        try:
+            return bool(is_running(task_id))
+        except Exception:
+            LOGGER.debug("failed to read managed task runtime state", exc_info=True)
+            return False
 
     def _external_session_permalink(self, session) -> str | None:
         channel_id = self._configured_agent_channel_id()
@@ -1954,10 +1976,18 @@ class SlackTeamController:
                 continue
             if not task.thread_ts:
                 continue
-            if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
-                continue
             is_running = getattr(self.runtime, "is_task_running", None)
             if callable(is_running) and is_running(task.task_id):
+                continue
+            if _queued_thread_followups(task.metadata):
+                agent = self.store.get_team_agent(task.agent_id)
+                if agent is None:
+                    continue
+                thread = SlackThreadRef(task.channel_id, task.thread_ts, task.parent_message_ts)
+                if self._resume_queued_thread_followups(task, agent, thread):
+                    resumed += 1
+                continue
+            if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
                 continue
             if self._managed_task_session_is_alive(task):
                 LOGGER.info(
@@ -2737,7 +2767,12 @@ class SlackTeamController:
             return True
         if agent:
             started = self._start_thread_followup(target_task, event, text, agent)
-            if started:
+            latest = self.store.get_agent_task(target_task.task_id) or target_task
+            if (
+                started
+                and message_ts
+                and not _queued_thread_followups_contain_message_ts(latest.metadata, message_ts)
+            ):
                 self._mark_message_in_progress(channel_id, message_ts)
             return started
         if task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
@@ -3653,12 +3688,13 @@ class SlackTeamController:
                 "queueing same-thread continuation for task %s; worker is still running",
                 previous_task.task_id,
             )
-            self._queue_running_task_followup(
+            queued_count = self._queue_running_task_followup(
                 previous_task,
                 request,
                 requested_by_slack_user=requested_by_slack_user,
                 request_message_ts=request_message_ts,
             )
+            self._post_queued_followup_notice(agent, thread, request.prompt, queued_count)
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
@@ -3780,21 +3816,43 @@ class SlackTeamController:
         *,
         requested_by_slack_user: str | None,
         request_message_ts: str | None,
-    ) -> AgentTask:
-        metadata = metadata_with_pr_urls(task.metadata, request.prompt)
+    ) -> int:
+        latest = self.store.get_agent_task(task.task_id) or task
+        metadata = metadata_with_pr_urls(latest.metadata, request.prompt)
         queued = _queued_thread_followups(metadata)
-        queued.append(
-            {
-                "prompt": request.prompt,
-                "message_ts": request_message_ts,
-                "requested_by_slack_user": requested_by_slack_user,
-                "created_at": utc_now().isoformat(),
-            }
-        )
-        metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued[-20:]
-        updated = replace(task, metadata=metadata, updated_at=utc_now())
+        queued = (
+            [
+                *queued,
+                {
+                    "prompt": request.prompt,
+                    "message_ts": request_message_ts,
+                    "requested_by_slack_user": requested_by_slack_user,
+                    "created_at": utc_now().isoformat(),
+                },
+            ]
+        )[-20:]
+        metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
-        return self.store.get_agent_task(task.task_id) or updated
+        self._mark_message_queued(latest.channel_id, request_message_ts)
+        return len(queued)
+
+    def _post_queued_followup_notice(
+        self,
+        agent,
+        thread: SlackThreadRef,
+        prompt: str,
+        queued_count: int,
+    ) -> None:
+        if queued_count > 1 and not _looks_like_direct_question(prompt):
+            return
+        try:
+            self.gateway.post_thread_reply(
+                thread,
+                _queued_followup_notice(agent.handle, prompt, queued_count),
+            )
+        except Exception:
+            LOGGER.debug("failed to post queued follow-up notice", exc_info=True)
 
     def _complete_active_thread_followup(
         self,
@@ -4993,6 +5051,9 @@ class SlackTeamController:
     def _mark_message_acknowledged(self, channel_id: str, message_ts: str | None) -> None:
         self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_ACKNOWLEDGED)
 
+    def _mark_message_queued(self, channel_id: str, message_ts: str | None) -> None:
+        self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_QUEUED)
+
     def _mark_message_in_progress(self, channel_id: str, message_ts: str | None) -> None:
         self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_IN_PROGRESS)
 
@@ -5019,8 +5080,8 @@ class SlackTeamController:
         thread: SlackThreadRef,
     ) -> None:
         # Backstop: surface and clear thread messages that the bot acknowledged
-        # or marked in-progress but never finalized. Otherwise the user sees
-        # :eyes: / :hourglass: lingering forever after the task closes.
+        # or marked queued/in-progress but never finalized. Otherwise the user
+        # sees status reactions lingering forever after the task closes.
         if not thread.thread_ts:
             return
         lookup = getattr(self.gateway, "bot_user_id", None)
@@ -5039,7 +5100,11 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to fetch thread for pending-reaction sweep", exc_info=True)
             return
-        pending_reactions = {TASK_REACTION_ACKNOWLEDGED, TASK_REACTION_IN_PROGRESS}
+        pending_reactions = {
+            TASK_REACTION_ACKNOWLEDGED,
+            TASK_REACTION_QUEUED,
+            TASK_REACTION_IN_PROGRESS,
+        }
         pending: list[str] = []
         for message in messages:
             message_ts = message.get("ts")
@@ -5201,7 +5266,11 @@ class SlackTeamController:
             return
         remove_reaction = getattr(self.gateway, "remove_reaction", None)
         if callable(remove_reaction):
-            for reaction in (TASK_REACTION_ACKNOWLEDGED, TASK_REACTION_IN_PROGRESS):
+            for reaction in (
+                TASK_REACTION_ACKNOWLEDGED,
+                TASK_REACTION_QUEUED,
+                TASK_REACTION_IN_PROGRESS,
+            ):
                 try:
                     remove_reaction(channel_id, message_ts, reaction)
                 except Exception:
@@ -5313,6 +5382,10 @@ class SlackTeamController:
             if task.parent_message_ts == message_ts:
                 return True
             if _metadata_has_message_ts(task.metadata, message_ts):
+                return True
+            if message_ts in _active_thread_followup_message_ts_values(task.metadata):
+                return True
+            if _queued_thread_followups_contain_message_ts(task.metadata, message_ts):
                 return True
         return False
 
@@ -6248,9 +6321,10 @@ def _event_has_slackgentic_progress_reaction(event: dict) -> bool:
         if not isinstance(reaction, dict):
             continue
         if reaction.get("name") in {
-            "hourglass_flowing_sand",
-            "eyes",
-            "white_check_mark",
+            TASK_REACTION_ACKNOWLEDGED,
+            TASK_REACTION_QUEUED,
+            TASK_REACTION_IN_PROGRESS,
+            TASK_REACTION_DONE,
         }:
             return True
     return False
@@ -6328,6 +6402,15 @@ def _queued_thread_followup_message_ts_values(queued: list[dict[str, object]]) -
     return list(dict.fromkeys(values))
 
 
+def _queued_thread_followups_contain_message_ts(
+    metadata: dict[str, object],
+    message_ts: str,
+) -> bool:
+    return message_ts in _queued_thread_followup_message_ts_values(
+        _queued_thread_followups(metadata)
+    )
+
+
 def _active_thread_followup_message_ts_values(metadata: dict[str, object]) -> list[str]:
     values: list[str] = []
     raw_values = metadata.get(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY)
@@ -6393,12 +6476,24 @@ def _live_thread_followup_prompt(prompt: str) -> str:
     )
 
 
+def _queued_followup_notice(handle: str, prompt: str, queued_count: int) -> str:
+    kind = "question" if _looks_like_direct_question(prompt) else "follow-up"
+    count = "" if queued_count <= 1 else f" There are now {queued_count} queued follow-ups."
+    return (
+        f"@{handle} is still in a running turn, and I could not deliver that {kind} live, "
+        "so I queued it. It will be sent when the run finishes; say `stop` here to "
+        f"interrupt the run and send queued follow-ups now.{count}"
+    )
+
+
 def _looks_like_direct_question(text: str) -> bool:
     compact = " ".join(text.strip().lower().split())
     if not compact:
         return False
     if "?" in compact:
         return True
+    if compact.startswith(("do not ", "don't ")):
+        return False
     starters = (
         "are ",
         "can ",
