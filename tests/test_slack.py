@@ -120,7 +120,10 @@ class SlackTests(unittest.TestCase):
             if block.get("block_id") == f"team.agent.actions.{agent.agent_id}"
         )
 
-        status_text = str(blocks[2])
+        status_block = next(
+            block for block in blocks if block.get("block_id") == f"team.status.{agent.agent_id}"
+        )
+        status_text = str(status_block)
         self.assertNotIn("https://example.slack.com/archives/C1/p171000001", status_text)
         self.assertEqual(
             [element["text"]["text"] for element in action_block["elements"]],
@@ -149,9 +152,35 @@ class SlackTests(unittest.TestCase):
         )
 
         rendered = str(blocks)
-        self.assertIn("Working: repair the installer", rendered)
+        self.assertIn("*Working:* repair the installer", rendered)
         self.assertNotIn("Occupied: Slack task:", rendered)
-        self.assertIn("Mode: :zap: Dangerous", rendered)
+        self.assertIn("*Mode:* :zap: Dangerous", rendered)
+
+    def test_roster_blocks_render_name_as_header_and_bold_status_prefixes(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        blocks = build_team_roster_blocks(
+            [agent],
+            {
+                agent.agent_id: AgentRosterStatus(
+                    "Working",
+                    "PRs: review the queue",
+                    dangerous_mode=True,
+                )
+            },
+        )
+
+        name_block = next(
+            block for block in blocks if block.get("block_id") == f"team.agent.{agent.agent_id}"
+        )
+        status_block = next(
+            block for block in blocks if block.get("block_id") == f"team.status.{agent.agent_id}"
+        )
+
+        self.assertEqual(name_block["type"], "header")
+        self.assertEqual(name_block["text"]["type"], "plain_text")
+        self.assertIn(agent.full_name, name_block["text"]["text"])
+        self.assertIn("*Working:* *PRs:* review the queue", status_block["text"]["text"])
+        self.assertIn("*Mode:* :zap: Dangerous", status_block["text"]["text"])
 
     def test_roster_blocks_sort_occupied_then_provider_then_name(self):
         agents = build_initial_model_team(codex_count=2, claude_count=2)
