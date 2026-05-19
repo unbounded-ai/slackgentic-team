@@ -2228,6 +2228,119 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_stop_task_clears_managed_session_setting(self):
+        from agent_harness.sessions.managed_session import (
+            managed_session_agent_key,
+            record_managed_session,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "free up via button", "C1")
+                task = replace(
+                    task,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-stop",
+                )
+                store.upsert_agent_task(task)
+                record_managed_session(
+                    store,
+                    Provider.CODEX,
+                    "codex-stop",
+                    agent.agent_id,
+                    dangerous_mode=False,
+                )
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.stop_task(task.task_id, AgentTaskStatus.DONE)
+
+                self.assertIsNone(
+                    store.get_setting(managed_session_agent_key(Provider.CODEX, "codex-stop"))
+                )
+            finally:
+                store.close()
+
+    def test_runtime_stop_all_clears_managed_session_settings(self):
+        from agent_harness.sessions.managed_session import (
+            managed_session_agent_key,
+            record_managed_session,
+        )
+
+        class HangingProcess(OneShotProcess):
+            def __init__(self, request):
+                super().__init__(request)
+                self.alive = True
+                self.reading = threading.Event()
+                self.release = threading.Event()
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                self.reading.set()
+                self.release.wait(timeout=5.0)
+                return ""
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            processes: list[HangingProcess] = []
+
+            def process_factory(request):
+                process = HangingProcess(request)
+                processes.append(process)
+                return process
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "cancel during shutdown", "C1")
+                task = replace(
+                    task,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-shutdown",
+                )
+                store.upsert_agent_task(task)
+                record_managed_session(
+                    store,
+                    Provider.CODEX,
+                    "codex-shutdown",
+                    agent.agent_id,
+                    dangerous_mode=False,
+                )
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED, join_timeout=1.0)
+
+                self.assertIsNone(
+                    store.get_setting(managed_session_agent_key(Provider.CODEX, "codex-shutdown"))
+                )
+            finally:
+                for process in processes:
+                    process.release.set()
+                store.close()
+
     def test_runtime_ignores_claude_permission_denials_in_dangerous_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

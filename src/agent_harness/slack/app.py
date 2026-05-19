@@ -32,7 +32,6 @@ from agent_harness.models import (
     PR_URL_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
-    AgentSession,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
@@ -1094,17 +1093,6 @@ class SlackTeamController:
                 )
             )
             seen_handles.add(agent.handle)
-        for agent_id, session in self._orphan_managed_sessions_by_agent().items():
-            agent = agents_by_id.get(agent_id)
-            if agent is None or agent.handle in seen_handles:
-                continue
-            occupied.append(
-                (
-                    agent.handle,
-                    external_session_dependency_id(session.provider, session.session_id),
-                )
-            )
-            seen_handles.add(agent.handle)
         return occupied
 
     def _occupied_handle_dependency_labels(self) -> list[tuple[str, str, str]]:
@@ -1133,20 +1121,36 @@ class SlackTeamController:
                 return _shorten(_task_roster_summary(task), 140)
         return "current task"
 
-    def _orphan_managed_sessions_by_agent(self):
-        sessions_by_agent: dict[str, AgentSession] = {}
-        for (provider, session_id), agent_id in managed_session_agents(self.store).items():
-            session = self.store.get_session(provider, session_id)
-            if session is None:
+    def _prune_stale_managed_sessions(self, agents) -> None:
+        """Drop managed_session settings that no longer match an active task.
+
+        A managed session record only stays valid while the runtime is actively
+        driving a task on that session. Once the task moves to a terminal state
+        the record should be cleared; otherwise the roster has no honest way to
+        explain the agent's occupancy. Defensive cleanup keeps the invariant
+        "Occupied implies a current deferred or active task" intact even when
+        an upstream code path forgets to call clear_managed_session.
+        """
+        valid_keys: set[tuple[Provider, str]] = set()
+        for agent in agents:
+            task = self.store.active_task_for_agent(agent.agent_id)
+            if task is None:
                 continue
-            if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            if task.session_provider is None or not task.session_id:
                 continue
-            existing = sessions_by_agent.get(agent_id)
-            if existing is None or (
-                existing.status != SessionStatus.ACTIVE and session.status == SessionStatus.ACTIVE
-            ):
-                sessions_by_agent[agent_id] = session
-        return sessions_by_agent
+            valid_keys.add((task.session_provider, task.session_id))
+        for (provider, session_id), _agent_id in managed_session_agents(self.store).items():
+            if (provider, session_id) in valid_keys:
+                continue
+            try:
+                clear_managed_session(self.store, provider, session_id)
+            except Exception:
+                LOGGER.debug(
+                    "failed to clear stale managed session %s/%s",
+                    provider.value,
+                    session_id,
+                    exc_info=True,
+                )
 
     def _handle_scheduled_work_request(self, event: dict, channel_id: str, text: str) -> bool:
         schedule_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
@@ -1300,6 +1304,7 @@ class SlackTeamController:
         return True
 
     def _roster_statuses(self, agents) -> dict[str, AgentRosterStatus]:
+        self._prune_stale_managed_sessions(agents)
         statuses = {agent.agent_id: AgentRosterStatus("Available") for agent in agents}
         for agent in agents:
             task = self.store.active_task_for_agent(agent.agent_id)
@@ -1364,26 +1369,6 @@ class SlackTeamController:
             if summary and summary.strip():
                 detail_parts.append(_shorten(summary, 100))
             elif session.cwd:
-                detail_parts.append(str(session.cwd.name or session.cwd))
-            else:
-                detail_parts.append(_shorten(session.session_id, 12))
-            statuses[agent_id] = AgentRosterStatus(
-                "Occupied",
-                ": ".join(detail_parts),
-                dangerous_mode=_external_session_dangerous_mode(session),
-                thread_url=self._external_session_permalink(session),
-                session_provider=session.provider,
-                session_id=session.session_id,
-            )
-        for agent_id, session in self._orphan_managed_sessions_by_agent().items():
-            if agent_id not in statuses:
-                continue
-            if statuses[agent_id].label != "Available":
-                continue
-            detail_parts = [
-                f"{session.provider.value} session not yet released",
-            ]
-            if session.cwd:
                 detail_parts.append(str(session.cwd.name or session.cwd))
             else:
                 detail_parts.append(_shorten(session.session_id, 12))
