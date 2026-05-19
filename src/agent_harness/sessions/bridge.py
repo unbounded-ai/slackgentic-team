@@ -17,6 +17,7 @@ from typing import Protocol
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.models import (
+    DANGEROUS_MODE_METADATA_KEY,
     AgentSession,
     PermissionMode,
     Provider,
@@ -282,11 +283,16 @@ class ExternalSessionBridge:
             return False
 
     def _codex_session_uses_dangerous_mode(self, session: AgentSession) -> bool:
-        return _codex_session_uses_dangerous_mode(
+        if _codex_session_uses_dangerous_mode(
             session,
             self.commands,
             self.terminal_notifier,
-        )
+        ):
+            return True
+        task = self.store.get_active_task_by_session(session.provider, session.session_id)
+        if task is None:
+            return False
+        return task.metadata.get(DANGEROUS_MODE_METADATA_KEY) is True
 
     def _send_to_claude_channel(
         self,

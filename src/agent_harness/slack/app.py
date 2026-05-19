@@ -1609,6 +1609,13 @@ class SlackTeamController:
             is_running = getattr(self.runtime, "is_task_running", None)
             if callable(is_running) and is_running(task.task_id):
                 continue
+            if self._managed_task_session_is_alive(task):
+                LOGGER.info(
+                    "leaving managed task %s ACTIVE; session %s is still alive",
+                    task.task_id,
+                    task.session_id,
+                )
+                continue
             if not should_resume_managed_run(task, now=now):
                 LOGGER.info(
                     "skipping resume of orphaned task %s (age/attempt bounds exceeded: attempts=%d)",
@@ -1630,6 +1637,14 @@ class SlackTeamController:
             if started:
                 resumed += 1
         return resumed
+
+    def _managed_task_session_is_alive(self, task: AgentTask) -> bool:
+        if task.session_provider is None or not task.session_id:
+            return False
+        session = self.store.get_session(task.session_provider, task.session_id)
+        if session is None:
+            return False
+        return session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}
 
     def _abandon_orphaned_task(self, task: AgentTask) -> None:
         metadata = dict(task.metadata)

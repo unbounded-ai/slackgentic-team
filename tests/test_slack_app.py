@@ -6653,6 +6653,163 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_startup_reconcile_keeps_stale_marker_when_session_still_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                stale_marker = (
+                    utc_now() - MANAGED_RUN_MAX_RESUME_AGE - timedelta(seconds=30)
+                ).isoformat()
+                task = replace(
+                    create_agent_task(agent, "long running orphan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-alive",
+                    metadata={
+                        MANAGED_RUN_STARTED_METADATA_KEY: stale_marker,
+                        DANGEROUS_MODE_METADATA_KEY: True,
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="codex-thread-alive",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        cwd=Path(tmp),
+                        started_at=utc_now(),
+                        last_seen_at=utc_now(),
+                        status=SessionStatus.ACTIVE,
+                        control_mode=ControlMode.MANAGED,
+                    )
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 0)
+                self.assertEqual(runtime.started, [])
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+                self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+            finally:
+                store.close()
+
+    def test_startup_reconcile_keeps_exhausted_attempts_when_session_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "still working", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-resilient",
+                    metadata={
+                        MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat(),
+                        MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY: MANAGED_RUN_MAX_RESUMES,
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="codex-thread-resilient",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        cwd=Path(tmp),
+                        started_at=utc_now(),
+                        last_seen_at=utc_now(),
+                        status=SessionStatus.IDLE,
+                        control_mode=ControlMode.MANAGED,
+                    )
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 0)
+                self.assertEqual(runtime.started, [])
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+            finally:
+                store.close()
+
+    def test_startup_reconcile_roster_shows_agent_busy_when_task_kept_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                stale_marker = (
+                    utc_now() - MANAGED_RUN_MAX_RESUME_AGE - timedelta(seconds=30)
+                ).isoformat()
+                task = replace(
+                    create_agent_task(agent, "summarize pyproject", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-roster",
+                    metadata={MANAGED_RUN_STARTED_METADATA_KEY: stale_marker},
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="codex-thread-roster",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        cwd=Path(tmp),
+                        started_at=utc_now(),
+                        last_seen_at=utc_now(),
+                        status=SessionStatus.ACTIVE,
+                        control_mode=ControlMode.MANAGED,
+                    )
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.cancel_orphaned_active_tasks()
+                controller.post_roster("C1")
+
+                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+            finally:
+                store.close()
+
     def test_plain_reply_to_persisted_active_task_restarts_same_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
