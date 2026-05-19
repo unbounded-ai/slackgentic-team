@@ -10,7 +10,7 @@ import threading
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from agent_harness.config import load_config_from_env
 from agent_harness.models import PermissionMode, SlackThreadRef
@@ -60,6 +60,12 @@ SLACKGENTIC_MCP_TOOL_NAMES = {
 SLACKGENTIC_MCP_PERMISSION_ALLOW = tuple(sorted(SLACKGENTIC_MCP_TOOL_NAMES))
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
+CREATE_PULL_REQUEST_TIMEOUT_SECONDS = 120
+
+
+class PullRequestHeadPreparation(NamedTuple):
+    head: str | None
+    error: str | None
 
 
 class ClaudeChannelServer:
@@ -214,7 +220,22 @@ class ClaudeChannelServer:
             return _tool_result(
                 "create_pull_request cwd must be an existing directory.", is_error=True
             )
-        args = _pull_request_create_args(arguments, title)
+        try:
+            head_preparation = _prepare_pull_request_head(
+                arguments,
+                cwd,
+                self.command_runner,
+            )
+        except FileNotFoundError:
+            return _tool_result("Git CLI `git` was not found on PATH.", is_error=True)
+        except subprocess.TimeoutExpired as exc:
+            return _tool_result(_timeout_message(exc), is_error=True)
+        except Exception as exc:
+            return _tool_result(f"Failed to prepare pull request branch: {exc}", is_error=True)
+        if head_preparation.error:
+            return _tool_result(head_preparation.error, is_error=True)
+
+        args = _pull_request_create_args(arguments, title, default_head=head_preparation.head)
         try:
             completed = self.command_runner(
                 args,
@@ -222,9 +243,12 @@ class ClaudeChannelServer:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
             )
         except FileNotFoundError:
             return _tool_result("GitHub CLI `gh` was not found on PATH.", is_error=True)
+        except subprocess.TimeoutExpired as exc:
+            return _tool_result(_timeout_message(exc), is_error=True)
         except Exception as exc:
             return _tool_result(f"Failed to create pull request: {exc}", is_error=True)
 
@@ -713,7 +737,7 @@ def _tools() -> list[dict[str, Any]]:
         {
             "name": "create_pull_request",
             "description": (
-                "Create a GitHub pull request for a pushed branch using `gh pr create`. "
+                "Create a GitHub pull request for a local or pushed branch using `gh pr create`. "
                 "Use this when a PR is ready or when Bash cannot reach GitHub from a sandbox."
             ),
             "inputSchema": {
@@ -797,12 +821,169 @@ def _tools() -> list[dict[str, Any]]:
     ]
 
 
-def _pull_request_create_args(arguments: dict[str, Any], title: str) -> list[str]:
+def _prepare_pull_request_head(
+    arguments: dict[str, Any],
+    cwd: Path,
+    command_runner: CommandRunner,
+) -> PullRequestHeadPreparation:
+    requested_head = _string_arg(arguments, "head")
+    if ":" in requested_head:
+        return PullRequestHeadPreparation(None, None)
+    if not _is_git_work_tree(cwd, command_runner):
+        return PullRequestHeadPreparation(None, None)
+
+    branch = requested_head
+    if branch:
+        if not _local_branch_exists(cwd, branch, command_runner):
+            return PullRequestHeadPreparation(None, None)
+    else:
+        branch = _current_git_branch(cwd, command_runner)
+        if not branch:
+            return PullRequestHeadPreparation(
+                None,
+                "create_pull_request could not determine the current branch. "
+                "Pass head explicitly when running outside a branch.",
+            )
+
+    base = _string_arg(arguments, "base")
+    if branch == base or (not base and branch in {"main", "master"}):
+        return PullRequestHeadPreparation(None, None)
+
+    remote, remote_branch, error = _push_target_for_branch(cwd, branch, command_runner)
+    if error:
+        return PullRequestHeadPreparation(None, error)
+
+    completed = command_runner(
+        [
+            "git",
+            "push",
+            "--set-upstream",
+            remote,
+            f"refs/heads/{branch}:refs/heads/{remote_branch}",
+        ],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        detail = _command_output(completed) or f"`git push` exited with {completed.returncode}."
+        return PullRequestHeadPreparation(
+            None,
+            f"Failed to push branch `{branch}` before creating pull request:\n{detail}",
+        )
+    return PullRequestHeadPreparation(remote_branch, None)
+
+
+def _push_target_for_branch(
+    cwd: Path,
+    branch: str,
+    command_runner: CommandRunner,
+) -> tuple[str, str, str | None]:
+    remotes = _git_remotes(cwd, command_runner)
+    if not remotes:
+        return "", "", "create_pull_request could not find a git remote to push the branch."
+
+    upstream = command_runner(
+        [
+            "git",
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            f"{branch}@{{upstream}}",
+        ],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
+    )
+    if upstream.returncode == 0:
+        parsed = _parse_upstream_ref(upstream.stdout.strip(), remotes)
+        if parsed is not None:
+            return parsed[0], parsed[1], None
+
+    remote = "origin" if "origin" in remotes else remotes[0]
+    return remote, branch, None
+
+
+def _is_git_work_tree(cwd: Path, command_runner: CommandRunner) -> bool:
+    completed = command_runner(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
+    )
+    return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+
+def _local_branch_exists(cwd: Path, branch: str, command_runner: CommandRunner) -> bool:
+    completed = command_runner(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
+    )
+    return completed.returncode == 0
+
+
+def _current_git_branch(cwd: Path, command_runner: CommandRunner) -> str:
+    completed = command_runner(
+        ["git", "branch", "--show-current"],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
+
+
+def _git_remotes(cwd: Path, command_runner: CommandRunner) -> list[str]:
+    completed = command_runner(
+        ["git", "remote"],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=CREATE_PULL_REQUEST_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        return []
+    return [remote.strip() for remote in completed.stdout.splitlines() if remote.strip()]
+
+
+def _parse_upstream_ref(upstream: str, remotes: list[str]) -> tuple[str, str] | None:
+    for remote in sorted(remotes, key=len, reverse=True):
+        prefix = f"{remote}/"
+        if upstream.startswith(prefix) and len(upstream) > len(prefix):
+            return remote, upstream[len(prefix) :]
+    return None
+
+
+def _pull_request_create_args(
+    arguments: dict[str, Any],
+    title: str,
+    *,
+    default_head: str | None = None,
+) -> list[str]:
     args = ["gh", "pr", "create", "--title", title, "--body", _string_arg(arguments, "body")]
-    for key, flag in (("base", "--base"), ("head", "--head"), ("repo", "--repo")):
-        value = _string_arg(arguments, key)
-        if value:
-            args.extend([flag, value])
+    base = _string_arg(arguments, "base")
+    if base:
+        args.extend(["--base", base])
+    head = _string_arg(arguments, "head") or default_head
+    if head:
+        args.extend(["--head", head])
+    repo = _string_arg(arguments, "repo")
+    if repo:
+        args.extend(["--repo", repo])
     if _bool_arg(arguments, "draft"):
         args.append("--draft")
     return args
@@ -829,6 +1010,19 @@ def _command_output(completed: subprocess.CompletedProcess[str]) -> str:
 def _github_pr_url(text: str) -> str:
     match = PR_URL_RE.search(text)
     return match.group(0) if match else ""
+
+
+def _timeout_message(exc: subprocess.TimeoutExpired) -> str:
+    command = exc.cmd[0] if isinstance(exc.cmd, list) and exc.cmd else exc.cmd
+    if isinstance(command, str) and command:
+        label = command
+        if isinstance(exc.cmd, list):
+            if exc.cmd[:3] == ["gh", "pr", "create"]:
+                label = "gh pr create"
+            elif exc.cmd[:2] == ["git", "push"]:
+                label = "git push"
+        return f"`{label}` timed out after {CREATE_PULL_REQUEST_TIMEOUT_SECONDS} seconds."
+    return f"Command timed out after {CREATE_PULL_REQUEST_TIMEOUT_SECONDS} seconds."
 
 
 def _tool_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
