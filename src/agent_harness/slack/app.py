@@ -1104,6 +1104,32 @@ class SlackTeamController:
             seen_handles.add(agent.handle)
         return occupied
 
+    def _occupied_handle_dependency_labels(self) -> list[tuple[str, str, str]]:
+        return [
+            (handle, task_id, self._agent_busy_dependency_label(task_id))
+            for handle, task_id in self._occupied_handle_task_ids()
+        ]
+
+    def _agent_busy_dependency_label(self, task_id: str | None) -> str:
+        external_session = parse_external_session_dependency_id(task_id)
+        if external_session is not None:
+            provider, session_id = external_session
+            prefix = f"{provider.value} external session"
+            summary = self.store.get_setting(
+                f"{EXTERNAL_SESSION_SUMMARY_PREFIX}{provider.value}.{session_id}"
+            )
+            if summary and summary.strip():
+                return f"{prefix}: {_shorten(summary, 140)}"
+            session = self.store.get_session(provider, session_id)
+            if session and session.cwd:
+                return f"{prefix}: {session.cwd.name or session.cwd}"
+            return prefix
+        if task_id:
+            task = self.store.get_agent_task(task_id)
+            if task is not None:
+                return _shorten(_task_roster_summary(task), 140)
+        return "current task"
+
     def _orphan_managed_sessions_by_agent(self):
         sessions_by_agent: dict[str, AgentSession] = {}
         for (provider, session_id), agent_id in managed_session_agents(self.store).items():
@@ -1987,7 +2013,7 @@ class SlackTeamController:
                 channel_id=channel_id,
                 message_ts=roster_ts,
                 initial_timing=str(payload.get("mode") or "now"),
-                occupied_handles=self._occupied_handle_task_ids(),
+                occupied_handles=self._occupied_handle_dependency_labels(),
             ),
         )
 
@@ -2294,6 +2320,7 @@ class SlackTeamController:
             deferred,
             deferred.description or f"after @{dependency.handle} finishes",
             request,
+            dependency_labeler=self._agent_busy_dependency_label,
         )
         if not self._try_update_message(thread.channel_id, thread.thread_ts, text):
             self.gateway.post_thread_reply(thread, text)
@@ -4079,7 +4106,10 @@ class SlackTeamController:
         self.gateway.post_thread_reply(
             thread,
             _format_deferred_work_ack(
-                deferred, parsed.deferred.description, parsed.deferred.request
+                deferred,
+                parsed.deferred.description,
+                parsed.deferred.request,
+                dependency_labeler=self._agent_busy_dependency_label,
             ),
             persona=agent,
             icon_url=self._agent_icon_url(agent),
@@ -4288,7 +4318,7 @@ class SlackTeamController:
             self.gateway.post_thread_reply(
                 thread,
                 (
-                    f"Cancelled deferred `{claimed.deferred_id}` because "
+                    f"Cancelled deferred task `{_shorten(claimed.prompt, 140)}` because "
                     f"@{request.requested_handle} is not an active agent."
                 ),
             )
@@ -4318,7 +4348,8 @@ class SlackTeamController:
             self.gateway.post_thread_reply(
                 thread,
                 (
-                    f"Deferred `{claimed.deferred_id}` is ready, but no matching agent "
+                    f"Deferred task `{_shorten(claimed.prompt, 140)}` is ready, "
+                    "but no matching agent "
                     "is available. I queued it and will start it when capacity opens."
                 ),
             )
@@ -4327,7 +4358,7 @@ class SlackTeamController:
                 last_task_id=pending.pending_id,
             )
             return True
-        text = f"Deferred `{claimed.deferred_id}` is ready now.\n\n" + format_agent_assignment(
+        text = "Deferred task is ready now.\n\n" + format_agent_assignment(
             result.agent,
             result.request.prompt,
             claimed.requested_by_slack_user,
@@ -6326,6 +6357,8 @@ def _format_deferred_work_ack(
     deferred: DeferredWork,
     description: str,
     request: WorkRequest,
+    *,
+    dependency_labeler: Callable[[str | None], str] | None = None,
 ) -> str:
     target = "somebody"
     if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
@@ -6336,7 +6369,8 @@ def _format_deferred_work_ack(
             label = dep.permalink or f"{dep.channel_id}/{dep.thread_ts}"
             dep_lines.append(f"- thread {label}")
         else:
-            dep_lines.append(f"- @{dep.handle} ({_format_agent_busy_dependency(dep.task_id)})")
+            label = _format_agent_busy_dependency(dep.task_id, dependency_labeler)
+            dep_lines.append(f"- @{dep.handle}: {label}")
     deps_text = "\n".join(dep_lines)
     timing = ""
     if deferred.after_dep_delay_seconds:
@@ -6344,23 +6378,30 @@ def _format_deferred_work_ack(
     elif deferred.run_at is not None:
         timing = f" then at {_format_schedule_timestamp(deferred.run_at)}"
     return (
-        f"Deferred `{deferred.deferred_id}`: {target} will run `{request.prompt}` "
+        f"Deferred: {target} will run `{request.prompt}` "
         f"{description}.{timing}\nWaiting on:\n{deps_text}"
     )
 
 
-def _format_agent_busy_dependency(task_id: str | None) -> str:
+def _format_agent_busy_dependency(
+    task_id: str | None,
+    dependency_labeler: Callable[[str | None], str] | None = None,
+) -> str:
+    if dependency_labeler is not None:
+        label = dependency_labeler(task_id)
+        if label:
+            return label
     external_session = parse_external_session_dependency_id(task_id)
     if external_session is not None:
-        provider, session_id = external_session
-        return f"{provider.value} external session `{session_id}`"
-    return f"task `{task_id}`"
+        provider, _session_id = external_session
+        return f"{provider.value} external session"
+    return "current task"
 
 
 def _format_deferred_ready_message(deferred: DeferredWork) -> str:
     fire_at = _format_schedule_timestamp(deferred.fire_at) if deferred.fire_at else "shortly"
     return (
-        f"Dependencies for deferred `{deferred.deferred_id}` are satisfied. "
+        f"Dependencies for deferred task `{_shorten(deferred.prompt, 180)}` are satisfied. "
         f"Starting at `{fire_at}` UTC."
     )
 
@@ -6398,7 +6439,7 @@ def _roster_work_modal(
     channel_id: str,
     message_ts: str | None,
     initial_timing: str,
-    occupied_handles: list[tuple[str, str]],
+    occupied_handles: list[tuple[str, str, str]],
 ) -> dict:
     timing_options = [
         _modal_option("Now", "now", "Start as soon as capacity is available."),
@@ -6579,10 +6620,10 @@ def _roster_work_modal(
     }
 
 
-def _roster_dependency_options(occupied_handles: list[tuple[str, str]]) -> list[dict]:
+def _roster_dependency_options(occupied_handles: list[tuple[str, str, str]]) -> list[dict]:
     options = [_modal_option("No dependency", "none")]
     seen: set[str] = set()
-    for handle, task_id in occupied_handles:
+    for handle, _task_id, label in occupied_handles:
         if handle in seen:
             continue
         seen.add(handle)
@@ -6590,7 +6631,7 @@ def _roster_dependency_options(occupied_handles: list[tuple[str, str]]) -> list[
             _modal_option(
                 f"@{handle}",
                 handle,
-                _format_agent_busy_dependency(task_id),
+                label,
             )
         )
         if len(options) >= 100:

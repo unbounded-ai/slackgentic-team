@@ -305,11 +305,21 @@ def build_team_roster_blocks(
         )
         blocks.append(
             {
-                "type": "section",
+                "type": "header",
                 "block_id": f"team.agent.{agent.agent_id}",
                 "text": {
+                    "type": "plain_text",
+                    "text": _plain_text_header(agent_identity_label(agent)),
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "section",
+                "block_id": f"team.status.{agent.agent_id}",
+                "text": {
                     "type": "mrkdwn",
-                    "text": f"*{agent_identity_label(agent)}*\n{status_text}",
+                    "text": status_text,
                 },
             }
         )
@@ -348,13 +358,19 @@ def _agent_accepts_new_work(status: AgentRosterStatus | None) -> bool:
 def _agent_status_text(status: AgentRosterStatus | None) -> str:
     if status is None:
         return "Available"
-    parts = [status.label]
-    if status.detail:
-        parts.append(status.detail)
-    lines = [": ".join(parts)]
+    detail = _bold_roster_detail_prefixes(status.detail) if status.detail else None
+    lines = [f"*{status.label}:* {detail}"] if detail else [status.label]
     if status.dangerous_mode:
-        lines.append("Mode: :zap: Dangerous")
+        lines.append("*Mode:* :zap: Dangerous")
     return "\n".join(lines)
+
+
+def _bold_roster_detail_prefixes(value: str) -> str:
+    return re.sub(r"(?<!\*)\b(PRs):", r"*\1:*", value)
+
+
+def _plain_text_header(value: str) -> str:
+    return value[:150]
 
 
 def _provider_breakdown_text(agents: list[TeamAgent]) -> str:
