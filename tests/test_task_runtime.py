@@ -1686,6 +1686,109 @@ class TaskRuntimeTests(unittest.TestCase):
                     process.release.set()
                 store.close()
 
+    def test_runtime_keeps_completed_worker_visible_until_done_callback_finishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            callback_started = threading.Event()
+            release_callback = threading.Event()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "finish slowly", "C1")
+                store.upsert_agent_task(task)
+
+                def on_task_done(task, agent, thread):
+                    callback_started.set()
+                    release_callback.wait(timeout=1.0)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                    on_task_done=on_task_done,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                self.assertTrue(callback_started.wait(timeout=1.0))
+                self.assertTrue(runtime.has_running_tasks())
+
+                release_callback.set()
+                deadline = time.monotonic() + 1.0
+                while runtime.has_running_tasks() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(runtime.has_running_tasks())
+            finally:
+                release_callback.set()
+                store.close()
+
+    def test_runtime_stop_all_uses_shared_join_budget(self):
+        class BlockingReadProcess(OneShotProcess):
+            instances: ClassVar[list["BlockingReadProcess"]] = []
+
+            def __init__(self, request):
+                super().__init__(request)
+                self.alive = True
+                self.reading = threading.Event()
+                self.release = threading.Event()
+                self.__class__.instances.append(self)
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                self.reading.set()
+                self.release.wait(timeout=5.0)
+                return ""
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            BlockingReadProcess.instances = []
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=2, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=BlockingReadProcess,
+                    poll_seconds=0.01,
+                )
+                for index, agent in enumerate(agents):
+                    task = create_agent_task(agent, f"block {index}", "C1")
+                    store.upsert_agent_task(task)
+                    runtime.start_task(task, agent, SlackThreadRef("C1", f"171.00000{index}"))
+
+                for process in BlockingReadProcess.instances:
+                    self.assertTrue(process.reading.wait(timeout=1.0))
+
+                start = time.monotonic()
+                with self.assertLogs("agent_harness.runtime.tasks", level="WARNING"):
+                    self.assertEqual(
+                        runtime.stop_all_running_tasks(status=None, join_timeout=0.02),
+                        0,
+                    )
+                self.assertLess(time.monotonic() - start, 0.15)
+                self.assertTrue(runtime.has_running_tasks())
+            finally:
+                for process in BlockingReadProcess.instances:
+                    process.release.set()
+                deadline = time.monotonic() + 1.0
+                while (
+                    "runtime" in locals()
+                    and runtime.has_running_tasks()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                store.close()
+
     def test_runtime_cancels_codex_run_that_never_starts_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

@@ -1,9 +1,12 @@
 import json
+import sys
 import tempfile
+import types
 import unittest
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.deferred import (
     AGENT_DEFERRED_SIGNAL_PREFIX,
@@ -61,6 +64,7 @@ from agent_harness.slack.app import (
     SlackMessageBackfill,
     SlackReplyTarget,
     SlackTeamController,
+    SocketModeSlackApp,
 )
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
@@ -336,6 +340,67 @@ def _roster_work_submission_payload(
 
 
 class SlackAppTests(unittest.TestCase):
+    def test_socket_mode_connect_retries_before_process_exit(self):
+        connect_calls = []
+        closed_clients = []
+        closed_apps = []
+
+        class FakeSocketModeClient:
+            def __init__(self, app_token, web_client):
+                self.app_token = app_token
+                self.web_client = web_client
+                self.socket_mode_request_listeners = []
+
+            def connect(self):
+                connect_calls.append("connect")
+                if len(connect_calls) == 1:
+                    raise RuntimeError("network unavailable")
+                raise KeyboardInterrupt()
+
+            def close(self):
+                closed_clients.append(True)
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id, payload=None):
+                self.envelope_id = envelope_id
+                self.payload = payload
+
+        class FakeBackoff:
+            def __init__(self, **kwargs):
+                self.failures = 0
+                self.next_delay = 0.0
+
+            def wait(self, stop_event):
+                self.failures += 1
+                return False
+
+        socket_mode_module = types.ModuleType("slack_sdk.socket_mode")
+        socket_mode_module.SocketModeClient = FakeSocketModeClient
+        response_module = types.ModuleType("slack_sdk.socket_mode.response")
+        response_module.SocketModeResponse = FakeSocketModeResponse
+        app = object.__new__(SocketModeSlackApp)
+        app.config = types.SimpleNamespace(slack=types.SimpleNamespace(app_token="xapp-test"))
+        app.gateway = types.SimpleNamespace(client=object())
+        app.close = lambda: closed_apps.append(True)
+        app.handle_request = lambda request: None
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "slack_sdk.socket_mode": socket_mode_module,
+                    "slack_sdk.socket_mode.response": response_module,
+                },
+            ),
+            patch("agent_harness.slack.app.LoopBackoff", FakeBackoff),
+            patch("agent_harness.slack.app.log_loop_failure"),
+        ):
+            app.run_forever()
+
+        self.assertEqual(connect_calls, ["connect", "connect"])
+        self.assertEqual(closed_clients, [True])
+        self.assertEqual(closed_apps, [True])
+
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

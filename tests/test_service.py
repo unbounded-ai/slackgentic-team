@@ -37,8 +37,13 @@ class ServiceTests(unittest.TestCase):
 
             self.assertTrue(payload["RunAtLoad"])
             self.assertTrue(payload["KeepAlive"])
+            self.assertEqual(payload["ExitTimeOut"], 30)
             self.assertEqual(payload["ProgramArguments"][-2:], ["slack", "serve"])
             self.assertNotIn(".codex/tmp", payload["EnvironmentVariables"]["PATH"])
+            self.assertEqual(
+                payload["EnvironmentVariables"]["PYTHONPATH"],
+                str(Path(tmp) / "src"),
+            )
             self.assertEqual(
                 payload["EnvironmentVariables"]["SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART"],
                 "false",
@@ -79,8 +84,10 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("ExecStart=", unit)
             self.assertIn("slack serve", unit)
             self.assertIn('Environment="PATH=', unit)
+            self.assertIn(f'Environment="PYTHONPATH={Path(tmp) / "src"}"', unit)
             self.assertIn('Environment="SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART=false"', unit)
             self.assertIn("Restart=always", unit)
+            self.assertIn("TimeoutStopSec=30", unit)
 
     def test_render_systemd_unit_runs_codex_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:
