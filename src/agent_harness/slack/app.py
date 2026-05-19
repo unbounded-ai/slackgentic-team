@@ -76,6 +76,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     managed_run_resume_attempts,
+    parse_agent_reaction_signal,
     parse_agent_roster_status_signal,
     should_resume_managed_run,
 )
@@ -191,6 +192,8 @@ SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
 SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
 SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
+SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
+SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
 SLACK_BACKFILL_FETCH_LIMIT = 500
 SLACK_BACKFILL_KNOWN_THREAD_LIMIT = 200
 SLACK_BACKFILL_GRACE_SECONDS = 5.0
@@ -417,6 +420,9 @@ class SlackTeamController:
 
     def handle_event(self, payload: dict) -> None:
         event = payload.get("event") or {}
+        if event.get("type") in {"reaction_added", "reaction_removed"}:
+            self._handle_reaction_event(event)
+            return
         channel_id, message_ts = self._recoverable_user_message_ref(event)
         if channel_id is None or message_ts is None:
             return
@@ -425,6 +431,143 @@ class SlackTeamController:
                 return
             self._handle_unprocessed_user_message_event(event, channel_id)
             self._mark_slack_message_processed(channel_id, message_ts)
+
+    def _handle_reaction_event(self, event: dict) -> None:
+        event_type = event.get("type")
+        item = event.get("item")
+        if event_type not in {"reaction_added", "reaction_removed"}:
+            return
+        if not isinstance(item, dict) or item.get("type") != "message":
+            return
+        channel_id = item.get("channel")
+        message_ts = item.get("ts")
+        reaction_name = event.get("reaction")
+        if not (
+            isinstance(channel_id, str)
+            and channel_id
+            and isinstance(message_ts, str)
+            and message_ts
+            and isinstance(reaction_name, str)
+            and reaction_name
+        ):
+            return
+        if not self._is_agent_channel(channel_id):
+            return
+        user_id = event.get("user")
+        if isinstance(user_id, str) and self._is_bot_user(user_id):
+            return
+        processed_key = _slack_reaction_processed_key(_reaction_event_dedupe_id(event))
+        with self._slack_message_lock:
+            if self.store.get_setting(processed_key):
+                return
+            handled = self._relay_user_reaction_to_agent(
+                event_type=event_type,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                reaction_name=reaction_name,
+                user_id=user_id if isinstance(user_id, str) else None,
+            )
+            if handled:
+                self.store.set_setting(processed_key, utc_now().isoformat())
+
+    def _relay_user_reaction_to_agent(
+        self,
+        *,
+        event_type: str,
+        channel_id: str,
+        message_ts: str,
+        reaction_name: str,
+        user_id: str | None,
+    ) -> bool:
+        record = self._agent_authored_message_record(channel_id, message_ts)
+        if record is None:
+            return False
+        task_id = _record_string(record, "task_id")
+        if not task_id:
+            return False
+        task = self.store.get_agent_task(task_id)
+        if task is None:
+            return False
+        thread_ts = _record_string(record, "thread_ts") or task.thread_ts
+        if not thread_ts:
+            return False
+        agent_id = _record_string(record, "agent_id") or task.agent_id
+        agent = self.store.get_team_agent(agent_id)
+        if agent is None:
+            return False
+        active_task = self._active_thread_task_for_agent(task, channel_id, thread_ts)
+        if active_task is None:
+            return False
+        if active_task.status != AgentTaskStatus.ACTIVE:
+            return False
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if not callable(is_running) or not is_running(active_task.task_id):
+            return False
+        self._remember_human_user(user_id)
+        prompt = _reaction_relay_prompt(
+            reaction_name,
+            self._display_name_for_slack_user(user_id) if user_id else None,
+            removed=event_type == "reaction_removed",
+        )
+        request = WorkRequest(
+            prompt=prompt,
+            assignment_mode=AssignmentMode.SPECIFIC,
+            requested_handle=agent.handle,
+        )
+        return self._continue_same_thread_agent_task(
+            request,
+            active_task,
+            agent,
+            SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+            requested_by_slack_user=user_id,
+        )
+
+    def _is_bot_user(self, user_id: str) -> bool:
+        try:
+            bot_user_id = self.gateway.bot_user_id()
+        except Exception:
+            LOGGER.debug("failed to look up bot user id for reaction event", exc_info=True)
+            bot_user_id = None
+        return bool(bot_user_id and user_id == bot_user_id)
+
+    def _remember_agent_authored_message(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        message_ts: str | None,
+        text: str | None = None,
+    ) -> None:
+        if not message_ts:
+            return
+        payload = {
+            "task_id": task.task_id,
+            "agent_id": agent.agent_id,
+            "thread_ts": thread.thread_ts,
+        }
+        if text:
+            payload["text"] = _shorten(text, 500)
+        try:
+            self.store.set_setting(
+                _agent_authored_message_setting_key(thread.channel_id, message_ts),
+                json.dumps(payload, sort_keys=True),
+            )
+        except Exception:
+            LOGGER.debug("failed to remember agent-authored Slack message", exc_info=True)
+
+    def _agent_authored_message_record(
+        self,
+        channel_id: str,
+        message_ts: str,
+    ) -> dict[str, object] | None:
+        raw = self.store.get_setting(_agent_authored_message_setting_key(channel_id, message_ts))
+        if not raw:
+            return None
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return record if isinstance(record, dict) else None
 
     def _recoverable_user_message_ref(self, event: dict) -> tuple[str | None, str | None]:
         event_type = event.get("type")
@@ -1496,6 +1639,7 @@ class SlackTeamController:
     def _start_runtime_task(self, task: AgentTask, agent, thread: SlackThreadRef) -> bool:
         started = self.runtime.start_task(task, agent, thread) if self.runtime else True
         if started:
+            self._remember_agent_authored_message(task, agent, thread, task.parent_message_ts)
             self._refresh_existing_roster(thread.channel_id)
         return started
 
@@ -2853,6 +2997,7 @@ class SlackTeamController:
     ) -> bool:
         if not thread.thread_ts:
             return False
+        self._remember_agent_authored_message(task, agent, thread, message_ts, text)
         if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
         active_agents = self.store.list_team_agents()
@@ -3703,6 +3848,9 @@ class SlackTeamController:
         roster_summary = parse_agent_roster_status_signal(signal)
         if roster_summary is not None:
             return self._update_task_roster_summary(task, agent, thread, roster_summary)
+        reaction_name = parse_agent_reaction_signal(signal)
+        if reaction_name is not None:
+            return self._react_to_latest_user_message(task, thread, reaction_name)
         if signal == AGENT_THREAD_DONE_SIGNAL:
             return self._complete_task_thread(thread.channel_id, thread.thread_ts)
         if is_agent_timer_signal(signal):
@@ -3752,6 +3900,23 @@ class SlackTeamController:
             )
         except Exception:
             LOGGER.debug("failed to refresh task thread header", exc_info=True)
+
+    def _react_to_latest_user_message(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+        reaction_name: str,
+    ) -> bool:
+        current = self.store.get_agent_task(task.task_id) or task
+        message_ts = _latest_user_message_ts_for_reaction(current.metadata)
+        if not message_ts:
+            return False
+        try:
+            self.gateway.add_reaction(thread.channel_id, message_ts, reaction_name)
+        except Exception:
+            LOGGER.debug("failed to add agent-requested Slack reaction", exc_info=True)
+            return False
+        return True
 
     def _schedule_agent_timer(
         self,
@@ -5698,6 +5863,14 @@ def _message_status_reaction_setting_key(channel_id: str, message_ts: str) -> st
     return f"{SETTING_MESSAGE_STATUS_REACTION_PREFIX}{channel_id}.{message_ts}"
 
 
+def _agent_authored_message_setting_key(channel_id: str, message_ts: str) -> str:
+    return f"{SETTING_AGENT_AUTHORED_MESSAGE_PREFIX}{channel_id}.{message_ts}"
+
+
+def _slack_reaction_processed_key(dedupe_id: str) -> str:
+    return f"{SETTING_SLACK_REACTION_PROCESSED_PREFIX}{dedupe_id}"
+
+
 def _is_roster_message(message: dict) -> bool:
     text = message.get("text")
     if isinstance(text, str) and text.startswith("Agent roster:"):
@@ -5729,6 +5902,41 @@ def _shorten(value: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
+
+
+def _reaction_event_dedupe_id(event: dict) -> str:
+    event_ts = event.get("event_ts")
+    if isinstance(event_ts, str) and event_ts:
+        return event_ts
+    payload = json.dumps(event, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _reaction_relay_prompt(
+    reaction_name: str,
+    display_name: str | None,
+    *,
+    removed: bool = False,
+) -> str:
+    actor = display_name.strip() if display_name and display_name.strip() else "A Slack user"
+    if removed:
+        return (
+            f"{actor} removed their :{reaction_name}: reaction from one of your "
+            "Slack-visible messages in this task thread. Treat this as lightweight "
+            "feedback; do not reply unless it changes what you should do."
+        )
+    return (
+        f"{actor} reacted with :{reaction_name}: to one of your Slack-visible messages "
+        "in this task thread. Treat this as lightweight feedback; do not reply unless "
+        "it changes what you should do."
+    )
+
+
+def _record_string(record: dict[str, object], key: str) -> str | None:
+    value = record.get(key)
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _event_has_slackgentic_progress_reaction(event: dict) -> bool:
@@ -5828,6 +6036,21 @@ def _active_thread_followup_message_ts_values(metadata: dict[str, object]) -> li
     if isinstance(raw_value, str) and raw_value:
         values.append(raw_value)
     return list(dict.fromkeys(values))
+
+
+def _latest_user_message_ts_for_reaction(metadata: dict[str, object]) -> str | None:
+    active_values = _active_thread_followup_message_ts_values(metadata)
+    if active_values:
+        return active_values[-1]
+    request_message_ts = metadata.get("request_message_ts")
+    if isinstance(request_message_ts, str) and request_message_ts:
+        return request_message_ts
+    history = metadata.get("request_message_ts_history")
+    if isinstance(history, list):
+        for item in reversed(history):
+            if isinstance(item, str) and item:
+                return item
+    return None
 
 
 def _queued_followup_prompt(prompts: list[str]) -> str:

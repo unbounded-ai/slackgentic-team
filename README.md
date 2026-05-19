@@ -171,7 +171,8 @@ each due occurrence.
 Task threads have two controls: `Finish and free up this agent` ends the task
 and frees the agent; replying `stop` sends an Esc-style interrupt to the current
 managed run without closing the task thread, so the next reply can change
-course.
+course. Reacting to an agent-authored message in an active task thread is
+delivered back to that agent as lightweight feedback.
 
 ## Why Hire/Fire Agents?
 

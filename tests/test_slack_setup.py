@@ -27,7 +27,9 @@ class SlackSetupTests(unittest.TestCase):
         self.assertTrue(manifest["settings"]["socket_mode_enabled"])
         self.assertNotIn("redirect_urls", manifest["oauth_config"])
         self.assertIn("commands", manifest["oauth_config"]["scopes"]["bot"])
+        self.assertIn("reactions:read", manifest["oauth_config"]["scopes"]["bot"])
         self.assertIn("message.groups", manifest["settings"]["event_subscriptions"]["bot_events"])
+        self.assertIn("reaction_added", manifest["settings"]["event_subscriptions"]["bot_events"])
         self.assertEqual(manifest["oauth_config"]["scopes"]["bot"], BOT_SCOPES)
         self.assertEqual(manifest["display_information"]["name"], "slackgentic-riley")
         commands = manifest["features"]["slash_commands"]

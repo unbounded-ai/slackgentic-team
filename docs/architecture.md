@@ -46,14 +46,14 @@ Supported Slack surfaces:
 - setup, team-management, and usage slash commands;
 - roster and task Block Kit buttons;
 - provider-neutral input/approval buttons;
-- message and app-mention events in the configured agent channel.
+- message, app-mention, and reaction events in the configured agent channel.
 
 The live dispatch path is:
 
 - `block_actions` -> roster buttons, task buttons, or agent request buttons;
 - `slash_commands` -> setup, usage, or team commands;
 - `events_api` -> mirrored external session replies, usage/team commands, task
-  thread replies, or new work assignment.
+  thread replies, emoji reaction relay, or new work assignment.
 
 ## Identity Model
 

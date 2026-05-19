@@ -1,6 +1,6 @@
 _metadata:
   major_version: 1
-  minor_version: 1
+  minor_version: 2
 display_information:
   name: slackgentic-local
   description: Slack control plane for local Codex and Claude agent sessions.
@@ -30,6 +30,7 @@ oauth_config:
       - groups:read
       - groups:write
       - groups:write.invites
+      - reactions:read
       - reactions:write
 settings:
   event_subscriptions:
@@ -37,6 +38,8 @@ settings:
       - app_mention
       - message.channels
       - message.groups
+      - reaction_added
+      - reaction_removed
   interactivity:
     is_enabled: true
   org_deploy_enabled: false

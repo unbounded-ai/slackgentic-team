@@ -32,6 +32,7 @@ BOT_SCOPES = [
     "groups:read",
     "groups:write",
     "groups:write.invites",
+    "reactions:read",
     "reactions:write",
     "users:read",
 ]
@@ -91,7 +92,7 @@ def build_slack_manifest(
     app_name = f"slackgentic-{instance}"
     slash_command = slash_command_override or slash_command_for_instance(instance)
     return {
-        "_metadata": {"major_version": 1, "minor_version": 1},
+        "_metadata": {"major_version": 1, "minor_version": 2},
         "display_information": {
             "name": app_name,
             "description": "Slack control plane for local Codex and Claude agent sessions.",
@@ -116,7 +117,13 @@ def build_slack_manifest(
         "oauth_config": {"scopes": {"bot": BOT_SCOPES}},
         "settings": {
             "event_subscriptions": {
-                "bot_events": ["app_mention", "message.channels", "message.groups"]
+                "bot_events": [
+                    "app_mention",
+                    "message.channels",
+                    "message.groups",
+                    "reaction_added",
+                    "reaction_removed",
+                ]
             },
             "interactivity": {"is_enabled": True},
             "org_deploy_enabled": False,

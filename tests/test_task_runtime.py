@@ -22,6 +22,7 @@ from agent_harness.models import (
     SlackThreadRef,
 )
 from agent_harness.runtime.tasks import (
+    AGENT_REACTION_SIGNAL_PREFIX,
     AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
     AGENT_THREAD_DONE_SIGNAL,
     MANAGED_RUN_MAX_RESUME_AGE,
@@ -45,6 +46,7 @@ from agent_harness.runtime.tasks import (
     _session_id_from_output,
     build_task_prompt,
     managed_run_resume_attempts,
+    parse_agent_reaction_signal,
     parse_agent_roster_status_signal,
     should_resume_managed_run,
 )
@@ -639,6 +641,16 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn(AGENT_TIMER_SIGNAL_PREFIX, prompt)
         self.assertIn("do not rely on terminal sleeps", prompt)
         self.assertIn("resumes the same agent", prompt)
+
+    def test_build_task_prompt_instructs_reaction_signal(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "work carefully", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn(AGENT_REACTION_SIGNAL_PREFIX, prompt)
+        self.assertIn("lightweight acknowledgement", prompt)
+        self.assertIn("Use this sparingly", prompt)
 
     def test_build_task_prompt_prefers_slackgentic_pr_mcp(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
@@ -1326,6 +1338,15 @@ class TaskRuntimeTests(unittest.TestCase):
             parse_agent_roster_status_signal(signal),
             "PR merge and daemon restart: running E2E",
         )
+
+    def test_agent_reaction_signal_is_stripped_from_visible_text(self):
+        signal = f"{AGENT_REACTION_SIGNAL_PREFIX}:thumbsup:"
+
+        visible, signals = _extract_agent_control_signals(f"Done.\n{signal}\n")
+
+        self.assertEqual(visible, "Done.")
+        self.assertEqual(signals, [signal])
+        self.assertEqual(parse_agent_reaction_signal(signal), "thumbsup")
 
     def test_agent_deferred_signal_is_stripped_from_visible_text(self):
         signal = f'{AGENT_DEFERRED_SIGNAL_PREFIX}{{"task":"follow up","depends_on":[]}}'
