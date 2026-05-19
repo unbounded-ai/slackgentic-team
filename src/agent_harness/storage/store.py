@@ -822,6 +822,26 @@ class Store:
             )
             self.conn.commit()
 
+    def get_active_task_by_session(self, provider: Provider, session_id: str) -> AgentTask | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM agent_tasks
+            WHERE session_provider = ?
+              AND session_id = ?
+              AND status IN (?, ?)
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (
+                provider.value,
+                session_id,
+                AgentTaskStatus.QUEUED.value,
+                AgentTaskStatus.ACTIVE.value,
+            ),
+        ).fetchone()
+        return _agent_task_from_row(row) if row else None
+
     def has_agent_task_session(self, provider: Provider, session_id: str) -> bool:
         row = self.conn.execute(
             """

@@ -1258,6 +1258,252 @@ class SessionBridgeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_codex_app_server_dangerous_inherits_from_active_managed_task(self):
+        from dataclasses import replace as _replace
+
+        from agent_harness.models import (
+            DANGEROUS_MODE_METADATA_KEY,
+            AgentTaskStatus,
+        )
+        from agent_harness.team import build_initial_model_team, create_agent_task
+
+        responses = []
+
+        class RequestingCodexClient:
+            def __init__(self, url, server_request_handler=None):
+                self.server_request_handler = server_request_handler
+
+            def send_to_thread(
+                self,
+                thread_id,
+                text,
+                cwd=None,
+                *,
+                approval_policy=None,
+                sandbox=None,
+                sandbox_policy=None,
+            ):
+                responses.append(approval_policy)
+                responses.append(
+                    self.server_request_handler(
+                        {
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {"command": "git add ."},
+                        }
+                    )
+                )
+                return True
+
+        class FailingAgentRequestHandler:
+            def handle_server_request(self, request, thread, *, provider_label=None):
+                raise AssertionError("dangerous managed Codex approval should not reach Slack")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "continue", "C1")
+                task = _replace(
+                    task,
+                    status=AgentTaskStatus.ACTIVE,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-managed",
+                    metadata={DANGEROUS_MODE_METADATA_KEY: True},
+                )
+                store.upsert_agent_task(task)
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    agent_request_handler=FailingAgentRequestHandler(),
+                )
+                # Session metadata carries no permission_mode/dangerous flag --
+                # the bridge must consult the still-ACTIVE managed task to find
+                # the dangerous-mode bit so codex approvals don't reach Slack.
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-managed",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient",
+                    RequestingCodexClient,
+                ):
+                    handled = bridge._send_to_codex_app_server(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0], "never")
+                self.assertEqual(responses[1], {"decision": "acceptForSession"})
+                self.assertEqual(gateway.replies, [])
+            finally:
+                store.close()
+
+    def test_codex_app_server_non_dangerous_task_still_requires_slack_approval(self):
+        from dataclasses import replace as _replace
+
+        from agent_harness.models import AgentTaskStatus
+        from agent_harness.team import build_initial_model_team, create_agent_task
+
+        recorded = []
+
+        class RequestingCodexClient:
+            def __init__(self, url, server_request_handler=None):
+                self.server_request_handler = server_request_handler
+
+            def send_to_thread(
+                self,
+                thread_id,
+                text,
+                cwd=None,
+                *,
+                approval_policy=None,
+                sandbox=None,
+                sandbox_policy=None,
+            ):
+                recorded.append(approval_policy)
+                return True
+
+        class RecordingAgentRequestHandler:
+            def handle_server_request(self, request, thread, *, provider_label=None):
+                recorded.append("forwarded")
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "continue", "C1")
+                task = _replace(
+                    task,
+                    status=AgentTaskStatus.ACTIVE,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-safe",
+                )
+                store.upsert_agent_task(task)
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    agent_request_handler=RecordingAgentRequestHandler(),
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-safe",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient",
+                    RequestingCodexClient,
+                ):
+                    handled = bridge._send_to_codex_app_server(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                # approval_policy must not be forced to "never" when the active
+                # managed task has no dangerous_mode metadata.
+                self.assertIsNone(recorded[0])
+            finally:
+                store.close()
+
+    def test_managed_session_setting_drives_dangerous_when_task_is_gone(self):
+        from agent_harness.sessions.managed_session import record_managed_session
+
+        responses = []
+
+        class RequestingCodexClient:
+            def __init__(self, url, server_request_handler=None):
+                self.server_request_handler = server_request_handler
+
+            def send_to_thread(
+                self,
+                thread_id,
+                text,
+                cwd=None,
+                *,
+                approval_policy=None,
+                sandbox=None,
+                sandbox_policy=None,
+            ):
+                responses.append(approval_policy)
+                responses.append(
+                    self.server_request_handler(
+                        {
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {"command": "git add ."},
+                        }
+                    )
+                )
+                return True
+
+        class FailingAgentRequestHandler:
+            def handle_server_request(self, request, thread, *, provider_label=None):
+                raise AssertionError("dangerous managed Codex approval should not reach Slack")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                record_managed_session(
+                    store,
+                    Provider.CODEX,
+                    "codex-managed",
+                    "agent-eli",
+                    dangerous_mode=True,
+                )
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(codex_binary="codex-bin", default_cwd=Path(tmp)),
+                    codex_app_server_url="ws://127.0.0.1:47684",
+                    agent_request_handler=FailingAgentRequestHandler(),
+                )
+                # No AgentTask exists for this session, but the managed-session
+                # setting still drives the bridge into dangerous mode so codex
+                # approvals never reach Slack.
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-managed",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                )
+
+                with patch(
+                    "agent_harness.sessions.bridge.CodexAppServerClient",
+                    RequestingCodexClient,
+                ):
+                    handled = bridge._send_to_codex_app_server(
+                        session,
+                        "continue",
+                        SlackThreadRef("C1", "171"),
+                    )
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0], "never")
+                self.assertEqual(responses[1], {"decision": "acceptForSession"})
+                self.assertEqual(gateway.replies, [])
+            finally:
+                store.close()
+
     def test_codex_slash_text_uses_regular_app_server_send(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

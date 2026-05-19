@@ -30,6 +30,7 @@ from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
     ROSTER_SUMMARY_METADATA_KEY,
+    AgentSession,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
@@ -96,6 +97,10 @@ from agent_harness.schedules import (
 )
 from agent_harness.sessions.bridge import ExternalSessionBridge
 from agent_harness.sessions.claude_channel import ensure_codex_mcp_server_registered
+from agent_harness.sessions.managed_session import (
+    clear_managed_session,
+    managed_session_agents,
+)
 from agent_harness.sessions.mirror import (
     EXTERNAL_SESSION_AGENT_PREFIX,
     EXTERNAL_SESSION_IGNORED_PREFIX,
@@ -943,7 +948,33 @@ class SlackTeamController:
                 )
             )
             seen_handles.add(agent.handle)
+        for agent_id, session in self._orphan_managed_sessions_by_agent().items():
+            agent = agents_by_id.get(agent_id)
+            if agent is None or agent.handle in seen_handles:
+                continue
+            occupied.append(
+                (
+                    agent.handle,
+                    external_session_dependency_id(session.provider, session.session_id),
+                )
+            )
+            seen_handles.add(agent.handle)
         return occupied
+
+    def _orphan_managed_sessions_by_agent(self):
+        sessions_by_agent: dict[str, AgentSession] = {}
+        for (provider, session_id), agent_id in managed_session_agents(self.store).items():
+            session = self.store.get_session(provider, session_id)
+            if session is None:
+                continue
+            if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+                continue
+            existing = sessions_by_agent.get(agent_id)
+            if existing is None or (
+                existing.status != SessionStatus.ACTIVE and session.status == SessionStatus.ACTIVE
+            ):
+                sessions_by_agent[agent_id] = session
+        return sessions_by_agent
 
     def _handle_scheduled_work_request(self, event: dict, channel_id: str, text: str) -> bool:
         schedule_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
@@ -1158,6 +1189,26 @@ class SlackTeamController:
             if summary and summary.strip():
                 detail_parts.append(_shorten(summary, 100))
             elif session.cwd:
+                detail_parts.append(str(session.cwd.name or session.cwd))
+            else:
+                detail_parts.append(_shorten(session.session_id, 12))
+            statuses[agent_id] = AgentRosterStatus(
+                "Occupied",
+                ": ".join(detail_parts),
+                dangerous_mode=_external_session_dangerous_mode(session),
+                thread_url=self._external_session_permalink(session),
+                session_provider=session.provider,
+                session_id=session.session_id,
+            )
+        for agent_id, session in self._orphan_managed_sessions_by_agent().items():
+            if agent_id not in statuses:
+                continue
+            if statuses[agent_id].label != "Available":
+                continue
+            detail_parts = [
+                f"{session.provider.value} session not yet released",
+            ]
+            if session.cwd:
                 detail_parts.append(str(session.cwd.name or session.cwd))
             else:
                 detail_parts.append(_shorten(session.session_id, 12))
@@ -1609,6 +1660,13 @@ class SlackTeamController:
             is_running = getattr(self.runtime, "is_task_running", None)
             if callable(is_running) and is_running(task.task_id):
                 continue
+            if self._managed_task_session_is_alive(task):
+                LOGGER.info(
+                    "leaving managed task %s ACTIVE; session %s is still alive",
+                    task.task_id,
+                    task.session_id,
+                )
+                continue
             if not should_resume_managed_run(task, now=now):
                 LOGGER.info(
                     "skipping resume of orphaned task %s (age/attempt bounds exceeded: attempts=%d)",
@@ -1630,6 +1688,14 @@ class SlackTeamController:
             if started:
                 resumed += 1
         return resumed
+
+    def _managed_task_session_is_alive(self, task: AgentTask) -> bool:
+        if task.session_provider is None or not task.session_id:
+            return False
+        session = self.store.get_session(task.session_provider, task.session_id)
+        if session is None:
+            return False
+        return session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}
 
     def _abandon_orphaned_task(self, task: AgentTask) -> None:
         metadata = dict(task.metadata)
@@ -2493,6 +2559,8 @@ class SlackTeamController:
                         exc_info=True,
                     )
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        if task.session_provider is not None and task.session_id:
+            clear_managed_session(self.store, task.session_provider, task.session_id)
         return stopped or task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
 
     def _handle_external_session_thread_reply(
@@ -3530,6 +3598,8 @@ class SlackTeamController:
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
             self._clear_task_request_status_reactions(task, thread)
+        if task.session_provider is not None and task.session_id:
+            clear_managed_session(self.store, task.session_provider, task.session_id)
         try:
             self.evaluate_pending_deferred_work()
         except Exception:
