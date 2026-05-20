@@ -646,6 +646,9 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertIn("somebody review", prompt)
         self.assertIn("stop and wait", prompt)
+        self.assertIn("that request is mandatory", prompt)
+        self.assertIn("Do not continue implementation work", prompt)
+        self.assertIn("If routing fails or no review context arrives", prompt)
 
     def test_build_task_prompt_instructs_periodic_slack_updates(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
