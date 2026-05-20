@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -208,6 +209,8 @@ SLACK_BACKFILL_FETCH_LIMIT = 500
 SLACK_BACKFILL_KNOWN_THREAD_LIMIT = 200
 SLACK_BACKFILL_GRACE_SECONDS = 5.0
 SLACK_BACKFILL_SLEEP_GAP_SECONDS = 30.0
+SLACK_SOCKET_WORKER_THREADS = 4
+SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
 DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
@@ -1777,8 +1780,15 @@ class SlackTeamController:
                 self._pin_roster_once(channel_id, posted.ts)
         return posted.ts
 
-    def refresh_or_post_roster(self, channel_id: str) -> str:
-        self._discover_recent_roster_messages(channel_id)
+    def refresh_or_post_roster(
+        self,
+        channel_id: str,
+        *,
+        discover: bool = True,
+        pin: bool = True,
+    ) -> str:
+        if discover:
+            self._discover_recent_roster_messages(channel_id)
         roster_ts_values = self._remembered_roster_ts_values(channel_id)
         if roster_ts_values:
             agents = self.store.list_team_agents()
@@ -1788,10 +1798,11 @@ class SlackTeamController:
             latest_roster_ts = roster_ts_values[-1]
             self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
             self.store.set_setting(SETTING_ROSTER_TS, latest_roster_ts)
-            try:
-                self._pin_roster_once(channel_id, latest_roster_ts)
-            except Exception:
-                LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
+            if pin:
+                try:
+                    self._pin_roster_once(channel_id, latest_roster_ts)
+                except Exception:
+                    LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
             for roster_ts in roster_ts_values:
                 if self._roster_render_is_current(channel_id, roster_ts, text, blocks):
                     continue
@@ -1813,9 +1824,12 @@ class SlackTeamController:
         return self.post_roster(channel_id)
 
     def _refresh_existing_roster(self, channel_id: str) -> None:
+        if self._remembered_roster_ts_values(channel_id):
+            self.refresh_or_post_roster(channel_id, discover=False, pin=False)
+            return
         self._discover_recent_roster_messages(channel_id)
         if self._remembered_roster_ts_values(channel_id):
-            self.refresh_or_post_roster(channel_id)
+            self.refresh_or_post_roster(channel_id, discover=False, pin=False)
 
     def _start_runtime_task(self, task: AgentTask, agent, thread: SlackThreadRef) -> bool:
         started = self.runtime.start_task(task, agent, thread) if self.runtime else True
@@ -4282,6 +4296,11 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to add agent-requested Slack reaction", exc_info=True)
             return False
+        if reaction_name in TASK_STATUS_REACTIONS:
+            self.store.set_setting(
+                _message_status_reaction_setting_key(thread.channel_id, message_ts),
+                reaction_name,
+            )
         return True
 
     def _schedule_agent_timer(
@@ -5297,12 +5316,7 @@ class SlackTeamController:
         )
         if current_reaction == reaction_name:
             return
-        self._clear_message_status_reactions(
-            channel_id,
-            message_ts,
-            except_reaction=reaction_name,
-            known_reaction=current_reaction,
-        )
+        previous_reaction = current_reaction if current_reaction in TASK_STATUS_REACTIONS else None
         try:
             self.gateway.add_reaction(channel_id, message_ts, reaction_name)
             self.store.set_setting(
@@ -5311,6 +5325,9 @@ class SlackTeamController:
             )
         except Exception:
             LOGGER.debug("failed to add Slack task status reaction", exc_info=True)
+            return
+        if previous_reaction:
+            self._remove_status_reaction(channel_id, message_ts, previous_reaction)
 
     def _clear_message_status_reactions(
         self,
@@ -5341,6 +5358,20 @@ class SlackTeamController:
         if except_reaction and stored_reaction == except_reaction:
             return
         self.store.delete_setting(status_key)
+
+    def _remove_status_reaction(
+        self,
+        channel_id: str,
+        message_ts: str,
+        reaction: str,
+    ) -> None:
+        remove_reaction = getattr(self.gateway, "remove_reaction", None)
+        if not callable(remove_reaction):
+            return
+        try:
+            remove_reaction(channel_id, message_ts, reaction)
+        except Exception:
+            LOGGER.debug("failed to remove stale Slack task reaction", exc_info=True)
 
     def _clear_pending_message_status_reactions(
         self,
@@ -5924,6 +5955,11 @@ class SocketModeSlackApp:
         if not config.slack.bot_token or not config.slack.app_token:
             raise ValueError("SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required")
         self.config = config
+        self._request_executor = ThreadPoolExecutor(
+            max_workers=SLACK_SOCKET_WORKER_THREADS,
+            thread_name_prefix="slackgentic-socket",
+        )
+        self._request_slots = threading.BoundedSemaphore(SLACK_SOCKET_MAX_PENDING_REQUESTS)
         self.store = Store(config.state_db)
         self.store.init_schema()
         self.gateway = SlackGateway(config.slack.bot_token)
@@ -6030,6 +6066,9 @@ class SocketModeSlackApp:
 
     def close(self) -> None:
         all_stopped = True
+        request_executor = getattr(self, "_request_executor", None)
+        if request_executor is not None:
+            request_executor.shutdown(wait=True)
         all_stopped = self.cpu_watchdog.stop() and all_stopped
         self.awake_keeper.stop()
         all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
@@ -6086,10 +6125,7 @@ class SocketModeSlackApp:
             socket_client.send_socket_mode_response(
                 SocketModeResponse(envelope_id=request.envelope_id)
             )
-            try:
-                self.handle_request(request)
-            except Exception:
-                LOGGER.exception("failed to handle Slack Socket Mode request")
+            self._submit_acknowledged_request(request)
 
         client.socket_mode_request_listeners.append(listener)
         shutdown = threading.Event()
@@ -6151,6 +6187,38 @@ class SocketModeSlackApp:
         elif request.type == "slash_commands":
             self.controller.handle_slash_command(request.payload)
         return None
+
+    def _submit_acknowledged_request(self, request) -> None:
+        request_executor = getattr(self, "_request_executor", None)
+        if request_executor is None:
+            self._handle_acknowledged_request(request)
+            return
+        request_slots = getattr(self, "_request_slots", None)
+        if request_slots is not None and not request_slots.acquire(blocking=False):
+            LOGGER.debug("Slack request worker backlog is full; handling request inline")
+            self._handle_acknowledged_request(request)
+            return
+        try:
+            request_executor.submit(self._handle_acknowledged_request_with_slot, request)
+        except RuntimeError:
+            if request_slots is not None:
+                request_slots.release()
+            LOGGER.debug("Slack request executor is shut down; handling request inline")
+            self._handle_acknowledged_request(request)
+
+    def _handle_acknowledged_request_with_slot(self, request) -> None:
+        try:
+            self._handle_acknowledged_request(request)
+        finally:
+            request_slots = getattr(self, "_request_slots", None)
+            if request_slots is not None:
+                request_slots.release()
+
+    def _handle_acknowledged_request(self, request) -> None:
+        try:
+            self.handle_request(request)
+        except Exception:
+            LOGGER.exception("failed to handle Slack Socket Mode request")
 
 
 def _ensure_codex_mcp_for_slack_app(config: AppConfig) -> None:
