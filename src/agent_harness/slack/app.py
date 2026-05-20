@@ -210,6 +210,7 @@ SLACK_BACKFILL_KNOWN_THREAD_LIMIT = 200
 SLACK_BACKFILL_GRACE_SECONDS = 5.0
 SLACK_BACKFILL_SLEEP_GAP_SECONDS = 30.0
 SLACK_SOCKET_WORKER_THREADS = 4
+SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
 DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
@@ -1779,7 +1780,13 @@ class SlackTeamController:
                 self._pin_roster_once(channel_id, posted.ts)
         return posted.ts
 
-    def refresh_or_post_roster(self, channel_id: str, *, discover: bool = True) -> str:
+    def refresh_or_post_roster(
+        self,
+        channel_id: str,
+        *,
+        discover: bool = True,
+        pin: bool = True,
+    ) -> str:
         if discover:
             self._discover_recent_roster_messages(channel_id)
         roster_ts_values = self._remembered_roster_ts_values(channel_id)
@@ -1791,10 +1798,11 @@ class SlackTeamController:
             latest_roster_ts = roster_ts_values[-1]
             self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
             self.store.set_setting(SETTING_ROSTER_TS, latest_roster_ts)
-            try:
-                self._pin_roster_once(channel_id, latest_roster_ts)
-            except Exception:
-                LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
+            if pin:
+                try:
+                    self._pin_roster_once(channel_id, latest_roster_ts)
+                except Exception:
+                    LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
             for roster_ts in roster_ts_values:
                 if self._roster_render_is_current(channel_id, roster_ts, text, blocks):
                     continue
@@ -1817,11 +1825,11 @@ class SlackTeamController:
 
     def _refresh_existing_roster(self, channel_id: str) -> None:
         if self._remembered_roster_ts_values(channel_id):
-            self.refresh_or_post_roster(channel_id, discover=False)
+            self.refresh_or_post_roster(channel_id, discover=False, pin=False)
             return
         self._discover_recent_roster_messages(channel_id)
         if self._remembered_roster_ts_values(channel_id):
-            self.refresh_or_post_roster(channel_id, discover=False)
+            self.refresh_or_post_roster(channel_id, discover=False, pin=False)
 
     def _start_runtime_task(self, task: AgentTask, agent, thread: SlackThreadRef) -> bool:
         started = self.runtime.start_task(task, agent, thread) if self.runtime else True
@@ -5951,6 +5959,7 @@ class SocketModeSlackApp:
             max_workers=SLACK_SOCKET_WORKER_THREADS,
             thread_name_prefix="slackgentic-socket",
         )
+        self._request_slots = threading.BoundedSemaphore(SLACK_SOCKET_MAX_PENDING_REQUESTS)
         self.store = Store(config.state_db)
         self.store.init_schema()
         self.gateway = SlackGateway(config.slack.bot_token)
@@ -6184,11 +6193,26 @@ class SocketModeSlackApp:
         if request_executor is None:
             self._handle_acknowledged_request(request)
             return
+        request_slots = getattr(self, "_request_slots", None)
+        if request_slots is not None and not request_slots.acquire(blocking=False):
+            LOGGER.debug("Slack request worker backlog is full; handling request inline")
+            self._handle_acknowledged_request(request)
+            return
         try:
-            request_executor.submit(self._handle_acknowledged_request, request)
+            request_executor.submit(self._handle_acknowledged_request_with_slot, request)
         except RuntimeError:
+            if request_slots is not None:
+                request_slots.release()
             LOGGER.debug("Slack request executor is shut down; handling request inline")
             self._handle_acknowledged_request(request)
+
+    def _handle_acknowledged_request_with_slot(self, request) -> None:
+        try:
+            self._handle_acknowledged_request(request)
+        finally:
+            request_slots = getattr(self, "_request_slots", None)
+            if request_slots is not None:
+                request_slots.release()
 
     def _handle_acknowledged_request(self, request) -> None:
         try:

@@ -425,6 +425,29 @@ class SlackAppTests(unittest.TestCase):
         self.assertEqual(submitted, [request])
         self.assertEqual(handled, [request])
 
+    def test_socket_mode_acknowledged_requests_fall_back_inline_when_backlog_full(self):
+        submitted = []
+        handled = []
+
+        class FakeExecutor:
+            def submit(self, callback, request):
+                submitted.append(request)
+
+        class FullSlots:
+            def acquire(self, blocking=False):
+                return False
+
+        request = types.SimpleNamespace(type="events_api", payload={"event": {}})
+        app = object.__new__(SocketModeSlackApp)
+        app._request_executor = FakeExecutor()
+        app._request_slots = FullSlots()
+        app.handle_request = lambda handled_request: handled.append(handled_request)
+
+        app._submit_acknowledged_request(request)
+
+        self.assertEqual(submitted, [])
+        self.assertEqual(handled, [request])
+
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1438,6 +1461,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(gateway.updates[-1]["ts"], "171.roster")
                 self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
                 self.assertEqual(gateway.channel_message_calls, [])
+                self.assertEqual(gateway.pins, [])
             finally:
                 store.close()
 
