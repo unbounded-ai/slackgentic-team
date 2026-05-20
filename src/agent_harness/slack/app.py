@@ -2005,11 +2005,7 @@ class SlackTeamController:
             if callable(is_running) and is_running(task.task_id):
                 continue
             if _queued_thread_followups(task.metadata):
-                agent = self.store.get_team_agent(task.agent_id)
-                if agent is None:
-                    continue
-                thread = SlackThreadRef(task.channel_id, task.thread_ts, task.parent_message_ts)
-                if self._resume_queued_thread_followups(task, agent, thread):
+                if self._resume_queued_thread_followup_task(task):
                     resumed += 1
                 continue
             if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
@@ -2042,6 +2038,31 @@ class SlackTeamController:
             if started:
                 resumed += 1
         return resumed
+
+    def resume_stranded_queued_thread_followups(self) -> int:
+        if self.runtime is None:
+            return 0
+        is_running = getattr(self.runtime, "is_task_running", None)
+        resumed = 0
+        for task in self.store.list_agent_tasks():
+            if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+                continue
+            if not task.thread_ts:
+                continue
+            if not _queued_thread_followups(task.metadata):
+                continue
+            if callable(is_running) and is_running(task.task_id):
+                continue
+            if self._resume_queued_thread_followup_task(task):
+                resumed += 1
+        return resumed
+
+    def _resume_queued_thread_followup_task(self, task: AgentTask) -> bool:
+        agent = self.store.get_team_agent(task.agent_id)
+        if agent is None or not task.thread_ts:
+            return False
+        thread = SlackThreadRef(task.channel_id, task.thread_ts, task.parent_message_ts)
+        return self._resume_queued_thread_followups(task, agent, thread)
 
     def _managed_task_session_is_alive(self, task: AgentTask) -> bool:
         if task.session_provider is None or not task.session_id:
@@ -3363,6 +3384,19 @@ class SlackTeamController:
         elif message_ts:
             self._clear_message_status_reactions(thread.channel_id, message_ts)
         return True
+
+    def handle_mirrored_session_agent_message(
+        self,
+        session,
+        agent,
+        thread: SlackThreadRef,
+        text: str,
+        message_ts: str | None = None,
+    ) -> bool:
+        task = self.store.get_active_task_by_session(session.provider, session.session_id)
+        if task is None:
+            return False
+        return self.handle_runtime_agent_message(task, agent, thread, text, message_ts)
 
     def _record_task_pr_urls(
         self,
@@ -5950,6 +5984,53 @@ class DeferredWorkRunner:
                     break
 
 
+class QueuedFollowupRunner:
+    def __init__(
+        self,
+        store: Store,
+        controller: SlackTeamController,
+        *,
+        poll_seconds: float = 5.0,
+    ):
+        self.store = store
+        self.controller = controller
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-queued-followups",
+        )
+        self._thread.start()
+
+    def stop(self) -> bool:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
+
+    def sync_once(self) -> int:
+        return self.controller.resume_stranded_queued_thread_followups()
+
+    def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
+        while not self._stop.wait(self.poll_seconds):
+            try:
+                self.sync_once()
+                backoff.reset()
+            except Exception:
+                log_loop_failure(LOGGER, "failed to resume queued Slackgentic follow-ups", backoff)
+                if backoff.wait(self._stop):
+                    break
+
+
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
         if not config.slack.bot_token or not config.slack.app_token:
@@ -6021,6 +6102,7 @@ class SocketModeSlackApp:
             on_external_session_occupancy_change=(
                 self.controller.handle_external_session_occupancy_change
             ),
+            on_agent_message=self.controller.handle_mirrored_session_agent_message,
             home=config.home,
         )
         self.session_mirror.start()
@@ -6043,6 +6125,12 @@ class SocketModeSlackApp:
             poll_seconds=max(config.poll_seconds, 1.0),
         )
         self.deferred_work.start()
+        self.queued_followups = QueuedFollowupRunner(
+            self.store,
+            self.controller,
+            poll_seconds=max(config.poll_seconds, 2.0),
+        )
+        self.queued_followups.start()
         self.slack_message_backfill = SlackMessageBackfill(
             self.store,
             self.gateway,
@@ -6073,6 +6161,7 @@ class SocketModeSlackApp:
         self.awake_keeper.stop()
         all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
         all_stopped = self.slack_message_backfill.stop() and all_stopped
+        all_stopped = self.queued_followups.stop() and all_stopped
         all_stopped = self.deferred_work.stop() and all_stopped
         all_stopped = self.scheduled_work.stop() and all_stopped
         all_stopped = self.scheduled_timers.stop() and all_stopped

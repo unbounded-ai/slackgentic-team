@@ -278,6 +278,61 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_existing_thread_notifies_assistant_message_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                transcript_path = Path(tmp) / "codex.jsonl"
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=transcript_path,
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                store.set_session_mirror_cursor(Provider.CODEX, "s1", 5)
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=6,
+                        metadata={
+                            "payload": {
+                                "type": "agent_message",
+                                "message": "somebody review this",
+                            }
+                        },
+                    )
+                ]
+                provider = CursorAwareProvider(session, events)
+                gateway = FakeGateway()
+                seen = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [provider],
+                    team_id="T1",
+                    channel_id="C1",
+                    on_agent_message=lambda *args: seen.append(args),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual([reply[1] for reply in gateway.replies], ["somebody review this"])
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0][0], session)
+                self.assertEqual(seen[0][2], thread)
+                self.assertEqual(seen[0][3], "somebody review this")
+                self.assertEqual(seen[0][4], "173.000001")
+            finally:
+                store.close()
+
     def test_ignored_external_session_is_not_remirrored(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

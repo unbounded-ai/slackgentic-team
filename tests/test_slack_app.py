@@ -7416,6 +7416,62 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_periodic_reconcile_replays_stranded_queued_followups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-queued",
+                    metadata={
+                        "queued_thread_followups": [
+                            {
+                                "prompt": "Please handle the queued feedback.",
+                                "message_ts": "171.user",
+                                "requested_by_slack_user": "U1",
+                                "created_at": utc_now().isoformat(),
+                            }
+                        ]
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller._mark_message_queued("C1", "171.user")
+                gateway.removed_reactions.clear()
+
+                resumed = controller.resume_stranded_queued_thread_followups()
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+                resumed_task = runtime.started[0][0]
+                self.assertIn("Please handle the queued feedback.", resumed_task.prompt)
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+                self.assertEqual(
+                    current_task.metadata.get("active_thread_followup_message_ts_values"),
+                    ["171.user"],
+                )
+                self.assertIn(("C1", "171.user", "inbox_tray"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.user", "hourglass_flowing_sand"), gateway.reactions)
+            finally:
+                store.close()
+
     def test_startup_reconcile_restarts_interrupted_managed_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
