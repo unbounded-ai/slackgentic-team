@@ -1474,7 +1474,43 @@ class TaskRuntimeTests(unittest.TestCase):
 
             self.assertEqual(message, "new")
 
-    def test_runtime_recovers_all_unseen_codex_transcript_messages_on_completion(self):
+    def test_runtime_recovers_only_transcript_messages_added_after_worker_start(self):
+        # A worker resuming a session pre-seeds its dedup set with the existing
+        # transcript so the recovery branch does not re-post chunks a prior
+        # worker already delivered. Recovery still has to fire for messages
+        # that genuinely appear during this worker's lifetime but slipped past
+        # streaming (transcript-only emissions, or a race between the last
+        # chunk and process exit).
+        class TranscriptAppendingProcess(OneShotProcess):
+            def __init__(self, request):
+                super().__init__(request)
+                self.transcript_path: Path | None = None
+                self.late_message_ts: str | None = None
+                self.late_message: str | None = None
+                self._appended = False
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if (
+                    not self._appended
+                    and self.transcript_path is not None
+                    and self.late_message is not None
+                    and self.late_message_ts is not None
+                ):
+                    payload = json.dumps(
+                        {
+                            "timestamp": self.late_message_ts,
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "agent_message",
+                                "message": self.late_message,
+                            },
+                        }
+                    )
+                    with self.transcript_path.open("a") as fh:
+                        fh.write(payload + "\n")
+                    self._appended = True
+                return ""
+
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             home = Path(tmp)
@@ -1499,42 +1535,38 @@ class TaskRuntimeTests(unittest.TestCase):
                     / f"rollout-2026-05-20T10-00-00-{session_id}.jsonl"
                 )
                 path.parent.mkdir(parents=True)
-                first_ts = (task.created_at + timedelta(seconds=1)).isoformat()
-                second_ts = (task.created_at + timedelta(seconds=2)).isoformat()
+                historical_ts = (task.created_at + timedelta(seconds=1)).isoformat()
+                late_ts = (task.created_at + timedelta(seconds=5)).isoformat()
                 path.write_text(
-                    "\n".join(
-                        [
-                            json.dumps(
-                                {
-                                    "timestamp": first_ts,
-                                    "type": "event_msg",
-                                    "payload": {
-                                        "type": "agent_message",
-                                        "message": "first visible update",
-                                    },
-                                }
-                            ),
-                            json.dumps(
-                                {
-                                    "timestamp": second_ts,
-                                    "type": "event_msg",
-                                    "payload": {
-                                        "type": "agent_message",
-                                        "message": "somebody review this handoff",
-                                    },
-                                }
-                            ),
-                        ]
+                    json.dumps(
+                        {
+                            "timestamp": historical_ts,
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "agent_message",
+                                "message": "historical update already in Slack",
+                            },
+                        }
                     )
                     + "\n"
                 )
+                processes: list[TranscriptAppendingProcess] = []
+
+                def factory(request):
+                    process = TranscriptAppendingProcess(request)
+                    process.transcript_path = path
+                    process.late_message_ts = late_ts
+                    process.late_message = "somebody review this handoff"
+                    processes.append(process)
+                    return process
+
                 gateway = FakeGateway()
                 seen = []
                 runtime = ManagedTaskRuntime(
                     store,
                     gateway,
                     AgentCommandConfig(),
-                    process_factory=SilentProcess,
+                    process_factory=factory,
                     poll_seconds=0.01,
                     on_agent_message=lambda task, agent, thread, text, message_ts: (
                         seen.append(text) or True
@@ -1544,11 +1576,14 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
                 for _ in range(50):
-                    if len(seen) >= 2:
+                    if seen:
                         break
                     time.sleep(0.01)
 
-                self.assertEqual(seen, ["first visible update", "somebody review this handoff"])
+                # Only the late message — written after the worker started —
+                # should reach Slack. The historical entry was already seeded
+                # into observed_agent_messages and must not be re-posted.
+                self.assertEqual(seen, ["somebody review this handoff"])
                 self.assertEqual(gateway.replies, seen)
             finally:
                 store.close()
@@ -3917,6 +3952,82 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(gateway.replies, ["Working", "Recovered final"])
                 self.assertEqual(seen, ["Working", "Recovered final"])
                 self.assertEqual(done_callbacks, [task.task_id])
+            finally:
+                store.close()
+
+    def test_runtime_does_not_repost_transcript_history_when_resuming_session(self):
+        # Resuming a session that already has visible messages (e.g. a previous
+        # worker on the same session before a daemon restart) must NOT replay
+        # the existing transcript to Slack. Without seeding observed messages,
+        # the recovery branch at process-exit posts every historical chunk and
+        # the thread sees every prior agent reply duplicated.
+        session_id = "claude-resume-historical-session"
+
+        class ResumeAssistantProcess(OneShotProcess):
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self.reads == 0:
+                    self.reads += 1
+                    return (
+                        f'{{"type":"system","subtype":"init","session_id":"{session_id}"}}\n'
+                        '{"type":"assistant","message":{"role":"assistant","content":'
+                        '[{"type":"text","text":"Yes, codex is simpler than claude here."}]}}\n'
+                    )
+                return ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "follow-up after restart", "C1"),
+                    session_id=session_id,
+                    session_provider=Provider.CLAUDE,
+                )
+                store.upsert_agent_task(task)
+
+                transcript_dir = home / ".claude" / "projects" / "-tmp-repo"
+                transcript_dir.mkdir(parents=True)
+                transcript_path = transcript_dir / f"{session_id}.jsonl"
+                historical = "Took a look at how Slackgentic mirrors Claude into Slack."
+                transcript_path.write_text(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": task.created_at.isoformat(),
+                            "sessionId": session_id,
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": historical}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=ResumeAssistantProcess,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                gateway = runtime.gateway
+                deadline = time.monotonic() + 5
+                while not gateway.replies and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                # Wait for the recovery branch to also fire.
+                time.sleep(0.2)
+
+                self.assertEqual(
+                    gateway.replies,
+                    ["Yes, codex is simpler than claude here."],
+                )
+                self.assertNotIn(historical, gateway.replies)
             finally:
                 store.close()
 
