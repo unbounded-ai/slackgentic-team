@@ -8165,6 +8165,7 @@ class SlackAppTests(unittest.TestCase):
                 queued = queued_task.metadata.get("queued_thread_followups")
                 self.assertIsInstance(queued, list)
                 self.assertEqual(len(queued), 2)
+                self.assertEqual(runtime.interrupted, [])
                 self.assertEqual(runtime.started, [])
                 self.assertIn(("C1", "171.user1", "inbox_tray"), gateway.reactions)
                 self.assertIn(("C1", "171.user2", "inbox_tray"), gateway.reactions)
@@ -8222,6 +8223,66 @@ class SlackAppTests(unittest.TestCase):
                 self.assertNotIn("active_thread_followup_message_ts", current_task.metadata)
                 self.assertNotIn("active_thread_followup_message_ts_values", current_task.metadata)
                 self.assertNotIn("queued_thread_followups", current_task.metadata)
+            finally:
+                store.close()
+
+    def test_direct_question_to_running_managed_task_interrupts_and_delivers_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                runtime = DetachedRuntime()
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Why is this queued message not delivering?",
+                            "ts": "171.user1",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.interrupted, [task.task_id])
+                self.assertEqual(runtime.started, [])
+                self.assertEqual(len(runtime.interrupted_sent), 1)
+                sent_task_id, sent_prompt = runtime.interrupted_sent[0]
+                self.assertEqual(sent_task_id, task.task_id)
+                self.assertIn("Why is this queued message not delivering?", sent_prompt)
+                self.assertIn("answer it explicitly", sent_prompt)
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertEqual(
+                    current_task.metadata.get("active_thread_followup_message_ts_values"),
+                    ["171.user1"],
+                )
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+                self.assertIn(("C1", "171.user1", "inbox_tray"), gateway.reactions)
+                self.assertIn(("C1", "171.user1", "inbox_tray"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.user1", "hourglass_flowing_sand"), gateway.reactions)
+                self.assertEqual(len(gateway.thread_replies), 1)
+                self.assertIn("sent the queued question", gateway.thread_replies[0]["text"])
+                self.assertNotIn("say `stop`", gateway.thread_replies[0]["text"])
             finally:
                 store.close()
 

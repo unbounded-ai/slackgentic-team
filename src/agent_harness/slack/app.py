@@ -3835,6 +3835,14 @@ class SlackTeamController:
                 requested_by_slack_user=requested_by_slack_user,
                 request_message_ts=request_message_ts,
             )
+            if _looks_like_direct_question(
+                request.prompt
+            ) and self._interrupt_running_task_for_queued_question(
+                previous_task,
+                agent,
+                thread,
+            ):
+                return True
             self._post_queued_followup_notice(agent, thread, request.prompt, queued_count)
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
@@ -3994,6 +4002,40 @@ class SlackTeamController:
             )
         except Exception:
             LOGGER.debug("failed to post queued follow-up notice", exc_info=True)
+
+    def _interrupt_running_task_for_queued_question(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+    ) -> bool:
+        if self.runtime is None:
+            return False
+        interrupt = getattr(self.runtime, "interrupt_task", None)
+        if not callable(interrupt):
+            return False
+        try:
+            interrupted = bool(interrupt(task.task_id))
+        except Exception:
+            LOGGER.debug("failed to interrupt running task for queued question", exc_info=True)
+            return False
+        if not interrupted:
+            return False
+        latest = self.store.get_agent_task(task.task_id) or task
+        if not self._send_queued_thread_followups_to_interrupted_task(latest, thread):
+            return False
+        try:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"Interrupted @{agent.handle}'s current run and sent the queued question "
+                    "so it can be answered before more work continues."
+                ),
+            )
+        except Exception:
+            LOGGER.debug("failed to post queued question interrupt notice", exc_info=True)
+        self.refresh_or_post_roster(thread.channel_id)
+        return True
 
     def _complete_active_thread_followup(
         self,
