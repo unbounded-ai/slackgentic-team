@@ -1484,10 +1484,15 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "feels right; Slackgentic hides the line and adds the reaction."
         ),
         (
-            "You may ask another agent for a review or second opinion by sending one "
-            "separate Slack-visible message beginning exactly `somebody review ...` "
-            "with the concrete item to review. After that message, stop and wait; "
-            "Slackgentic will route the review and resume you with the review context."
+            "When the user explicitly asks for another agent, someone else, a review, "
+            "or a second opinion, that request is mandatory. Send one separate "
+            "Slack-visible message beginning exactly `somebody review ...` with the "
+            "concrete item to review. After that message, stop and wait; Slackgentic "
+            "will route the review and resume you with the review context. Do not "
+            "continue implementation work, open a PR, schedule a delayed follow-up, "
+            "or send a final answer as a substitute before the review context returns. "
+            "If routing fails or no review context arrives, say that concrete blocker "
+            "in Slack and use an available delegation fallback when possible."
         ),
         (
             "If the user is clearly closing the whole Slack thread or says no more work "

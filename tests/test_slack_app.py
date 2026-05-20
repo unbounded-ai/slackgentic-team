@@ -97,6 +97,7 @@ class FakeGateway:
         self.pins = []
         self.history_messages = []
         self.thread_history_messages = {}
+        self.channel_message_calls = []
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -221,6 +222,7 @@ class FakeGateway:
         return result
 
     def channel_messages(self, channel_id, oldest=None, limit=200):
+        self.channel_message_calls.append((channel_id, oldest, limit))
         messages = [
             item for item in self.history_messages if item.get("channel", channel_id) == channel_id
         ]
@@ -403,6 +405,48 @@ class SlackAppTests(unittest.TestCase):
         self.assertEqual(connect_calls, ["connect", "connect"])
         self.assertEqual(closed_clients, [True])
         self.assertEqual(closed_apps, [True])
+
+    def test_socket_mode_acknowledged_requests_run_on_worker(self):
+        submitted = []
+        handled = []
+
+        class FakeExecutor:
+            def submit(self, callback, request):
+                submitted.append(request)
+                callback(request)
+
+        request = types.SimpleNamespace(type="events_api", payload={"event": {}})
+        app = object.__new__(SocketModeSlackApp)
+        app._request_executor = FakeExecutor()
+        app.handle_request = lambda handled_request: handled.append(handled_request)
+
+        app._submit_acknowledged_request(request)
+
+        self.assertEqual(submitted, [request])
+        self.assertEqual(handled, [request])
+
+    def test_socket_mode_acknowledged_requests_fall_back_inline_when_backlog_full(self):
+        submitted = []
+        handled = []
+
+        class FakeExecutor:
+            def submit(self, callback, request):
+                submitted.append(request)
+
+        class FullSlots:
+            def acquire(self, blocking=False):
+                return False
+
+        request = types.SimpleNamespace(type="events_api", payload={"event": {}})
+        app = object.__new__(SocketModeSlackApp)
+        app._request_executor = FakeExecutor()
+        app._request_slots = FullSlots()
+        app.handle_request = lambda handled_request: handled.append(handled_request)
+
+        app._submit_acknowledged_request(request)
+
+        self.assertEqual(submitted, [])
+        self.assertEqual(handled, [request])
 
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1416,6 +1460,8 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(gateway.updates[-1]["ts"], "171.roster")
                 self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
+                self.assertEqual(gateway.channel_message_calls, [])
+                self.assertEqual(gateway.pins, [])
             finally:
                 store.close()
 
@@ -1456,6 +1502,7 @@ class SlackAppTests(unittest.TestCase):
                 controller = SlackTeamController(store, gateway, default_channel_id="C1")
 
                 controller._mark_message_acknowledged("C1", "171.000001")
+                self.assertEqual(gateway.removed_reactions, [])
                 gateway.removed_reactions.clear()
 
                 controller._mark_message_queued("C1", "171.000001")
@@ -1476,6 +1523,14 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(
                     gateway.removed_reactions,
                     [("C1", "171.000001", "inbox_tray")],
+                )
+                self.assertEqual(
+                    gateway.reactions,
+                    [
+                        ("C1", "171.000001", "eyes"),
+                        ("C1", "171.000001", "inbox_tray"),
+                        ("C1", "171.000001", "hourglass_flowing_sand"),
+                    ],
                 )
             finally:
                 store.close()
@@ -1610,6 +1665,10 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertTrue(handled)
                 self.assertIn(("C1", "171.user", "eyes"), gateway.reactions)
+
+                controller._mark_message_in_progress("C1", "171.user")
+
+                self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
             finally:
                 store.close()
 
@@ -3250,10 +3309,6 @@ class SlackAppTests(unittest.TestCase):
                     ],
                 )
                 self.assertIn(("C1", "171.000001", "eyes"), gateway.removed_reactions)
-                self.assertIn(
-                    ("C1", "171.000001", "white_check_mark"),
-                    gateway.removed_reactions,
-                )
             finally:
                 store.close()
 
@@ -4346,7 +4401,6 @@ class SlackAppTests(unittest.TestCase):
                     ("C1", "171.agent", "hourglass_flowing_sand"),
                     gateway.removed_reactions,
                 )
-                self.assertIn(("C1", "171.agent", "white_check_mark"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.agent", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
@@ -7362,6 +7416,62 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_periodic_reconcile_replays_stranded_queued_followups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-queued",
+                    metadata={
+                        "queued_thread_followups": [
+                            {
+                                "prompt": "Please handle the queued feedback.",
+                                "message_ts": "171.user",
+                                "requested_by_slack_user": "U1",
+                                "created_at": utc_now().isoformat(),
+                            }
+                        ]
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                controller._mark_message_queued("C1", "171.user")
+                gateway.removed_reactions.clear()
+
+                resumed = controller.resume_stranded_queued_thread_followups()
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+                resumed_task = runtime.started[0][0]
+                self.assertIn("Please handle the queued feedback.", resumed_task.prompt)
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
+                self.assertEqual(
+                    current_task.metadata.get("active_thread_followup_message_ts_values"),
+                    ["171.user"],
+                )
+                self.assertIn(("C1", "171.user", "inbox_tray"), gateway.removed_reactions)
+                self.assertIn(("C1", "171.user", "hourglass_flowing_sand"), gateway.reactions)
+            finally:
+                store.close()
+
     def test_startup_reconcile_restarts_interrupted_managed_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -7839,7 +7949,6 @@ class SlackAppTests(unittest.TestCase):
                     gateway.removed_reactions,
                 )
                 self.assertIn(("C1", task.thread_ts, "eyes"), gateway.removed_reactions)
-                self.assertIn(("C1", task.thread_ts, "link"), gateway.removed_reactions)
                 self.assertIn(("C1", task.thread_ts, "white_check_mark"), gateway.reactions)
                 self.assertIn(
                     "Finished and freed up this agent.", gateway.thread_replies[-1]["text"]

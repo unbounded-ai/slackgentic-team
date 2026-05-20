@@ -81,6 +81,11 @@ class SessionMirror:
         terminal_notifier: SessionTerminalNotifier | None = None,
         codex_app_server_url: str | None = DEFAULT_CODEX_APP_SERVER_URL,
         on_external_session_occupancy_change: Callable[[str], None] | None = None,
+        on_agent_message: Callable[
+            [AgentSession, TeamAgent, SlackThreadRef, str, str | None],
+            None,
+        ]
+        | None = None,
         home: Path | None = None,
     ):
         self.store = store
@@ -92,6 +97,7 @@ class SessionMirror:
         self.terminal_notifier = terminal_notifier or SessionTerminalNotifier()
         self.codex_app_server_url = codex_app_server_url
         self.on_external_session_occupancy_change = on_external_session_occupancy_change
+        self.on_agent_message = on_agent_message
         self.home = home or Path.home()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -378,12 +384,20 @@ class SessionMirror:
                         f"{session.provider.value}:{session.session_id}:user",
                     )
                 else:
-                    self.gateway.post_thread_reply(
+                    posted = self.gateway.post_thread_reply(
                         thread,
                         chunk.text,
                         persona=agent,
                         icon_url=icon_url,
                     )
+                    if self.on_agent_message is not None:
+                        try:
+                            self.on_agent_message(session, agent, thread, chunk.text, posted.ts)
+                        except Exception:
+                            LOGGER.exception(
+                                "failed to handle mirrored %s session agent message",
+                                session.provider.value,
+                            )
             except Exception:
                 LOGGER.exception(
                     "failed to mirror %s session %s into Slack",
