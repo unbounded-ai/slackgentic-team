@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -3957,17 +3958,40 @@ class SlackTeamController:
         latest = self.store.get_agent_task(task.task_id) or task
         metadata = metadata_with_pr_urls(latest.metadata, request.prompt)
         queued = _queued_thread_followups(metadata)
-        queued = (
-            [
-                *queued,
-                {
-                    "prompt": request.prompt,
-                    "message_ts": request_message_ts,
-                    "requested_by_slack_user": requested_by_slack_user,
-                    "created_at": utc_now().isoformat(),
-                },
-            ]
-        )[-20:]
+        new_entry: dict[str, object] = {
+            "prompt": request.prompt,
+            "message_ts": request_message_ts,
+            "requested_by_slack_user": requested_by_slack_user,
+            "created_at": utc_now().isoformat(),
+        }
+        # 1. Slack can redeliver the same event_callback (same message_ts) when
+        #    the daemon is mid-shutdown or its ack is delayed. Treat that as a
+        #    duplicate and refresh the existing entry instead of stacking it.
+        if isinstance(request_message_ts, str) and request_message_ts:
+            for existing in queued:
+                if existing.get("message_ts") == request_message_ts:
+                    existing.update(new_entry)
+                    metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
+                    updated = replace(latest, metadata=metadata, updated_at=utc_now())
+                    self.store.upsert_agent_task(updated)
+                    self._mark_message_queued(latest.channel_id, request_message_ts)
+                    return len(queued)
+        # 2. Users who re-send the same text within the queue window (e.g. "do
+        #    you see hooks?" twice, 53s apart, because the first reply was
+        #    silently dropped) should not get the agent to answer the same
+        #    question twice. Collapse onto the most recent message_ts.
+        normalized = request.prompt.strip()
+        if normalized and queued:
+            last = queued[-1]
+            last_prompt = last.get("prompt")
+            if isinstance(last_prompt, str) and last_prompt.strip() == normalized:
+                last.update(new_entry)
+                metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
+                updated = replace(latest, metadata=metadata, updated_at=utc_now())
+                self.store.upsert_agent_task(updated)
+                self._mark_message_queued(latest.channel_id, request_message_ts)
+                return len(queued)
+        queued = [*queued, new_entry][-20:]
         metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
         updated = replace(latest, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
@@ -5890,11 +5914,14 @@ class SlackMessageBackfill:
 
     def _known_thread_ts(self, channel_id: str) -> set[str]:
         thread_ts_values: set[str] = set()
-        tasks = [
-            task
-            for task in self.store.list_agent_tasks(include_done=True)
-            if task.channel_id == channel_id and task.thread_ts
-        ]
+        try:
+            tasks = [
+                task
+                for task in self.store.list_agent_tasks(include_done=True)
+                if task.channel_id == channel_id and task.thread_ts
+            ]
+        except sqlite3.Error:
+            return thread_ts_values
         tasks.sort(
             key=lambda task: (
                 task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE},
@@ -5905,20 +5932,28 @@ class SlackMessageBackfill:
             if task.thread_ts:
                 thread_ts_values.add(task.thread_ts)
         remaining = max(0, SLACK_BACKFILL_KNOWN_THREAD_LIMIT - len(thread_ts_values))
-        sessions = sorted(
-            self.store.list_sessions(),
-            key=lambda session: (
-                session.status != SessionStatus.ACTIVE,
-                -((session.last_seen_at or utc_now()).timestamp()),
-            ),
-        )
-        for session in sessions[:remaining]:
-            thread = self.store.get_slack_thread_for_session(
-                session.provider,
-                session.session_id,
-                self.team_id,
-                channel_id,
+        try:
+            sessions = sorted(
+                self.store.list_sessions(),
+                key=lambda session: (
+                    session.status != SessionStatus.ACTIVE,
+                    -((session.last_seen_at or utc_now()).timestamp()),
+                ),
             )
+        except sqlite3.Error:
+            return thread_ts_values
+        for session in sessions[:remaining]:
+            try:
+                thread = self.store.get_slack_thread_for_session(
+                    session.provider,
+                    session.session_id,
+                    self.team_id,
+                    channel_id,
+                )
+            except sqlite3.Error:
+                # The store can transiently fail under daemon shutdown races;
+                # skip this session rather than aborting the whole backfill.
+                continue
             if thread and thread.thread_ts:
                 thread_ts_values.add(thread.thread_ts)
         return thread_ts_values

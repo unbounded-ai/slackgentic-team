@@ -698,7 +698,10 @@ def _table_cell(text: str, *, bold: bool = False) -> dict[str, Any]:
 
 
 def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> list[dict[str, Any]]:
-    blank_cell_text = "\u00a0"
+    # Slack's rich-text table validator rejects cells whose text strips to ""
+    # ("must be more than 0 characters"), so a literal NBSP or other
+    # whitespace-only placeholder is not safe \u2014 use a visible em-dash.
+    blank_cell_text = "\u2014"
     elements: list[dict[str, Any]] = []
     for part in re.split(r"(`[^`]*`)", text.strip()):
         if not part:
@@ -710,8 +713,9 @@ def _rich_text_elements_from_table_cell(text: str, *, bold: bool = False) -> lis
             style["code"] = True
         else:
             value = re.sub(r"\*\*([^*]+)\*\*", r"\1", value)
-        if not value:
+        if not value.strip():
             value = blank_cell_text
+            style.pop("code", None)
         if bold:
             style["bold"] = True
         element: dict[str, Any] = {"type": "text", "text": value}

@@ -879,15 +879,25 @@ class Store:
         team_id: str,
         channel_id: str,
     ) -> SlackThreadRef | None:
-        row = self.conn.execute(
-            """
-            SELECT *
-            FROM slack_threads
-            WHERE provider = ? AND session_id = ? AND team_id = ? AND channel_id = ?
-            LIMIT 1
-            """,
-            (provider.value, session_id, team_id, channel_id),
-        ).fetchone()
+        # Guard against the backfill loop racing the daemon-shutdown path:
+        # `close()` can drop a thread-local connection while a backfill worker
+        # is mid-execute, surfacing as `sqlite3.InterfaceError: bad parameter
+        # or other API misuse`. Treat that as "no row" so the caller keeps the
+        # session ids it already collected instead of aborting the whole sync.
+        if not session_id or not channel_id:
+            return None
+        try:
+            row = self.conn.execute(
+                """
+                SELECT *
+                FROM slack_threads
+                WHERE provider = ? AND session_id = ? AND team_id = ? AND channel_id = ?
+                LIMIT 1
+                """,
+                (provider.value, session_id, team_id or "", channel_id),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
         if row is None:
             return None
         return SlackThreadRef(
