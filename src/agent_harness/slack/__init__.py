@@ -520,6 +520,7 @@ def build_task_thread_blocks(
     if pr_urls:
         label = "PRs" if len(pr_urls) > 1 else "PR"
         pr_line = f"\n*{label}:* {slack_pr_links(pr_urls)}"
+    task_lines = _task_display_lines(task)
     blocks = [
         {
             "type": "section",
@@ -528,7 +529,7 @@ def build_task_thread_blocks(
                 "text": (
                     f"*{agent.full_name}* `@{agent.handle}` picked up a {task_label}.\n"
                     f"{dangerous_line}"
-                    f"*Task:* {_task_display_prompt(task)}"
+                    f"{task_lines}"
                     f"{pr_line}"
                 ),
             },
@@ -552,11 +553,21 @@ def build_task_thread_blocks(
     return blocks
 
 
-def _task_display_prompt(task: AgentTask) -> str:
-    for key in (ROSTER_SUMMARY_METADATA_KEY, ASSIGNMENT_PROMPT_METADATA_KEY):
-        value = task.metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+def _task_display_lines(task: AgentTask) -> str:
+    original_prompt = _task_original_prompt(task)
+    lines = [f"*Task:* {original_prompt}"]
+    summary = task.metadata.get(ROSTER_SUMMARY_METADATA_KEY)
+    if isinstance(summary, str) and summary.strip():
+        summary = summary.strip()
+        if summary != original_prompt:
+            lines.append(f"*Latest summary:* {summary}")
+    return "\n".join(lines)
+
+
+def _task_original_prompt(task: AgentTask) -> str:
+    value = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return task.prompt
 
 
