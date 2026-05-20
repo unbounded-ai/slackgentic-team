@@ -23,6 +23,7 @@ from agent_harness.team import (
     agent_identity_label,
 )
 from agent_harness.team.routing import parse_lightweight_handles
+from agent_harness.updates import UpdateCandidate
 
 SLACK_PERMALINK_RE = re.compile(
     r"https://(?P<workspace>[^/]+)/archives/(?P<channel>[A-Z0-9]+)/p(?P<packed_ts>\d{16})"
@@ -469,6 +470,54 @@ def build_channel_overview_blocks(
             },
         },
     ]
+
+
+def build_update_prompt_blocks(
+    candidate: UpdateCandidate,
+    *,
+    status_text: str | None = None,
+    include_actions: bool = True,
+) -> list[dict[str, Any]]:
+    release = candidate.release
+    release_link = (
+        f"\n*Release:* <{release.html_url}|{release.tag_name}>" if release.html_url else ""
+    )
+    status_line = f"\n*Status:* {status_text}" if status_text else ""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Slackgentic update available*\n"
+                    f"Current: `{candidate.current_version}`  Latest: `{release.version}`"
+                    f"{release_link}{status_line}\n"
+                    "Upgrade now to install the published release and restart the service."
+                ),
+            },
+        }
+    ]
+    if include_actions:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"slackgentic.update.{release.version}",
+                "elements": [
+                    _button(
+                        "Upgrade now",
+                        "slackgentic.update.install",
+                        encode_action_value("update.install", version=release.version),
+                        "primary",
+                    ),
+                    _button(
+                        "Not now",
+                        "slackgentic.update.dismiss",
+                        encode_action_value("update.dismiss", version=release.version),
+                    ),
+                ],
+            }
+        )
+    return blocks
 
 
 def build_external_session_capacity_blocks(

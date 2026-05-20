@@ -243,6 +243,13 @@ slackgentic service uninstall
 On macOS, active managed sessions and sessions started outside Slack keep the
 machine awake with the built-in `caffeinate` command until the work is done.
 
+Slackgentic checks GitHub Releases periodically. When a newer published version
+appears, it posts one prompt in the agent channel for that version. Clicking
+`Upgrade now` updates a clean source checkout to the release tag, reinstalls the
+editable package, and restarts the service. Non-source installs are upgraded from
+the release tarball. Dirty source checkouts are left untouched until you commit,
+stash, or move the local changes.
+
 `slackgentic slack doctor` also reports macOS network-wake readiness: Wake for
 network access, TCP keepalive, Wi-Fi wake support, and scheduled wakes. Network
 wake can help with Wake-on-LAN/Bonjour-style wakeups, but it is best-effort and
@@ -289,6 +296,9 @@ variables override stored values.
 | `SLACKGENTIC_CLAUDE_AGENTS` | Default initial Claude count. |
 | `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS avatar directory, or `off`. |
 | `SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS` | Allow managed tasks to start in macOS privacy-protected locations after you have granted OS access. |
+| `SLACKGENTIC_UPDATE_CHECK_ENABLED` | Enable or disable release checks, default `true`. |
+| `SLACKGENTIC_UPDATE_CHECK_INTERVAL_SECONDS` | Seconds between release checks, default `300`. |
+| `SLACKGENTIC_UPDATE_REPOSITORY` | GitHub repository used for update checks, default `unbounded-ai/slackgentic-team`. |
 
 ## Development
 
@@ -313,6 +323,16 @@ slackgentic slack serve
 
 More validation steps are in [docs/e2e-slack.md](docs/e2e-slack.md). The design
 notes are in [docs/architecture.md](docs/architecture.md).
+
+## Publishing Releases
+
+1. Bump the version in `pyproject.toml` and `src/agent_harness/__init__.py`.
+2. Merge the change to `main`.
+3. Create and push a matching tag, for example `v0.1.1`.
+
+The release workflow validates that the tag and source versions match, then
+creates a GitHub Release. Running Slackgentic services consume that release
+metadata during their next update check.
 
 ## Current Limits
 

@@ -481,6 +481,36 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_update_button_starts_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            calls = []
+
+            class UpdateRunner:
+                def start_upgrade(self, version, channel_id, message_ts):
+                    calls.append((version, channel_id, message_ts))
+
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller.set_update_runner(UpdateRunner())
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.000001"},
+                        "actions": [
+                            {"value": encode_action_value("update.install", version="0.2.0")}
+                        ],
+                    }
+                )
+
+                self.assertEqual(calls, [("0.2.0", "C1", "171.000001")])
+            finally:
+                store.close()
+
     def test_refresh_roster_tolerates_slack_update_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

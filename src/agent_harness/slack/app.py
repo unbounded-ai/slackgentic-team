@@ -126,6 +126,7 @@ from agent_harness.slack import (
     build_setup_modal,
     build_task_thread_blocks,
     build_team_roster_blocks,
+    build_update_prompt_blocks,
     decode_action_value,
     encode_action_value,
     is_dependency_intent,
@@ -170,6 +171,13 @@ from agent_harness.team.routing import (
     strip_dangerous_mode_tag,
 )
 from agent_harness.timers import is_agent_timer_signal, parse_agent_timer_signal
+from agent_harness.updates import (
+    GitHubReleaseSource,
+    SelfUpdater,
+    SlackgenticUpdateRunner,
+    UpdateCandidate,
+    UpdateChecker,
+)
 
 LOGGER = logging.getLogger(__name__)
 SETTING_CHANNEL_ID = "slack.channel_id"
@@ -295,8 +303,12 @@ class SlackTeamController:
         self.codex_app_server_url = codex_app_server_url or DEFAULT_CODEX_APP_SERVER_URL
         self.slash_command = slash_command
         self.default_cwd = default_cwd or Path.cwd()
+        self.update_runner: SlackgenticUpdateRunner | None = None
         self._slack_message_lock = threading.Lock()
         self._normalize_existing_agents()
+
+    def set_update_runner(self, update_runner: SlackgenticUpdateRunner | None) -> None:
+        self.update_runner = update_runner
 
     def _run_after_view_ack(self, label: str, callback: Callable[[], None]) -> None:
         def run() -> None:
@@ -334,6 +346,8 @@ class SlackTeamController:
             self._schedule_from_action(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name in {"external.session.detach", "external.session.finish"}:
             self._external_session_detach_from_action(decoded, channel_id)
+        elif action_name.startswith("update."):
+            self._update_from_action(decoded, channel_id, message_ts)
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
             self.session_bridge.handle_agent_request_block_action(decoded, channel_id, message_ts)
 
@@ -2132,6 +2146,40 @@ class SlackTeamController:
             )
             if updated != agent:
                 self.store.upsert_team_agent(updated)
+
+    def update_channel_id(self) -> str | None:
+        return self.default_channel_id or self.store.get_setting(SETTING_CHANNEL_ID)
+
+    def post_update_prompt(self, channel_id: str, candidate: UpdateCandidate) -> str | None:
+        posted = self.gateway.post_message(
+            channel_id,
+            _update_prompt_text(candidate),
+            blocks=build_update_prompt_blocks(candidate),
+        )
+        return posted.ts
+
+    def _update_from_action(
+        self,
+        payload: dict,
+        channel_id: str,
+        message_ts: str | None,
+    ) -> None:
+        if not message_ts:
+            return
+        update_runner = self.update_runner
+        version = payload.get("version")
+        if update_runner is None or not isinstance(version, str) or not version:
+            self.gateway.post_message(
+                channel_id,
+                "Slackgentic update handling is not available in this process.",
+                thread_ts=message_ts,
+            )
+            return
+        action = payload.get("action")
+        if action == "update.install":
+            update_runner.start_upgrade(version, channel_id, message_ts)
+        elif action == "update.dismiss":
+            update_runner.dismiss(version, channel_id, message_ts)
 
     def _hire_from_action(
         self,
@@ -6146,6 +6194,7 @@ class SocketModeSlackApp:
             thread_name_prefix="slackgentic-socket",
         )
         self._request_slots = threading.BoundedSemaphore(SLACK_SOCKET_MAX_PENDING_REQUESTS)
+        self._shutdown = threading.Event()
         self.store = Store(config.state_db)
         self.store.init_schema()
         self.gateway = SlackGateway(config.slack.bot_token)
@@ -6188,6 +6237,24 @@ class SocketModeSlackApp:
             slash_command=config.slack.slash_command,
             default_cwd=config.commands.default_cwd,
         )
+        self.update_runner = SlackgenticUpdateRunner(
+            store=self.store,
+            checker=UpdateChecker(GitHubReleaseSource(config.updates.repository)),
+            updater=SelfUpdater(repository=config.updates.repository),
+            channel_id=self.controller.update_channel_id,
+            prompt=self.controller.post_update_prompt,
+            update_message=self.gateway.update_message,
+            status_blocks=lambda candidate, status, include_actions: build_update_prompt_blocks(
+                candidate,
+                status_text=status,
+                include_actions=include_actions,
+            ),
+            restart=self._restart_after_update,
+            enabled=config.updates.enabled,
+            poll_seconds=config.updates.check_interval_seconds,
+        )
+        self.controller.set_update_runner(self.update_runner)
+        self.update_runner.start()
         self.runtime.on_task_done = self.controller.handle_runtime_task_done
         self.runtime.on_agent_message = self.controller.handle_runtime_agent_message
         self.runtime.on_agent_control = self.controller.handle_runtime_agent_control
@@ -6262,6 +6329,9 @@ class SocketModeSlackApp:
         request_executor = getattr(self, "_request_executor", None)
         if request_executor is not None:
             request_executor.shutdown(wait=True)
+        update_runner = getattr(self, "update_runner", None)
+        if update_runner is not None:
+            all_stopped = update_runner.stop() and all_stopped
         all_stopped = self.cpu_watchdog.stop() and all_stopped
         self.awake_keeper.stop()
         all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
@@ -6294,6 +6364,25 @@ class SocketModeSlackApp:
         else:
             LOGGER.warning("background workers are still active; Store close skipped")
 
+    def request_shutdown(self) -> None:
+        self._shutdown.set()
+
+    def _restart_after_update(self) -> None:
+        from agent_harness.service import restart_service
+
+        try:
+            result = restart_service(force=True)
+        except Exception as exc:
+            self.request_shutdown()
+            raise RuntimeError(
+                "installed the update, but automatic service restart failed"
+            ) from exc
+        if result != 0:
+            self.request_shutdown()
+            raise RuntimeError(
+                f"installed the update, but service restart exited with status {result}"
+            )
+
     def run_forever(self) -> None:
         import signal
 
@@ -6322,7 +6411,9 @@ class SocketModeSlackApp:
             self._submit_acknowledged_request(request)
 
         client.socket_mode_request_listeners.append(listener)
-        shutdown = threading.Event()
+        shutdown = getattr(self, "_shutdown", threading.Event())
+        self._shutdown = shutdown
+        shutdown.clear()
 
         def _request_shutdown(_signum=None, _frame=None) -> None:
             shutdown.set()
@@ -6435,6 +6526,13 @@ def run_slack_app(config: AppConfig | None = None) -> int:
     finally:
         app.close()
     return 0
+
+
+def _update_prompt_text(candidate: UpdateCandidate) -> str:
+    return (
+        f"Slackgentic {candidate.release.tag_name} is available "
+        f"(current {candidate.current_version}). Upgrade now?"
+    )
 
 
 def _first_action(payload: dict) -> dict | None:
