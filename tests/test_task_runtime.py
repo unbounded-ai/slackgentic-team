@@ -1743,6 +1743,52 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_post_agent_chunk_drops_output_after_stop_requested(self):
+        # When the user explicitly releases a task (Done/Cancel button →
+        # runtime.stop_task), any buffered child-process output that still
+        # streams in before the worker thread exits must NOT reach Slack.
+        # Previously the chunk loop kept posting until the next stop check.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "do the thing", "C1")
+                store.upsert_agent_task(task)
+                thread = SlackThreadRef("C1", "171.release")
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=OneShotProcess(None),
+                    thread=thread,
+                    worker=threading.Thread(),
+                )
+
+                runtime._post_agent_chunk(running, "before release")
+                self.assertEqual(gateway.replies, ["before release"])
+
+                running.stop_requested = True
+                runtime._post_agent_chunk(running, "after release — should not post")
+                self.assertEqual(gateway.replies, ["before release"])
+
+                running.stop_requested = False
+                runtime._post_agent_chunk(running, "release cleared — posts again")
+                self.assertEqual(
+                    gateway.replies,
+                    ["before release", "release cleared — posts again"],
+                )
+            finally:
+                store.close()
+
     def test_runtime_stop_task_keeps_unjoined_worker_visible_until_exit(self):
         class BlockingReadProcess(OneShotProcess):
             def __init__(self, request):

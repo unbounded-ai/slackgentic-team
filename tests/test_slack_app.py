@@ -8295,6 +8295,100 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_same_thread_reply_dedups_queued_followups_by_message_ts_and_text(self):
+        class UninterruptibleRuntime(DetachedRuntime):
+            def interrupt_task(self, task_id):
+                self.interrupted.append(task_id)
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="172.thread",
+                    parent_message_ts="172.parent",
+                )
+                store.upsert_agent_task(task)
+                runtime = UninterruptibleRuntime()
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                # Same Slack event redelivered twice — should collapse to one entry.
+                redelivery = {
+                    "event": {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "do you see hooks from both claude and codex?",
+                        "ts": "172.user1",
+                        "thread_ts": "172.thread",
+                    }
+                }
+                controller.handle_event(redelivery)
+                controller.handle_event(redelivery)
+
+                queued = store.get_agent_task(task.task_id).metadata.get("queued_thread_followups")
+                self.assertIsInstance(queued, list)
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(queued[0]["message_ts"], "172.user1")
+
+                # Distinct message_ts but identical text within the window — the
+                # user impatiently re-sent the same question. Collapse onto the
+                # later message_ts so the agent only sees it once.
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "do you see hooks from both claude and codex?",
+                            "ts": "172.user2",
+                            "thread_ts": "172.thread",
+                        }
+                    }
+                )
+
+                queued = store.get_agent_task(task.task_id).metadata.get("queued_thread_followups")
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(queued[0]["message_ts"], "172.user2")
+
+                # A genuinely different question must still queue separately.
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "and what about the rate limits?",
+                            "ts": "172.user3",
+                            "thread_ts": "172.thread",
+                        }
+                    }
+                )
+
+                queued = store.get_agent_task(task.task_id).metadata.get("queued_thread_followups")
+                self.assertEqual(len(queued), 2)
+                self.assertEqual(
+                    [entry["prompt"] for entry in queued],
+                    [
+                        "do you see hooks from both claude and codex?",
+                        "and what about the rate limits?",
+                    ],
+                )
+            finally:
+                store.close()
+
     def test_direct_question_to_running_managed_task_interrupts_and_delivers_followup(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

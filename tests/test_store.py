@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -298,6 +299,48 @@ class StoreTests(unittest.TestCase):
                 store.set_session_mirror_cursor(Provider.CODEX, "s1", 42)
 
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 42)
+            finally:
+                store.close()
+
+    def test_get_slack_thread_for_session_handles_sqlite_errors_gracefully(self):
+        # The backfill loop races daemon shutdown: close() can drop the
+        # connection while a read is mid-flight, surfacing as sqlite3.Error.
+        # Returning None lets the loop keep the ids it already collected
+        # rather than crash and lose backfill for the whole tick.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+
+                class _BrokenConn:
+                    def execute(self, *_args, **_kwargs):
+                        raise sqlite3.InterfaceError("bad parameter or other API misuse")
+
+                # Pre-seed the thread-local cache via the descriptor, then swap
+                # it for a connection-like object that always raises on execute.
+                store._local.conn = _BrokenConn()  # type: ignore[attr-defined]
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
+                )
+            finally:
+                # Restore so close() doesn't try to .close() the broken stub.
+                store._local.conn = None  # type: ignore[attr-defined]
+                store.close()
+
+    def test_get_slack_thread_for_session_rejects_missing_ids_without_querying(self):
+        # The same call-site can legitimately pass blank ids for unborn
+        # sessions; treat that as "no thread" instead of round-tripping to
+        # SQLite (which would also return None, but with a wasted query).
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "", "T1", "C1")
+                )
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "")
+                )
             finally:
                 store.close()
 

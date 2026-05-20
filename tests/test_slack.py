@@ -406,21 +406,27 @@ class SlackTests(unittest.TestCase):
             },
         )
 
-    def test_slack_blocks_for_markdown_table_renders_empty_cells_as_blank_text(self):
+    def test_slack_blocks_for_markdown_table_renders_empty_cells_as_visible_placeholder(self):
         blocks = slack_blocks_for_markdown_table("| Name | State |\n|---|---|\n| Avery | |")
 
         self.assertIsNotNone(blocks)
         assert blocks is not None
-        empty_cell_text = blocks[0]["rows"][1][1]["elements"][0]["elements"][0]["text"]
-        self.assertEqual(empty_cell_text, "\u00a0")
+        empty_cell = blocks[0]["rows"][1][1]["elements"][0]["elements"][0]
+        # Slack rejects whitespace-only cells ("must be more than 0 characters"),
+        # so the placeholder must be a visible glyph.
+        self.assertEqual(empty_cell["text"], "\u2014")
+        self.assertNotIn("style", empty_cell)
 
-    def test_slack_blocks_for_markdown_table_renders_empty_code_cells_as_blank_text(self):
+    def test_slack_blocks_for_markdown_table_renders_empty_code_cells_as_visible_placeholder(self):
         blocks = slack_blocks_for_markdown_table("| Name | State |\n|---|---|\n| `` | busy |")
 
         self.assertIsNotNone(blocks)
         assert blocks is not None
-        empty_code_text = blocks[0]["rows"][1][0]["elements"][0]["elements"][0]["text"]
-        self.assertEqual(empty_code_text, "\u00a0")
+        empty_code = blocks[0]["rows"][1][0]["elements"][0]["elements"][0]
+        self.assertEqual(empty_code["text"], "\u2014")
+        # An originally-empty code cell should not keep `code` styling on the
+        # placeholder \u2014 that would render as `\u2014` in mono and read as content.
+        self.assertNotIn("code", empty_code.get("style", {}))
 
     def test_parse_agent_handles(self):
         self.assertEqual(parse_agent_handles("please ask @Riley and @sage"), ["riley", "sage"])
