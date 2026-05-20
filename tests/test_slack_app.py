@@ -1919,7 +1919,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_runtime_task_exit_refreshes_roster_and_frees_agent(self):
+    def test_runtime_task_exit_refreshes_roster_and_keeps_root_task_occupied(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -1932,6 +1932,11 @@ class SlackAppTests(unittest.TestCase):
                     status=AgentTaskStatus.ACTIVE,
                     thread_ts="171.000001",
                     parent_message_ts="171.000001",
+                    metadata={
+                        PR_URLS_METADATA_KEY: ["https://github.com/acme/app/pull/42"],
+                        ROSTER_SUMMARY_METADATA_KEY: "validate ownership PR",
+                        MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat(),
+                    },
                 )
                 store.upsert_agent_task(task)
                 store.set_setting(SETTING_ROSTER_TS, "171.000099")
@@ -1944,13 +1949,16 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertEqual(gateway.updates[-1]["ts"], "171.000099")
-                self.assertIn("1 available, 0 occupied", gateway.updates[-1]["text"])
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
+                self.assertIn("validate ownership PR", str(gateway.updates[-1]["blocks"]))
                 self.assertIn(
-                    ("C1", "171.000001", "hourglass_flowing_sand"),
-                    gateway.removed_reactions,
+                    "<https://github.com/acme/app/pull/42|acme/app#42>",
+                    str(gateway.updates[-1]["blocks"]),
                 )
-                self.assertIn(("C1", "171.000001", "eyes"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.000001", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()
@@ -1981,7 +1989,7 @@ class SlackAppTests(unittest.TestCase):
                     SlackThreadRef("C1", "171.thread", "171.bot"),
                 )
 
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
                 self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"),
@@ -1991,7 +1999,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_runtime_self_parented_followup_frees_agent_after_run_exit(self):
+    def test_runtime_self_parented_followup_keeps_agent_occupied_after_run_exit(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2023,8 +2031,8 @@ class SlackAppTests(unittest.TestCase):
                     SlackThreadRef("C1", "171.000001"),
                 )
 
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
-                self.assertIn("1 available, 0 occupied", gateway.updates[-1]["text"])
+                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.ACTIVE)
+                self.assertIn("0 available, 1 occupied", gateway.updates[-1]["text"])
                 self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
@@ -2074,9 +2082,61 @@ class SlackAppTests(unittest.TestCase):
                     [item.agent_id for item in store.idle_team_agents()],
                     [agent.agent_id],
                 )
+                self.assertEqual(gateway.updates[-1]["ts"], "171.bot")
+                self.assertNotIn("actions", str(gateway.updates[-1]["blocks"]))
                 self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"),
                     gateway.removed_reactions,
+                )
+            finally:
+                store.close()
+
+    def test_agent_final_handle_line_routes_callback_without_action_button(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                ravi, leah = build_initial_model_team(1, 1)
+                ravi = replace(ravi, handle="ravi", provider_preference=Provider.CODEX)
+                leah = replace(leah, handle="leah", provider_preference=Provider.CLAUDE)
+                store.upsert_team_agent(ravi)
+                store.upsert_team_agent(leah)
+                parent = replace(
+                    create_agent_task(leah, "drive the design to completion", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    requested_by_slack_user="U1",
+                )
+                store.upsert_agent_task(parent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                handled = controller.handle_runtime_agent_message(
+                    parent,
+                    leah,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    "If that's green, I'll move to implementation.\n\n@ravi",
+                    "171.agent",
+                )
+
+                self.assertTrue(handled)
+                self.assertEqual(len(runtime.started), 1)
+                callback_task, callback_agent, callback_thread = runtime.started[0]
+                self.assertEqual(callback_agent.agent_id, ravi.agent_id)
+                self.assertEqual(callback_task.kind, AgentTaskKind.REVIEW)
+                self.assertIn("respond in the same thread", callback_task.prompt)
+                self.assertEqual(callback_thread.thread_ts, "171.thread")
+                self.assertNotIn("Finish and free up", str(gateway.thread_replies[-1]["blocks"]))
+                self.assertEqual(
+                    store.get_agent_task(parent.task_id).status,
+                    AgentTaskStatus.ACTIVE,
                 )
             finally:
                 store.close()
@@ -7288,7 +7348,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_restarted_managed_run_exit_frees_agent(self):
+    def test_restarted_managed_run_exit_keeps_root_task_occupied(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -7327,12 +7387,14 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertEqual(resumed, 1)
-                self.assertEqual(store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
                 self.assertIn(
                     ("C1", "171.user", "hourglass_flowing_sand"), gateway.removed_reactions
                 )
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user", "white_check_mark"), gateway.removed_reactions)
                 self.assertNotIn(("C1", "171.user", "white_check_mark"), gateway.reactions)
             finally:
                 store.close()

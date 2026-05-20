@@ -2464,6 +2464,8 @@ class TaskRuntimeTests(unittest.TestCase):
                 for _ in range(100):
                     if store.get_setting(
                         managed_session_agent_key(Provider.CODEX, "codex-thread-1")
+                    ) and store.get_setting(
+                        managed_session_dangerous_key(Provider.CODEX, "codex-thread-1")
                     ):
                         break
                     time.sleep(0.01)
