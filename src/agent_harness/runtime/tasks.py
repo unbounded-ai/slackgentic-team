@@ -516,6 +516,12 @@ class ManagedTaskRuntime:
             if not running.process.is_alive():
                 time.sleep(0.05)
                 tail = running.process.read_available(max_reads=100, timeout=0.05)
+                if running.stop_requested:
+                    # The process exited because we asked it to; do not post the
+                    # tail buffer, recovered transcript lines, or "finished without
+                    # a response" message — the user already released the task.
+                    self._remove_running_task(task_id, running)
+                    return
                 self._capture_session_id(running, tail, final=True)
                 self._capture_permission_denials(running, tail, final=True)
                 self._capture_resume_errors(running, tail, final=True)
@@ -796,6 +802,10 @@ class ManagedTaskRuntime:
         normalized = visible_text.strip()
         if not normalized:
             handle_terminal_signals()
+            return
+        if running.stop_requested:
+            # The user explicitly released or stopped the task; pending output
+            # from the child process must not reach Slack after that signal.
             return
         if running.observed_agent_messages is None:
             running.observed_agent_messages = set()
