@@ -201,12 +201,19 @@ class ManagedTaskRuntime:
         allowed_tools: tuple[str, ...] = (),
     ) -> bool:
         with self._lock:
-            if task.task_id in self._running:
+            current = self._running.get(task.task_id)
+            if current is not None and (
+                current.worker is not threading.current_thread() or current.process.is_alive()
+            ):
                 LOGGER.debug(
                     "refusing duplicate start for task %s; a worker is already running",
                     task.task_id,
                 )
                 return False
+            if current is not None:
+                # The current worker can restart its own just-finished task from
+                # the completion callback, for example to flush queued follow-ups.
+                self._running.pop(task.task_id, None)
         provider = agent.provider_preference or Provider.CODEX
         default_cwd = self._default_cwd()
         cwd = _task_cwd(task, default_cwd)
@@ -533,8 +540,10 @@ class ManagedTaskRuntime:
                 if running.permission_denials:
                     self._handle_claude_permission_denial(running, completed_task)
                     return
-                recovered_message = self._recover_unseen_visible_message(completed_task, running)
-                if recovered_message:
+                for recovered_message in self._recover_unseen_visible_messages(
+                    completed_task,
+                    running,
+                ):
                     self._post_agent_chunk(running, recovered_message)
                 if (
                     running.visible_message_count == 0
@@ -844,37 +853,49 @@ class ManagedTaskRuntime:
         return handled
 
     def _recover_visible_message(self, task: AgentTask, running: RunningTask) -> str | None:
+        messages = self._recover_visible_messages(task, running)
+        return messages[-1] if messages else None
+
+    def _recover_visible_messages(self, task: AgentTask, running: RunningTask) -> list[str]:
         provider = _provider_for_running(running)
         if not task.session_id:
-            return None
+            return []
         if provider == Provider.CODEX:
-            return _latest_codex_transcript_message(
+            return _codex_transcript_messages(
                 task.session_id,
                 self.home,
                 since=task.created_at,
             )
         if provider == Provider.CLAUDE:
-            return _latest_claude_transcript_message(
+            return _claude_transcript_messages(
                 task.session_id,
                 self.home,
                 since=task.created_at,
             )
-        return None
+        return []
 
     def _recover_unseen_visible_message(
         self,
         task: AgentTask,
         running: RunningTask,
     ) -> str | None:
-        message = self._recover_visible_message(task, running)
-        if not message:
-            return None
-        normalized = message.strip()
-        if not normalized:
-            return None
-        if running.observed_agent_messages and normalized in running.observed_agent_messages:
-            return None
-        return message
+        messages = self._recover_unseen_visible_messages(task, running)
+        return messages[-1] if messages else None
+
+    def _recover_unseen_visible_messages(
+        self,
+        task: AgentTask,
+        running: RunningTask,
+    ) -> list[str]:
+        recovered: list[str] = []
+        for message in self._recover_visible_messages(task, running):
+            normalized = message.strip()
+            if not normalized:
+                continue
+            if running.observed_agent_messages and normalized in running.observed_agent_messages:
+                continue
+            recovered.append(message)
+        return recovered
 
     def _agent_icon_url(self, agent: TeamAgent) -> str | None:
         if self.agent_icon_url is None:
@@ -2228,9 +2249,19 @@ def _latest_codex_transcript_message(
     *,
     since: datetime | None = None,
 ) -> str | None:
+    messages = _codex_transcript_messages(session_id, home, since=since)
+    return messages[-1] if messages else None
+
+
+def _codex_transcript_messages(
+    session_id: str,
+    home: Path,
+    *,
+    since: datetime | None = None,
+) -> list[str]:
     sessions_root = home / ".codex" / "sessions"
     if not sessions_root.exists():
-        return None
+        return []
     try:
         paths = sorted(
             sessions_root.rglob(f"*{session_id}.jsonl"),
@@ -2238,12 +2269,12 @@ def _latest_codex_transcript_message(
             reverse=True,
         )
     except OSError:
-        return None
+        return []
     for path in paths:
-        message = _latest_codex_transcript_message_from_path(path, since=since)
-        if message:
-            return message
-    return None
+        messages = _codex_transcript_messages_from_path(path, since=since)
+        if messages:
+            return messages
+    return []
 
 
 def _latest_codex_transcript_message_from_path(
@@ -2251,11 +2282,20 @@ def _latest_codex_transcript_message_from_path(
     *,
     since: datetime | None = None,
 ) -> str | None:
-    latest: str | None = None
+    messages = _codex_transcript_messages_from_path(path, since=since)
+    return messages[-1] if messages else None
+
+
+def _codex_transcript_messages_from_path(
+    path: Path,
+    *,
+    since: datetime | None = None,
+) -> list[str]:
+    messages: list[str] = []
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        return None
+        return []
     for line in lines:
         try:
             record = json.loads(line)
@@ -2268,8 +2308,8 @@ def _latest_codex_transcript_message_from_path(
             continue
         message = _codex_transcript_record_message(record)
         if message:
-            latest = message
-    return latest
+            messages.append(message)
+    return messages
 
 
 def _codex_transcript_record_message(record: dict) -> str | None:
@@ -2290,9 +2330,19 @@ def _latest_claude_transcript_message(
     *,
     since: datetime | None = None,
 ) -> str | None:
+    messages = _claude_transcript_messages(session_id, home, since=since)
+    return messages[-1] if messages else None
+
+
+def _claude_transcript_messages(
+    session_id: str,
+    home: Path,
+    *,
+    since: datetime | None = None,
+) -> list[str]:
     projects_root = home / ".claude" / "projects"
     if not projects_root.exists():
-        return None
+        return []
     try:
         paths = sorted(
             projects_root.rglob(f"{session_id}.jsonl"),
@@ -2300,12 +2350,12 @@ def _latest_claude_transcript_message(
             reverse=True,
         )
     except OSError:
-        return None
+        return []
     for path in paths:
-        message = _latest_claude_transcript_message_from_path(path, since=since)
-        if message:
-            return message
-    return None
+        messages = _claude_transcript_messages_from_path(path, since=since)
+        if messages:
+            return messages
+    return []
 
 
 def _latest_claude_transcript_message_from_path(
@@ -2313,11 +2363,20 @@ def _latest_claude_transcript_message_from_path(
     *,
     since: datetime | None = None,
 ) -> str | None:
-    latest: str | None = None
+    messages = _claude_transcript_messages_from_path(path, since=since)
+    return messages[-1] if messages else None
+
+
+def _claude_transcript_messages_from_path(
+    path: Path,
+    *,
+    since: datetime | None = None,
+) -> list[str]:
+    messages: list[str] = []
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        return None
+        return []
     for line in lines:
         try:
             record = json.loads(line)
@@ -2332,8 +2391,8 @@ def _latest_claude_transcript_message_from_path(
             continue
         message = _claude_assistant_message_text(record)
         if message:
-            latest = message
-    return latest
+            messages.append(message)
+    return messages
 
 
 def _claude_json_chunks(

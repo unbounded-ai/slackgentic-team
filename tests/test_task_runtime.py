@@ -1471,6 +1471,85 @@ class TaskRuntimeTests(unittest.TestCase):
 
             self.assertEqual(message, "new")
 
+    def test_runtime_recovers_all_unseen_codex_transcript_messages_on_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            home = Path(tmp)
+            session_id = "session-recover-all"
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "recover transcript", "C1"),
+                    session_provider=Provider.CODEX,
+                    session_id=session_id,
+                )
+                store.upsert_agent_task(task)
+                path = (
+                    home
+                    / ".codex"
+                    / "sessions"
+                    / "2026"
+                    / "05"
+                    / "20"
+                    / f"rollout-2026-05-20T10-00-00-{session_id}.jsonl"
+                )
+                path.parent.mkdir(parents=True)
+                first_ts = (task.created_at + timedelta(seconds=1)).isoformat()
+                second_ts = (task.created_at + timedelta(seconds=2)).isoformat()
+                path.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "timestamp": first_ts,
+                                    "type": "event_msg",
+                                    "payload": {
+                                        "type": "agent_message",
+                                        "message": "first visible update",
+                                    },
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "timestamp": second_ts,
+                                    "type": "event_msg",
+                                    "payload": {
+                                        "type": "agent_message",
+                                        "message": "somebody review this handoff",
+                                    },
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n"
+                )
+                gateway = FakeGateway()
+                seen = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=SilentProcess,
+                    poll_seconds=0.01,
+                    on_agent_message=lambda task, agent, thread, text, message_ts: (
+                        seen.append(text) or True
+                    ),
+                    home=home,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if len(seen) >= 2:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(seen, ["first visible update", "somebody review this handoff"])
+                self.assertEqual(gateway.replies, seen)
+            finally:
+                store.close()
+
     def test_runtime_does_not_post_process_lifecycle_message_on_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -3327,6 +3406,53 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
+            finally:
+                store.close()
+
+    def test_runtime_done_callback_can_restart_same_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "initial", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+                done_event = threading.Event()
+                callbacks = []
+                restart_results = []
+
+                def on_task_done(completed_task, callback_agent, thread):
+                    callbacks.append(completed_task.prompt)
+                    if len(callbacks) == 1:
+                        followup = replace(
+                            completed_task,
+                            prompt="queued follow-up",
+                            status=AgentTaskStatus.ACTIVE,
+                        )
+                        store.upsert_agent_task(followup)
+                        restart_results.append(runtime.start_task(followup, callback_agent, thread))
+                    else:
+                        done_event.set()
+
+                runtime.on_task_done = on_task_done
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.thread")))
+                for _ in range(100):
+                    if done_event.is_set():
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(restart_results, [True])
+                self.assertEqual(callbacks, ["initial", "queued follow-up"])
             finally:
                 store.close()
 
