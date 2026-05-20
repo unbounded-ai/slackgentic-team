@@ -169,10 +169,12 @@ daemon when due. One-off items run once; recurring items are rescheduled after
 each due occurrence.
 
 Task threads have two controls: `Finish and free up this agent` ends the task
-and frees the agent; replying `stop` sends an Esc-style interrupt to the current
-managed run without closing the task thread, so the next reply can change
-course. Reacting to an agent-authored message in an active task thread is
-delivered back to that agent as lightweight feedback.
+and frees the agent; replying in the thread sends the follow-up into the active
+task, interrupting the current managed run first when live delivery is not
+available. Replying `stop` sends only the interrupt without closing the task
+thread or replaying fallback-queued replies. Reacting to an agent-authored
+message in an active task thread is delivered back to that agent as lightweight
+feedback.
 
 ## Why Hire/Fire Agents?
 

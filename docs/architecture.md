@@ -95,16 +95,17 @@ assistant output into the thread, and forwards user replies back into the live
 process when the provider supports interactive input.
 
 When live delivery is unavailable for a running managed task, same-thread user
-replies are persisted in the task metadata as queued follow-ups. When the
-current provider process exits, Slackgentic resumes the same task/session with
-all queued follow-ups together instead of acknowledging and dropping them. Each
-queued Slack message keeps its own in-progress reaction and is cleared by its
-own timestamp when the resumed provider run completes.
+replies interrupt the current provider turn and are sent into the same task
+right away. Slackgentic only persists queued follow-ups as a recovery path when
+interrupt delivery fails, or when replaying older queued rows after restart.
+Each Slack reply keeps its own in-progress reaction and is cleared by its own
+timestamp when the provider run completes.
 
 Replying `stop` in a task thread sends an Esc-style interrupt into the current
 managed provider process without marking the task done or terminating the
-process. This mirrors an interactive interrupt: the thread stays active and the
-next reply can continue from a new direction.
+process. This mirrors an interactive interrupt: fallback-queued replies are
+cleared, the thread stays active, and the next reply can continue from a new
+direction.
 
 For review requests, the parser records the author handle when text contains
 phrasing such as `@riley's PR` or `PR by @riley`. The picker first prefers

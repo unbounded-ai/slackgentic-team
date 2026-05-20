@@ -2861,7 +2861,6 @@ class SlackTeamController:
                 return True
             self._interrupt_thread_task(
                 target_task,
-                agent,
                 thread,
                 message_ts,
             )
@@ -2899,7 +2898,6 @@ class SlackTeamController:
     def _interrupt_thread_task(
         self,
         task: AgentTask,
-        agent,
         thread: SlackThreadRef,
         message_ts: str | None,
     ) -> None:
@@ -2912,20 +2910,10 @@ class SlackTeamController:
                 stopped = bool(self.runtime.stop_task(task.task_id, status=None))
         self._mark_message_complete(thread.channel_id, message_ts)
         if stopped:
-            latest = self.store.get_agent_task(task.task_id) or task
-            resumed_queued = False
-            if agent is not None:
-                resumed_queued = self._send_queued_thread_followups_to_interrupted_task(
-                    latest,
-                    thread,
-                )
+            self._discard_queued_thread_followups(task, thread)
             self.gateway.post_thread_reply(
                 thread,
-                (
-                    "Interrupted the current run and sent the queued follow-ups."
-                    if resumed_queued
-                    else "Interrupted the current run. Send the next instruction here to continue."
-                ),
+                "Interrupted the current run. Send the next instruction here to continue.",
             )
         else:
             self.gateway.post_thread_reply(
@@ -3826,23 +3814,23 @@ class SlackTeamController:
                 self._remember_request_message_for_task(previous_task, request_message_ts)
                 return True
             LOGGER.debug(
-                "queueing same-thread continuation for task %s; worker is still running",
+                "interrupting same-thread continuation for task %s; worker is still running",
                 previous_task.task_id,
             )
+            if self._interrupt_running_task_for_followup(
+                previous_task,
+                request,
+                thread,
+                requested_by_slack_user=requested_by_slack_user,
+                request_message_ts=request_message_ts,
+            ):
+                return True
             queued_count = self._queue_running_task_followup(
                 previous_task,
                 request,
                 requested_by_slack_user=requested_by_slack_user,
                 request_message_ts=request_message_ts,
             )
-            if _looks_like_direct_question(
-                request.prompt
-            ) and self._interrupt_running_task_for_queued_question(
-                previous_task,
-                agent,
-                thread,
-            ):
-                return True
             self._post_queued_followup_notice(agent, thread, request.prompt, queued_count)
             return True
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
@@ -4003,37 +3991,102 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to post queued follow-up notice", exc_info=True)
 
-    def _interrupt_running_task_for_queued_question(
+    def _discard_queued_thread_followups(
         self,
         task: AgentTask,
-        agent,
         thread: SlackThreadRef,
+    ) -> None:
+        latest = self.store.get_agent_task(task.task_id) or task
+        queued = _queued_thread_followups(latest.metadata)
+        if not queued:
+            return
+        metadata = dict(latest.metadata)
+        metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        for message_ts in _queued_thread_followup_message_ts_values(queued):
+            self._clear_message_status_reactions(thread.channel_id, message_ts)
+
+    def _interrupt_running_task_for_followup(
+        self,
+        task: AgentTask,
+        request: WorkRequest,
+        thread: SlackThreadRef,
+        *,
+        requested_by_slack_user: str | None,
+        request_message_ts: str | None,
     ) -> bool:
         if self.runtime is None:
             return False
         interrupt = getattr(self.runtime, "interrupt_task", None)
-        if not callable(interrupt):
+        send = getattr(self.runtime, "send_to_interrupted_task", None)
+        if not callable(interrupt) or not callable(send):
             return False
+        latest = self.store.get_agent_task(task.task_id) or task
+        queued = _queued_thread_followups(latest.metadata)
+        prompts = [item["prompt"] for item in queued if isinstance(item.get("prompt"), str)]
+        prompts.append(request.prompt)
+        prompts = [prompt for prompt in prompts if prompt.strip()]
+        if not prompts:
+            return False
+        message_ts_values = _queued_thread_followup_message_ts_values(queued)
+        if request_message_ts:
+            message_ts_values.append(request_message_ts)
+        message_ts_values = list(dict.fromkeys(message_ts_values))
+        prompt = _queued_followup_prompt(prompts)
         try:
             interrupted = bool(interrupt(task.task_id))
         except Exception:
-            LOGGER.debug("failed to interrupt running task for queued question", exc_info=True)
+            LOGGER.debug(
+                "failed to interrupt running task for same-thread follow-up", exc_info=True
+            )
             return False
         if not interrupted:
             return False
-        latest = self.store.get_agent_task(task.task_id) or task
-        if not self._send_queued_thread_followups_to_interrupted_task(latest, thread):
-            return False
         try:
-            self.gateway.post_thread_reply(
-                thread,
-                (
-                    f"Interrupted @{agent.handle}'s current run and sent the queued question "
-                    "so it can be answered before more work continues."
-                ),
-            )
+            sent = bool(send(latest.task_id, prompt))
         except Exception:
-            LOGGER.debug("failed to post queued question interrupt notice", exc_info=True)
+            LOGGER.debug(
+                "failed to send follow-up to interrupted running task",
+                exc_info=True,
+            )
+            return False
+        if not sent:
+            return False
+        metadata = dict(latest.metadata)
+        metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
+        active_message_ts_values = list(
+            dict.fromkeys(
+                [
+                    *_active_thread_followup_message_ts_values(metadata),
+                    *message_ts_values,
+                ]
+            )
+        )
+        if active_message_ts_values:
+            metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = (
+                active_message_ts_values
+            )
+            metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
+        metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
+        metadata = metadata_with_pr_urls(metadata, *prompts)
+        metadata = self._with_linked_thread_context(
+            metadata,
+            prompt,
+            current_thread=thread,
+        )
+        updated = replace(
+            latest,
+            prompt=prompt,
+            requested_by_slack_user=requested_by_slack_user
+            or _last_queued_requested_by(queued)
+            or latest.requested_by_slack_user,
+            updated_at=utc_now(),
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(updated)
+        for message_ts in message_ts_values:
+            self._mark_message_in_progress(thread.channel_id, message_ts)
         self.refresh_or_post_roster(thread.channel_id)
         return True
 
@@ -4073,8 +4126,18 @@ class SlackTeamController:
         metadata = dict(latest.metadata)
         metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
         message_ts_values = _queued_thread_followup_message_ts_values(queued)
-        if message_ts_values:
-            metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = message_ts_values
+        active_message_ts_values = list(
+            dict.fromkeys(
+                [
+                    *_active_thread_followup_message_ts_values(metadata),
+                    *message_ts_values,
+                ]
+            )
+        )
+        if active_message_ts_values:
+            metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = (
+                active_message_ts_values
+            )
             metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
         else:
             metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY, None)
@@ -6765,8 +6828,8 @@ def _queued_followup_notice(handle: str, prompt: str, queued_count: int) -> str:
     count = "" if queued_count <= 1 else f" There are now {queued_count} queued follow-ups."
     return (
         f"@{handle} is still in a running turn, and I could not deliver that {kind} live, "
-        "so I queued it. It will be sent when the run finishes; say `stop` here to "
-        f"interrupt the run and send queued follow-ups now.{count}"
+        "so I queued it as a fallback. It will be sent when the run finishes; say `stop` "
+        f"here to interrupt the run and clear queued follow-ups.{count}"
     )
 
 
