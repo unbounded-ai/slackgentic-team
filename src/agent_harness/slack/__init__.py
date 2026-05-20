@@ -483,6 +483,14 @@ def build_update_prompt_blocks(
         f"\n*Release:* <{release.html_url}|{release.tag_name}>" if release.html_url else ""
     )
     status_line = f"\n*Status:* {status_text}" if status_text else ""
+    # Drop the "Upgrade now to install…" prompt once a status line has been
+    # set — by then the upgrade has moved past the prompt stage and repeating
+    # the call-to-action under "Status: Installed…" reads wrong.
+    call_to_action = (
+        "\nUpgrade now to install the published release and restart the service."
+        if status_text is None
+        else ""
+    )
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
@@ -491,8 +499,7 @@ def build_update_prompt_blocks(
                 "text": (
                     "*Slackgentic update available*\n"
                     f"Current: `{candidate.current_version}`  Latest: `{release.version}`"
-                    f"{release_link}{status_line}\n"
-                    "Upgrade now to install the published release and restart the service."
+                    f"{release_link}{status_line}{call_to_action}"
                 ),
             },
         }

@@ -243,17 +243,29 @@ slackgentic service uninstall
 On macOS, active managed sessions and sessions started outside Slack keep the
 machine awake with the built-in `caffeinate` command until the work is done.
 
-Slackgentic checks GitHub Releases periodically. When a newer published version
-appears, it posts one prompt in the agent channel for that version. Clicking
-`Upgrade now` updates a clean source checkout to the release tag, reinstalls the
-editable package, and restarts the service. Non-source installs are upgraded from
-the release tarball. Dirty source checkouts are left untouched until you commit,
-stash, or move the local changes.
-
 `slackgentic slack doctor` also reports macOS network-wake readiness: Wake for
 network access, TCP keepalive, Wi-Fi wake support, and scheduled wakes. Network
 wake can help with Wake-on-LAN/Bonjour-style wakeups, but it is best-effort and
 does not make Slack a reliable way to wake a closed-lid or deep-sleeping laptop.
+
+## Updating
+
+You do not need to `git pull` or rerun `pip install` to update Slackgentic.
+The running daemon checks GitHub Releases of `unbounded-ai/slackgentic-team`
+every five minutes. When a newer published version appears it posts one
+prompt in the agent channel:
+
+> *Slackgentic update available*
+> Current: `0.1.0`  Latest: `0.1.1`
+> [Upgrade now] [Skip]
+
+Clicking *Upgrade now* fetches and checks out the release tag in the local
+source checkout, reinstalls the editable package, restarts the service, and
+edits the same Slack message in place with a green checkmark once the new
+daemon is back up. Non-source installs upgrade from the release tarball.
+
+Dirty source checkouts are left untouched until you commit, stash, or move
+the local changes — Slackgentic refuses to overwrite work in progress.
 
 ## Reset
 

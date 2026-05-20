@@ -14,6 +14,7 @@ from agent_harness.slack import (
     build_start_session_modal,
     build_task_thread_blocks,
     build_team_roster_blocks,
+    build_update_prompt_blocks,
     dangerous_flag,
     decode_action_value,
     encode_action_value,
@@ -430,6 +431,45 @@ class SlackTests(unittest.TestCase):
 
     def test_parse_agent_handles(self):
         self.assertEqual(parse_agent_handles("please ask @Riley and @sage"), ["riley", "sage"])
+
+    def test_update_prompt_blocks_show_call_to_action_only_before_status(self):
+        from agent_harness.updates import ReleaseInfo, UpdateCandidate
+
+        candidate = UpdateCandidate(
+            current_version="0.1.0",
+            release=ReleaseInfo(
+                version="0.1.1",
+                tag_name="v0.1.1",
+                html_url="https://github.com/example-org/example-repo/releases/tag/v0.1.1",
+            ),
+            repository="example-org/example-repo",
+        )
+
+        prompt = build_update_prompt_blocks(candidate)
+        prompt_text = prompt[0]["text"]["text"]
+        self.assertIn("Upgrade now to install the published release", prompt_text)
+        self.assertNotIn("*Status:*", prompt_text)
+
+        in_progress = build_update_prompt_blocks(
+            candidate,
+            status_text="Installing Slackgentic v0.1.1 and preparing a restart.",
+            include_actions=False,
+        )
+        in_progress_text = in_progress[0]["text"]["text"]
+        # Once we're past the prompt stage the call-to-action under
+        # "Status: Installing…" reads wrong, so drop it.
+        self.assertNotIn("Upgrade now to install the published release", in_progress_text)
+        self.assertIn("Installing Slackgentic v0.1.1", in_progress_text)
+
+        done = build_update_prompt_blocks(
+            candidate,
+            status_text=":white_check_mark: Installed Slackgentic v0.1.1 and restarted successfully.",
+            include_actions=False,
+        )
+        done_text = done[0]["text"]["text"]
+        self.assertNotIn("Upgrade now to install the published release", done_text)
+        self.assertIn(":white_check_mark:", done_text)
+        self.assertIn("restarted successfully", done_text)
 
 
 if __name__ == "__main__":

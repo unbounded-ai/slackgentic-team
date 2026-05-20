@@ -205,6 +205,121 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(restarts, [True])
                 self.assertIn("Installed Slackgentic v0.2.0", updates[-1])
+                # The pre-restart message should hand off the post-restart
+                # ack to the next daemon by recording where to update.
+                pending = store.get_setting("slackgentic.update.restart_pending")
+                self.assertIsNotNone(pending)
+                payload = json.loads(pending)
+                self.assertEqual(payload["channel_id"], "C1")
+                self.assertEqual(payload["message_ts"], "171")
+                self.assertEqual(payload["version"], "0.2.0")
+            finally:
+                store.close()
+
+    def test_start_posts_post_restart_ack_when_pending_matches_current_version(self):
+        from agent_harness import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.0.0",
+                    release=ReleaseInfo(version=__version__, tag_name=f"v{__version__}"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(
+                    f"slackgentic.update.candidate.{__version__}", candidate.to_json()
+                )
+                store.set_setting(
+                    "slackgentic.update.restart_pending",
+                    json.dumps({"channel_id": "C1", "message_ts": "999", "version": __version__}),
+                )
+                updates: list[tuple[str, str, str]] = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(
+                        (channel_id, ts, text)
+                    ),
+                    status_blocks=lambda update, status, include_actions: [],
+                    # Disable the background check loop so the test stays
+                    # focused on the startup ack behavior.
+                    enabled=True,
+                )
+                runner.start()
+                try:
+                    self.assertEqual(len(updates), 1)
+                    channel_id, ts, text = updates[0]
+                    self.assertEqual(channel_id, "C1")
+                    self.assertEqual(ts, "999")
+                    self.assertIn(":white_check_mark:", text)
+                    self.assertIn(f"v{__version__}", text)
+                    self.assertIn("restarted successfully", text)
+                    self.assertIsNone(store.get_setting("slackgentic.update.restart_pending"))
+                finally:
+                    runner.stop()
+            finally:
+                store.close()
+
+    def test_start_does_not_ack_when_pending_version_does_not_match(self):
+        # If the kickstart somehow brought up a daemon at the OLD version
+        # (e.g. the install step was rolled back), do not lie to the user by
+        # claiming a successful upgrade. Leave the pending marker alone so
+        # the operator can investigate.
+        from agent_harness import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                pending_payload = {
+                    "channel_id": "C1",
+                    "message_ts": "999",
+                    "version": f"{__version__}-rollback-target",
+                }
+                store.set_setting("slackgentic.update.restart_pending", json.dumps(pending_payload))
+                updates: list[tuple[str, str, str]] = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(
+                        (channel_id, ts, text)
+                    ),
+                    status_blocks=lambda update, status, include_actions: [],
+                )
+                runner.start()
+                try:
+                    self.assertEqual(updates, [])
+                    # Marker is intentionally retained — we don't want to
+                    # quietly drop the breadcrumb when the version mismatch
+                    # might mean a partial rollback.
+                    self.assertEqual(
+                        json.loads(store.get_setting("slackgentic.update.restart_pending")),
+                        pending_payload,
+                    )
+                finally:
+                    runner.stop()
             finally:
                 store.close()
 

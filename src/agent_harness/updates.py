@@ -30,6 +30,10 @@ SETTING_UPDATE_INSTALLED_VERSION = "slackgentic.update.installed_version"
 SETTING_UPDATE_LAST_CHECK_AT = "slackgentic.update.last_check_at"
 SETTING_UPDATE_LAST_ERROR = "slackgentic.update.last_error"
 SETTING_UPDATE_CANDIDATE_PREFIX = "slackgentic.update.candidate."
+# Records the prompt message the running daemon should update once it comes
+# back up on the newly-installed version. Cleared after the post-restart ack
+# is posted (or after one failed attempt, to avoid retry storms).
+SETTING_UPDATE_RESTART_PENDING = "slackgentic.update.restart_pending"
 
 
 class UpdateCheckError(RuntimeError):
@@ -417,6 +421,7 @@ class SlackgenticUpdateRunner:
         if self._thread and self._thread.is_alive():
             return
         self.store.delete_setting(SETTING_UPDATE_INSTALLING_VERSION)
+        self._confirm_pending_restart_once()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -424,6 +429,49 @@ class SlackgenticUpdateRunner:
             name="slackgentic-update-check",
         )
         self._thread.start()
+
+    def _confirm_pending_restart_once(self) -> None:
+        # When the previous daemon process kickstarted itself after a
+        # successful pip install, it recorded the prompt message it wanted
+        # the newly-loaded daemon to update with a success ack. Run that ack
+        # exactly once. Clear the marker after a matching-version attempt
+        # (success or Slack failure) so a transient API error doesn't loop
+        # on every subsequent restart. Leave the marker untouched on a
+        # version mismatch — that means the kickstart did not actually
+        # adopt the new build and an operator should look at it.
+        raw = self.store.get_setting(SETTING_UPDATE_RESTART_PENDING)
+        if not raw:
+            return
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
+            return
+        channel_id = payload.get("channel_id")
+        message_ts = payload.get("message_ts")
+        version = payload.get("version")
+        if (
+            not isinstance(channel_id, str)
+            or not isinstance(message_ts, str)
+            or not isinstance(version, str)
+        ):
+            self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
+            return
+        if version != __version__:
+            return
+        candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
+        tag_name = candidate.release.tag_name
+        text = f":white_check_mark: Installed Slackgentic {tag_name} and restarted successfully."
+        try:
+            self.update_message(
+                channel_id,
+                message_ts,
+                text,
+                self.status_blocks(candidate, text, False),
+            )
+        except Exception:
+            LOGGER.exception("failed to post post-restart upgrade ack")
+        self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
 
     def stop(self) -> bool:
         self._stop.set()
@@ -550,6 +598,20 @@ class SlackgenticUpdateRunner:
                 message_ts,
                 message,
                 self.status_blocks(candidate, message, False),
+            )
+            # Hand the post-restart success ack off to whatever daemon comes
+            # up after the kickstart. The setting is the only thing that
+            # survives this process exiting in a few hundred milliseconds.
+            self.store.set_setting(
+                SETTING_UPDATE_RESTART_PENDING,
+                json.dumps(
+                    {
+                        "channel_id": channel_id,
+                        "message_ts": message_ts,
+                        "version": candidate.version,
+                    },
+                    sort_keys=True,
+                ),
             )
             if self.restart is not None:
                 self.restart()
