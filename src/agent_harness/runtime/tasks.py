@@ -308,6 +308,22 @@ class ManagedTaskRuntime:
             resume_session_id=request.resume_session_id,
             allowed_tools=launch_allowed_tools,
         )
+        if request.resume_session_id:
+            # The transcript already exists from a prior worker run (e.g. a
+            # daemon restart). Anything visible in it was already posted to
+            # Slack by that prior worker; without seeding the dedup set here,
+            # the recovery branch at process-exit (_recover_unseen_visible_messages)
+            # would re-post the entire history and the user sees every prior
+            # reply duplicated in the thread.
+            try:
+                historical = self._recover_visible_messages(task, running)
+            except Exception:
+                LOGGER.debug("failed to seed observed messages from transcript", exc_info=True)
+                historical = []
+            if historical:
+                running.observed_agent_messages = {
+                    message.strip() for message in historical if message.strip()
+                }
         with self._lock:
             self._running[task.task_id] = running
         worker.start()
