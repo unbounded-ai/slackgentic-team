@@ -1,7 +1,12 @@
 import unittest
 from dataclasses import replace
 
-from agent_harness.models import PR_URLS_METADATA_KEY, ROSTER_SUMMARY_METADATA_KEY, Provider
+from agent_harness.models import (
+    ASSIGNMENT_PROMPT_METADATA_KEY,
+    PR_URLS_METADATA_KEY,
+    ROSTER_SUMMARY_METADATA_KEY,
+    Provider,
+)
 from agent_harness.slack import (
     AgentRosterStatus,
     build_external_session_capacity_blocks,
@@ -268,23 +273,42 @@ class SlackTests(unittest.TestCase):
         )
         self.assertEqual([item["action_id"] for item in elements], ["task.done"])
 
-    def test_task_blocks_use_roster_summary_when_present(self):
+    def test_task_blocks_show_original_task_and_latest_summary(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         from agent_harness.team import create_agent_task
 
         task = replace(
             create_agent_task(agent, "tiny latest prompt", "C1"),
             metadata={
+                ASSIGNMENT_PROMPT_METADATA_KEY: "fix the task pickup message",
                 ROSTER_SUMMARY_METADATA_KEY: (
                     "Roster UX fix: refreshing Priya's task thread header"
-                )
+                ),
             },
         )
 
         rendered = str(build_task_thread_blocks(task, agent))
 
+        self.assertIn("*Task:* fix the task pickup message", rendered)
         self.assertIn("Roster UX fix: refreshing Priya's task thread header", rendered)
         self.assertNotIn("tiny latest prompt", rendered)
+
+    def test_task_blocks_omit_duplicate_latest_summary(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = replace(
+            create_agent_task(agent, "ship the status view", "C1"),
+            metadata={
+                ASSIGNMENT_PROMPT_METADATA_KEY: "ship the status view",
+                ROSTER_SUMMARY_METADATA_KEY: "ship the status view",
+            },
+        )
+
+        rendered = str(build_task_thread_blocks(task, agent))
+
+        self.assertIn("*Task:* ship the status view", rendered)
+        self.assertNotIn("*Latest summary:*", rendered)
 
     def test_task_blocks_show_pr_links_from_metadata(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
