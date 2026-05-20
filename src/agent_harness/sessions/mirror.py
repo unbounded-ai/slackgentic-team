@@ -37,6 +37,7 @@ from agent_harness.sessions.claude_channel import (
     is_slackgentic_mcp_server_configured,
 )
 from agent_harness.sessions.terminal import SessionTerminalNotifier
+from agent_harness.sessions.todo_mirror import TodoMirror
 from agent_harness.slack import build_external_session_capacity_blocks
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
@@ -99,6 +100,7 @@ class SessionMirror:
         self.on_external_session_occupancy_change = on_external_session_occupancy_change
         self.on_agent_message = on_agent_message
         self.home = home or Path.home()
+        self._todo_mirror = TodoMirror(store, gateway, home=self.home)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -188,10 +190,22 @@ class SessionMirror:
                     continue
                 self._update_parent_summary(session, thread, chunks)
                 self._update_cursor_if_needed(session, max_line)
+                self._sync_todo_mirror(session, thread)
                 continue
             self._post_session_channel_notice_once(session, thread)
             self._mirror_new_events(provider, session, thread, agent)
+            self._sync_todo_mirror(session, thread)
         self._sync_capacity_notices(channel_id)
+
+    def _sync_todo_mirror(self, session: AgentSession, thread: SlackThreadRef) -> None:
+        try:
+            self._todo_mirror.sync_session(session, thread)
+        except Exception:
+            LOGGER.exception(
+                "failed to sync todo mirror for %s session %s",
+                session.provider.value,
+                session.session_id,
+            )
 
     def _run(self) -> None:
         backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
