@@ -8,6 +8,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_harness.team import DEFAULT_CLAUDE_TEAM_SIZE, DEFAULT_CODEX_TEAM_SIZE
+from agent_harness.updates import (
+    DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS,
+    DEFAULT_UPDATE_REPOSITORY,
+)
 
 
 class SlackConfig(BaseModel):
@@ -79,6 +83,20 @@ class TeamConfig(BaseModel):
     )
 
 
+class UpdateConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = Field(default=True, validation_alias="SLACKGENTIC_UPDATE_CHECK_ENABLED")
+    repository: str = Field(
+        default=DEFAULT_UPDATE_REPOSITORY,
+        validation_alias="SLACKGENTIC_UPDATE_REPOSITORY",
+    )
+    check_interval_seconds: float = Field(
+        default=DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS,
+        validation_alias="SLACKGENTIC_UPDATE_CHECK_INTERVAL_SECONDS",
+    )
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -91,6 +109,7 @@ class AppConfig(BaseModel):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     commands: AgentCommandConfig = Field(default_factory=AgentCommandConfig)
     team: TeamConfig = Field(default_factory=TeamConfig)
+    updates: UpdateConfig = Field(default_factory=UpdateConfig)
 
 
 def default_config_file() -> Path:
@@ -142,4 +161,5 @@ def load_config_from_env(config_file: Path | None = None) -> AppConfig:
     config_values["slack"] = SlackConfig.model_validate(merged_values)
     config_values["team"] = TeamConfig.model_validate(merged_values)
     config_values["commands"] = AgentCommandConfig.model_validate(merged_values)
+    config_values["updates"] = UpdateConfig.model_validate(merged_values)
     return AppConfig.model_validate(config_values)
