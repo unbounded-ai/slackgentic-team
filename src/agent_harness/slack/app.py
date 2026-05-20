@@ -79,6 +79,9 @@ from agent_harness.runtime.health import LoopBackoff, ProcessCpuWatchdog, log_lo
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY,
+    MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
+    MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     managed_run_resume_attempts,
@@ -681,7 +684,7 @@ class SlackTeamController:
                 exclude_agent_ids=sticky_excluded_agent_ids,
             )
             return
-        blocks = build_task_thread_blocks(result.task, result.agent)
+        blocks = _task_thread_blocks(result.task, result.agent)
         posted = self.gateway.post_thread_reply(
             thread,
             format_agent_assignment(
@@ -895,7 +898,7 @@ class SlackTeamController:
             dangerous_mode=_task_dangerous_mode(result.task),
         )
         text = f"Capacity is available now.\n\n{assignment_text}"
-        blocks = build_task_thread_blocks(result.task, result.agent)
+        blocks = _task_thread_blocks(result.task, result.agent)
         posted = self.gateway.post_thread_reply(
             thread,
             text,
@@ -1350,7 +1353,7 @@ class SlackTeamController:
             claimed.requested_by_slack_user,
             dangerous_mode=_task_dangerous_mode(result.task),
         )
-        blocks = build_task_thread_blocks(result.task, result.agent)
+        blocks = _task_thread_blocks(result.task, result.agent)
         posted = self.gateway.post_thread_reply(
             thread,
             text,
@@ -2427,7 +2430,7 @@ class SlackTeamController:
             )
             self.refresh_or_post_roster(channel_id)
             return False
-        blocks = build_task_thread_blocks(result.task, result.agent)
+        blocks = _task_thread_blocks(result.task, result.agent)
         text = format_agent_assignment(
             result.agent,
             result.request.prompt,
@@ -3267,6 +3270,22 @@ class SlackTeamController:
         if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
         active_agents = self.store.list_team_agents()
+        final_handle_request = _agent_authored_final_handle_callback_request(
+            text,
+            active_agents,
+            sender_agent=agent,
+        )
+        if final_handle_request is not None:
+            handled = self._start_agent_authored_specific_request(
+                final_handle_request,
+                task,
+                agent,
+                thread,
+                text,
+                message_ts=message_ts,
+            )
+            if handled:
+                return True
         request = _agent_authored_review_request(text, active_agents)
         if request is None:
             self._clear_answered_request_status_reactions(task, thread)
@@ -3539,7 +3558,7 @@ class SlackTeamController:
                 )
                 handled = True
                 continue
-            blocks = build_task_thread_blocks(result.task, result.agent)
+            blocks = _task_thread_blocks(result.task, result.agent)
             posted = self.gateway.post_thread_reply(
                 thread,
                 format_agent_assignment(
@@ -4055,6 +4074,7 @@ class SlackTeamController:
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
             self._clear_task_request_status_reactions(task, thread)
+            self._remove_task_action_buttons_if_resolved(task)
         if task.session_provider is not None and task.session_id:
             clear_managed_session(self.store, task.session_provider, task.session_id)
         try:
@@ -4068,7 +4088,10 @@ class SlackTeamController:
         self._clear_completed_run_pending_reactions(task, thread)
         if self._resume_queued_thread_followups(task, agent, thread):
             return
-        task = self._finish_completed_runtime_task(task, thread)
+        if task_is_child:
+            task = self.store.get_agent_task(task.task_id) or task
+        else:
+            task = self._hold_completed_runtime_task_open(task, thread)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
@@ -4151,7 +4174,7 @@ class SlackTeamController:
         delegated_task = self.store.get_agent_task(delegated_task.task_id) or delegated_task
         self._start_runtime_task(delegated_task, target_agent, thread)
 
-    def _finish_completed_runtime_task(
+    def _hold_completed_runtime_task_open(
         self,
         task: AgentTask,
         thread: SlackThreadRef,
@@ -4159,33 +4182,27 @@ class SlackTeamController:
         current = self.store.get_agent_task(task.task_id) or task
         if current.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
             return current
-        self.store.update_agent_task_status(current.task_id, AgentTaskStatus.DONE)
-        finished = self.store.get_agent_task(current.task_id) or replace(
-            current,
-            status=AgentTaskStatus.DONE,
-            updated_at=utc_now(),
-        )
-        if self._has_continuing_thread_work(finished, thread):
-            self._remove_task_action_buttons_if_resolved(finished)
-        else:
-            self._mark_task_complete(finished, thread, include_thread=False)
-        return finished
-
-    def _has_continuing_thread_work(
-        self,
-        task: AgentTask,
-        thread: SlackThreadRef,
-    ) -> bool:
-        if isinstance(task.metadata.get("delegate_to_agent_id"), str) or isinstance(
-            task.metadata.get("delegate_prompt"), str
+        metadata = dict(current.metadata)
+        for key in (
+            MANAGED_RUN_STARTED_METADATA_KEY,
+            MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
+            MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
+            MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY,
         ):
-            return True
-        for thread_task in self.store.list_thread_agent_tasks(thread.channel_id, thread.thread_ts):
-            if thread_task.task_id == task.task_id:
-                continue
-            if thread_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
-                return True
-        return False
+            metadata.pop(key, None)
+        held = current
+        if current.status != AgentTaskStatus.ACTIVE or metadata != current.metadata:
+            held = replace(
+                current,
+                status=AgentTaskStatus.ACTIVE,
+                metadata=metadata,
+                updated_at=utc_now(),
+            )
+            self.store.upsert_agent_task(held)
+        if thread.thread_ts:
+            self.store.upsert_managed_thread_task(held, thread)
+        self._restore_task_action_buttons_if_active(held)
+        return self.store.get_agent_task(current.task_id) or held
 
     def handle_runtime_agent_control(
         self,
@@ -4235,7 +4252,6 @@ class SlackTeamController:
     def _refresh_task_thread_header(self, task: AgentTask, agent) -> None:
         if not task.channel_id or not task.parent_message_ts:
             return
-        include_actions = task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
         try:
             self.gateway.update_message(
                 task.channel_id,
@@ -4246,7 +4262,7 @@ class SlackTeamController:
                     task.requested_by_slack_user,
                     dangerous_mode=_task_dangerous_mode(task),
                 ),
-                blocks=build_task_thread_blocks(task, agent, include_actions=include_actions),
+                blocks=_task_thread_blocks(task, agent),
             )
         except Exception:
             LOGGER.debug("failed to refresh task thread header", exc_info=True)
@@ -4738,7 +4754,7 @@ class SlackTeamController:
             claimed.requested_by_slack_user,
             dangerous_mode=_task_dangerous_mode(result.task),
         )
-        blocks = build_task_thread_blocks(result.task, result.agent)
+        blocks = _task_thread_blocks(result.task, result.agent)
         posted = self.gateway.post_thread_reply(
             thread,
             text,
@@ -5254,14 +5270,9 @@ class SlackTeamController:
             self._clear_pending_message_status_reactions(thread.channel_id, message_ts)
 
     def _keeps_request_status_in_progress(self, task: AgentTask, thread: SlackThreadRef) -> bool:
-        if isinstance(task.metadata.get(MANAGED_RUN_STARTED_METADATA_KEY), str):
-            return True
         if isinstance(task.metadata.get("delegate_to_agent_id"), str) or isinstance(
             task.metadata.get("delegate_prompt"), str
         ):
-            return True
-        parent_task_id = task.metadata.get("parent_task_id")
-        if isinstance(parent_task_id, str) and parent_task_id == task.task_id:
             return True
         for thread_task in self.store.list_thread_agent_tasks(thread.channel_id, thread.thread_ts):
             if thread_task.task_id == task.task_id:
@@ -5374,7 +5385,7 @@ class SlackTeamController:
             LOGGER.debug("failed to remove resolved task action buttons", exc_info=True)
 
     def _restore_task_action_buttons_if_active(self, task: AgentTask) -> None:
-        if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+        if not _task_should_show_action_buttons(task):
             return
         if not task.parent_message_ts:
             return
@@ -7341,6 +7352,47 @@ def _agent_authored_review_request(text: str, agents) -> WorkRequest | None:
     return None
 
 
+_FINAL_HANDLE_CALLBACK_RE = re.compile(r"^\s*@(?P<handle>[A-Za-z][A-Za-z0-9_-]{1,31})\s*[.!?]?\s*$")
+_REVIEW_CALLBACK_HINT_RE = re.compile(
+    r"\b(?:review|green|green[-\s]?light|sign[-\s]?off|approve|approval|check|decision)\b",
+    re.IGNORECASE,
+)
+
+
+def _agent_authored_final_handle_callback_request(
+    text: str,
+    agents,
+    *,
+    sender_agent,
+) -> WorkRequest | None:
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", text.strip()) if item.strip()]
+    if len(paragraphs) < 2:
+        return None
+    final_paragraph = canonicalize_agent_mentions(paragraphs[-1], agents)
+    match = _FINAL_HANDLE_CALLBACK_RE.match(final_paragraph)
+    if not match:
+        return None
+    handle = normalize_handle(match.group("handle"))
+    target = next((agent for agent in agents if agent.handle == handle), None)
+    if target is None or target.agent_id == sender_agent.agent_id:
+        return None
+    context = "\n\n".join(paragraphs[:-1]).strip()
+    sender_handle = getattr(sender_agent, "handle", "the sending agent")
+    prompt = (
+        f"Review @{sender_handle}'s latest Slack-visible message and respond in the same "
+        "thread. If it asks for a decision, answer directly before taking further action."
+    )
+    task_kind = (
+        AgentTaskKind.REVIEW if _REVIEW_CALLBACK_HINT_RE.search(context) else AgentTaskKind.WORK
+    )
+    return WorkRequest(
+        prompt=prompt,
+        assignment_mode=AssignmentMode.SPECIFIC,
+        requested_handle=handle,
+        task_kind=task_kind,
+    )
+
+
 def _agent_authored_external_callback_text(text: str, request: WorkRequest) -> str:
     stripped = text.strip()
     if "\n" not in stripped:
@@ -7536,6 +7588,20 @@ def _render_delegate_template(text: str, sender, target) -> str:
         .replace("{target_handle}", target.handle)
         .strip()
     )
+
+
+def _task_thread_blocks(task: AgentTask, agent) -> list[dict]:
+    return build_task_thread_blocks(
+        task,
+        agent,
+        include_actions=_task_should_show_action_buttons(task),
+    )
+
+
+def _task_should_show_action_buttons(task: AgentTask) -> bool:
+    if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+        return False
+    return not (_is_subtask(task) or _is_external_thread_helper_task(task))
 
 
 def _is_subtask(task: AgentTask) -> bool:
