@@ -1887,6 +1887,60 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_exit_keeps_final_pr_message_in_occupied_roster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "fix the roster regression", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_agent_message(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                    "Fixed in https://github.com/acme/app/pull/79",
+                    "171.agent",
+                )
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+
+                controller.handle_runtime_task_done(
+                    current,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+                self.assertEqual(
+                    current.metadata[PR_URLS_METADATA_KEY],
+                    ["https://github.com/acme/app/pull/79"],
+                )
+                roster_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.roster"
+                ]
+                self.assertGreaterEqual(len(roster_updates), 1)
+                self.assertIn("0 available, 1 occupied", roster_updates[-1]["text"])
+                self.assertIn("*PR:*", str(roster_updates[-1]["blocks"]))
+                self.assertIn(
+                    "<https://github.com/acme/app/pull/79|acme/app#79>",
+                    str(roster_updates[-1]["blocks"]),
+                )
+            finally:
+                store.close()
+
     def test_roster_status_signal_refreshes_thread_header_when_summary_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
