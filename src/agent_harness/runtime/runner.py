@@ -35,6 +35,7 @@ class LaunchRequest:
     safe_auto_extra_roots: tuple[Path, ...] = ()
     codex_binary: str = "codex"
     claude_binary: str = "claude"
+    claude_effort: str | None = None
 
     @property
     def dangerous(self) -> bool:
@@ -107,6 +108,8 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
                 args.extend(["--permission-mode", permission_flag])
         if request.model:
             args.extend(["--model", request.model])
+        if request.claude_effort:
+            args.extend(["--effort", request.claude_effort])
         if request.worktree:
             args.extend(["--worktree", request.worktree])
         args.append(request.prompt)

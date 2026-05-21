@@ -905,6 +905,150 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_passes_claude_effort_from_user_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            settings_dir = home / ".claude"
+            settings_dir.mkdir()
+            (settings_dir / "settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_prefers_project_claude_effort_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            (home / ".claude").mkdir()
+            (home / ".claude" / "settings.json").write_text(json.dumps({"effortLevel": "low"}))
+            (project / ".claude").mkdir(parents=True)
+            (project / ".claude" / "settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_defaults_claude_effort_when_settings_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_defaults_claude_effort_when_settings_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            settings_dir = home / ".claude"
+            settings_dir.mkdir()
+            (settings_dir / "settings.json").write_text(json.dumps({"effortLevel": "unknown"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
