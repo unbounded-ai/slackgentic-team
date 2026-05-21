@@ -1528,6 +1528,16 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "current task is complete; use it only when the entire thread should be closed."
         ),
         (
+            "When you believe the work the Slack user asked for is done and you have "
+            "nothing else queued, send one short Slack-visible closing message that names "
+            "what landed in a single line and asks whether there is anything else or "
+            "whether you should be released. Then stop. Do not emit "
+            f"`{AGENT_THREAD_DONE_SIGNAL}`, do not open a new turn on your own, and do "
+            "not silently exit — Slackgentic will surface a release button under your "
+            "closing message so the Slack user can free you up with one click or reply "
+            "with the next step."
+        ),
+        (
             "When you hand work to a specific agent, use that agent's exact Slackgentic "
             "@handle from the thread or roster. Write the handle as plain text with no "
             "backticks or inline code formatting. Put that plain @handle at the start "
