@@ -3,6 +3,7 @@ from dataclasses import replace
 
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     Provider,
@@ -290,7 +291,7 @@ class SlackTests(unittest.TestCase):
 
         rendered = str(build_task_thread_blocks(task, agent))
 
-        self.assertIn("*Task:* fix the task pickup message", rendered)
+        self.assertIn("*Original Task:* fix the task pickup message", rendered)
         self.assertIn("Roster UX fix: refreshing Priya's task thread header", rendered)
         self.assertNotIn("tiny latest prompt", rendered)
 
@@ -308,8 +309,28 @@ class SlackTests(unittest.TestCase):
 
         rendered = str(build_task_thread_blocks(task, agent))
 
-        self.assertIn("*Task:* ship the status view", rendered)
+        self.assertIn("*Original Task:* ship the status view", rendered)
         self.assertNotIn("*Latest summary:*", rendered)
+
+    def test_task_blocks_preserve_first_original_task_when_assignment_changes(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = replace(
+            create_agent_task(agent, "third prompt", "C1"),
+            metadata={
+                ORIGINAL_TASK_METADATA_KEY: "first original task description",
+                ASSIGNMENT_PROMPT_METADATA_KEY: "second assignment prompt",
+                ROSTER_SUMMARY_METADATA_KEY: "currently validating the release",
+            },
+        )
+
+        rendered = str(build_task_thread_blocks(task, agent))
+
+        self.assertIn("*Original Task:* first original task description", rendered)
+        self.assertIn("*Latest summary:* currently validating the release", rendered)
+        self.assertNotIn("second assignment prompt", rendered)
+        self.assertNotIn("third prompt", rendered)
 
     def test_task_blocks_show_pr_links_from_metadata(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

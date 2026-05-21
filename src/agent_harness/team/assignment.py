@@ -6,6 +6,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    ORIGINAL_TASK_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
     PR_URL_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
@@ -102,6 +103,9 @@ def assign_work_request(
     if not isinstance(assignment_prompt, str) or not assignment_prompt.strip():
         assignment_prompt = request.prompt
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = assignment_prompt
+    original_task = metadata.get(ORIGINAL_TASK_METADATA_KEY)
+    if not isinstance(original_task, str) or not original_task.strip():
+        metadata[ORIGINAL_TASK_METADATA_KEY] = assignment_prompt
     roster_summary = metadata.get(ROSTER_SUMMARY_METADATA_KEY)
     if not isinstance(roster_summary, str) or not roster_summary.strip():
         metadata[ROSTER_SUMMARY_METADATA_KEY] = assignment_prompt
