@@ -31,6 +31,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URL_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
@@ -1400,13 +1401,16 @@ class SlackTeamController:
                 continue
             if task.status == AgentTaskStatus.QUEUED:
                 label = "Queued"
-                detail = _shorten(_task_roster_summary(task), 140)
+                detail = _task_roster_detail(task)
             elif self._task_is_runtime_running(task.task_id):
                 label = "Working"
-                detail = _shorten(_task_roster_summary(task), 140)
+                detail = _task_roster_detail(task)
             else:
                 label = "Occupied"
-                detail = _shorten(f"Open thread: {_task_roster_summary(task)}", 140)
+                detail = (
+                    f"Open thread: {_shorten(_task_roster_summary(task), 140)}\n"
+                    f"*Original Task:* {_shorten(_task_original_prompt(task), 180)}"
+                )
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
                 detail,
@@ -1428,7 +1432,7 @@ class SlackTeamController:
                 continue
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Working",
-                _shorten(_task_roster_summary(task), 140),
+                _task_roster_detail(task),
                 dangerous_mode=_task_dangerous_mode(task),
                 pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
@@ -4483,9 +4487,10 @@ class SlackTeamController:
                 task.parent_message_ts,
                 format_agent_assignment(
                     agent,
-                    _task_roster_summary(task),
+                    _task_original_prompt(task),
                     task.requested_by_slack_user,
                     dangerous_mode=_task_dangerous_mode(task),
+                    latest_summary=_task_roster_summary(task),
                 ),
                 blocks=_task_thread_blocks(task, agent),
             )
@@ -5154,6 +5159,7 @@ class SlackTeamController:
         metadata: dict[str, object] = {
             "parent_task_id": parent_task.task_id,
             "parent_agent_id": parent_task.agent_id,
+            ORIGINAL_TASK_METADATA_KEY: _task_original_prompt(parent_task),
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
@@ -5162,7 +5168,7 @@ class SlackTeamController:
             metadata[PR_URL_METADATA_KEY] = parent_pr_urls[0]
             metadata[PR_URLS_METADATA_KEY] = list(parent_pr_urls)
         context = self._thread_context(channel_id, thread_ts)
-        prompt_context = f"Original task: {_task_assignment_prompt(parent_task)}"
+        prompt_context = f"Original task: {_task_original_prompt(parent_task)}"
         if context:
             metadata["thread_context"] = f"{prompt_context}\n{context}"
         else:
@@ -7080,6 +7086,13 @@ def _task_roster_summary(task: AgentTask) -> str:
     return _task_assignment_prompt(task)
 
 
+def _task_roster_detail(task: AgentTask) -> str:
+    return (
+        f"{_shorten(_task_roster_summary(task), 140)}\n"
+        f"*Original Task:* {_shorten(_task_original_prompt(task), 180)}"
+    )
+
+
 def _roster_summary_line(value: str) -> str:
     return _shorten(value, 160)
 
@@ -7093,6 +7106,13 @@ def _external_session_dangerous_mode(session) -> bool:
 def _task_assignment_prompt(task: AgentTask) -> str:
     prompt = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
     return prompt if isinstance(prompt, str) and prompt.strip() else task.prompt
+
+
+def _task_original_prompt(task: AgentTask) -> str:
+    original_task = task.metadata.get(ORIGINAL_TASK_METADATA_KEY)
+    if isinstance(original_task, str) and original_task.strip():
+        return original_task.strip()
+    return _task_assignment_prompt(task)
 
 
 def _work_request_from_scheduled_work(scheduled: ScheduledWork) -> WorkRequest:

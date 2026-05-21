@@ -17,6 +17,7 @@ from agent_harness.deferred import (
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
@@ -1423,6 +1424,7 @@ class SlackAppTests(unittest.TestCase):
                     "*Queued:* Roster UX fix: validating E2E before PR merge",
                     blocks,
                 )
+                self.assertIn("*Original Task:* rerun tests", blocks)
                 self.assertNotIn("Slack task:", blocks)
             finally:
                 store.close()
@@ -1454,7 +1456,141 @@ class SlackAppTests(unittest.TestCase):
                     ("*Queued:* Improve roster summaries and dangerous-mode display"),
                     blocks,
                 )
+                self.assertIn(
+                    "*Original Task:* Improve roster summaries and dangerous-mode display",
+                    blocks,
+                )
                 self.assertNotIn("Slack task:", blocks)
+            finally:
+                store.close()
+
+    def test_roster_preserves_first_original_task_while_summary_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "latest follow-up prompt", "C1"),
+                    metadata={
+                        ORIGINAL_TASK_METADATA_KEY: "first original task description",
+                        ASSIGNMENT_PROMPT_METADATA_KEY: "second assignment prompt",
+                        ROSTER_SUMMARY_METADATA_KEY: "currently validating the release",
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("*Queued:* currently validating the release", blocks)
+                self.assertIn("*Original Task:* first original task description", blocks)
+                self.assertNotIn("second assignment prompt", blocks)
+                self.assertNotIn("latest follow-up prompt", blocks)
+            finally:
+                store.close()
+
+    def test_channel_assignment_preserves_original_task_after_roster_update_e2e(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "repair the status view",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task, started_agent, thread = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                self.assertEqual(
+                    task.metadata[ORIGINAL_TASK_METADATA_KEY],
+                    "repair the status view",
+                )
+                first_message = gateway.thread_replies[0]
+                self.assertIn("*Original Task:* repair the status view", first_message["text"])
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    str(first_message["blocks"]),
+                )
+                runtime.running_task_ids.add(task.task_id)
+                store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    thread,
+                    f"{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}validating the release",
+                )
+
+                self.assertTrue(handled)
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(
+                    current.metadata[ROSTER_SUMMARY_METADATA_KEY],
+                    "validating the release",
+                )
+                self.assertEqual(
+                    current.metadata[ORIGINAL_TASK_METADATA_KEY],
+                    "repair the status view",
+                )
+                header_updates = [
+                    update
+                    for update in gateway.updates
+                    if update["ts"] == current.parent_message_ts
+                ]
+                self.assertEqual(len(header_updates), 1)
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    header_updates[0]["text"],
+                )
+                self.assertIn(
+                    "*Latest summary:* validating the release",
+                    header_updates[0]["text"],
+                )
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    str(header_updates[0]["blocks"]),
+                )
+                roster_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.roster"
+                ]
+                self.assertGreaterEqual(len(roster_updates), 1)
+                self.assertIn(
+                    "*Working:* validating the release",
+                    str(roster_updates[-1]["blocks"]),
+                )
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    str(roster_updates[-1]["blocks"]),
+                )
             finally:
                 store.close()
 
@@ -1886,8 +2022,17 @@ class SlackAppTests(unittest.TestCase):
                     "Roster UX fix: opening PR after E2E",
                     header_updates[0]["text"],
                 )
+                self.assertIn("*Original Task:* small follow-up", header_updates[0]["text"])
+                self.assertIn(
+                    "*Latest summary:* Roster UX fix: opening PR after E2E",
+                    header_updates[0]["text"],
+                )
                 self.assertIn(
                     "Roster UX fix: opening PR after E2E",
+                    str(header_updates[0]["blocks"]),
+                )
+                self.assertIn(
+                    "*Original Task:* small follow-up",
                     str(header_updates[0]["blocks"]),
                 )
                 roster_updates = [
@@ -1896,6 +2041,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(roster_updates), 1)
                 self.assertIn(
                     "*Queued:* Roster UX fix: opening PR after E2E",
+                    str(roster_updates[0]["blocks"]),
+                )
+                self.assertIn(
+                    "*Original Task:* small follow-up",
                     str(roster_updates[0]["blocks"]),
                 )
                 self.assertNotIn("Slack task:", str(roster_updates[0]["blocks"]))
@@ -4919,7 +5068,7 @@ class SlackAppTests(unittest.TestCase):
                 tasks = store.list_agent_tasks()
                 self.assertEqual(tasks[0].prompt, "review the repo")
                 rendered = gateway.thread_replies[0]["blocks"][0]["text"]["text"]
-                self.assertIn("*Task:* review the repo", rendered)
+                self.assertIn("*Original Task:* review the repo", rendered)
             finally:
                 store.close()
 
