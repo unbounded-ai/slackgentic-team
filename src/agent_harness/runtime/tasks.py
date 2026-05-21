@@ -1503,11 +1503,19 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "table. If you need multiple tables, send separate messages."
         ),
         (
-            "When a lightweight acknowledgement is better than a message, you may react to "
-            "the Slack user's latest message by putting a hidden line on its own line in "
-            f"the exact form `{AGENT_REACTION_SIGNAL_PREFIX}<emoji-name>`, for example "
-            f"`{AGENT_REACTION_SIGNAL_PREFIX}thumbsup`. Use this sparingly, only when it "
-            "feels right; Slackgentic hides the line and adds the reaction."
+            "Slack reactions are a natural way to acknowledge the most recent message in "
+            "this thread, from the user or from another agent, without sending a new "
+            "reply. Add a hidden line on its own line in the exact form "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}<emoji-name>` and Slackgentic will hide the "
+            "line and react to that latest message. Reach for one when it fits the "
+            f"moment: `{AGENT_REACTION_SIGNAL_PREFIX}eyes` when you're picking something "
+            f"up, `{AGENT_REACTION_SIGNAL_PREFIX}thumbsup` to agree with a teammate, "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}white_check_mark` to confirm something is "
+            f"done, `{AGENT_REACTION_SIGNAL_PREFIX}tada` when a teammate ships something, "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}thinking_face` when a call is genuinely "
+            "close. Aim for roughly one reaction every few of your replies, not on "
+            "every message, and skip it when a real reply already covers what you'd "
+            "say."
         ),
         (
             "When the user explicitly asks for another agent, someone else, a review, "

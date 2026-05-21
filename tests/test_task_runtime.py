@@ -687,8 +687,8 @@ class TaskRuntimeTests(unittest.TestCase):
         prompt = build_task_prompt(agent, task)
 
         self.assertIn(AGENT_REACTION_SIGNAL_PREFIX, prompt)
-        self.assertIn("lightweight acknowledgement", prompt)
-        self.assertIn("Use this sparingly", prompt)
+        self.assertIn("from the user or from another agent", prompt)
+        self.assertIn("not on every message", prompt)
 
     def test_build_task_prompt_prefers_slackgentic_pr_mcp(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
