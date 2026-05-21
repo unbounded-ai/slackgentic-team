@@ -29,6 +29,20 @@ agent needs you.
 
 ## Quick Install
 
+Recommended — installs `slackgentic` on `PATH` globally via
+[uv](https://docs.astral.sh/uv/) so the command works in any shell:
+
+```sh
+uv tool install --with pip git+https://github.com/unbounded-ai/slackgentic-team.git
+slackgentic slack setup
+slackgentic service install && slackgentic service status
+```
+
+`--with pip` lets the in-app updater apply new releases in place.
+
+Alternatively, install from a source checkout — needed if you want to track
+`main` or hack on the code:
+
 ```sh
 git clone https://github.com/unbounded-ai/slackgentic-team.git && cd slackgentic-team
 python3.13 -m venv .venv && source .venv/bin/activate && pip install -e . && slackgentic slack setup
