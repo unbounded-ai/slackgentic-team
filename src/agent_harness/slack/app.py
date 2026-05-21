@@ -31,6 +31,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URL_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
@@ -1404,13 +1405,16 @@ class SlackTeamController:
                 continue
             if task.status == AgentTaskStatus.QUEUED:
                 label = "Queued"
-                detail = _shorten(_task_roster_summary(task), 140)
+                detail = _task_roster_detail(task)
             elif self._task_is_runtime_running(task.task_id):
                 label = "Working"
-                detail = _shorten(_task_roster_summary(task), 140)
+                detail = _task_roster_detail(task)
             else:
                 label = "Occupied"
-                detail = _shorten(f"Open thread: {_task_roster_summary(task)}", 140)
+                detail = (
+                    f"Open thread: {_shorten(_task_roster_summary(task), 140)}\n"
+                    f"*Original Task:* {_shorten(_task_original_prompt(task), 180)}"
+                )
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
                 detail,
@@ -1432,7 +1436,7 @@ class SlackTeamController:
                 continue
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Working",
-                _shorten(_task_roster_summary(task), 140),
+                _task_roster_detail(task),
                 dangerous_mode=_task_dangerous_mode(task),
                 pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
@@ -4519,7 +4523,7 @@ class SlackTeamController:
             return self._update_task_roster_summary(task, agent, thread, roster_summary)
         reaction_name = parse_agent_reaction_signal(signal)
         if reaction_name is not None:
-            return self._react_to_latest_user_message(task, thread, reaction_name)
+            return self._react_to_latest_thread_message(task, agent, thread, reaction_name)
         if signal == AGENT_THREAD_DONE_SIGNAL:
             return self._complete_task_thread(thread.channel_id, thread.thread_ts)
         if is_agent_timer_signal(signal):
@@ -4561,23 +4565,31 @@ class SlackTeamController:
                 task.parent_message_ts,
                 format_agent_assignment(
                     agent,
-                    _task_roster_summary(task),
+                    _task_original_prompt(task),
                     task.requested_by_slack_user,
                     dangerous_mode=_task_dangerous_mode(task),
+                    latest_summary=_task_roster_summary(task),
                 ),
                 blocks=_task_thread_blocks(task, agent),
             )
         except Exception:
             LOGGER.debug("failed to refresh task thread header", exc_info=True)
 
-    def _react_to_latest_user_message(
+    def _react_to_latest_thread_message(
         self,
         task: AgentTask,
+        agent,
         thread: SlackThreadRef,
         reaction_name: str,
     ) -> bool:
         current = self.store.get_agent_task(task.task_id) or task
-        message_ts = _latest_user_message_ts_for_reaction(current.metadata)
+        user_message_ts = _latest_user_message_ts_for_reaction(current.metadata)
+        message_ts = self._latest_reactable_message_ts(
+            task,
+            agent,
+            thread,
+            fallback_ts=user_message_ts,
+        )
         if not message_ts:
             return False
         try:
@@ -4585,12 +4597,44 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to add agent-requested Slack reaction", exc_info=True)
             return False
-        if reaction_name in TASK_STATUS_REACTIONS:
+        if reaction_name in TASK_STATUS_REACTIONS and message_ts == user_message_ts:
             self.store.set_setting(
                 _message_status_reaction_setting_key(thread.channel_id, message_ts),
                 reaction_name,
             )
         return True
+
+    def _latest_reactable_message_ts(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        *,
+        fallback_ts: str | None,
+    ) -> str | None:
+        if not thread.channel_id or not thread.thread_ts:
+            return fallback_ts
+        try:
+            messages = self.gateway.thread_messages(
+                thread.channel_id,
+                thread.thread_ts,
+                limit=20,
+            )
+        except Exception:
+            LOGGER.debug("failed to fetch thread messages for reaction", exc_info=True)
+            messages = []
+        skip_ts = {thread.thread_ts}
+        if task.parent_message_ts:
+            skip_ts.add(task.parent_message_ts)
+        for message in reversed(messages):
+            ts = message.get("ts")
+            if not isinstance(ts, str) or not ts or ts in skip_ts:
+                continue
+            record = self._agent_authored_message_record(thread.channel_id, ts)
+            if record and _record_string(record, "agent_id") == agent.agent_id:
+                continue
+            return ts
+        return fallback_ts
 
     def _schedule_agent_timer(
         self,
@@ -5232,6 +5276,7 @@ class SlackTeamController:
         metadata: dict[str, object] = {
             "parent_task_id": parent_task.task_id,
             "parent_agent_id": parent_task.agent_id,
+            ORIGINAL_TASK_METADATA_KEY: _task_original_prompt(parent_task),
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
@@ -5240,7 +5285,7 @@ class SlackTeamController:
             metadata[PR_URL_METADATA_KEY] = parent_pr_urls[0]
             metadata[PR_URLS_METADATA_KEY] = list(parent_pr_urls)
         context = self._thread_context(channel_id, thread_ts)
-        prompt_context = f"Original task: {_task_assignment_prompt(parent_task)}"
+        prompt_context = f"Original task: {_task_original_prompt(parent_task)}"
         if context:
             metadata["thread_context"] = f"{prompt_context}\n{context}"
         else:
@@ -7190,6 +7235,13 @@ def _task_roster_summary(task: AgentTask) -> str:
     return _task_assignment_prompt(task)
 
 
+def _task_roster_detail(task: AgentTask) -> str:
+    return (
+        f"{_shorten(_task_roster_summary(task), 140)}\n"
+        f"*Original Task:* {_shorten(_task_original_prompt(task), 180)}"
+    )
+
+
 def _roster_summary_line(value: str) -> str:
     return _shorten(value, 160)
 
@@ -7203,6 +7255,13 @@ def _external_session_dangerous_mode(session) -> bool:
 def _task_assignment_prompt(task: AgentTask) -> str:
     prompt = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
     return prompt if isinstance(prompt, str) and prompt.strip() else task.prompt
+
+
+def _task_original_prompt(task: AgentTask) -> str:
+    original_task = task.metadata.get(ORIGINAL_TASK_METADATA_KEY)
+    if isinstance(original_task, str) and original_task.strip():
+        return original_task.strip()
+    return _task_assignment_prompt(task)
 
 
 def _work_request_from_scheduled_work(scheduled: ScheduledWork) -> WorkRequest:

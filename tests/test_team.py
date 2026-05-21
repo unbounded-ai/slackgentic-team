@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentTaskKind,
@@ -159,6 +160,10 @@ class TeamTests(unittest.TestCase):
                 assert result is not None
                 self.assertEqual(
                     result.task.metadata[ROSTER_SUMMARY_METADATA_KEY],
+                    "tell me what are my open PRs in talos repo",
+                )
+                self.assertEqual(
+                    result.task.metadata[ORIGINAL_TASK_METADATA_KEY],
                     "tell me what are my open PRs in talos repo",
                 )
             finally:

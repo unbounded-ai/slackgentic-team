@@ -10,6 +10,7 @@ from typing import Any
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    ORIGINAL_TASK_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentTask,
     Provider,
@@ -657,7 +658,7 @@ def build_task_thread_blocks(
 
 def _task_display_lines(task: AgentTask) -> str:
     original_prompt = _task_original_prompt(task)
-    lines = [f"*Task:* {original_prompt}"]
+    lines = [f"*Original Task:* {original_prompt}"]
     summary = task.metadata.get(ROSTER_SUMMARY_METADATA_KEY)
     if isinstance(summary, str) and summary.strip():
         summary = summary.strip()
@@ -667,6 +668,9 @@ def _task_display_lines(task: AgentTask) -> str:
 
 
 def _task_original_prompt(task: AgentTask) -> str:
+    original_task = task.metadata.get(ORIGINAL_TASK_METADATA_KEY)
+    if isinstance(original_task, str) and original_task.strip():
+        return original_task.strip()
     value = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
     if isinstance(value, str) and value.strip():
         return value.strip()
