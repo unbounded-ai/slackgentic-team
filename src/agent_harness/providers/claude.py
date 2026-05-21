@@ -279,7 +279,7 @@ def _session_ended_by_exit(records: Iterable[dict[str, Any]]) -> bool:
 def _is_normal_conversation_record_after_exit(record: dict[str, Any], text: str) -> bool:
     record_type = record.get("type")
     if record_type == "assistant":
-        return not _is_synthetic_no_response_record(record)
+        return not is_synthetic_claude_assistant_record(record)
     if record_type != "user":
         return False
     if record.get("isMeta") is True:
@@ -287,7 +287,10 @@ def _is_normal_conversation_record_after_exit(record: dict[str, Any], text: str)
     return not _is_local_command_text(text)
 
 
-def _is_synthetic_no_response_record(record: dict[str, Any]) -> bool:
+def is_synthetic_claude_assistant_record(record: dict[str, Any]) -> bool:
+    # Claude's CLI inserts these on a resume that has nothing new to say
+    # (e.g. when a tool result completes a prior turn). The text would
+    # otherwise leak to Slack as if the agent spoke up unprompted.
     message = record.get("message")
     if not isinstance(message, dict):
         return False

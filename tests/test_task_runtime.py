@@ -1121,6 +1121,23 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(chunks, ["Not stuck - continuing now."])
         self.assertEqual(buffer, "")
 
+    def test_claude_json_output_skips_synthetic_no_response_marker(self):
+        # Claude's CLI emits a synthetic assistant record whenever a resume
+        # has nothing to say. The runtime stream renderer must NOT surface
+        # that synthetic text — otherwise the user sees the bot post
+        # "No response requested." in their Slack thread out of nowhere.
+        chunks, buffer = _process_output_chunks(
+            Provider.CLAUDE,
+            (
+                '{"type":"assistant","message":{"model":"<synthetic>",'
+                '"content":[{"type":"text","text":"No response requested."}]}}\n'
+                '{"type":"result","subtype":"success","is_error":false,"result":"Done"}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Done"])
+        self.assertEqual(buffer, "")
+
     def test_codex_long_message_splits_at_paragraph_boundary(self):
         first = "Short opener."
         second = "Body paragraph." + (" filler" * 400)

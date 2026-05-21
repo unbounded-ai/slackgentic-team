@@ -34,6 +34,7 @@ from agent_harness.permissions import (
     task_permission_mode,
 )
 from agent_harness.pr_links import pr_urls_from_metadata
+from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
@@ -2435,6 +2436,8 @@ def _claude_transcript_messages_from_path(
             continue
         if record.get("type") != "assistant":
             continue
+        if is_synthetic_claude_assistant_record(record):
+            continue
         timestamp = parse_timestamp(record.get("timestamp"))
         if since is not None and timestamp is not None and timestamp < since:
             continue
@@ -2490,6 +2493,8 @@ def _render_claude_json_line(line: str) -> str | None:
         result = event.get("result")
         return _clean_terminal_output(str(result)) if result else None
     if event_type == "assistant":
+        if is_synthetic_claude_assistant_record(event):
+            return None
         return _claude_assistant_message_text(event)
     if event_type == "error":
         message = event.get("message") or event.get("error")
