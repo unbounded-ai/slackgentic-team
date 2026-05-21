@@ -5,8 +5,7 @@ permissions:
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
 
 jobs:
   github-release:
@@ -14,25 +13,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
-      - name: Validate version tag
-        env:
-          TAG_NAME: ${{ github.ref_name }}
+      - name: Resolve release version
+        id: version
         run: |
-          python - <<'PY'
-          import os
+          python - <<'PY' >>"$GITHUB_OUTPUT"
           import re
           import tomllib
           from pathlib import Path
-
-          tag_name = os.environ["TAG_NAME"]
-          if not re.fullmatch(r"v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", tag_name):
-              raise SystemExit(f"release tags must look like vX.Y.Z: {tag_name}")
-          tag_version = tag_name.removeprefix("v")
 
           project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
           pyproject_version = project["version"]
@@ -41,18 +35,46 @@ jobs:
           init_version = match.group(1) if match else None
 
           versions = {
-              "tag": tag_version,
               "pyproject.toml": pyproject_version,
               "src/agent_harness/__init__.py": init_version,
           }
           if len(set(versions.values())) != 1:
               raise SystemExit(f"version mismatch: {versions}")
+
+          version = pyproject_version
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+              raise SystemExit(f"version must look like X.Y.Z: {version}")
+
+          print(f"version={version}")
+          print(f"tag=v{version}")
           PY
 
+      - name: Skip if tag already exists
+        id: check
+        env:
+          TAG_NAME: ${{ steps.version.outputs.tag }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$TAG_NAME" >/dev/null; then
+            echo "Tag $TAG_NAME already exists; nothing to release."
+            echo "exists=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          TAG_NAME: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG_NAME" -m "$TAG_NAME"
+          git push origin "$TAG_NAME"
+
       - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ steps.version.outputs.tag }}
         run: |
-          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
-            gh release create "$TAG_NAME" --verify-tag --generate-notes
+          gh release create "$TAG_NAME" --verify-tag --generate-notes
