@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +26,14 @@ class UpdateVersionTests(unittest.TestCase):
         self.assertFalse(is_newer_version("1.0.0", "1.0"))
         self.assertFalse(is_newer_version("1.0.0-rc1", "1.0.0"))
         self.assertTrue(is_newer_version("1.0.0", "1.0.0-rc1"))
+
+    def test_package_version_matches_project_metadata(self):
+        from agent_harness import __version__
+
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        metadata = tomllib.loads(pyproject.read_text())
+
+        self.assertEqual(__version__, metadata["project"]["version"])
 
 
 class GitHubReleaseSourceTests(unittest.TestCase):

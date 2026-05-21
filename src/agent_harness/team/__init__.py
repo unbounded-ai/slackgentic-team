@@ -804,13 +804,21 @@ def format_agent_assignment(
     requester: str | None = None,
     *,
     dangerous_mode: bool = False,
+    latest_summary: str | None = None,
 ) -> str:
     requester_text = f" for <@{requester}>" if requester else ""
     opener = _assignment_opener(agent)
     lines = [f"{opener}{requester_text}."]
     if dangerous_mode:
         lines.append("*:zap: Dangerous mode*")
-    lines.append(f"*Task:* {prompt.strip()}")
+    original_task = prompt.strip()
+    lines.append(f"*Original Task:* {original_task}")
+    if (
+        latest_summary is not None
+        and latest_summary.strip()
+        and latest_summary.strip() != original_task
+    ):
+        lines.append(f"*Latest summary:* {latest_summary.strip()}")
     return "\n\n".join(lines)
 
 
@@ -824,7 +832,7 @@ def format_agent_handoff_assignment(
     lines = [f"Got it, @{sender.handle}. I'll handle it."]
     if dangerous_mode:
         lines.append("*:zap: Dangerous mode*")
-    lines.append(f"*Task:* {prompt.strip()}")
+    lines.append(f"*Original Task:* {prompt.strip()}")
     return "\n\n".join(lines)
 
 
