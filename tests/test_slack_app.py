@@ -1838,6 +1838,88 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_agent_reaction_signal_reacts_to_other_agents_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                team = build_initial_model_team(2, 0)
+                actor, peer = team[0], team[1]
+                for member in team:
+                    store.upsert_team_agent(member)
+                task = replace(
+                    create_agent_task(actor, "ship the fix", "C1"),
+                    metadata={"request_message_ts": "171.user"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                thread = SlackThreadRef("C1", "171.thread")
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {"username": "user", "text": "kick off", "ts": "171.user"},
+                    {"username": peer.full_name, "text": "looking", "ts": "172.peer"},
+                ]
+                controller._remember_agent_authored_message(
+                    task,
+                    peer,
+                    thread,
+                    "172.peer",
+                    "looking",
+                )
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    actor,
+                    thread,
+                    f"{AGENT_REACTION_SIGNAL_PREFIX}thumbsup",
+                )
+
+                self.assertTrue(handled)
+                self.assertIn(("C1", "172.peer", "thumbsup"), gateway.reactions)
+                self.assertNotIn(("C1", "171.user", "thumbsup"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_agent_reaction_signal_skips_own_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the fix", "C1"),
+                    metadata={"request_message_ts": "171.user"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                thread = SlackThreadRef("C1", "171.thread")
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {"username": "user", "text": "kick off", "ts": "171.user"},
+                    {"username": agent.full_name, "text": "on it", "ts": "172.own"},
+                ]
+                controller._remember_agent_authored_message(
+                    task,
+                    agent,
+                    thread,
+                    "172.own",
+                    "on it",
+                )
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    thread,
+                    f"{AGENT_REACTION_SIGNAL_PREFIX}eyes",
+                )
+
+                self.assertTrue(handled)
+                self.assertIn(("C1", "171.user", "eyes"), gateway.reactions)
+                self.assertNotIn(("C1", "172.own", "eyes"), gateway.reactions)
+            finally:
+                store.close()
+
     def test_roster_shows_runtime_running_task_occupancy(self):
         class RuntimeWithRunningTask(FakeRuntime):
             def __init__(self, running):
