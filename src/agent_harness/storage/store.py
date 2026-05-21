@@ -5,11 +5,13 @@ import sqlite3
 import threading
 import uuid
 from contextlib import suppress
+from datetime import timedelta
 from pathlib import Path
 
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    DEFAULT_TEAM_AGENT_KIND,
     PERMISSION_MODE_METADATA_KEY,
     AgentSession,
     AgentTask,
@@ -21,6 +23,9 @@ from agent_harness.models import (
     DeferredWorkStatus,
     PendingWorkRequest,
     PendingWorkRequestStatus,
+    PmInitiative,
+    PmInitiativeStatus,
+    PmSubtask,
     Provider,
     ScheduledTimer,
     ScheduledTimerStatus,
@@ -31,6 +36,7 @@ from agent_harness.models import (
     SessionStatus,
     SlackThreadRef,
     TeamAgent,
+    TeamAgentKind,
     TeamAgentStatus,
     WorkDependency,
     WorkDependencyKind,
@@ -77,6 +83,7 @@ CREATE TABLE IF NOT EXISTS team_agents (
   sort_order INTEGER NOT NULL,
   provider_preference TEXT,
   status TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'engineer',
   hired_at TEXT,
   fired_at TEXT,
   metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -311,6 +318,46 @@ CREATE TABLE IF NOT EXISTS deferred_work_requests (
 
 CREATE INDEX IF NOT EXISTS idx_deferred_work_status
   ON deferred_work_requests(status, fire_at, created_at);
+
+CREATE TABLE IF NOT EXISTS pm_initiatives (
+  initiative_id TEXT NOT NULL PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  thread_ts TEXT NOT NULL,
+  message_ts TEXT,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_by_slack_user TEXT,
+  pm_agent_id TEXT,
+  pm_task_id TEXT,
+  watchdog_last_run_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pm_agent_id) REFERENCES team_agents(agent_id),
+  FOREIGN KEY(pm_task_id) REFERENCES agent_tasks(task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pm_initiatives_status_updated
+  ON pm_initiatives(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS pm_subtasks (
+  initiative_id TEXT NOT NULL,
+  local_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  deferred_id TEXT NOT NULL,
+  depends_on_json TEXT NOT NULL DEFAULT '[]',
+  sort_order INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (initiative_id, local_id),
+  FOREIGN KEY(initiative_id) REFERENCES pm_initiatives(initiative_id),
+  FOREIGN KEY(deferred_id) REFERENCES deferred_work_requests(deferred_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pm_subtasks_initiative_sort
+  ON pm_subtasks(initiative_id, sort_order);
+
+CREATE INDEX IF NOT EXISTS idx_pm_subtasks_deferred
+  ON pm_subtasks(deferred_id);
 """
 
 
@@ -365,7 +412,16 @@ class Store:
     def init_schema(self) -> None:
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._ensure_team_agent_kind_column()
             self.conn.commit()
+
+    def _ensure_team_agent_kind_column(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(team_agents)").fetchall()
+        columns = {row["name"] for row in rows}
+        if "kind" not in columns:
+            self.conn.execute(
+                "ALTER TABLE team_agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'engineer'"
+            )
 
     def upsert_session(self, session: AgentSession) -> None:
         self.conn.execute(
@@ -443,9 +499,9 @@ class Store:
             INSERT INTO team_agents (
               agent_id, handle, full_name, initials, color_hex, avatar_slug,
               icon_emoji, role, personality, voice, unique_strength,
-              reaction_names_json, sort_order, provider_preference, status,
+              reaction_names_json, sort_order, provider_preference, status, kind,
               hired_at, fired_at, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id) DO UPDATE SET
               handle = excluded.handle,
               full_name = excluded.full_name,
@@ -461,6 +517,7 @@ class Store:
               sort_order = excluded.sort_order,
               provider_preference = excluded.provider_preference,
               status = excluded.status,
+              kind = excluded.kind,
               hired_at = excluded.hired_at,
               fired_at = excluded.fired_at,
               metadata_json = excluded.metadata_json
@@ -2094,6 +2151,10 @@ class Store:
 
     def _dependency_is_satisfied(self, dep: WorkDependency) -> bool:
         terminal = {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}
+        if dep.kind == WorkDependencyKind.SUBTASK:
+            if not dep.task_id:
+                return False
+            return self._deferred_work_dependency_is_satisfied(dep.task_id)
         if dep.kind == WorkDependencyKind.THREAD:
             if not dep.channel_id or not dep.thread_ts:
                 return False
@@ -2159,6 +2220,286 @@ class Store:
         session = self.get_session(provider, session_id)
         return bool(session and session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE})
 
+    def create_pm_initiative(
+        self,
+        thread: SlackThreadRef,
+        *,
+        title: str,
+        summary: str,
+        requested_by_slack_user: str | None = None,
+        pm_agent_id: str | None = None,
+        pm_task_id: str | None = None,
+    ) -> PmInitiative:
+        now = utc_now()
+        initiative = PmInitiative(
+            initiative_id=f"pm_{uuid.uuid4().hex[:12]}",
+            channel_id=thread.channel_id,
+            thread_ts=thread.thread_ts,
+            message_ts=thread.message_ts,
+            title=title,
+            summary=summary,
+            status=PmInitiativeStatus.PLANNING,
+            requested_by_slack_user=requested_by_slack_user,
+            pm_agent_id=pm_agent_id,
+            pm_task_id=pm_task_id,
+            watchdog_last_run_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO pm_initiatives (
+                  initiative_id, channel_id, thread_ts, message_ts, title, summary, status,
+                  requested_by_slack_user, pm_agent_id, pm_task_id, watchdog_last_run_at,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _pm_initiative_values(initiative),
+            )
+            self.conn.commit()
+        return initiative
+
+    def get_pm_initiative(self, initiative_id: str) -> PmInitiative | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM pm_initiatives WHERE initiative_id = ?",
+                (initiative_id,),
+            ).fetchone()
+        return _pm_initiative_from_row(row) if row else None
+
+    def list_pm_initiatives(
+        self,
+        *,
+        statuses: tuple[PmInitiativeStatus, ...] | None = None,
+        limit: int = 50,
+    ) -> list[PmInitiative]:
+        selected = statuses or (
+            PmInitiativeStatus.PLANNING,
+            PmInitiativeStatus.ACTIVE,
+        )
+        if not selected:
+            return []
+        placeholders = ", ".join("?" for _ in selected)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM pm_initiatives
+                WHERE status IN ({placeholders})
+                ORDER BY created_at, initiative_id
+                LIMIT ?
+                """,
+                (*[item.value for item in selected], limit),
+            ).fetchall()
+        return [_pm_initiative_from_row(row) for row in rows]
+
+    def update_pm_initiative_status(
+        self,
+        initiative_id: str,
+        status: PmInitiativeStatus,
+    ) -> PmInitiative | None:
+        now = utc_now()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE pm_initiatives
+                SET status = ?, updated_at = ?
+                WHERE initiative_id = ?
+                """,
+                (status.value, now.isoformat(), initiative_id),
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_pm_initiative(initiative_id)
+
+    def update_pm_initiative_owner(
+        self,
+        initiative_id: str,
+        *,
+        pm_agent_id: str,
+        pm_task_id: str,
+    ) -> None:
+        now = utc_now()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE pm_initiatives
+                SET pm_agent_id = ?, pm_task_id = ?, updated_at = ?
+                WHERE initiative_id = ?
+                """,
+                (pm_agent_id, pm_task_id, now.isoformat(), initiative_id),
+            )
+            self.conn.commit()
+
+    def mark_pm_initiative_watchdog_run(self, initiative_id: str) -> None:
+        now = utc_now()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE pm_initiatives
+                SET watchdog_last_run_at = ?, updated_at = ?
+                WHERE initiative_id = ?
+                """,
+                (now.isoformat(), now.isoformat(), initiative_id),
+            )
+            self.conn.commit()
+
+    def add_pm_subtask_dispatch(
+        self,
+        *,
+        initiative: PmInitiative,
+        local_id: str,
+        title: str,
+        request: WorkRequest,
+        plan_depends_on: tuple[str, ...],
+        existing_subtasks: list[PmSubtask],
+        after_delay_seconds: int,
+        sort_order: int,
+        description: str | None = None,
+    ) -> PmSubtask:
+        """Insert one PM subtask + its deferred_work row in a single transaction.
+
+        Sibling references in ``plan_depends_on`` are resolved against the
+        ``existing_subtasks`` list (built up by the caller in topological order).
+        Root subtasks (empty deps) are inserted in READY status with fire_at=now,
+        so the DeferredWorkRunner dispatches them on the next tick without an
+        extra promotion step.
+        """
+        deferred_by_local: dict[str, PmSubtask] = {
+            item.local_id: item for item in existing_subtasks
+        }
+        resolved_deps: list[WorkDependency] = []
+        for dep_local_id in plan_depends_on:
+            sibling = deferred_by_local.get(dep_local_id)
+            if sibling is None:
+                raise ValueError(
+                    f"PM subtask {local_id!r} depends on {dep_local_id!r}, which was not inserted yet"
+                )
+            resolved_deps.append(
+                WorkDependency(
+                    kind=WorkDependencyKind.SUBTASK,
+                    task_id=sibling.deferred_id,
+                    initiative_id=initiative.initiative_id,
+                    local_id=sibling.local_id,
+                    description=f"subtask {sibling.local_id}",
+                )
+            )
+        now = utc_now()
+        deferred_id = f"defer_{uuid.uuid4().hex[:12]}"
+        if resolved_deps:
+            status = DeferredWorkStatus.WAITING_DEPS
+            fire_at = None
+            deps_satisfied_at = None
+        else:
+            status = DeferredWorkStatus.READY
+            fire_at = now + timedelta(seconds=after_delay_seconds) if after_delay_seconds else now
+            deps_satisfied_at = now
+        deferred = DeferredWork(
+            deferred_id=deferred_id,
+            channel_id=initiative.channel_id,
+            thread_ts=initiative.thread_ts,
+            message_ts=initiative.message_ts,
+            prompt=request.prompt,
+            assignment_mode=request.assignment_mode,
+            requested_handle=request.requested_handle,
+            task_kind=request.task_kind,
+            author_handle=request.author_handle,
+            pr_url=request.pr_url,
+            dangerous_mode=request.dangerous_mode,
+            requested_by_slack_user=initiative.requested_by_slack_user,
+            depends_on=tuple(resolved_deps),
+            after_dep_delay_seconds=after_delay_seconds or None,
+            run_at=None,
+            fire_at=fire_at,
+            deps_satisfied_at=deps_satisfied_at,
+            status=status,
+            description=description or f"PM initiative {initiative.initiative_id}: {title}",
+            created_at=now,
+            updated_at=now,
+        )
+        subtask = PmSubtask(
+            initiative_id=initiative.initiative_id,
+            local_id=local_id,
+            title=title,
+            deferred_id=deferred_id,
+            depends_on=tuple(plan_depends_on),
+            sort_order=sort_order,
+            created_at=now,
+        )
+        with self._lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute(
+                    """
+                    INSERT INTO deferred_work_requests (
+                      deferred_id, channel_id, thread_ts, message_ts, prompt, assignment_mode,
+                      requested_handle, task_kind, author_handle, pr_url, dangerous_mode,
+                      requested_by_slack_user, depends_on_json, after_dep_delay_seconds, run_at,
+                      fire_at, deps_satisfied_at, status, description, created_at, updated_at,
+                      dispatched_at, last_task_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _deferred_work_values(deferred),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO pm_subtasks (
+                      initiative_id, local_id, title, deferred_id, depends_on_json,
+                      sort_order, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        subtask.initiative_id,
+                        subtask.local_id,
+                        subtask.title,
+                        subtask.deferred_id,
+                        json.dumps(list(subtask.depends_on), sort_keys=True),
+                        subtask.sort_order,
+                        subtask.created_at.isoformat(),
+                    ),
+                )
+                self.conn.commit()
+            except sqlite3.Error:
+                with suppress(sqlite3.Error):
+                    self.conn.execute("ROLLBACK")
+                raise
+        return subtask
+
+    def list_pm_subtasks(self, initiative_id: str) -> list[PmSubtask]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM pm_subtasks
+                WHERE initiative_id = ?
+                ORDER BY sort_order, local_id
+                """,
+                (initiative_id,),
+            ).fetchall()
+        return [_pm_subtask_from_row(row) for row in rows]
+
+    def cancel_pm_initiative_for_thread(self, channel_id: str, thread_ts: str) -> int:
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE pm_initiatives
+                SET status = ?, updated_at = ?
+                WHERE channel_id = ?
+                  AND thread_ts = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    PmInitiativeStatus.CANCELLED.value,
+                    utc_now().isoformat(),
+                    channel_id,
+                    thread_ts,
+                    PmInitiativeStatus.PLANNING.value,
+                    PmInitiativeStatus.ACTIVE.value,
+                ),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
     def cancel_deferred_work_for_thread(self, channel_id: str, thread_ts: str) -> int:
         with self._lock:
             cursor = self.conn.execute(
@@ -2200,6 +2541,7 @@ def _team_agent_values(agent: TeamAgent) -> tuple[object, ...]:
         agent.sort_order,
         agent.provider_preference.value if agent.provider_preference else None,
         agent.status.value,
+        agent.kind.value,
         agent.hired_at.isoformat() if agent.hired_at else None,
         agent.fired_at.isoformat() if agent.fired_at else None,
         json.dumps(agent.metadata, sort_keys=True),
@@ -2237,6 +2579,11 @@ def _normalize_bridge_prompt(value: str) -> str:
 
 def _team_agent_from_row(row: sqlite3.Row) -> TeamAgent:
     provider_preference = row["provider_preference"]
+    kind_value: str | None
+    try:
+        kind_value = row["kind"]
+    except (IndexError, KeyError):
+        kind_value = None
     return TeamAgent(
         agent_id=row["agent_id"],
         handle=row["handle"],
@@ -2253,6 +2600,7 @@ def _team_agent_from_row(row: sqlite3.Row) -> TeamAgent:
         sort_order=int(row["sort_order"]),
         provider_preference=Provider(provider_preference) if provider_preference else None,
         status=TeamAgentStatus(row["status"]),
+        kind=TeamAgentKind(kind_value) if kind_value else DEFAULT_TEAM_AGENT_KIND,
         hired_at=parse_timestamp(row["hired_at"]),
         fired_at=parse_timestamp(row["fired_at"]),
         metadata=json.loads(row["metadata_json"] or "{}"),
@@ -2438,6 +2786,8 @@ def _serialize_dependency(dep: WorkDependency) -> dict[str, object]:
         "task_id": dep.task_id,
         "handle": dep.handle,
         "description": dep.description,
+        "initiative_id": dep.initiative_id,
+        "local_id": dep.local_id,
     }
 
 
@@ -2450,6 +2800,10 @@ def _deserialize_dependency(raw: dict[str, object]) -> WorkDependency:
         task_id=raw.get("task_id") if isinstance(raw.get("task_id"), str) else None,
         handle=raw.get("handle") if isinstance(raw.get("handle"), str) else None,
         description=raw.get("description") if isinstance(raw.get("description"), str) else None,
+        initiative_id=(
+            raw.get("initiative_id") if isinstance(raw.get("initiative_id"), str) else None
+        ),
+        local_id=raw.get("local_id") if isinstance(raw.get("local_id"), str) else None,
     )
 
 
@@ -2512,4 +2866,54 @@ def _deferred_work_from_row(row: sqlite3.Row) -> DeferredWork:
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
         dispatched_at=parse_timestamp(row["dispatched_at"]),
         last_task_id=row["last_task_id"],
+    )
+
+
+def _pm_initiative_values(initiative: PmInitiative) -> tuple[object, ...]:
+    return (
+        initiative.initiative_id,
+        initiative.channel_id,
+        initiative.thread_ts,
+        initiative.message_ts,
+        initiative.title,
+        initiative.summary,
+        initiative.status.value,
+        initiative.requested_by_slack_user,
+        initiative.pm_agent_id,
+        initiative.pm_task_id,
+        initiative.watchdog_last_run_at.isoformat() if initiative.watchdog_last_run_at else None,
+        initiative.created_at.isoformat(),
+        initiative.updated_at.isoformat(),
+    )
+
+
+def _pm_initiative_from_row(row: sqlite3.Row) -> PmInitiative:
+    return PmInitiative(
+        initiative_id=row["initiative_id"],
+        channel_id=row["channel_id"],
+        thread_ts=row["thread_ts"],
+        message_ts=row["message_ts"],
+        title=row["title"],
+        summary=row["summary"],
+        status=PmInitiativeStatus(row["status"]),
+        requested_by_slack_user=row["requested_by_slack_user"],
+        pm_agent_id=row["pm_agent_id"],
+        pm_task_id=row["pm_task_id"],
+        watchdog_last_run_at=parse_timestamp(row["watchdog_last_run_at"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+    )
+
+
+def _pm_subtask_from_row(row: sqlite3.Row) -> PmSubtask:
+    depends_raw = json.loads(row["depends_on_json"] or "[]")
+    depends = tuple(item for item in depends_raw if isinstance(item, str))
+    return PmSubtask(
+        initiative_id=row["initiative_id"],
+        local_id=row["local_id"],
+        title=row["title"],
+        deferred_id=row["deferred_id"],
+        depends_on=depends,
+        sort_order=int(row["sort_order"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
     )

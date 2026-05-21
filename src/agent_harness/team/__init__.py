@@ -7,12 +7,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from agent_harness.models import (
+    DEFAULT_TEAM_AGENT_KIND,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
     Provider,
     TeamAgent,
+    TeamAgentKind,
     TeamAgentStatus,
     WorkRequest,
     utc_now,
@@ -600,12 +602,14 @@ def generate_team_agent(
     avatar_index: int | None = None,
     outside_interests: Sequence[str] | None = None,
     active_first_names: set[str] | frozenset[str] | None = None,
+    kind: TeamAgentKind | str = DEFAULT_TEAM_AGENT_KIND,
 ) -> TeamAgent:
     provider = (
         provider_preference
         if isinstance(provider_preference, Provider)
         else Provider(provider_preference)
     )
+    agent_kind = kind if isinstance(kind, TeamAgentKind) else TeamAgentKind(kind)
     used_handles = set(existing_handles or set())
     digest = _digest(seed, sort_order)
     profile = ROLE_PROFILES[sort_order % len(ROLE_PROFILES)]
@@ -636,13 +640,14 @@ def generate_team_agent(
         color_hex=color,
         avatar_slug=avatar_slug,
         icon_emoji=icon_emoji,
-        role=AGENT_CONTEXT_PLACEHOLDER,
+        role="program manager" if agent_kind == TeamAgentKind.PM else AGENT_CONTEXT_PLACEHOLDER,
         personality=AGENT_CONTEXT_PLACEHOLDER,
         voice=AGENT_CONTEXT_PLACEHOLDER,
         unique_strength=AGENT_CONTEXT_PLACEHOLDER,
         reaction_names=profile.reaction_names,
         sort_order=sort_order,
         provider_preference=provider,
+        kind=agent_kind,
         hired_at=utc_now(),
         metadata={
             "seed": seed,
@@ -667,6 +672,7 @@ def hire_team_agents(
     avatar_agents: list[TeamAgent] | None = None,
     randomize_identities: bool = False,
     rng: random.Random | random.SystemRandom | None = None,
+    kind: TeamAgentKind | str = DEFAULT_TEAM_AGENT_KIND,
 ) -> list[TeamAgent]:
     if count < 1:
         raise ValueError("hire count must be at least 1")
@@ -692,6 +698,7 @@ def hire_team_agents(
         randomize=randomize_identities,
         rng=chooser,
     )
+    agent_kind = kind if isinstance(kind, TeamAgentKind) else TeamAgentKind(kind)
     hired: list[TeamAgent] = []
     for offset in range(count):
         provider = (
@@ -709,6 +716,7 @@ def hire_team_agents(
                 _random_outside_interests(chooser) if randomize_identities and chooser else None
             ),
             active_first_names=active_first_names,
+            kind=agent_kind,
         )
         used_handles.add(agent.handle)
         active_first_names.add(_agent_first_name(agent).lower())
@@ -786,12 +794,57 @@ def agent_personal_context(agent: TeamAgent) -> str:
 
 
 def runtime_personality_prompt(agent: TeamAgent) -> str:
-    return (
+    base = (
         f"You are {agent.full_name}, known in Slack as @{agent.handle}. "
         "Personal context is explicitly included so it can lightly carry into "
         f"your personality when you chat: {agent_personal_context(agent)}. "
         "Do not roleplay beyond the engineering task."
     )
+    if agent.kind != TeamAgentKind.PM:
+        return base
+    return base + "\n\n" + PM_PERSONA_PROMPT
+
+
+PM_PERSONA_PROMPT = (
+    "You are a Slackgentic PM (program manager). Whenever someone tags you, "
+    "treat the request as a PM responsibility — never act as a worker on the "
+    "engineering task yourself.\n"
+    "\n"
+    "Your loop on a new initiative:\n"
+    "1. Requirements gathering. If the project is ambiguous, missing acceptance "
+    "criteria, missing scope boundaries, or could reasonably be implemented in "
+    "more than one way, ask the user one focused round of clarifying questions "
+    "in Slack and wait for their reply. Do not emit a plan yet. Bundle related "
+    "questions into a single message instead of asking one at a time.\n"
+    "2. Planning. Once you have enough to plan, emit exactly one hidden control "
+    "line on its own final line in the form `SLACKGENTIC: PM_PLAN <json>` (the "
+    "harness will inject the exact JSON shape on this turn). Subtasks should "
+    "be the smallest coherent units of independent work; depend_on edges "
+    "should be real ordering constraints, not preferences. Prefer `somebody` "
+    "as the target unless you have a real reason to pin a specific handle. "
+    "When a design problem genuinely benefits from multiple perspectives, set "
+    "`co_designers` to the list of 2+ handles instead of picking a single "
+    "target; the harness will fan out parallel drafts and a synthesis "
+    "subtask.\n"
+    "3. Ownership. After the plan is accepted you stay in the initiative "
+    "thread until every subtask reaches a terminal state. You are the single "
+    "point of contact: the watchdog escalates blockers to you, users ask you "
+    "about status, and you are responsible for unblocking work.\n"
+    "\n"
+    "Answering status questions. When the user asks how the project is going, "
+    "answer using the most recent `[PM HARNESS: initiative state]` block the "
+    "harness has injected into the conversation. Quote the actual subtask "
+    "states; do not invent progress. If the snapshot is missing or stale, "
+    "say so plainly and ask the user to refresh.\n"
+    "\n"
+    "Surfacing blockers. The harness escalates approval waits, stuck tasks, "
+    "and plan failures into this thread. When you see one, decide whether to "
+    "(a) nudge the worker, (b) reassign by canceling and re-creating the "
+    "subtask, or (c) surface the decision to the user with a concrete "
+    "recommendation. Default to surfacing rather than guessing.\n"
+    "\n"
+    "Tone. Be terse and operational. You are coordinating, not coding."
+)
 
 
 def format_agent_introduction(agent: TeamAgent) -> str:
@@ -928,7 +981,12 @@ def pick_idle_agent(
             if agent.handle == normalized:
                 return agent
         return None
-    candidates = agents
+    # ANYONE mode: PM-kind agents are reserved for PM duties (planning,
+    # requirements gathering, status answering) and never picked up generic
+    # worker tasks. PM resolvers are always routed via AssignmentMode.SPECIFIC.
+    candidates = [agent for agent in agents if agent.kind != TeamAgentKind.PM]
+    if not candidates:
+        return None
     if request.task_kind == AgentTaskKind.REVIEW:
         if author_agent and author_agent.provider_preference is not None:
             cross_model = [

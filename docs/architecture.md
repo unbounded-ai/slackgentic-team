@@ -199,6 +199,83 @@ and resumes the same agent in the same thread using the existing same-thread
 continuation path, preserving the provider session id when one is known. Marking
 a thread done cancels pending timers for that thread.
 
+## PM Initiatives
+
+PM-flavored agents are a distinct roster persona. Hire one with
+`team hire --kind pm` (provider can be `claude` or `codex`). PM-kind agents
+are stored on the same `team_agents` table with a `kind` column, and the
+work router filters them out of the ANYONE candidate pool so they are never
+picked up for generic worker tasks. The schema migration backfills
+`kind = 'engineer'` for pre-existing rows.
+
+Two entry points trigger PM mode:
+
+- `pm: ship the new logging stack` / `pm plan the migration to FastAPI` —
+  the `pm` keyword shortcut routes to an idle PM-kind agent (or falls back
+  to a worker when no PM is hired).
+- `@alice plan the storage refactor` — tagging a PM-kind agent by handle
+  always activates PM mode, even without the `pm` keyword. The Slack
+  controller compares the leading handle against the PM roster and pins
+  assignment with `AssignmentMode.SPECIFIC`.
+
+In a thread that already owns a PM initiative, follow-up replies stay with
+the same PM agent (the thread lookup in `_handle_pm_request` defers to
+`_handle_task_thread_reply` so a new initiative is not created). The
+controller wraps each follow-up with a `[PM HARNESS: initiative state]`
+snapshot — initiative id/title/status plus every subtask's status and owner
+handle — before delivery, so the PM can answer status questions or replan
+without re-reading thread history.
+
+The PM owns the initiative for its full life cycle. After emitting the
+plan, the PM resolver task is not marked `DONE` for PM-kind agents — the
+agent stays assigned to the thread so it can field clarifying questions,
+status checks, and replans. Because PM-kind agents are excluded from the
+worker router, this does not consume a worker slot.
+
+The plan itself is a hidden `SLACKGENTIC: PM_PLAN {...}` control line.
+The JSON includes a title, summary, and up to 20 subtasks with sibling
+`depends_on` ids, target (`somebody` or a specific handle), task kind
+(`work`/`review`), and an optional `after_delay_seconds` gate. The PM
+persona prompt also instructs the agent to ask at most one or two
+clarifying questions in the thread before committing to a plan.
+
+A subtask may include a `co_designers: [handles…]` list of two or more
+worker handles. `expand_codesign_plan` fans the subtask out into one draft
+per co-designer (each new `local_id` is `<original_id>--<handle>`, pinned
+to that handle with `AssignmentMode.SPECIFIC`) plus a synthesis subtask
+that takes the original `local_id` and depends on every draft. Downstream
+subtasks that referenced the original id continue to depend on the
+synthesis stage, so fan-out is transparent to the rest of the DAG.
+
+After validation, Slackgentic persists each subtask as a `deferred_work`
+row (with sibling references stored as `WorkDependency(kind=SUBTASK)`),
+plus one `pm_subtasks` row per subtask for human-readable bookkeeping.
+Root subtasks (no plan-level deps) are inserted in `ready` status with
+`fire_at = now()` so the existing deferred-work poller dispatches them on
+the next tick. As each subtask finishes, `evaluate_pending_deferred_work`
+already promotes downstream subtasks — no new dispatch code is needed.
+
+A `PMInitiativeRunner` polls active initiatives every ~30 s and acts as
+a watchdog. It surfaces blockers in the initiative thread once per
+fingerprint:
+
+- `STALLED_APPROVAL` — an unresolved `slack_agent_requests` row in a
+  subtask's thread older than 5 minutes.
+- `STALLED_TASK` — a subtask task in `active` for longer than 30 minutes
+  with no managed runtime activity.
+- terminal recap — when every subtask reaches a terminal status, the
+  watchdog posts a per-subtask outcome list, sets the initiative to `done`
+  or `cancelled`, and clears the dedup settings.
+
+The watchdog only reads state and posts in Slack. Dispatch belongs to the
+deferred-work poller; this separation keeps the watchdog safe even when it
+sees a transient false positive.
+
+Marking the initiative thread done cascades through
+`cancel_pm_initiative_for_thread` and the existing
+`cancel_deferred_work_for_thread`, so cancelling a PM thread stops all
+non-terminal subtasks.
+
 ## User Scheduled Work
 
 Users can create one-off or recurring scheduled work from the agent channel with

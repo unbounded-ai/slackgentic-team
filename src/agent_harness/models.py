@@ -49,6 +49,14 @@ class TeamAgentStatus(StrEnum):
     FIRED = "fired"
 
 
+class TeamAgentKind(StrEnum):
+    ENGINEER = "engineer"
+    PM = "pm"
+
+
+DEFAULT_TEAM_AGENT_KIND = TeamAgentKind.ENGINEER
+
+
 class AgentTaskStatus(StrEnum):
     QUEUED = "queued"
     ACTIVE = "active"
@@ -97,6 +105,14 @@ class DeferredWorkStatus(StrEnum):
 class WorkDependencyKind(StrEnum):
     THREAD = "thread"
     AGENT_BUSY = "agent_busy"
+    SUBTASK = "subtask"
+
+
+class PmInitiativeStatus(StrEnum):
+    PLANNING = "planning"
+    ACTIVE = "active"
+    DONE = "done"
+    CANCELLED = "cancelled"
 
 
 class AssignmentMode(StrEnum):
@@ -191,9 +207,14 @@ class TeamAgent:
     sort_order: int
     provider_preference: Provider | None = None
     status: TeamAgentStatus = TeamAgentStatus.ACTIVE
+    kind: TeamAgentKind = DEFAULT_TEAM_AGENT_KIND
     hired_at: datetime | None = None
     fired_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_pm(self) -> bool:
+        return self.kind == TeamAgentKind.PM
 
 
 @dataclass(frozen=True)
@@ -311,6 +332,36 @@ class WorkDependency:
     task_id: str | None = None
     handle: str | None = None
     description: str | None = None
+    initiative_id: str | None = None
+    local_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PmInitiative:
+    initiative_id: str
+    channel_id: str
+    thread_ts: str
+    title: str
+    summary: str
+    status: PmInitiativeStatus
+    created_at: datetime
+    updated_at: datetime
+    message_ts: str | None = None
+    requested_by_slack_user: str | None = None
+    pm_agent_id: str | None = None
+    pm_task_id: str | None = None
+    watchdog_last_run_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PmSubtask:
+    initiative_id: str
+    local_id: str
+    title: str
+    deferred_id: str
+    depends_on: tuple[str, ...]
+    sort_order: int
+    created_at: datetime
 
 
 @dataclass(frozen=True)
