@@ -147,6 +147,7 @@ class RunnerTests(unittest.TestCase):
                 permission_mode=PermissionMode.DANGEROUS,
                 model="opus",
                 worktree="feature",
+                claude_effort="high",
             )
         )
         self.assertEqual(command, "claude")
@@ -154,6 +155,9 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--verbose", args)
         self.assertIn("--output-format", args)
         self.assertIn("stream-json", args)
+        self.assertIn("--effort", args)
+        effort_index = args.index("--effort")
+        self.assertEqual(args[effort_index + 1], "high")
         self.assertNotIn("--no-session-persistence", args)
         self.assertIn("--dangerously-skip-permissions", args)
         self.assertNotIn("--permission-mode", args)
@@ -173,6 +177,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--permission-mode", args)
         permission_index = args.index("--permission-mode")
         self.assertEqual(args[permission_index + 1], "acceptEdits")
+        self.assertNotIn("--effort", args)
         self.assertNotIn("--dangerously-skip-permissions", args)
         self.assertIn("--allowedTools=Bash(git status:*)", args)
         self.assertIn("--allowedTools=Bash(git add:*)", args)
@@ -335,12 +340,16 @@ class RunnerTests(unittest.TestCase):
                 prompt="continue",
                 cwd=Path("/tmp/repo"),
                 resume_session_id="session-1",
+                claude_effort="max",
             )
         )
 
         self.assertEqual(command, "claude")
         self.assertIn("--resume", args)
         self.assertIn("session-1", args)
+        self.assertIn("--effort", args)
+        effort_index = args.index("--effort")
+        self.assertEqual(args[effort_index + 1], "max")
         self.assertEqual(args[-1], "continue")
 
     def test_claude_resume_command_adds_safe_auto_extra_roots(self):
