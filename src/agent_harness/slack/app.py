@@ -3870,14 +3870,31 @@ class SlackTeamController:
                 "could not deliver same-thread follow-up live; terminating worker for fresh resume on task %s",
                 previous_task.task_id,
             )
+            stop_succeeded = True
             if self.runtime is not None:
                 try:
-                    self.runtime.stop_task(previous_task.task_id, status=None)
+                    stop_succeeded = bool(
+                        self.runtime.stop_task(previous_task.task_id, status=None)
+                    )
                 except Exception:
+                    stop_succeeded = False
                     LOGGER.debug(
                         "failed to stop worker before fresh same-thread resume",
                         exc_info=True,
                     )
+            if not stop_succeeded:
+                # The worker did not exit even after the escalation in
+                # stop_task; the runtime's slot for this task_id is still
+                # occupied, so start_task below would silently refuse the
+                # fresh resume and the user's message would disappear into
+                # the task row with no worker to pick it up. Tell the user
+                # so they can retry instead of waiting forever.
+                LOGGER.warning(
+                    "fresh same-thread resume blocked for task %s; surfacing delivery failure to Slack",
+                    previous_task.task_id,
+                )
+                self._post_followup_delivery_failed_notice(thread, agent)
+                return False
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         metadata = metadata_with_pr_urls(metadata, request.prompt)
@@ -3905,6 +3922,25 @@ class SlackTeamController:
         self.store.upsert_agent_task(task)
         self._restore_task_action_buttons_if_active(task)
         return self._start_runtime_task(task, agent, thread)
+
+    def _post_followup_delivery_failed_notice(
+        self,
+        thread: SlackThreadRef,
+        agent,
+    ) -> None:
+        handle = getattr(agent, "handle", None) or "the agent"
+        text = (
+            f"I couldn't deliver your message to @{handle} — the previous run "
+            "is stuck and a fresh resume could not be started. Please send the "
+            "message again in a moment."
+        )
+        try:
+            self.gateway.post_thread_reply(thread, text)
+        except Exception:
+            LOGGER.debug(
+                "failed to post same-thread follow-up delivery failure notice",
+                exc_info=True,
+            )
 
     def _send_live_managed_task_followup(
         self,
