@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import html
+import json
 import logging
 import os
 import re
@@ -1013,6 +1014,9 @@ def _render_codex_event(event: AgentEvent) -> RenderedSessionEvent | None:
         message = payload.get("message") or payload.get("text")
         text = _clean_text(str(message)) if message else ""
         return RenderedSessionEvent(text, "user") if text else None
+    if event_type == "function_call" and _is_codex_native_request_user_input(payload):
+        text = _format_codex_request_user_input(payload)
+        return RenderedSessionEvent(text, "assistant") if text else None
     return None
 
 
@@ -1024,6 +1028,9 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
     message = event.metadata.get("message")
     if not isinstance(message, dict):
         return None
+    ask_user_question_text = _claude_ask_user_question_text(message)
+    if ask_user_question_text:
+        return RenderedSessionEvent(ask_user_question_text, "assistant")
     text = _claude_message_text(message)
     if not text:
         return None
@@ -1054,6 +1061,114 @@ def _claude_message_text(message: dict) -> str | None:
             if cleaned:
                 text_parts.append(cleaned)
     return "\n\n".join(text_parts) if text_parts else None
+
+
+def _claude_ask_user_question_text(message: dict) -> str | None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "tool_use" or item.get("name") != "AskUserQuestion":
+            continue
+        questions = item.get("input")
+        if not isinstance(questions, dict):
+            continue
+        return _format_ask_user_question(questions.get("questions"))
+    return None
+
+
+def _format_ask_user_question(questions: object) -> str | None:
+    if not isinstance(questions, list):
+        return None
+    blocks: list[str] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        block = _format_question_block(question)
+        if block:
+            blocks.append(block)
+    if not blocks:
+        return None
+    header = (
+        "*Claude is asking a question in the terminal.* "
+        "Answer in the Claude terminal — Slackgentic cannot forward the selection."
+    )
+    return "\n\n".join([header, *blocks])
+
+
+def _is_codex_native_request_user_input(payload: dict) -> bool:
+    if payload.get("name") != "request_user_input":
+        return False
+    namespace = payload.get("namespace")
+    return not (isinstance(namespace, str) and namespace.strip())
+
+
+def _format_codex_request_user_input(payload: dict) -> str | None:
+    arguments = payload.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = None
+    if not isinstance(arguments, dict):
+        return None
+    block = _format_question_block(arguments)
+    if not block:
+        return None
+    header = (
+        "*Codex is asking a question in the terminal.* "
+        "Answer in the Codex terminal — Slackgentic cannot forward the selection."
+    )
+    return f"{header}\n\n{block}"
+
+
+def _format_question_block(question: dict) -> str | None:
+    question_text = _clean_text(_question_string_field(question, "question"))
+    header = _clean_text(_question_string_field(question, "header"))
+    options = _question_options(question.get("options"))
+    if not question_text and not options:
+        return None
+    lines: list[str] = []
+    if header:
+        suffix = " (select all that apply)" if question.get("multiSelect") is True else ""
+        lines.append(f"*{header}*{suffix}")
+    if question_text:
+        lines.append(question_text)
+    for label, description in options:
+        if description:
+            lines.append(f"• `{label}` — {description}")
+        else:
+            lines.append(f"• `{label}`")
+    return "\n".join(lines) if lines else None
+
+
+def _question_string_field(question: dict, key: str) -> str:
+    value = question.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _question_options(value: object) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        return []
+    options: list[tuple[str, str]] = []
+    for item in value:
+        if isinstance(item, str):
+            label = _clean_text(item)
+            if label:
+                options.append((label, ""))
+            continue
+        if not isinstance(item, dict):
+            continue
+        label = _clean_text(item.get("label") if isinstance(item.get("label"), str) else "")
+        if not label:
+            continue
+        description = _clean_text(
+            item.get("description") if isinstance(item.get("description"), str) else ""
+        )
+        options.append((label, description))
+    return options
 
 
 def _slack_chunks(text: str, limit: int = 2800) -> list[str]:
