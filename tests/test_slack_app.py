@@ -1169,7 +1169,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "#dangerous-mode write a tiny validation note",
+                            "text": "somebody #dangerous-mode write a tiny validation note",
                             "ts": "171.000001",
                         }
                     }
@@ -1481,7 +1481,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "write the status update",
+                            "text": "somebody write the status update",
                             "ts": "171.000001",
                         }
                     }
@@ -2809,7 +2809,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "tablet service should be multi-tablet",
+                            "text": "somebody make the tablet service multi-tablet",
                             "ts": "171.000001",
                         }
                     }
@@ -3320,7 +3320,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "Update the README",
+                            "text": "somebody update the README",
                             "ts": "171.000001",
                         }
                     }
@@ -3365,8 +3365,8 @@ class SlackAppTests(unittest.TestCase):
                             "channel": "C1",
                             "user": "U1",
                             "text": (
-                                "Can you explain how this works with "
-                                "https://github.com/acme/app/pull/42?"
+                                "somebody explain how this works with "
+                                "https://github.com/acme/app/pull/42"
                             ),
                             "ts": "171.000001",
                         }
@@ -3428,7 +3428,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Fix this issue {linked_url}",
+                            "text": f"somebody fix this issue {linked_url}",
                             "ts": "171.000001",
                         }
                     }
@@ -3488,7 +3488,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Fix the threading bug from {linked_url}",
+                            "text": f"somebody fix the threading bug from {linked_url}",
                             "ts": "1712345680.000001",
                         }
                     }
@@ -3622,7 +3622,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Fix the threading bug from {linked_url}",
+                            "text": f"somebody fix the threading bug from {linked_url}",
                             "ts": "1712345680.000001",
                         }
                     }
@@ -3678,7 +3678,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Look at {linked_url} and fix it",
+                            "text": f"somebody look at {linked_url} and fix it",
                             "ts": "1712345680.000002",
                         }
                     }
@@ -3731,7 +3731,7 @@ class SlackAppTests(unittest.TestCase):
                             "channel": "C1",
                             "user": "U1",
                             "thread_ts": "1712345680.000003",
-                            "text": f"Please look at {linked_url}",
+                            "text": f"somebody look at {linked_url}",
                             "ts": "1712345680.000004",
                         }
                     }
@@ -3837,7 +3837,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update the README",
+                        "text": "somebody update the README",
                         "ts": "171.000001",
                     }
                 }
@@ -3871,7 +3871,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update docs after wake",
+                        "text": "somebody update docs after wake",
                         "ts": "171.000010",
                     }
                 )
@@ -3889,7 +3889,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(recovered, 1)
                 self.assertEqual(len(store.list_agent_tasks()), 1)
-                self.assertEqual(store.list_agent_tasks()[0].prompt, "Update docs after wake")
+                self.assertEqual(store.list_agent_tasks()[0].prompt, "update docs after wake")
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "181.000000")
             finally:
@@ -3916,7 +3916,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update docs after interrupted restart",
+                        "text": "somebody update docs after interrupted restart",
                         "ts": "171.000010",
                         "reactions": [{"name": "white_check_mark"}],
                     }
@@ -3937,7 +3937,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(store.list_agent_tasks()), 1)
                 self.assertEqual(
                     store.list_agent_tasks()[0].prompt,
-                    "Update docs after interrupted restart",
+                    "update docs after interrupted restart",
                 )
                 self.assertEqual(len(runtime.started), 1)
             finally:
@@ -4075,7 +4075,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "Update docs when someone is available",
+                            "text": "somebody update the docs",
                             "ts": "171.000010",
                         }
                     }
@@ -4088,7 +4088,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update docs when someone is available",
+                        "text": "somebody update the docs",
                         "ts": "171.000010",
                         "reactions": [{"name": "white_check_mark"}],
                     }
@@ -4290,7 +4290,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "#dangerous-mode Update the README",
+                            "text": "somebody #dangerous-mode update the README",
                             "ts": "171.000001",
                         }
                     }
@@ -4298,7 +4298,7 @@ class SlackAppTests(unittest.TestCase):
 
                 tasks = store.list_agent_tasks()
                 self.assertEqual(len(tasks), 1)
-                self.assertEqual(tasks[0].prompt, "Update the README")
+                self.assertEqual(tasks[0].prompt, "update the README")
                 self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
                 started_task, _, _ = runtime.started[0]
                 self.assertTrue(started_task.metadata[DANGEROUS_MODE_METADATA_KEY])

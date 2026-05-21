@@ -197,12 +197,14 @@ The PM emits a structured plan (title, summary, up to 20 subtasks with
 sibling dependencies). Subtasks may optionally include a `co_designers`
 list of two or more handles, in which case the PM fans the subtask out
 into one draft per co-designer running in parallel and follows up with
-an automatic synthesis stage. Each subtask becomes a deferred-work row,
-dispatched the moment its dependencies satisfy. A watchdog polls active
-initiatives and surfaces blockers in the initiative thread — stalled
-approvals, stuck tasks, or plan failures — but never starts or stops
-work on its own. When every subtask finishes, the watchdog posts a
-recap and closes the initiative.
+an automatic synthesis stage. The plan is parked for approval — no
+subtask runs until the user clicks *Start executing* on the plan message
+(or *Cancel* to drop it). Once approved, each subtask becomes a
+deferred-work row, dispatched the moment its dependencies satisfy. A
+watchdog polls active initiatives and surfaces blockers in the initiative
+thread — stalled approvals, stuck tasks, or plan failures — but never
+starts or stops work on its own. When every subtask finishes, the
+watchdog posts a recap and closes the initiative.
 
 Marking the PM thread done cancels every non-terminal subtask in the
 initiative.

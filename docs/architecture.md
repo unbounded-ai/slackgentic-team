@@ -247,13 +247,27 @@ that takes the original `local_id` and depends on every draft. Downstream
 subtasks that referenced the original id continue to depend on the
 synthesis stage, so fan-out is transparent to the rest of the DAG.
 
-After validation, Slackgentic persists each subtask as a `deferred_work`
-row (with sibling references stored as `WorkDependency(kind=SUBTASK)`),
-plus one `pm_subtasks` row per subtask for human-readable bookkeeping.
-Root subtasks (no plan-level deps) are inserted in `ready` status with
-`fire_at = now()` so the existing deferred-work poller dispatches them on
-the next tick. As each subtask finishes, `evaluate_pending_deferred_work`
-already promotes downstream subtasks — no new dispatch code is needed.
+After validation, the controller does *not* immediately dispatch the
+plan. Instead, the initiative is moved to `awaiting_approval` with the
+expanded plan serialized into `pm_initiatives.pending_plan_json`, and the
+plan ack message is posted with a *Start executing* (primary) and
+*Cancel* (danger) button row. The watchdog skips initiatives in
+`planning` or `awaiting_approval`, so nothing runs until a human chooses.
+
+When the user clicks *Start executing*, the block-action handler
+deserializes the parked plan, promotes the initiative to `active`,
+persists each subtask as a `deferred_work` row (with sibling references
+stored as `WorkDependency(kind=SUBTASK)`) plus one `pm_subtasks` row per
+subtask, and inserts root subtasks (no plan-level deps) in `ready` status
+with `fire_at = now()` so the existing deferred-work poller dispatches
+them on the next tick. As each subtask finishes,
+`evaluate_pending_deferred_work` promotes downstream subtasks — no new
+dispatch code is needed. If subtask persistence fails partway through,
+the initiative is rolled back to `cancelled` and the surfaced error is
+posted to the thread. *Cancel* moves the initiative straight to
+`cancelled` without persisting any subtasks. Both buttons rewrite the
+plan message to drop the action row and append a `_Plan {status}._`
+footer so the approval cannot be re-clicked.
 
 A `PMInitiativeRunner` polls active initiatives every ~30 s and acts as
 a watchdog. It surfaces blockers in the initiative thread once per

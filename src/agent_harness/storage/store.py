@@ -331,6 +331,8 @@ CREATE TABLE IF NOT EXISTS pm_initiatives (
   pm_agent_id TEXT,
   pm_task_id TEXT,
   watchdog_last_run_at TEXT,
+  pending_plan_json TEXT,
+  pending_plan_message_ts TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(pm_agent_id) REFERENCES team_agents(agent_id),
@@ -413,6 +415,7 @@ class Store:
         with self._lock:
             self.conn.executescript(SCHEMA)
             self._ensure_team_agent_kind_column()
+            self._ensure_pm_initiative_pending_plan_columns()
             self.conn.commit()
 
     def _ensure_team_agent_kind_column(self) -> None:
@@ -421,6 +424,16 @@ class Store:
         if "kind" not in columns:
             self.conn.execute(
                 "ALTER TABLE team_agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'engineer'"
+            )
+
+    def _ensure_pm_initiative_pending_plan_columns(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(pm_initiatives)").fetchall()
+        columns = {row["name"] for row in rows}
+        if "pending_plan_json" not in columns:
+            self.conn.execute("ALTER TABLE pm_initiatives ADD COLUMN pending_plan_json TEXT")
+        if "pending_plan_message_ts" not in columns:
+            self.conn.execute(
+                "ALTER TABLE pm_initiatives ADD COLUMN pending_plan_message_ts TEXT"
             )
 
     def upsert_session(self, session: AgentSession) -> None:
@@ -2252,8 +2265,8 @@ class Store:
                 INSERT INTO pm_initiatives (
                   initiative_id, channel_id, thread_ts, message_ts, title, summary, status,
                   requested_by_slack_user, pm_agent_id, pm_task_id, watchdog_last_run_at,
-                  created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  pending_plan_json, pending_plan_message_ts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _pm_initiative_values(initiative),
             )
@@ -2276,6 +2289,7 @@ class Store:
     ) -> list[PmInitiative]:
         selected = statuses or (
             PmInitiativeStatus.PLANNING,
+            PmInitiativeStatus.AWAITING_APPROVAL,
             PmInitiativeStatus.ACTIVE,
         )
         if not selected:
@@ -2307,6 +2321,39 @@ class Store:
                 WHERE initiative_id = ?
                 """,
                 (status.value, now.isoformat(), initiative_id),
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_pm_initiative(initiative_id)
+
+    def set_pm_initiative_pending_plan(
+        self,
+        initiative_id: str,
+        *,
+        plan_json: str | None,
+        status: PmInitiativeStatus,
+        pending_plan_message_ts: str | None = None,
+    ) -> PmInitiative | None:
+        """Stash (or clear) the parsed plan and move the initiative to ``status``."""
+        now = utc_now()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE pm_initiatives
+                SET pending_plan_json = ?,
+                    pending_plan_message_ts = ?,
+                    status = ?,
+                    updated_at = ?
+                WHERE initiative_id = ?
+                """,
+                (
+                    plan_json,
+                    pending_plan_message_ts,
+                    status.value,
+                    now.isoformat(),
+                    initiative_id,
+                ),
             )
             self.conn.commit()
             if cursor.rowcount == 0:
@@ -2486,7 +2533,7 @@ class Store:
                 SET status = ?, updated_at = ?
                 WHERE channel_id = ?
                   AND thread_ts = ?
-                  AND status IN (?, ?)
+                  AND status IN (?, ?, ?)
                 """,
                 (
                     PmInitiativeStatus.CANCELLED.value,
@@ -2494,6 +2541,7 @@ class Store:
                     channel_id,
                     thread_ts,
                     PmInitiativeStatus.PLANNING.value,
+                    PmInitiativeStatus.AWAITING_APPROVAL.value,
                     PmInitiativeStatus.ACTIVE.value,
                 ),
             )
@@ -2882,12 +2930,15 @@ def _pm_initiative_values(initiative: PmInitiative) -> tuple[object, ...]:
         initiative.pm_agent_id,
         initiative.pm_task_id,
         initiative.watchdog_last_run_at.isoformat() if initiative.watchdog_last_run_at else None,
+        initiative.pending_plan_json,
+        initiative.pending_plan_message_ts,
         initiative.created_at.isoformat(),
         initiative.updated_at.isoformat(),
     )
 
 
 def _pm_initiative_from_row(row: sqlite3.Row) -> PmInitiative:
+    columns = row.keys()
     return PmInitiative(
         initiative_id=row["initiative_id"],
         channel_id=row["channel_id"],
@@ -2900,6 +2951,12 @@ def _pm_initiative_from_row(row: sqlite3.Row) -> PmInitiative:
         pm_agent_id=row["pm_agent_id"],
         pm_task_id=row["pm_task_id"],
         watchdog_last_run_at=parse_timestamp(row["watchdog_last_run_at"]),
+        pending_plan_json=row["pending_plan_json"] if "pending_plan_json" in columns else None,
+        pending_plan_message_ts=(
+            row["pending_plan_message_ts"]
+            if "pending_plan_message_ts" in columns
+            else None
+        ),
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
     )

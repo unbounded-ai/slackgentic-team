@@ -458,6 +458,66 @@ CODESIGN_SYNTHESIS_PROMPT_TEMPLATE = (
 )
 
 
+def serialize_parsed_pm_plan(plan: ParsedPmPlan) -> str:
+    """Serialize an expanded ``ParsedPmPlan`` for later replay after approval.
+
+    Stored verbatim on ``pm_initiatives.pending_plan_json``. Deserialization
+    skips the JSON parser used for incoming PM signals and rebuilds the
+    dataclasses directly, so handle-set drift between planning and approval
+    does not invalidate the stored plan.
+    """
+    payload = {
+        "title": plan.title,
+        "summary": plan.summary,
+        "subtasks": [
+            {
+                "id": subtask.local_id,
+                "title": subtask.title,
+                "prompt": subtask.request.prompt,
+                "assignment_mode": subtask.request.assignment_mode.value,
+                "requested_handle": subtask.request.requested_handle,
+                "task_kind": subtask.request.task_kind.value,
+                "permission_mode": subtask.request.permission_mode.value,
+                "depends_on": list(subtask.depends_on),
+                "after_delay_seconds": subtask.after_delay_seconds,
+                "co_designers": list(subtask.co_designers),
+            }
+            for subtask in plan.subtasks
+        ],
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def deserialize_parsed_pm_plan(blob: str) -> ParsedPmPlan:
+    data = json.loads(blob)
+    subtasks: list[ParsedPmSubtask] = []
+    for item in data["subtasks"]:
+        request = WorkRequest(
+            prompt=item["prompt"],
+            assignment_mode=AssignmentMode(item["assignment_mode"]),
+            requested_handle=item.get("requested_handle"),
+            task_kind=AgentTaskKind(item.get("task_kind") or AgentTaskKind.WORK.value),
+            permission_mode=PermissionMode(
+                item.get("permission_mode") or DEFAULT_PERMISSION_MODE.value
+            ),
+        )
+        subtasks.append(
+            ParsedPmSubtask(
+                local_id=item["id"],
+                title=item["title"],
+                request=request,
+                depends_on=tuple(item.get("depends_on") or ()),
+                after_delay_seconds=int(item.get("after_delay_seconds") or 0),
+                co_designers=tuple(item.get("co_designers") or ()),
+            )
+        )
+    return ParsedPmPlan(
+        title=data["title"],
+        summary=data["summary"],
+        subtasks=tuple(subtasks),
+    )
+
+
 def expand_codesign_plan(plan: ParsedPmPlan) -> ParsedPmPlan:
     """Fan out co-design subtasks into per-designer drafts plus a synthesis stage.
 

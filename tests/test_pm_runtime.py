@@ -141,7 +141,7 @@ class PmDispatchTests(unittest.TestCase):
 
 
 class PmRuntimeTests(unittest.TestCase):
-    def test_pm_plan_signal_creates_initiative_subtasks(self):
+    def test_pm_plan_signal_parks_for_approval_without_firing(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -191,13 +191,90 @@ class PmRuntimeTests(unittest.TestCase):
                 self.assertTrue(handled)
                 refreshed = store.get_pm_initiative(initiative.initiative_id)
                 assert refreshed is not None
-                self.assertEqual(refreshed.status, PmInitiativeStatus.ACTIVE)
+                self.assertEqual(refreshed.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertIsNotNone(refreshed.pending_plan_json)
+                # No subtasks should be persisted, and nothing should fire.
+                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
+                self.assertEqual(
+                    [t for t, *_ in runtime.started if t.task_id != pm_task.task_id], []
+                )
+                # Plan ack mentions the approval gate.
+                plan_message = gateway.thread_replies[-1]
+                self.assertIn("Start executing", plan_message.get("text", ""))
+            finally:
+                store.close()
+
+    def test_pm_initiative_start_button_dispatches_root_subtasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Ship feature X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                signal = _build_plan_signal(
+                    initiative.initiative_id,
+                    handles=[agent.handle],
+                )
+                controller.handle_runtime_agent_control(pm_task, agent, thread_ref, signal)
+                parked = store.get_pm_initiative(initiative.initiative_id)
+                assert parked is not None
+                self.assertEqual(parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+
+                action_value = json.dumps(
+                    {
+                        "v": 1,
+                        "action": "pm_initiative.start",
+                        "initiative_id": initiative.initiative_id,
+                    }
+                )
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {"action_id": "pm_initiative.start", "value": action_value}
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.plan"},
+                        "user": {"id": "U2"},
+                    }
+                )
+
+                approved = store.get_pm_initiative(initiative.initiative_id)
+                assert approved is not None
+                self.assertEqual(approved.status, PmInitiativeStatus.ACTIVE)
+                self.assertIsNone(approved.pending_plan_json)
                 subtasks = store.list_pm_subtasks(initiative.initiative_id)
                 self.assertEqual([s.local_id for s in subtasks], ["investigate", "implement"])
                 root_deferred = store.get_deferred_work(subtasks[0].deferred_id)
                 assert root_deferred is not None
-                # The root subtask kicks off immediately because the PM resolver
-                # was marked DONE before the eager fire.
                 self.assertIn(
                     root_deferred.status,
                     {DeferredWorkStatus.DONE, DeferredWorkStatus.READY},
@@ -205,12 +282,79 @@ class PmRuntimeTests(unittest.TestCase):
                 child_deferred = store.get_deferred_work(subtasks[1].deferred_id)
                 assert child_deferred is not None
                 self.assertEqual(child_deferred.status, DeferredWorkStatus.WAITING_DEPS)
-                # The resolver task itself is now done.
-                resolver_task = store.get_agent_task(pm_task.task_id)
-                assert resolver_task is not None
-                self.assertEqual(resolver_task.status, AgentTaskStatus.DONE)
                 # The root subtask was dispatched to the (now idle) agent.
-                self.assertTrue(any(t.task_id != pm_task.task_id for t, *_ in runtime.started))
+                self.assertTrue(
+                    any(t.task_id != pm_task.task_id for t, *_ in runtime.started)
+                )
+            finally:
+                store.close()
+
+    def test_pm_initiative_cancel_button_cancels_without_firing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Ship feature X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                signal = _build_plan_signal(
+                    initiative.initiative_id,
+                    handles=[agent.handle],
+                )
+                controller.handle_runtime_agent_control(pm_task, agent, thread_ref, signal)
+
+                action_value = json.dumps(
+                    {
+                        "v": 1,
+                        "action": "pm_initiative.cancel",
+                        "initiative_id": initiative.initiative_id,
+                    }
+                )
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {"action_id": "pm_initiative.cancel", "value": action_value}
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.plan"},
+                        "user": {"id": "U2"},
+                    }
+                )
+
+                cancelled = store.get_pm_initiative(initiative.initiative_id)
+                assert cancelled is not None
+                self.assertEqual(cancelled.status, PmInitiativeStatus.CANCELLED)
+                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
+                self.assertEqual(
+                    [t for t, *_ in runtime.started if t.task_id != pm_task.task_id], []
+                )
             finally:
                 store.close()
 

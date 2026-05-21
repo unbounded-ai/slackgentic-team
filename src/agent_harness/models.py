@@ -110,6 +110,7 @@ class WorkDependencyKind(StrEnum):
 
 class PmInitiativeStatus(StrEnum):
     PLANNING = "planning"
+    AWAITING_APPROVAL = "awaiting_approval"
     ACTIVE = "active"
     DONE = "done"
     CANCELLED = "cancelled"
@@ -351,6 +352,8 @@ class PmInitiative:
     pm_agent_id: str | None = None
     pm_task_id: str | None = None
     watchdog_last_run_at: datetime | None = None
+    pending_plan_json: str | None = None
+    pending_plan_message_ts: str | None = None
 
 
 @dataclass(frozen=True)
