@@ -23,6 +23,7 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.providers.base import AgentProvider
+from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.codex_app_server import DEFAULT_CODEX_APP_SERVER_URL
 from agent_harness.runtime.health import LoopBackoff, log_loop_failure
 from agent_harness.runtime.tasks import build_task_prompt
@@ -1024,6 +1025,8 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
     if event.event_type not in {"assistant", "user"}:
         return None
     if event.metadata.get("isMeta") is True:
+        return None
+    if event.event_type == "assistant" and is_synthetic_claude_assistant_record(event.metadata):
         return None
     message = event.metadata.get("message")
     if not isinstance(message, dict):

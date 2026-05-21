@@ -2311,6 +2311,25 @@ class SessionMirrorTests(unittest.TestCase):
         assert rendered is not None
         self.assertNotIn("channel source", rendered)
 
+    def test_render_claude_event_drops_synthetic_no_response_record(self):
+        # The mirror used to surface this synthetic record verbatim into the
+        # Slack thread. Treat it as nothing-to-render — the agent did not
+        # actually speak.
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "No response requested."}],
+                }
+            },
+        )
+
+        self.assertIsNone(render_session_event(event))
+
     def test_codex_parent_warns_when_session_lacks_remote_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
