@@ -34,6 +34,7 @@ from agent_harness.permissions import (
     task_permission_mode,
 )
 from agent_harness.pr_links import pr_urls_from_metadata
+from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
@@ -62,6 +63,9 @@ MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
 MANAGED_RUN_PROGRESS_WARNING_TIMEOUT = timedelta(minutes=5)
 MANAGED_RUN_STALL_TIMEOUT = timedelta(minutes=15)
+CLAUDE_EFFORT_SETTING = "effortLevel"
+CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+CLAUDE_DEFAULT_EFFORT = "xhigh"
 FAST_STREAM_POLL_SECONDS = 0.1
 MIN_STREAM_POLL_SECONDS = 0.01
 TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS = 5.0
@@ -266,6 +270,11 @@ class ManagedTaskRuntime:
             safe_auto_extra_roots=_safe_auto_extra_roots(provider, cwd, default_cwd),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
+            claude_effort=(
+                _claude_effort_from_settings(cwd, self.home)
+                if provider == Provider.CLAUDE
+                else None
+            ),
         )
         process = self.process_factory(request)
         try:
@@ -1632,6 +1641,48 @@ def _safe_auto_extra_roots(provider: Provider, cwd: Path, default_cwd: Path) -> 
     return (root,)
 
 
+def _claude_effort_from_settings(cwd: Path, home: Path) -> str:
+    effort: str | None = None
+    for path in _claude_settings_paths(cwd, home):
+        value = _claude_effort_from_settings_file(path)
+        if value is not None:
+            effort = value
+    return effort or CLAUDE_DEFAULT_EFFORT
+
+
+def _claude_settings_paths(cwd: Path, home: Path) -> tuple[Path, ...]:
+    paths: list[Path] = [
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+    ]
+    for root in reversed((cwd, *cwd.parents)):
+        paths.append(root / ".claude" / "settings.json")
+        paths.append(root / ".claude" / "settings.local.json")
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(_resolved_path(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return tuple(deduped)
+
+
+def _claude_effort_from_settings_file(path: Path) -> str | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(CLAUDE_EFFORT_SETTING)
+    if not isinstance(value, str):
+        return None
+    effort = value.strip().lower()
+    return effort if effort in CLAUDE_EFFORT_LEVELS else None
+
+
 def _macos_tcc_protected_cwd_issue(
     cwd: Path,
     *,
@@ -2435,6 +2486,8 @@ def _claude_transcript_messages_from_path(
             continue
         if record.get("type") != "assistant":
             continue
+        if is_synthetic_claude_assistant_record(record):
+            continue
         timestamp = parse_timestamp(record.get("timestamp"))
         if since is not None and timestamp is not None and timestamp < since:
             continue
@@ -2490,6 +2543,8 @@ def _render_claude_json_line(line: str) -> str | None:
         result = event.get("result")
         return _clean_terminal_output(str(result)) if result else None
     if event_type == "assistant":
+        if is_synthetic_claude_assistant_record(event):
+            return None
         return _claude_assistant_message_text(event)
     if event_type == "error":
         message = event.get("message") or event.get("error")
