@@ -123,8 +123,11 @@ from agent_harness.sessions.mirror import (
     SessionMirror,
 )
 from agent_harness.slack import (
+    IDLE_RELEASE_PROMPT_TEXT,
     AgentRosterStatus,
     build_channel_overview_blocks,
+    build_idle_release_dismissed_blocks,
+    build_idle_release_prompt_blocks,
     build_setup_modal,
     build_task_thread_blocks,
     build_team_roster_blocks,
@@ -255,6 +258,7 @@ THREAD_CONTEXT_DELEGATE_VISIBLE_PROMPT = "continue using the thread context abov
 QUEUED_THREAD_FOLLOWUPS_METADATA_KEY = "queued_thread_followups"
 ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY = "active_thread_followup_message_ts"
 ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY = "active_thread_followup_message_ts_values"
+IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY = "idle_release_prompt_message_ts"
 LINKED_THREAD_ROUTE_INTENT_RE = re.compile(
     r"\b(?:this|the)\s+unrelated\s+thread\b"
     r"|\binstead\s+of\s+(?:this|the\s+current|current)\s+(?:thread|one)\b"
@@ -3845,6 +3849,7 @@ class SlackTeamController:
         request_message_ts: str | None = None,
         try_live_send: bool = True,
     ) -> bool:
+        previous_task = self._dismiss_idle_release_prompt(previous_task, thread)
         previous_task = self._record_task_pr_urls(previous_task, agent, thread, request.prompt)
         if (
             try_live_send
@@ -4199,6 +4204,7 @@ class SlackTeamController:
         prompts = [item["prompt"] for item in queued if isinstance(item.get("prompt"), str)]
         if not prompts:
             return False
+        latest = self._dismiss_idle_release_prompt(latest, thread)
         metadata = dict(latest.metadata)
         metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
         message_ts_values = _queued_thread_followup_message_ts_values(queued)
@@ -4325,15 +4331,25 @@ class SlackTeamController:
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
         if not isinstance(delegate_to_agent_id, str) or not isinstance(delegate_prompt, str):
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         if not delegate_prompt.strip() or not thread.thread_ts:
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         target_agent = self.store.get_team_agent(delegate_to_agent_id)
         if target_agent is None:
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         if target_agent.agent_id == agent.agent_id:
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         if target_agent.agent_id in self._busy_agent_ids_for_assignment():
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         visible_prompt = task.metadata.get("delegate_visible_prompt")
         if not isinstance(visible_prompt, str) or not visible_prompt.strip():
@@ -4432,6 +4448,68 @@ class SlackTeamController:
             self.store.upsert_managed_thread_task(held, thread)
         self._restore_task_action_buttons_if_active(held)
         return self.store.get_agent_task(current.task_id) or held
+
+    def _post_idle_release_prompt(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+    ) -> None:
+        if not thread.thread_ts:
+            return
+        current = self.store.get_agent_task(task.task_id) or task
+        if current.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return
+        existing_ts = current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+        if isinstance(existing_ts, str) and existing_ts:
+            return
+        try:
+            posted = self.gateway.post_thread_reply(
+                thread,
+                IDLE_RELEASE_PROMPT_TEXT,
+                blocks=build_idle_release_prompt_blocks(current),
+            )
+        except Exception:
+            LOGGER.debug("failed to post idle release prompt", exc_info=True)
+            return
+        message_ts = getattr(posted, "ts", None)
+        if not message_ts:
+            return
+        latest = self.store.get_agent_task(current.task_id) or current
+        if latest.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return
+        metadata = dict(latest.metadata)
+        metadata[IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY] = message_ts
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+
+    def _dismiss_idle_release_prompt(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        message_ts = current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+        if not isinstance(message_ts, str) or not message_ts:
+            return current
+        channel_id = thread.channel_id or current.channel_id
+        if channel_id:
+            try:
+                self.gateway.update_message(
+                    channel_id,
+                    message_ts,
+                    " ",
+                    blocks=build_idle_release_dismissed_blocks(current),
+                )
+            except Exception:
+                LOGGER.debug("failed to dismiss idle release prompt", exc_info=True)
+        metadata = dict(current.metadata)
+        metadata.pop(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, None)
+        if metadata == current.metadata:
+            return current
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return self.store.get_agent_task(current.task_id) or updated
 
     def handle_runtime_agent_control(
         self,
@@ -5431,6 +5509,7 @@ class SlackTeamController:
     ) -> None:
         task = self.store.get_agent_task(task.task_id) or task
         self._remove_task_action_buttons_if_resolved(task)
+        task = self._clear_idle_release_prompt_on_close(task, thread)
         if include_thread and task.thread_ts:
             self._mark_message_complete(thread.channel_id, task.thread_ts)
         for message_ts in _task_request_message_ts_values(task):
@@ -5438,6 +5517,37 @@ class SlackTeamController:
                 continue
             self._clear_message_status_reactions(thread.channel_id, message_ts)
         self._reconcile_pending_thread_reactions(task, thread)
+
+    def _clear_idle_release_prompt_on_close(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        message_ts = current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+        if not isinstance(message_ts, str) or not message_ts:
+            return current
+        channel_id = thread.channel_id or current.channel_id
+        if channel_id:
+            try:
+                self.gateway.update_message(
+                    channel_id,
+                    message_ts,
+                    " ",
+                    blocks=build_idle_release_dismissed_blocks(current),
+                )
+            except Exception:
+                LOGGER.debug(
+                    "failed to clear idle release prompt on task close",
+                    exc_info=True,
+                )
+        metadata = dict(current.metadata)
+        metadata.pop(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, None)
+        if metadata == current.metadata:
+            return current
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return self.store.get_agent_task(current.task_id) or updated
 
     def _reconcile_pending_thread_reactions(
         self,

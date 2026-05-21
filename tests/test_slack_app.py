@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from dataclasses import replace
@@ -8,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import (
     AGENT_DEFERRED_SIGNAL_PREFIX,
     DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
@@ -47,6 +49,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_MAX_RESUMES,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
+    ManagedTaskRuntime,
     managed_run_resume_attempts,
 )
 from agent_harness.schedules import (
@@ -59,6 +62,7 @@ from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
     CLAUDE_CHANNEL_PERMISSION_METHOD,
     DEFAULT_AGENT_AVATAR_BASE_URL,
+    IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY,
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
     ClaudePermissionAutoResolver,
@@ -2463,6 +2467,451 @@ class SlackAppTests(unittest.TestCase):
                     gateway.removed_reactions,
                 )
             finally:
+                store.close()
+
+    def _find_idle_release_prompt(self, gateway):
+        for reply in gateway.thread_replies:
+            blocks = reply.get("blocks") or []
+            for block in blocks:
+                block_id = block.get("block_id", "")
+                if block_id.startswith("task.idle.actions."):
+                    return reply
+        return None
+
+    def test_runtime_task_exit_posts_idle_release_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+
+                idle_reply = self._find_idle_release_prompt(gateway)
+                self.assertIsNotNone(idle_reply, "expected idle release prompt to be posted")
+                self.assertEqual(idle_reply["thread"].thread_ts, "171.thread")
+                self.assertIn("Free up this agent", str(idle_reply["blocks"]))
+                self.assertIn("Reply", idle_reply["text"])
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(
+                    current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY),
+                    idle_reply["ts"],
+                )
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+            finally:
+                store.close()
+
+    def test_runtime_task_exit_idle_prompt_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                first_count = sum(
+                    1
+                    for reply in gateway.thread_replies
+                    if any(
+                        block.get("block_id", "").startswith("task.idle.actions.")
+                        for block in (reply.get("blocks") or [])
+                    )
+                )
+                self.assertEqual(first_count, 1)
+
+                refreshed = store.get_agent_task(task.task_id)
+                assert refreshed is not None
+                controller.handle_runtime_task_done(
+                    refreshed,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                second_count = sum(
+                    1
+                    for reply in gateway.thread_replies
+                    if any(
+                        block.get("block_id", "").startswith("task.idle.actions.")
+                        for block in (reply.get("blocks") or [])
+                    )
+                )
+                self.assertEqual(second_count, 1)
+            finally:
+                store.close()
+
+    def test_runtime_subtask_exit_skips_idle_release_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                parent_task = replace(
+                    create_agent_task(agent, "parent task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(parent_task)
+                subtask = replace(
+                    create_agent_task(agent, "look at the PR", "C1", kind=AgentTaskKind.REVIEW),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.subbot",
+                )
+                subtask = replace(
+                    subtask,
+                    metadata={
+                        "parent_task_id": parent_task.task_id,
+                        "parent_agent_id": agent.agent_id,
+                    },
+                )
+                store.upsert_agent_task(subtask)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    subtask,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.subbot"),
+                )
+
+                self.assertIsNone(self._find_idle_release_prompt(gateway))
+            finally:
+                store.close()
+
+    def test_idle_release_prompt_button_finishes_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": idle_reply["ts"]},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "task.done",
+                                    task_id=task.task_id,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.DONE)
+                self.assertNotIn(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, current.metadata)
+                dismissed = next(
+                    (update for update in gateway.updates if update["ts"] == idle_reply["ts"]),
+                    None,
+                )
+                self.assertIsNotNone(dismissed)
+                self.assertNotIn("Free up this agent", str(dismissed["blocks"]))
+                self.assertTrue(
+                    any(
+                        reply.get("text") == "Finished and freed up this agent."
+                        for reply in gateway.thread_replies
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_same_thread_continuation_dismisses_idle_release_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "actually also fix the readme",
+                            "ts": "171.user2",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertNotIn(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, current.metadata)
+                dismissed = next(
+                    (update for update in gateway.updates if update["ts"] == idle_reply["ts"]),
+                    None,
+                )
+                self.assertIsNotNone(dismissed)
+                self.assertNotIn("Free up this agent", str(dismissed["blocks"]))
+            finally:
+                store.close()
+
+    def test_runtime_task_exit_skips_idle_prompt_when_queued_followups_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        "queued_thread_followups": [
+                            {
+                                "prompt": "and another thing",
+                                "message_ts": "171.user2",
+                                "requested_by_slack_user": "U1",
+                            }
+                        ]
+                    },
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+
+                self.assertIsNone(self._find_idle_release_prompt(gateway))
+                self.assertEqual(len(runtime.started), 1)
+            finally:
+                store.close()
+
+    def _drive_runtime_to_idle(self, runtime, gateway, *, timeout: float = 2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if runtime.has_running_tasks():
+                time.sleep(0.01)
+                continue
+            if self._find_idle_release_prompt(gateway) is not None:
+                return True
+            time.sleep(0.01)
+        return self._find_idle_release_prompt(gateway) is not None
+
+    def test_runtime_to_controller_e2e_posts_idle_prompt_for_codex(self):
+        class CodexFinalProcess:
+            def __init__(self, request):
+                self.request = request
+                self._read_once = False
+
+            def start(self):
+                pass
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self._read_once:
+                    return ""
+                self._read_once = True
+                return (
+                    '{"type":"item.completed","item":{"type":"agent_message",'
+                    '"text":"Wrapped up the validation."}}\n'
+                )
+
+            def is_alive(self):
+                return False
+
+            def terminate(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=CodexFinalProcess,
+                    poll_seconds=0.01,
+                    on_task_done=controller.handle_runtime_task_done,
+                    on_agent_message=controller.handle_runtime_agent_message,
+                    on_agent_control=controller.handle_runtime_agent_control,
+                )
+                controller.runtime = runtime
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.thread", "171.parent"))
+                self.assertTrue(self._drive_runtime_to_idle(runtime, gateway))
+
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+                self.assertEqual(idle_reply["thread"].thread_ts, "171.thread")
+                self.assertIn("Free up this agent", str(idle_reply["blocks"]))
+                self.assertTrue(
+                    any(
+                        reply.get("text") == "Wrapped up the validation."
+                        for reply in gateway.thread_replies
+                    )
+                )
+            finally:
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                store.close()
+
+    def test_runtime_to_controller_e2e_posts_idle_prompt_for_claude(self):
+        class ClaudeFinalProcess:
+            def __init__(self, request):
+                self.request = request
+                self._read_once = False
+
+            def start(self):
+                pass
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self._read_once:
+                    return ""
+                self._read_once = True
+                return (
+                    '{"type":"result","subtype":"success","is_error":false,'
+                    '"result":"Investigation finished."}\n'
+                )
+
+            def is_alive(self):
+                return False
+
+            def terminate(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "investigate the bug", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ClaudeFinalProcess,
+                    poll_seconds=0.01,
+                    on_task_done=controller.handle_runtime_task_done,
+                    on_agent_message=controller.handle_runtime_agent_message,
+                    on_agent_control=controller.handle_runtime_agent_control,
+                )
+                controller.runtime = runtime
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.thread", "171.parent"))
+                self.assertTrue(self._drive_runtime_to_idle(runtime, gateway))
+
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+                self.assertEqual(idle_reply["thread"].thread_ts, "171.thread")
+                self.assertIn("Free up this agent", str(idle_reply["blocks"]))
+                self.assertTrue(
+                    any(
+                        reply.get("text") == "Investigation finished."
+                        for reply in gateway.thread_replies
+                    )
+                )
+            finally:
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
                 store.close()
 
     def test_agent_final_handle_line_routes_callback_without_action_button(self):
