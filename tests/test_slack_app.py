@@ -3521,6 +3521,157 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_resume_pending_work_skips_when_parent_task_already_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                # Mirrors the production shape: a delegation pending whose
+                # source task lives in the same thread, but the pending's
+                # request_message_ts is a *child* reply ts — so the existing
+                # "has-task-for-request-message" check would not cancel it.
+                parent_task = replace(
+                    create_agent_task(agent, "original task", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.dead-thread",
+                    parent_message_ts="171.dead-thread",
+                )
+                store.upsert_agent_task(parent_task)
+                pending = store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.dead-thread", "171.dead-child"),
+                    WorkRequest(
+                        prompt="follow-up that should not revive",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                    extra_metadata={
+                        "parent_task_id": parent_task.task_id,
+                        "delegated_from_task_id": parent_task.task_id,
+                    },
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                self.assertEqual(resumed, 0)
+                # No new task started and no "Capacity is available now."
+                # reply landed in the dead thread.
+                self.assertEqual(runtime.started, [])
+                self.assertFalse(
+                    any(
+                        "Capacity is available now" in reply["text"]
+                        for reply in gateway.thread_replies
+                    ),
+                    gateway.thread_replies,
+                )
+                # The pending must be cancelled in the DB so a future
+                # capacity-freeing event cannot keep targeting the same row.
+                row = store.conn.execute(
+                    "SELECT status FROM pending_work_requests WHERE pending_id = ?",
+                    (pending.pending_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row["status"], "cancelled")
+            finally:
+                store.close()
+
+    def test_resume_pending_work_revives_when_destination_thread_still_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                # Two agents: one is mid-turn on the destination thread (so
+                # the thread is *not* dead), the other is idle and can pick
+                # up the pending follow-up.
+                busy_agent, idle_agent = build_initial_model_team(0, 2)
+                store.upsert_team_agent(busy_agent)
+                store.upsert_team_agent(idle_agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                live_task = replace(
+                    create_agent_task(busy_agent, "live work", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.live-thread",
+                    parent_message_ts="171.live-thread",
+                )
+                store.upsert_agent_task(live_task)
+                store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.live-thread", "171.live-child"),
+                    WorkRequest(
+                        prompt="follow-up while the thread is still live",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=idle_agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                    extra_metadata={"parent_task_id": live_task.task_id},
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                # The parent task is still ACTIVE, so the pending must not
+                # be cancelled as stale; the idle agent picks it up.
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+                started_task, started_agent, _ = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, idle_agent.agent_id)
+                self.assertIn(
+                    "follow-up while the thread is still live",
+                    started_task.prompt,
+                )
+            finally:
+                store.close()
+
+    def test_resume_pending_work_revives_when_thread_has_no_prior_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                # Top-level work request that arrived when no agents were
+                # idle: queued onto a fresh thread anchor with no prior tasks.
+                # Once capacity frees this must still revive.
+                store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.fresh", "171.fresh"),
+                    WorkRequest(
+                        prompt="fresh top-level work",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+            finally:
+                store.close()
+
     def test_resume_pending_work_uses_stored_channel_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

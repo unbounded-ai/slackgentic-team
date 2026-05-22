@@ -881,6 +881,23 @@ class SlackTeamController:
                 PendingWorkRequestStatus.CANCELLED,
             )
             return False
+        if self._is_pending_for_dead_thread(pending):
+            # The destination thread is no longer alive — every task in it is
+            # done or cancelled, and any parent/delegating task is also
+            # finished. Reviving here would post "Capacity is available now."
+            # into a thread the user has already closed out, dragging an
+            # agent back to a discussion that wrapped hours or days ago.
+            LOGGER.info(
+                "cancelling stale pending work request %s; thread %s/%s has no live work",
+                pending.pending_id,
+                pending.channel_id,
+                pending.thread_ts,
+            )
+            self.store.update_pending_work_request_status(
+                pending.pending_id,
+                PendingWorkRequestStatus.CANCELLED,
+            )
+            return False
         author_agent = None
         if pending.author_agent_id:
             author_agent = self.store.get_team_agent(pending.author_agent_id)
@@ -951,6 +968,45 @@ class SlackTeamController:
         deferred_work_id = pending.extra_metadata.get("deferred_work_id")
         if isinstance(deferred_work_id, str) and deferred_work_id:
             self.store.update_deferred_work_last_task(deferred_work_id, last_task_id=task_id)
+
+    def _is_pending_for_dead_thread(self, pending: PendingWorkRequest) -> bool:
+        # Scheduled/deferred pendings drive future-tense work that is supposed
+        # to land in its own fresh thread; never treat those as stale.
+        if pending.extra_metadata.get("scheduled_work_id"):
+            return False
+        if pending.extra_metadata.get("deferred_work_id"):
+            return False
+        parent_task_id = pending.extra_metadata.get("parent_task_id")
+        if not isinstance(parent_task_id, str) or not parent_task_id:
+            parent_task_id = pending.extra_metadata.get("delegated_from_task_id")
+        if isinstance(parent_task_id, str) and parent_task_id:
+            parent_task = self.store.get_agent_task(parent_task_id)
+            if parent_task is None:
+                # The parent row is gone; play it safe and revive normally.
+                return False
+            if parent_task.status not in {
+                AgentTaskStatus.DONE,
+                AgentTaskStatus.CANCELLED,
+            }:
+                return False
+        elif not pending.thread_ts:
+            # No parent and no thread anchor — nothing to declare dead.
+            return False
+        if not pending.thread_ts:
+            return False
+        thread_tasks = [
+            task
+            for task in self.store.list_agent_tasks(include_done=True)
+            if task.channel_id == pending.channel_id and task.thread_ts == pending.thread_ts
+        ]
+        if not thread_tasks:
+            # Fresh thread (top-level request that found no idle agents and
+            # never produced a thread reply). Still eligible for revival.
+            return False
+        return all(
+            task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}
+            for task in thread_tasks
+        )
 
     def _post_text(self, target: SlackReplyTarget, text: str) -> None:
         if target.thread_ts:
