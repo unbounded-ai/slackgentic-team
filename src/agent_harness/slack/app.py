@@ -1916,7 +1916,13 @@ class SlackTeamController:
         path = Path(configured).expanduser()
         return path if path.exists() and path.is_dir() else None
 
-    def hire_agents(self, count: int, provider: Provider | None = None):
+    def hire_agents(
+        self,
+        count: int,
+        provider: Provider | None = None,
+        *,
+        kind: TeamAgentKind = TeamAgentKind.ENGINEER,
+    ):
         if not self._can_hire(count):
             raise ValueError(AGENT_LIMIT_MESSAGE)
         active_agents = self.store.list_team_agents()
@@ -1928,6 +1934,7 @@ class SlackTeamController:
             balance_agents=active_agents,
             avatar_agents=active_agents,
             randomize_identities=True,
+            kind=kind,
         )
         for agent in hired:
             self._release_inactive_handle(agent.handle)
@@ -2389,6 +2396,8 @@ class SlackTeamController:
         count = int(payload.get("count") or 1)
         provider_text = payload.get("provider")
         provider = Provider(provider_text) if provider_text else None
+        kind_text = payload.get("kind")
+        kind = TeamAgentKind(kind_text) if kind_text else TeamAgentKind.ENGINEER
         if not self._can_hire(count):
             thread_ts = roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
             self._post_text(
@@ -2396,7 +2405,7 @@ class SlackTeamController:
                 f"{AGENT_LIMIT_MESSAGE} Max team size is {MAX_TEAM_AGENTS}.",
             )
             return
-        hired = self.hire_agents(count, provider)
+        hired = self.hire_agents(count, provider, kind=kind)
         ts = roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
         if not ts:
             ts = self.post_roster(channel_id)
