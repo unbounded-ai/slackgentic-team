@@ -277,3 +277,24 @@ class ManagedAgentProcess:
         kill = getattr(self.child, "kill", None)
         if callable(kill):
             kill(signal.SIGTERM)
+
+    def kill(self) -> None:
+        if self.child is None:
+            return
+        # pexpect's terminate(force=True) walks SIGHUP/SIGCONT/SIGINT/SIGTERM
+        # then SIGKILL, which is the strongest shutdown the child exposes.
+        terminate = getattr(self.child, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate(force=True)
+                return
+            except TypeError:
+                pass
+        proc = getattr(self.child, "proc", None)
+        proc_kill = getattr(proc, "kill", None)
+        if callable(proc_kill):
+            proc_kill()
+            return
+        kill = getattr(self.child, "kill", None)
+        if callable(kill):
+            kill(signal.SIGKILL)

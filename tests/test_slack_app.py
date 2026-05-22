@@ -8762,6 +8762,73 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_same_thread_reply_surfaces_delivery_failure_when_worker_cannot_stop(self):
+        class StuckRuntime(DetachedRuntime):
+            def interrupt_task(self, task_id):
+                self.interrupted.append(task_id)
+                return False
+
+            def stop_task(self, task_id, status=AgentTaskStatus.CANCELLED):
+                self.stopped.append((task_id, status))
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "initial task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                runtime = StuckRuntime()
+                runtime.running_task_ids.add(task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "Try this approach instead.",
+                            "ts": "171.user1",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                # We attempted to interrupt and then stop, both failed.
+                self.assertEqual(runtime.interrupted, [task.task_id])
+                self.assertEqual([entry[0] for entry in runtime.stopped], [task.task_id])
+                # Fresh resume must NOT have been attempted because the worker
+                # slot is still occupied; start_task would silently refuse.
+                self.assertEqual(runtime.started, [])
+                # The original task row stays put — the follow-up did not
+                # overwrite it, so the user's question is not stuck in a row
+                # nobody is reading.
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertEqual(current_task.prompt, "initial task")
+                # Slack receives a visible notice so the user knows to retry.
+                delivery_notices = [
+                    reply for reply in gateway.thread_replies if "couldn't deliver" in reply["text"]
+                ]
+                self.assertEqual(len(delivery_notices), 1)
+                self.assertIn(f"@{agent.handle}", delivery_notices[0]["text"])
+            finally:
+                store.close()
+
     def test_direct_question_to_running_managed_task_interrupts_and_delivers_followup(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

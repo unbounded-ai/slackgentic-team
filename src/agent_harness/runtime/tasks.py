@@ -364,6 +364,7 @@ class ManagedTaskRuntime:
         status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
         *,
         join_timeout: float = 2.0,
+        kill_join_timeout: float | None = None,
     ) -> bool:
         running = self._get_running(task_id)
         if running is None:
@@ -383,11 +384,26 @@ class ManagedTaskRuntime:
             self._remove_running_task(task_id, running)
             return True
         running.worker.join(timeout=max(0.0, join_timeout))
-        if running.worker.is_alive():
-            LOGGER.warning("managed task worker did not stop for %s", task_id)
-            return False
-        self._remove_running_task(task_id, running)
-        return True
+        if not running.worker.is_alive():
+            self._remove_running_task(task_id, running)
+            return True
+        # SIGTERM did not free the worker. Escalate to a hard kill so a hung
+        # provider process cannot indefinitely block restart of this task.
+        LOGGER.warning(
+            "managed task worker for %s did not exit on terminate; escalating to kill",
+            task_id,
+        )
+        try:
+            running.process.kill()
+        except Exception:
+            LOGGER.debug("failed to escalate kill for managed task %s", task_id, exc_info=True)
+        escalation_timeout = kill_join_timeout if kill_join_timeout is not None else join_timeout
+        running.worker.join(timeout=max(0.0, escalation_timeout))
+        if not running.worker.is_alive():
+            self._remove_running_task(task_id, running)
+            return True
+        LOGGER.warning("managed task worker did not stop for %s", task_id)
+        return False
 
     def interrupt_task(self, task_id: str) -> bool:
         running = self._get_running(task_id)

@@ -1985,6 +1985,80 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_stop_task_escalates_to_kill_when_terminate_does_not_exit(self):
+        class TerminateIgnoredProcess(OneShotProcess):
+            def __init__(self, request):
+                super().__init__(request)
+                self.alive = True
+                self.reading = threading.Event()
+                self.release = threading.Event()
+                self.terminate_called = False
+                self.kill_called = False
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                self.reading.set()
+                self.release.wait(timeout=5.0)
+                return ""
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                # SIGTERM is ignored; the read loop keeps blocking.
+                self.terminate_called = True
+
+            def kill(self):
+                # SIGKILL frees the worker.
+                self.kill_called = True
+                self.alive = False
+                self.release.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            processes: list[TerminateIgnoredProcess] = []
+
+            def process_factory(request):
+                process = TerminateIgnoredProcess(request)
+                processes.append(process)
+                return process
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "needs kill to stop", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+                with self.assertLogs("agent_harness.runtime.tasks", level="WARNING") as logs:
+                    self.assertTrue(
+                        runtime.stop_task(
+                            task.task_id,
+                            status=None,
+                            join_timeout=0.05,
+                            kill_join_timeout=1.0,
+                        )
+                    )
+                self.assertTrue(processes[0].terminate_called)
+                self.assertTrue(processes[0].kill_called)
+                self.assertTrue(
+                    any("escalating to kill" in message for message in logs.output),
+                    logs.output,
+                )
+                self.assertFalse(runtime.has_running_tasks())
+            finally:
+                for process in processes:
+                    process.release.set()
+                store.close()
+
     def test_runtime_stop_task_keeps_unjoined_worker_visible_until_exit(self):
         class BlockingReadProcess(OneShotProcess):
             def __init__(self, request):
