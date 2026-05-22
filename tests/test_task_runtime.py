@@ -26,6 +26,8 @@ from agent_harness.runtime.tasks import (
     AGENT_REACTION_SIGNAL_PREFIX,
     AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY,
+    MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES,
     MANAGED_RUN_MAX_RESUME_AGE,
     MANAGED_RUN_MAX_RESUMES,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
@@ -37,6 +39,7 @@ from agent_harness.runtime.tasks import (
     _allowed_tool_for_claude_denial,
     _allowed_tools_for_claude_denial,
     _append_allowed_tool,
+    _claude_empty_text_block_api_error,
     _claude_missing_resume_session,
     _claude_permission_denials,
     _clean_terminal_output,
@@ -47,6 +50,7 @@ from agent_harness.runtime.tasks import (
     _requested_repo_cwd,
     _session_id_from_output,
     build_task_prompt,
+    managed_run_empty_text_block_api_retries,
     managed_run_resume_attempts,
     parse_agent_reaction_signal,
     parse_agent_roster_status_signal,
@@ -388,6 +392,45 @@ class ClaudeMissingResumeProcess(OneShotProcess):
                         "errors": [
                             "No conversation found with session ID: missing-session",
                         ],
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
+class ClaudeEmptyTextBlockApiErrorProcess(OneShotProcess):
+    """Emit an assistant text block containing the recoverable empty-text-block API error."""
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "API Error: 400 messages: text content "
+                                        "blocks must be non-empty"
+                                    ),
+                                }
+                            ],
+                        },
+                        "session_id": "broken-session",
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "session_id": "broken-session",
                     }
                 )
                 + "\n"
@@ -1517,6 +1560,94 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertTrue(missing)
         self.assertEqual(buffer, "")
         self.assertIsNone(session_id)
+
+    def test_claude_empty_text_block_api_error_detects_assistant_text_block(self):
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "API Error: 400 messages: text content blocks must be non-empty",
+                        }
+                    ],
+                },
+            }
+        )
+
+        detected, buffer = _claude_empty_text_block_api_error(f"{line}\n")
+
+        self.assertTrue(detected)
+        self.assertEqual(buffer, "")
+
+    def test_claude_empty_text_block_api_error_detects_result_errors_field(self):
+        line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["API Error: 400 messages: text content blocks must be non-empty"],
+            }
+        )
+
+        detected, _ = _claude_empty_text_block_api_error(f"{line}\n")
+
+        self.assertTrue(detected)
+
+    def test_claude_empty_text_block_api_error_ignores_subagent_tool_result(self):
+        # Sub-agent tool_result lines can carry the same error text without
+        # indicating that the main session itself broke. Restart should not
+        # fire for those.
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "agent-1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "API Error: 400 messages: text content "
+                                        "blocks must be non-empty"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+
+        detected, _ = _claude_empty_text_block_api_error(f"{line}\n")
+
+        self.assertFalse(detected)
+
+    def test_claude_empty_text_block_api_error_buffers_partial_line(self):
+        partial = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text"'
+
+        detected, buffer = _claude_empty_text_block_api_error(partial)
+
+        self.assertFalse(detected)
+        self.assertEqual(buffer, partial)
+
+    def test_managed_run_empty_text_block_api_retries_counter(self):
+        agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+        task = create_agent_task(agent, "review pr", "C1")
+
+        self.assertEqual(managed_run_empty_text_block_api_retries(task), 0)
+
+        task = replace(
+            task,
+            metadata={MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY: 2},
+        )
+
+        self.assertEqual(managed_run_empty_text_block_api_retries(task), 2)
 
     def test_agent_control_signal_is_stripped_from_visible_text(self):
         visible, signals = _extract_agent_control_signals(
@@ -3798,6 +3929,119 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[0].resume_session_id, "missing-session")
                 self.assertIsNone(requests[1].resume_session_id)
+            finally:
+                store.close()
+
+    def test_runtime_restarts_managed_claude_on_empty_text_block_api_error(self):
+        # The Anthropic API rejects requests whose conversation history holds
+        # an empty assistant text content block. Once Claude emits one into a
+        # session, every subsequent request fails the same way — only a fresh
+        # session (no --resume) can recover. Slackgentic should detect the
+        # error in the worker's tail output and restart automatically.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudeEmptyTextBlockApiErrorProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "review pr", "C1")
+                task = replace(
+                    task,
+                    session_provider=Provider.CLAUDE,
+                    session_id="broken-session",
+                )
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(200):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertIn("Done", gateway.replies)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[0].resume_session_id, "broken-session")
+                # Retry MUST drop the session so the bad turn isn't replayed.
+                self.assertIsNone(requests[1].resume_session_id)
+                # A short notice should reach the user so the restart isn't silent.
+                self.assertTrue(
+                    any("empty text content block" in reply for reply in gateway.replies)
+                )
+                # The retry counter survives across the retry start so the cap
+                # is enforced; it is cleared by _clear_managed_run_started once
+                # the successful retry's worker completes its full lifecycle
+                # (covered separately by the cap test + the existing cleanup
+                # mechanism for the other counters).
+                persisted = store.get_agent_task(task.task_id)
+                assert persisted is not None
+                self.assertEqual(
+                    persisted.metadata.get(MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY),
+                    1,
+                )
+            finally:
+                store.close()
+
+    def test_runtime_gives_up_on_empty_text_block_api_error_after_retry_cap(self):
+        # If every restart hits the same error, slackgentic must not loop
+        # forever. Once MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES is
+        # exhausted, the task is left in its error path instead of being
+        # restarted again.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeEmptyTextBlockApiErrorProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "review pr", "C1")
+                task = replace(
+                    task,
+                    session_provider=Provider.CLAUDE,
+                    session_id="broken-session",
+                    metadata={
+                        MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY: (
+                            MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES
+                        )
+                    },
+                )
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                # Give the loop ample time to attempt a retry that should not happen.
+                for _ in range(80):
+                    if len(requests) > 1:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(len(requests), 1)
             finally:
                 store.close()
 

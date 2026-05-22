@@ -57,8 +57,10 @@ MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY = "managed_run_stall_recoveries"
 MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY = "managed_run_original_prompt"
+MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY = "managed_run_empty_text_block_api_retries"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_STALL_RECOVERIES = 2
+MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES = 2
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
 MANAGED_RUN_PROGRESS_WARNING_TIMEOUT = timedelta(minutes=5)
@@ -105,6 +107,8 @@ class RunningTask:
     permission_request_tokens: dict[str, str] = field(default_factory=dict)
     resume_error_buffer: str = ""
     missing_resume_session: bool = False
+    api_error_buffer: str = ""
+    empty_text_block_api_error: bool = False
     observed_agent_messages: set[str] | None = None
     control_signals: list[str] = field(default_factory=list)
     terminal_control_signal_handled: bool = False
@@ -533,6 +537,7 @@ class ManagedTaskRuntime:
             self._capture_transcript_activity(running)
             permission_denied = self._capture_permission_denials(running, output)
             self._capture_resume_errors(running, output)
+            self._capture_empty_text_block_api_error(running, output)
             if permission_denied and running.process.is_alive():
                 try:
                     running.process.terminate()
@@ -571,6 +576,7 @@ class ManagedTaskRuntime:
                 self._capture_session_id(running, tail, final=True)
                 self._capture_permission_denials(running, tail, final=True)
                 self._capture_resume_errors(running, tail, final=True)
+                self._capture_empty_text_block_api_error(running, tail, final=True)
                 if running.missing_resume_session:
                     chunks = []
                 else:
@@ -588,6 +594,8 @@ class ManagedTaskRuntime:
                     LOGGER.debug("failed to load completed task", exc_info=True)
                     completed_task = running.task
                 if self._retry_missing_claude_resume(running, completed_task):
+                    return
+                if self._retry_empty_text_block_api_error(running, completed_task):
                     return
                 if running.permission_denials:
                     self._handle_claude_permission_denial(running, completed_task)
@@ -1137,6 +1145,80 @@ class ManagedTaskRuntime:
         )
         return True
 
+    def _capture_empty_text_block_api_error(
+        self,
+        running: RunningTask,
+        output: str,
+        *,
+        final: bool = False,
+    ) -> None:
+        if _provider_for_running(running) != Provider.CLAUDE:
+            return
+        detected, running.api_error_buffer = _claude_empty_text_block_api_error(
+            output,
+            running.api_error_buffer,
+            final=final,
+        )
+        if detected:
+            running.empty_text_block_api_error = True
+
+    def _retry_empty_text_block_api_error(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+    ) -> bool:
+        # The Claude API rejects requests whose conversation history contains
+        # an empty text content block in any assistant turn. The model
+        # occasionally emits an empty text block alongside a tool_use; once it
+        # is in the session, every subsequent request fails the same way. The
+        # only reliable recovery is a fresh session — resuming the same
+        # session_id would just replay the bad turn back to the API.
+        if (
+            _provider_for_running(running) != Provider.CLAUDE
+            or not running.empty_text_block_api_error
+        ):
+            return False
+        current = self.store.get_agent_task(completed_task.task_id) or completed_task
+        attempts = managed_run_empty_text_block_api_retries(current)
+        if attempts >= MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES:
+            return False
+        LOGGER.info(
+            "Claude rejected empty text content block for task %s; restarting with "
+            "fresh session (attempt %s/%s)",
+            completed_task.task_id,
+            attempts + 1,
+            MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES,
+        )
+        metadata = dict(current.metadata)
+        metadata[MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY] = attempts + 1
+        retry_task = replace(
+            current,
+            session_provider=Provider.CLAUDE,
+            session_id=None,
+            status=AgentTaskStatus.ACTIVE,
+            metadata=metadata,
+            updated_at=utc_now(),
+        )
+        self.store.upsert_agent_task(retry_task)
+        self.gateway.post_thread_reply(
+            running.thread,
+            (
+                f"{running.agent.full_name} hit a transient Claude SDK error "
+                "(empty text content block). Restarting with a fresh session "
+                "and retrying."
+            ),
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
+        self._remove_running_task(completed_task.task_id, running)
+        self.start_task(
+            retry_task,
+            running.agent,
+            running.thread,
+            allowed_tools=running.allowed_tools,
+        )
+        return True
+
     def _handle_claude_permission_denial(
         self,
         running: RunningTask,
@@ -1297,11 +1379,15 @@ class ManagedTaskRuntime:
         has_attempts = MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY in current.metadata
         has_stall_recoveries = MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY in current.metadata
         has_original_prompt = MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY in current.metadata
+        has_text_block_retries = (
+            MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY in current.metadata
+        )
         if (
             not has_marker
             and not has_attempts
             and not has_stall_recoveries
             and not has_original_prompt
+            and not has_text_block_retries
         ):
             return current
         metadata = dict(current.metadata)
@@ -1309,6 +1395,7 @@ class ManagedTaskRuntime:
         metadata.pop(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY, None)
         updated = replace(current, metadata=metadata, updated_at=utc_now())
         try:
             self.store.upsert_agent_task(updated)
@@ -1927,6 +2014,60 @@ def _claude_line_missing_resume_session(line: str) -> bool:
         isinstance(error, str) and "No conversation found with session ID:" in error
         for error in errors
     )
+
+
+_EMPTY_TEXT_BLOCK_API_ERROR_NEEDLE = "text content blocks must be non-empty"
+
+
+def _claude_empty_text_block_api_error(
+    text: str,
+    buffer: str = "",
+    final: bool = False,
+) -> tuple[bool, str]:
+    combined = buffer + text
+    if not combined:
+        return False, buffer
+    lines = combined.splitlines(keepends=True)
+    next_buffer = ""
+    if lines and not _line_has_ending(lines[-1]) and not final:
+        next_buffer = lines.pop()
+    detected = any(_claude_line_has_empty_text_block_api_error(line.strip()) for line in lines)
+    return detected, next_buffer
+
+
+def _claude_line_has_empty_text_block_api_error(line: str) -> bool:
+    # Only match the error when it surfaces in the SDK's own output channels
+    # (a top-level assistant text block or a result-event error string).
+    # Plain substring matching would also fire on sub-agent tool_result lines
+    # carrying the same error text, which is a recoverable nested-agent case
+    # that does not require restarting the main session.
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") == "assistant":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                value = part.get("text")
+                if isinstance(value, str) and _EMPTY_TEXT_BLOCK_API_ERROR_NEEDLE in value:
+                    return True
+    errors = event.get("errors")
+    return isinstance(errors, list) and any(
+        isinstance(err, str) and _EMPTY_TEXT_BLOCK_API_ERROR_NEEDLE in err for err in errors
+    )
+
+
+def managed_run_empty_text_block_api_retries(task: AgentTask) -> int:
+    value = task.metadata.get(MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
 
 
 def _claude_result_permission_denials(event: object) -> list[dict]:
