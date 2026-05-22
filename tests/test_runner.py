@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from pathlib import Path
@@ -154,7 +155,9 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--print", args)
         self.assertIn("--verbose", args)
         self.assertIn("--output-format", args)
-        self.assertIn("stream-json", args)
+        self.assertIn("--input-format", args)
+        input_index = args.index("--input-format")
+        self.assertEqual(args[input_index + 1], "stream-json")
         self.assertIn("--effort", args)
         effort_index = args.index("--effort")
         self.assertEqual(args[effort_index + 1], "high")
@@ -162,7 +165,9 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", args)
         self.assertNotIn("--permission-mode", args)
         self.assertIn("--worktree", args)
-        self.assertEqual(args[-1], "fix it")
+        # Initial prompt is delivered over stdin as a stream-json user turn,
+        # not as a positional argv. See ManagedAgentProcess.start.
+        self.assertNotIn("fix it", args)
 
     def test_claude_command_uses_safe_auto_permission_mode_by_default(self):
         command, args = build_command(
@@ -347,10 +352,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(command, "claude")
         self.assertIn("--resume", args)
         self.assertIn("session-1", args)
+        self.assertIn("--input-format", args)
         self.assertIn("--effort", args)
         effort_index = args.index("--effort")
         self.assertEqual(args[effort_index + 1], "max")
-        self.assertEqual(args[-1], "continue")
+        # See above: the prompt is now streamed to stdin, not passed positionally.
+        self.assertNotIn("continue", args)
 
     def test_claude_resume_command_adds_safe_auto_extra_roots(self):
         command, args = build_command(
@@ -447,12 +454,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(child.sent, [])
         self.assertFalse(child.eof_sent)
 
-    def test_managed_process_sends_claude_prompt_as_argument(self):
+    def test_managed_process_sends_claude_prompt_over_pipe_stdin_as_stream_json(self):
         child = FakeChild()
         calls = []
 
-        def fake_spawn(command, args, **kwargs):
-            calls.append((command, args, kwargs))
+        def fake_popen_spawn(command, **kwargs):
+            calls.append((command, kwargs))
             return child
 
         process = ManagedAgentProcess(
@@ -463,20 +470,61 @@ class RunnerTests(unittest.TestCase):
             )
         )
 
-        with patch("pexpect.spawn", fake_spawn):
+        def fail_pty_spawn(*_args, **_kwargs):
+            raise AssertionError("claude --input-format stream-json should use pipe-backed spawn")
+
+        with (
+            patch("pexpect.spawn", fail_pty_spawn),
+            patch("pexpect.popen_spawn.PopenSpawn", fake_popen_spawn),
+        ):
             process.start()
 
-        self.assertEqual(calls[0][0], "claude")
-        self.assertEqual(calls[0][1][-1], "hidden claude prompt")
-        self.assertEqual(child.sent, [])
+        self.assertEqual(calls[0][0][0], "claude")
+        # Prompt is not on argv anymore; it's written to stdin.
+        self.assertNotIn("hidden claude prompt", calls[0][0])
+        self.assertEqual(len(child.sent), 1)
+        payload = json.loads(child.sent[0])
+        self.assertEqual(payload["type"], "user")
+        self.assertEqual(payload["message"]["role"], "user")
+        self.assertEqual(payload["message"]["content"], "hidden claude prompt")
+        # Stdin must stay open so follow-up user turns can be appended.
+        self.assertFalse(child.eof_sent)
+
+    def test_managed_claude_send_writes_stream_json_user_turn(self):
+        child = FakeChild()
+
+        def fake_popen_spawn(command, **kwargs):
+            return child
+
+        process = ManagedAgentProcess(
+            LaunchRequest(
+                provider=Provider.CLAUDE,
+                prompt="initial",
+                cwd=Path("/tmp/repo"),
+            )
+        )
+
+        with (
+            patch("pexpect.spawn", lambda *a, **k: child),
+            patch("pexpect.popen_spawn.PopenSpawn", fake_popen_spawn),
+        ):
+            process.start()
+            process.send("a follow-up from slack")
+
+        # First send is the initial prompt; second is the follow-up.
+        self.assertEqual(len(child.sent), 2)
+        followup = json.loads(child.sent[1])
+        self.assertEqual(followup["type"], "user")
+        self.assertEqual(followup["message"]["role"], "user")
+        self.assertEqual(followup["message"]["content"], "a follow-up from slack")
         self.assertFalse(child.eof_sent)
 
     def test_managed_claude_process_passes_slack_thread_env(self):
         child = FakeChild()
         calls = []
 
-        def fake_spawn(command, args, **kwargs):
-            calls.append((command, args, kwargs))
+        def fake_popen_spawn(command, **kwargs):
+            calls.append((command, kwargs))
             return child
 
         process = ManagedAgentProcess(
@@ -489,18 +537,18 @@ class RunnerTests(unittest.TestCase):
             )
         )
 
-        with patch("pexpect.spawn", fake_spawn):
+        with patch("pexpect.popen_spawn.PopenSpawn", fake_popen_spawn):
             process.start()
 
-        self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_CHANNEL_ID"], "C1")
-        self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_THREAD_TS"], "171.000001")
+        self.assertEqual(calls[0][1]["env"]["SLACKGENTIC_CLAUDE_CHANNEL_ID"], "C1")
+        self.assertEqual(calls[0][1]["env"]["SLACKGENTIC_CLAUDE_THREAD_TS"], "171.000001")
 
     def test_managed_claude_dangerous_mode_sets_channel_dangerous_env(self):
         child = FakeChild()
         calls = []
 
-        def fake_spawn(command, args, **kwargs):
-            calls.append((command, args, kwargs))
+        def fake_popen_spawn(command, **kwargs):
+            calls.append((command, kwargs))
             return child
 
         process = ManagedAgentProcess(
@@ -512,17 +560,17 @@ class RunnerTests(unittest.TestCase):
             )
         )
 
-        with patch("pexpect.spawn", fake_spawn):
+        with patch("pexpect.popen_spawn.PopenSpawn", fake_popen_spawn):
             process.start()
 
-        self.assertEqual(calls[0][2]["env"]["SLACKGENTIC_CLAUDE_DANGEROUS_MODE"], "1")
+        self.assertEqual(calls[0][1]["env"]["SLACKGENTIC_CLAUDE_DANGEROUS_MODE"], "1")
 
     def test_managed_claude_safe_auto_omits_channel_dangerous_env(self):
         child = FakeChild()
         calls = []
 
-        def fake_spawn(command, args, **kwargs):
-            calls.append((command, args, kwargs))
+        def fake_popen_spawn(command, **kwargs):
+            calls.append((command, kwargs))
             return child
 
         process = ManagedAgentProcess(
@@ -535,15 +583,18 @@ class RunnerTests(unittest.TestCase):
 
         clean_env = dict(os.environ)
         clean_env.pop("SLACKGENTIC_CLAUDE_DANGEROUS_MODE", None)
-        with patch.dict(os.environ, clean_env, clear=True), patch("pexpect.spawn", fake_spawn):
+        with (
+            patch.dict(os.environ, clean_env, clear=True),
+            patch("pexpect.popen_spawn.PopenSpawn", fake_popen_spawn),
+        ):
             process.start()
 
         self.assertNotIn(
             "SLACKGENTIC_CLAUDE_DANGEROUS_MODE",
-            calls[0][2]["env"],
+            calls[0][1]["env"],
         )
         self.assertEqual(
-            calls[0][2]["env"][CLAUDE_CHANNEL_PERMISSION_MODE_ENV],
+            calls[0][1]["env"][CLAUDE_CHANNEL_PERMISSION_MODE_ENV],
             PermissionMode.SAFE_AUTO.value,
         )
 
