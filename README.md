@@ -397,11 +397,11 @@ notes are in [docs/architecture.md](docs/architecture.md).
 
 1. Bump the version in `pyproject.toml` and `src/agent_harness/__init__.py`.
 2. Merge the change to `main`.
-3. Create and push a matching tag, for example `v0.1.1`.
 
-The release workflow validates that the tag and source versions match, then
-creates a GitHub Release. Running Slackgentic services consume that release
-metadata during their next update check.
+The release workflow runs on every push to `main`. When it sees a version that
+does not yet have a matching `vX.Y.Z` tag, it creates the tag and a GitHub
+Release with auto-generated notes. Running Slackgentic services consume that
+release metadata during their next update check.
 
 ## Current Limits
 

@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from dataclasses import replace
@@ -8,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import (
     AGENT_DEFERRED_SIGNAL_PREFIX,
     DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
@@ -17,6 +19,7 @@ from agent_harness.deferred import (
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
@@ -46,6 +49,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_MAX_RESUMES,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
+    ManagedTaskRuntime,
     managed_run_resume_attempts,
 )
 from agent_harness.schedules import (
@@ -58,6 +62,7 @@ from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
     CLAUDE_CHANNEL_PERMISSION_METHOD,
     DEFAULT_AGENT_AVATAR_BASE_URL,
+    IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY,
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
     ClaudePermissionAutoResolver,
@@ -1423,6 +1428,7 @@ class SlackAppTests(unittest.TestCase):
                     "*Queued:* Roster UX fix: validating E2E before PR merge",
                     blocks,
                 )
+                self.assertIn("*Original Task:* rerun tests", blocks)
                 self.assertNotIn("Slack task:", blocks)
             finally:
                 store.close()
@@ -1454,7 +1460,141 @@ class SlackAppTests(unittest.TestCase):
                     ("*Queued:* Improve roster summaries and dangerous-mode display"),
                     blocks,
                 )
+                self.assertIn(
+                    "*Original Task:* Improve roster summaries and dangerous-mode display",
+                    blocks,
+                )
                 self.assertNotIn("Slack task:", blocks)
+            finally:
+                store.close()
+
+    def test_roster_preserves_first_original_task_while_summary_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "latest follow-up prompt", "C1"),
+                    metadata={
+                        ORIGINAL_TASK_METADATA_KEY: "first original task description",
+                        ASSIGNMENT_PROMPT_METADATA_KEY: "second assignment prompt",
+                        ROSTER_SUMMARY_METADATA_KEY: "currently validating the release",
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.update_agent_task_thread(task.task_id, "171.000001", "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("*Queued:* currently validating the release", blocks)
+                self.assertIn("*Original Task:* first original task description", blocks)
+                self.assertNotIn("second assignment prompt", blocks)
+                self.assertNotIn("latest follow-up prompt", blocks)
+            finally:
+                store.close()
+
+    def test_channel_assignment_preserves_original_task_after_roster_update_e2e(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "somebody repair the status view",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                task, started_agent, thread = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, agent.agent_id)
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                self.assertEqual(
+                    task.metadata[ORIGINAL_TASK_METADATA_KEY],
+                    "repair the status view",
+                )
+                first_message = gateway.thread_replies[0]
+                self.assertIn("*Original Task:* repair the status view", first_message["text"])
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    str(first_message["blocks"]),
+                )
+                runtime.running_task_ids.add(task.task_id)
+                store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    thread,
+                    f"{AGENT_ROSTER_STATUS_SIGNAL_PREFIX}validating the release",
+                )
+
+                self.assertTrue(handled)
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(
+                    current.metadata[ROSTER_SUMMARY_METADATA_KEY],
+                    "validating the release",
+                )
+                self.assertEqual(
+                    current.metadata[ORIGINAL_TASK_METADATA_KEY],
+                    "repair the status view",
+                )
+                header_updates = [
+                    update
+                    for update in gateway.updates
+                    if update["ts"] == current.parent_message_ts
+                ]
+                self.assertEqual(len(header_updates), 1)
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    header_updates[0]["text"],
+                )
+                self.assertIn(
+                    "*Latest summary:* validating the release",
+                    header_updates[0]["text"],
+                )
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    str(header_updates[0]["blocks"]),
+                )
+                roster_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.roster"
+                ]
+                self.assertGreaterEqual(len(roster_updates), 1)
+                self.assertIn(
+                    "*Working:* validating the release",
+                    str(roster_updates[-1]["blocks"]),
+                )
+                self.assertIn(
+                    "*Original Task:* repair the status view",
+                    str(roster_updates[-1]["blocks"]),
+                )
             finally:
                 store.close()
 
@@ -1535,15 +1675,6 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(gateway.removed_reactions, [])
                 gateway.removed_reactions.clear()
 
-                controller._mark_message_queued("C1", "171.000001")
-
-                self.assertEqual(gateway.reactions[-1], ("C1", "171.000001", "inbox_tray"))
-                self.assertEqual(
-                    gateway.removed_reactions,
-                    [("C1", "171.000001", "eyes")],
-                )
-                gateway.removed_reactions.clear()
-
                 controller._mark_message_in_progress("C1", "171.000001")
                 controller._mark_message_in_progress("C1", "171.000001")
 
@@ -1552,13 +1683,12 @@ class SlackAppTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     gateway.removed_reactions,
-                    [("C1", "171.000001", "inbox_tray")],
+                    [("C1", "171.000001", "eyes")],
                 )
                 self.assertEqual(
                     gateway.reactions,
                     [
                         ("C1", "171.000001", "eyes"),
-                        ("C1", "171.000001", "inbox_tray"),
                         ("C1", "171.000001", "hourglass_flowing_sand"),
                     ],
                 )
@@ -1699,6 +1829,88 @@ class SlackAppTests(unittest.TestCase):
                 controller._mark_message_in_progress("C1", "171.user")
 
                 self.assertIn(("C1", "171.user", "eyes"), gateway.removed_reactions)
+            finally:
+                store.close()
+
+    def test_agent_reaction_signal_reacts_to_other_agents_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                team = build_initial_model_team(2, 0)
+                actor, peer = team[0], team[1]
+                for member in team:
+                    store.upsert_team_agent(member)
+                task = replace(
+                    create_agent_task(actor, "ship the fix", "C1"),
+                    metadata={"request_message_ts": "171.user"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                thread = SlackThreadRef("C1", "171.thread")
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {"username": "user", "text": "kick off", "ts": "171.user"},
+                    {"username": peer.full_name, "text": "looking", "ts": "172.peer"},
+                ]
+                controller._remember_agent_authored_message(
+                    task,
+                    peer,
+                    thread,
+                    "172.peer",
+                    "looking",
+                )
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    actor,
+                    thread,
+                    f"{AGENT_REACTION_SIGNAL_PREFIX}thumbsup",
+                )
+
+                self.assertTrue(handled)
+                self.assertIn(("C1", "172.peer", "thumbsup"), gateway.reactions)
+                self.assertNotIn(("C1", "171.user", "thumbsup"), gateway.reactions)
+            finally:
+                store.close()
+
+    def test_agent_reaction_signal_skips_own_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "ship the fix", "C1"),
+                    metadata={"request_message_ts": "171.user"},
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                thread = SlackThreadRef("C1", "171.thread")
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {"username": "user", "text": "kick off", "ts": "171.user"},
+                    {"username": agent.full_name, "text": "on it", "ts": "172.own"},
+                ]
+                controller._remember_agent_authored_message(
+                    task,
+                    agent,
+                    thread,
+                    "172.own",
+                    "on it",
+                )
+
+                handled = controller.handle_runtime_agent_control(
+                    task,
+                    agent,
+                    thread,
+                    f"{AGENT_REACTION_SIGNAL_PREFIX}eyes",
+                )
+
+                self.assertTrue(handled)
+                self.assertIn(("C1", "171.user", "eyes"), gateway.reactions)
+                self.assertNotIn(("C1", "172.own", "eyes"), gateway.reactions)
             finally:
                 store.close()
 
@@ -1886,8 +2098,17 @@ class SlackAppTests(unittest.TestCase):
                     "Roster UX fix: opening PR after E2E",
                     header_updates[0]["text"],
                 )
+                self.assertIn("*Original Task:* small follow-up", header_updates[0]["text"])
+                self.assertIn(
+                    "*Latest summary:* Roster UX fix: opening PR after E2E",
+                    header_updates[0]["text"],
+                )
                 self.assertIn(
                     "Roster UX fix: opening PR after E2E",
+                    str(header_updates[0]["blocks"]),
+                )
+                self.assertIn(
+                    "*Original Task:* small follow-up",
                     str(header_updates[0]["blocks"]),
                 )
                 roster_updates = [
@@ -1896,6 +2117,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(roster_updates), 1)
                 self.assertIn(
                     "*Queued:* Roster UX fix: opening PR after E2E",
+                    str(roster_updates[0]["blocks"]),
+                )
+                self.assertIn(
+                    "*Original Task:* small follow-up",
                     str(roster_updates[0]["blocks"]),
                 )
                 self.assertNotIn("Slack task:", str(roster_updates[0]["blocks"]))
@@ -2232,6 +2457,408 @@ class SlackAppTests(unittest.TestCase):
                     gateway.removed_reactions,
                 )
             finally:
+                store.close()
+
+    def _find_idle_release_prompt(self, gateway):
+        for reply in gateway.thread_replies:
+            blocks = reply.get("blocks") or []
+            for block in blocks:
+                block_id = block.get("block_id", "")
+                if block_id.startswith("task.idle.actions."):
+                    return reply
+        return None
+
+    def test_runtime_task_exit_posts_idle_release_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+
+                idle_reply = self._find_idle_release_prompt(gateway)
+                self.assertIsNotNone(idle_reply, "expected idle release prompt to be posted")
+                self.assertEqual(idle_reply["thread"].thread_ts, "171.thread")
+                self.assertIn("Free up this agent", str(idle_reply["blocks"]))
+                self.assertIn("Reply", idle_reply["text"])
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(
+                    current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY),
+                    idle_reply["ts"],
+                )
+                self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
+            finally:
+                store.close()
+
+    def test_runtime_task_exit_idle_prompt_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                first_count = sum(
+                    1
+                    for reply in gateway.thread_replies
+                    if any(
+                        block.get("block_id", "").startswith("task.idle.actions.")
+                        for block in (reply.get("blocks") or [])
+                    )
+                )
+                self.assertEqual(first_count, 1)
+
+                refreshed = store.get_agent_task(task.task_id)
+                assert refreshed is not None
+                controller.handle_runtime_task_done(
+                    refreshed,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                second_count = sum(
+                    1
+                    for reply in gateway.thread_replies
+                    if any(
+                        block.get("block_id", "").startswith("task.idle.actions.")
+                        for block in (reply.get("blocks") or [])
+                    )
+                )
+                self.assertEqual(second_count, 1)
+            finally:
+                store.close()
+
+    def test_runtime_subtask_exit_skips_idle_release_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                parent_task = replace(
+                    create_agent_task(agent, "parent task", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(parent_task)
+                subtask = replace(
+                    create_agent_task(agent, "look at the PR", "C1", kind=AgentTaskKind.REVIEW),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.subbot",
+                )
+                subtask = replace(
+                    subtask,
+                    metadata={
+                        "parent_task_id": parent_task.task_id,
+                        "parent_agent_id": agent.agent_id,
+                    },
+                )
+                store.upsert_agent_task(subtask)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    subtask,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.subbot"),
+                )
+
+                self.assertIsNone(self._find_idle_release_prompt(gateway))
+            finally:
+                store.close()
+
+    def test_idle_release_prompt_button_finishes_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": idle_reply["ts"]},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "task.done",
+                                    task_id=task.task_id,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertEqual(current.status, AgentTaskStatus.DONE)
+                self.assertNotIn(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, current.metadata)
+                dismissed = next(
+                    (update for update in gateway.updates if update["ts"] == idle_reply["ts"]),
+                    None,
+                )
+                self.assertIsNotNone(dismissed)
+                self.assertNotIn("Free up this agent", str(dismissed["blocks"]))
+                self.assertTrue(
+                    any(
+                        reply.get("text") == "Finished and freed up this agent."
+                        for reply in gateway.thread_replies
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_same_thread_continuation_dismisses_idle_release_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_runtime_task_done(
+                    task,
+                    agent,
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "actually also fix the readme",
+                            "ts": "171.user2",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                current = store.get_agent_task(task.task_id)
+                assert current is not None
+                self.assertNotIn(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, current.metadata)
+                dismissed = next(
+                    (update for update in gateway.updates if update["ts"] == idle_reply["ts"]),
+                    None,
+                )
+                self.assertIsNotNone(dismissed)
+                self.assertNotIn("Free up this agent", str(dismissed["blocks"]))
+            finally:
+                store.close()
+
+    def _drive_runtime_to_idle(self, runtime, gateway, *, timeout: float = 2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if runtime.has_running_tasks():
+                time.sleep(0.01)
+                continue
+            if self._find_idle_release_prompt(gateway) is not None:
+                return True
+            time.sleep(0.01)
+        return self._find_idle_release_prompt(gateway) is not None
+
+    def test_runtime_to_controller_e2e_posts_idle_prompt_for_codex(self):
+        class CodexFinalProcess:
+            def __init__(self, request):
+                self.request = request
+                self._read_once = False
+
+            def start(self):
+                pass
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self._read_once:
+                    return ""
+                self._read_once = True
+                return (
+                    '{"type":"item.completed","item":{"type":"agent_message",'
+                    '"text":"Wrapped up the validation."}}\n'
+                )
+
+            def is_alive(self):
+                return False
+
+            def terminate(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "validate ownership", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=CodexFinalProcess,
+                    poll_seconds=0.01,
+                    on_task_done=controller.handle_runtime_task_done,
+                    on_agent_message=controller.handle_runtime_agent_message,
+                    on_agent_control=controller.handle_runtime_agent_control,
+                )
+                controller.runtime = runtime
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.thread", "171.parent"))
+                self.assertTrue(self._drive_runtime_to_idle(runtime, gateway))
+
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+                self.assertEqual(idle_reply["thread"].thread_ts, "171.thread")
+                self.assertIn("Free up this agent", str(idle_reply["blocks"]))
+                self.assertTrue(
+                    any(
+                        reply.get("text") == "Wrapped up the validation."
+                        for reply in gateway.thread_replies
+                    )
+                )
+            finally:
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                store.close()
+
+    def test_runtime_to_controller_e2e_posts_idle_prompt_for_claude(self):
+        class ClaudeFinalProcess:
+            def __init__(self, request):
+                self.request = request
+                self._read_once = False
+
+            def start(self):
+                pass
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self._read_once:
+                    return ""
+                self._read_once = True
+                return (
+                    '{"type":"result","subtype":"success","is_error":false,'
+                    '"result":"Investigation finished."}\n'
+                )
+
+            def is_alive(self):
+                return False
+
+            def terminate(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "investigate the bug", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                )
+                store.upsert_agent_task(task)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ClaudeFinalProcess,
+                    poll_seconds=0.01,
+                    on_task_done=controller.handle_runtime_task_done,
+                    on_agent_message=controller.handle_runtime_agent_message,
+                    on_agent_control=controller.handle_runtime_agent_control,
+                )
+                controller.runtime = runtime
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.thread", "171.parent"))
+                self.assertTrue(self._drive_runtime_to_idle(runtime, gateway))
+
+                idle_reply = self._find_idle_release_prompt(gateway)
+                assert idle_reply is not None
+                self.assertEqual(idle_reply["thread"].thread_ts, "171.thread")
+                self.assertIn("Free up this agent", str(idle_reply["blocks"]))
+                self.assertTrue(
+                    any(
+                        reply.get("text") == "Investigation finished."
+                        for reply in gateway.thread_replies
+                    )
+                )
+            finally:
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
                 store.close()
 
     def test_agent_final_handle_line_routes_callback_without_action_button(self):
@@ -2891,6 +3518,157 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(row["status"], "assigned")
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(runtime.started[0][1].agent_id, agent.agent_id)
+            finally:
+                store.close()
+
+    def test_resume_pending_work_skips_when_parent_task_already_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                # Mirrors the production shape: a delegation pending whose
+                # source task lives in the same thread, but the pending's
+                # request_message_ts is a *child* reply ts — so the existing
+                # "has-task-for-request-message" check would not cancel it.
+                parent_task = replace(
+                    create_agent_task(agent, "original task", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.dead-thread",
+                    parent_message_ts="171.dead-thread",
+                )
+                store.upsert_agent_task(parent_task)
+                pending = store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.dead-thread", "171.dead-child"),
+                    WorkRequest(
+                        prompt="follow-up that should not revive",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                    extra_metadata={
+                        "parent_task_id": parent_task.task_id,
+                        "delegated_from_task_id": parent_task.task_id,
+                    },
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                self.assertEqual(resumed, 0)
+                # No new task started and no "Capacity is available now."
+                # reply landed in the dead thread.
+                self.assertEqual(runtime.started, [])
+                self.assertFalse(
+                    any(
+                        "Capacity is available now" in reply["text"]
+                        for reply in gateway.thread_replies
+                    ),
+                    gateway.thread_replies,
+                )
+                # The pending must be cancelled in the DB so a future
+                # capacity-freeing event cannot keep targeting the same row.
+                row = store.conn.execute(
+                    "SELECT status FROM pending_work_requests WHERE pending_id = ?",
+                    (pending.pending_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row["status"], "cancelled")
+            finally:
+                store.close()
+
+    def test_resume_pending_work_revives_when_destination_thread_still_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                # Two agents: one is mid-turn on the destination thread (so
+                # the thread is *not* dead), the other is idle and can pick
+                # up the pending follow-up.
+                busy_agent, idle_agent = build_initial_model_team(0, 2)
+                store.upsert_team_agent(busy_agent)
+                store.upsert_team_agent(idle_agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                live_task = replace(
+                    create_agent_task(busy_agent, "live work", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.live-thread",
+                    parent_message_ts="171.live-thread",
+                )
+                store.upsert_agent_task(live_task)
+                store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.live-thread", "171.live-child"),
+                    WorkRequest(
+                        prompt="follow-up while the thread is still live",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=idle_agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                    extra_metadata={"parent_task_id": live_task.task_id},
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                # The parent task is still ACTIVE, so the pending must not
+                # be cancelled as stale; the idle agent picks it up.
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+                started_task, started_agent, _ = runtime.started[0]
+                self.assertEqual(started_agent.agent_id, idle_agent.agent_id)
+                self.assertIn(
+                    "follow-up while the thread is still live",
+                    started_task.prompt,
+                )
+            finally:
+                store.close()
+
+    def test_resume_pending_work_revives_when_thread_has_no_prior_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                # Top-level work request that arrived when no agents were
+                # idle: queued onto a fresh thread anchor with no prior tasks.
+                # Once capacity frees this must still revive.
+                store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.fresh", "171.fresh"),
+                    WorkRequest(
+                        prompt="fresh top-level work",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    requested_by_slack_user="U1",
+                )
+
+                resumed = controller.resume_pending_work_requests("C1")
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
             finally:
                 store.close()
 
@@ -3943,68 +4721,6 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_slack_message_backfill_skips_queued_followup_message_with_task(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.sqlite")
-            gateway = FakeGateway()
-            runtime = DetachedRuntime()
-            try:
-                store.init_schema()
-                agent = build_initial_model_team(1, 0)[0]
-                store.upsert_team_agent(agent)
-                task = replace(
-                    create_agent_task(agent, "initial task", "C1"),
-                    status=AgentTaskStatus.ACTIVE,
-                    thread_ts="171.thread",
-                    parent_message_ts="171.parent",
-                    metadata={
-                        "queued_thread_followups": [
-                            {
-                                "prompt": "Queued follow-up",
-                                "message_ts": "171.000010",
-                                "requested_by_slack_user": "U1",
-                                "created_at": utc_now().isoformat(),
-                            }
-                        ]
-                    },
-                )
-                store.upsert_agent_task(task)
-                controller = SlackTeamController(
-                    store,
-                    gateway,
-                    default_channel_id="C1",
-                    runtime=runtime,
-                )
-                controller._mark_slack_message_processed("C1", "171.000010")
-                gateway.history_messages.append(
-                    {
-                        "type": "message",
-                        "channel": "C1",
-                        "user": "U1",
-                        "text": "Queued follow-up",
-                        "ts": "171.000010",
-                        "thread_ts": "171.thread",
-                        "reactions": [{"name": "inbox_tray"}],
-                    }
-                )
-                backfill = SlackMessageBackfill(
-                    store,
-                    gateway,
-                    controller,
-                    team_id="local",
-                    sleep_gap_seconds=5.0,
-                    grace_seconds=0.0,
-                    now=lambda: 181.0,
-                )
-
-                recovered = backfill.recover_since("171.000005")
-
-                self.assertEqual(recovered, 0)
-                self.assertEqual(runtime.started, [])
-                self.assertEqual(len(store.list_agent_tasks()), 1)
-            finally:
-                store.close()
-
     def test_slack_message_backfill_skips_stored_agent_request_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -4919,7 +5635,7 @@ class SlackAppTests(unittest.TestCase):
                 tasks = store.list_agent_tasks()
                 self.assertEqual(tasks[0].prompt, "review the repo")
                 rendered = gateway.thread_replies[0]["blocks"][0]["text"]["text"]
-                self.assertIn("*Task:* review the repo", rendered)
+                self.assertIn("*Original Task:* review the repo", rendered)
             finally:
                 store.close()
 
@@ -7387,121 +8103,6 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_startup_reconcile_replays_stranded_queued_followups_without_run_marker(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.sqlite")
-            gateway = FakeGateway()
-            runtime = DetachedRuntime()
-            try:
-                store.init_schema()
-                agent = build_initial_model_team(1, 0)[0]
-                store.upsert_team_agent(agent)
-                task = replace(
-                    create_agent_task(agent, "initial task", "C1"),
-                    status=AgentTaskStatus.ACTIVE,
-                    thread_ts="171.thread",
-                    parent_message_ts="171.parent",
-                    session_provider=Provider.CODEX,
-                    session_id="codex-thread-queued",
-                    metadata={
-                        "queued_thread_followups": [
-                            {
-                                "prompt": "What happened to this queued question?",
-                                "message_ts": "171.user",
-                                "requested_by_slack_user": "U1",
-                                "created_at": utc_now().isoformat(),
-                            }
-                        ]
-                    },
-                )
-                store.upsert_agent_task(task)
-                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
-                controller = SlackTeamController(
-                    store,
-                    gateway,
-                    default_channel_id="C1",
-                    runtime=runtime,
-                )
-                controller._mark_message_queued("C1", "171.user")
-                gateway.removed_reactions.clear()
-
-                resumed = controller.cancel_orphaned_active_tasks()
-
-                self.assertEqual(resumed, 1)
-                self.assertEqual(len(runtime.started), 1)
-                restarted, restarted_agent, restarted_thread = runtime.started[0]
-                self.assertEqual(restarted.task_id, task.task_id)
-                self.assertEqual(restarted_agent.agent_id, agent.agent_id)
-                self.assertEqual(restarted_thread.thread_ts, "171.thread")
-                self.assertIn("What happened to this queued question?", restarted.prompt)
-                current_task = store.get_agent_task(task.task_id)
-                assert current_task is not None
-                self.assertEqual(
-                    current_task.metadata.get("active_thread_followup_message_ts_values"),
-                    ["171.user"],
-                )
-                self.assertNotIn("queued_thread_followups", current_task.metadata)
-                self.assertIn(("C1", "171.user", "inbox_tray"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user", "hourglass_flowing_sand"), gateway.reactions)
-            finally:
-                store.close()
-
-    def test_periodic_reconcile_replays_stranded_queued_followups(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.sqlite")
-            gateway = FakeGateway()
-            runtime = DetachedRuntime()
-            try:
-                store.init_schema()
-                agent = build_initial_model_team(1, 0)[0]
-                store.upsert_team_agent(agent)
-                task = replace(
-                    create_agent_task(agent, "initial task", "C1"),
-                    status=AgentTaskStatus.ACTIVE,
-                    thread_ts="171.thread",
-                    parent_message_ts="171.parent",
-                    session_provider=Provider.CODEX,
-                    session_id="codex-thread-queued",
-                    metadata={
-                        "queued_thread_followups": [
-                            {
-                                "prompt": "Please handle the queued feedback.",
-                                "message_ts": "171.user",
-                                "requested_by_slack_user": "U1",
-                                "created_at": utc_now().isoformat(),
-                            }
-                        ]
-                    },
-                )
-                store.upsert_agent_task(task)
-                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
-                controller = SlackTeamController(
-                    store,
-                    gateway,
-                    default_channel_id="C1",
-                    runtime=runtime,
-                )
-                controller._mark_message_queued("C1", "171.user")
-                gateway.removed_reactions.clear()
-
-                resumed = controller.resume_stranded_queued_thread_followups()
-
-                self.assertEqual(resumed, 1)
-                self.assertEqual(len(runtime.started), 1)
-                resumed_task = runtime.started[0][0]
-                self.assertIn("Please handle the queued feedback.", resumed_task.prompt)
-                current_task = store.get_agent_task(task.task_id)
-                assert current_task is not None
-                self.assertNotIn("queued_thread_followups", current_task.metadata)
-                self.assertEqual(
-                    current_task.metadata.get("active_thread_followup_message_ts_values"),
-                    ["171.user"],
-                )
-                self.assertIn(("C1", "171.user", "inbox_tray"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user", "hourglass_flowing_sand"), gateway.reactions)
-            finally:
-                store.close()
-
     def test_startup_reconcile_restarts_interrupted_managed_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -8222,8 +8823,18 @@ class SlackAppTests(unittest.TestCase):
                     SlackThreadRef("C1", "171.thread", "171.parent"),
                 )
 
-                self.assertIn(("C1", "171.user1", "white_check_mark"), gateway.reactions)
-                self.assertIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+                # The run finished. Pending follow-up reactions are cleared, but
+                # the bot must NOT stamp :white_check_mark: on the user's
+                # messages just because the run ended — the agent may not have
+                # actually addressed them.
+                self.assertNotIn(("C1", "171.user1", "white_check_mark"), gateway.reactions)
+                self.assertNotIn(("C1", "171.user2", "white_check_mark"), gateway.reactions)
+                self.assertIn(
+                    ("C1", "171.user1", "hourglass_flowing_sand"), gateway.removed_reactions
+                )
+                self.assertIn(
+                    ("C1", "171.user2", "hourglass_flowing_sand"), gateway.removed_reactions
+                )
                 self.assertEqual(runtime.started, [])
                 current_task = store.get_agent_task(task.task_id)
                 assert current_task is not None
@@ -8233,7 +8844,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_same_thread_reply_queues_only_when_running_task_cannot_interrupt(self):
+    def test_same_thread_reply_starts_fresh_resume_when_running_task_cannot_interrupt(self):
         class UninterruptibleRuntime(DetachedRuntime):
             def interrupt_task(self, task_id):
                 self.interrupted.append(task_id)
@@ -8275,30 +8886,41 @@ class SlackAppTests(unittest.TestCase):
                     }
                 )
 
+                # The interrupt failed, so the worker is presumed zombie.
+                # Instead of stashing the message in a queue, we terminate the
+                # worker and start a fresh resume with the new prompt as the
+                # next thing the agent sees. No queue metadata, no
+                # "I queued it" notice, no inbox_tray reaction.
                 current_task = store.get_agent_task(task.task_id)
                 assert current_task is not None
-                queued = current_task.metadata.get("queued_thread_followups")
-                self.assertIsInstance(queued, list)
-                self.assertEqual(len(queued), 1)
+                self.assertNotIn("queued_thread_followups", current_task.metadata)
                 self.assertEqual(runtime.interrupted, [task.task_id])
                 self.assertEqual(runtime.interrupted_sent, [])
-                self.assertIn(("C1", "171.user1", "inbox_tray"), gateway.reactions)
-                self.assertNotIn(
+                self.assertEqual([entry[0] for entry in runtime.stopped], [task.task_id])
+                self.assertEqual(len(runtime.started), 1)
+                resumed_task, _, _ = runtime.started[0]
+                self.assertIn("Use the model-based resolver instead.", resumed_task.prompt)
+                self.assertNotIn(("C1", "171.user1", "inbox_tray"), gateway.reactions)
+                self.assertIn(
                     ("C1", "171.user1", "hourglass_flowing_sand"),
                     gateway.reactions,
                 )
-                self.assertEqual(len(gateway.thread_replies), 1)
-                self.assertIn(
-                    "could not deliver that follow-up live",
-                    gateway.thread_replies[0]["text"],
+                self.assertEqual(
+                    [reply for reply in gateway.thread_replies if "queued" in reply["text"]],
+                    [],
+                    "stop should not have produced any 'I queued it' notice",
                 )
             finally:
                 store.close()
 
-    def test_same_thread_reply_dedups_queued_followups_by_message_ts_and_text(self):
-        class UninterruptibleRuntime(DetachedRuntime):
+    def test_same_thread_reply_surfaces_delivery_failure_when_worker_cannot_stop(self):
+        class StuckRuntime(DetachedRuntime):
             def interrupt_task(self, task_id):
                 self.interrupted.append(task_id)
+                return False
+
+            def stop_task(self, task_id, status=AgentTaskStatus.CANCELLED):
+                self.stopped.append((task_id, status))
                 return False
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -8311,11 +8933,11 @@ class SlackAppTests(unittest.TestCase):
                 task = replace(
                     create_agent_task(agent, "initial task", "C1"),
                     status=AgentTaskStatus.ACTIVE,
-                    thread_ts="172.thread",
-                    parent_message_ts="172.parent",
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
                 )
                 store.upsert_agent_task(task)
-                runtime = UninterruptibleRuntime()
+                runtime = StuckRuntime()
                 runtime.running_task_ids.add(task.task_id)
                 controller = SlackTeamController(
                     store,
@@ -8324,68 +8946,37 @@ class SlackAppTests(unittest.TestCase):
                     runtime=runtime,
                 )
 
-                # Same Slack event redelivered twice — should collapse to one entry.
-                redelivery = {
-                    "event": {
-                        "type": "message",
-                        "channel": "C1",
-                        "user": "U1",
-                        "text": "do you see hooks from both claude and codex?",
-                        "ts": "172.user1",
-                        "thread_ts": "172.thread",
-                    }
-                }
-                controller.handle_event(redelivery)
-                controller.handle_event(redelivery)
-
-                queued = store.get_agent_task(task.task_id).metadata.get("queued_thread_followups")
-                self.assertIsInstance(queued, list)
-                self.assertEqual(len(queued), 1)
-                self.assertEqual(queued[0]["message_ts"], "172.user1")
-
-                # Distinct message_ts but identical text within the window — the
-                # user impatiently re-sent the same question. Collapse onto the
-                # later message_ts so the agent only sees it once.
                 controller.handle_event(
                     {
                         "event": {
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "do you see hooks from both claude and codex?",
-                            "ts": "172.user2",
-                            "thread_ts": "172.thread",
+                            "text": "Try this approach instead.",
+                            "ts": "171.user1",
+                            "thread_ts": "171.thread",
                         }
                     }
                 )
 
-                queued = store.get_agent_task(task.task_id).metadata.get("queued_thread_followups")
-                self.assertEqual(len(queued), 1)
-                self.assertEqual(queued[0]["message_ts"], "172.user2")
-
-                # A genuinely different question must still queue separately.
-                controller.handle_event(
-                    {
-                        "event": {
-                            "type": "message",
-                            "channel": "C1",
-                            "user": "U1",
-                            "text": "and what about the rate limits?",
-                            "ts": "172.user3",
-                            "thread_ts": "172.thread",
-                        }
-                    }
-                )
-
-                queued = store.get_agent_task(task.task_id).metadata.get("queued_thread_followups")
-                self.assertEqual(len(queued), 2)
-                self.assertEqual(
-                    [entry["prompt"] for entry in queued],
-                    [
-                        "do you see hooks from both claude and codex?",
-                        "and what about the rate limits?",
-                    ],
-                )
+                # We attempted to interrupt and then stop, both failed.
+                self.assertEqual(runtime.interrupted, [task.task_id])
+                self.assertEqual([entry[0] for entry in runtime.stopped], [task.task_id])
+                # Fresh resume must NOT have been attempted because the worker
+                # slot is still occupied; start_task would silently refuse.
+                self.assertEqual(runtime.started, [])
+                # The original task row stays put — the follow-up did not
+                # overwrite it, so the user's question is not stuck in a row
+                # nobody is reading.
+                current_task = store.get_agent_task(task.task_id)
+                assert current_task is not None
+                self.assertEqual(current_task.prompt, "initial task")
+                # Slack receives a visible notice so the user knows to retry.
+                delivery_notices = [
+                    reply for reply in gateway.thread_replies if "couldn't deliver" in reply["text"]
+                ]
+                self.assertEqual(len(delivery_notices), 1)
+                self.assertIn(f"@{agent.handle}", delivery_notices[0]["text"])
             finally:
                 store.close()
 
@@ -8573,7 +9164,17 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_stop_in_task_thread_discards_queued_followups_after_interrupt(self):
+    def test_stop_clears_orphaned_active_task_when_no_live_worker(self):
+        # Regression: previously, "stop" against a task whose runtime worker
+        # had already exited but whose DB row still said ACTIVE would just
+        # post "No active run is currently running for this task." over and
+        # over, leaving subsequent follow-ups stuck. Stop must always reach a
+        # terminal state.
+        class NoRunningRuntime(DetachedRuntime):
+            def interrupt_task(self, task_id):
+                self.interrupted.append(task_id)
+                return False
+
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -8582,40 +9183,19 @@ class SlackAppTests(unittest.TestCase):
                 agent = build_initial_model_team(1, 0)[0]
                 store.upsert_team_agent(agent)
                 task = replace(
-                    create_agent_task(agent, "initial task", "C1"),
+                    create_agent_task(agent, "stale active task", "C1"),
                     status=AgentTaskStatus.ACTIVE,
                     thread_ts="171.thread",
                     parent_message_ts="171.parent",
                 )
-                task = replace(
-                    task,
-                    metadata={
-                        **task.metadata,
-                        "queued_thread_followups": [
-                            {
-                                "prompt": "Switch to the LLM schedule resolver.",
-                                "message_ts": "171.user1",
-                                "requested_by_slack_user": "U1",
-                            },
-                            {
-                                "prompt": "Also keep the stop command.",
-                                "message_ts": "171.user2",
-                                "requested_by_slack_user": "U1",
-                            },
-                        ],
-                    },
-                )
                 store.upsert_agent_task(task)
-                runtime = DetachedRuntime()
-                runtime.running_task_ids.add(task.task_id)
+                runtime = NoRunningRuntime()
                 controller = SlackTeamController(
                     store,
                     gateway,
                     default_channel_id="C1",
                     runtime=runtime,
                 )
-                controller._mark_message_queued("C1", "171.user1")
-                controller._mark_message_queued("C1", "171.user2")
 
                 controller.handle_event(
                     {
@@ -8630,26 +9210,14 @@ class SlackAppTests(unittest.TestCase):
                     }
                 )
 
-                self.assertEqual(runtime.interrupted, [task.task_id])
-                self.assertEqual(runtime.started, [])
-                self.assertEqual(runtime.interrupted_sent, [])
-                self.assertIn(task.task_id, runtime.running_task_ids)
-                self.assertIn(("C1", "171.stop", "white_check_mark"), gateway.reactions)
                 current_task = store.get_agent_task(task.task_id)
                 assert current_task is not None
-                self.assertNotIn("queued_thread_followups", current_task.metadata)
-                self.assertIn(("C1", "171.user1", "inbox_tray"), gateway.removed_reactions)
-                self.assertIn(("C1", "171.user2", "inbox_tray"), gateway.removed_reactions)
-                self.assertNotIn(
-                    ("C1", "171.user1", "hourglass_flowing_sand"),
-                    gateway.reactions,
+                self.assertEqual(current_task.status, AgentTaskStatus.CANCELLED)
+                self.assertIn(("C1", "171.stop", "white_check_mark"), gateway.reactions)
+                self.assertIn(
+                    "Cleared the stale active state",
+                    gateway.thread_replies[-1]["text"],
                 )
-                self.assertNotIn(
-                    ("C1", "171.user2", "hourglass_flowing_sand"),
-                    gateway.reactions,
-                )
-                self.assertIn("Interrupted the current run", gateway.thread_replies[-1]["text"])
-                self.assertNotIn("sent the queued follow-ups", gateway.thread_replies[-1]["text"])
             finally:
                 store.close()
 

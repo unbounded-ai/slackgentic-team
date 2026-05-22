@@ -10,6 +10,7 @@ from typing import Any
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    ORIGINAL_TASK_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentTask,
     Provider,
@@ -561,6 +562,52 @@ def build_external_session_capacity_blocks(
     ]
 
 
+IDLE_RELEASE_PROMPT_TEXT = (
+    "_Idle. Reply in this thread with anything else you need, "
+    "or use the button to free up this agent._"
+)
+
+IDLE_RELEASE_DISMISSED_TEXT = "_Continuing — picked up the next turn in this thread._"
+
+
+def build_idle_release_prompt_blocks(task: AgentTask) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "block_id": f"task.idle.{task.task_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": IDLE_RELEASE_PROMPT_TEXT,
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"task.idle.actions.{task.task_id}",
+            "elements": [
+                _button(
+                    "Free up this agent",
+                    "task.done",
+                    encode_action_value("task.done", task_id=task.task_id),
+                    "primary",
+                ),
+            ],
+        },
+    ]
+
+
+def build_idle_release_dismissed_blocks(task: AgentTask) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "block_id": f"task.idle.{task.task_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": IDLE_RELEASE_DISMISSED_TEXT,
+            },
+        },
+    ]
+
+
 def build_task_thread_blocks(
     task: AgentTask,
     agent: TeamAgent,
@@ -611,7 +658,7 @@ def build_task_thread_blocks(
 
 def _task_display_lines(task: AgentTask) -> str:
     original_prompt = _task_original_prompt(task)
-    lines = [f"*Task:* {original_prompt}"]
+    lines = [f"*Original Task:* {original_prompt}"]
     summary = task.metadata.get(ROSTER_SUMMARY_METADATA_KEY)
     if isinstance(summary, str) and summary.strip():
         summary = summary.strip()
@@ -621,6 +668,9 @@ def _task_display_lines(task: AgentTask) -> str:
 
 
 def _task_original_prompt(task: AgentTask) -> str:
+    original_task = task.metadata.get(ORIGINAL_TASK_METADATA_KEY)
+    if isinstance(original_task, str) and original_task.strip():
+        return original_task.strip()
     value = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
     if isinstance(value, str) and value.strip():
         return value.strip()

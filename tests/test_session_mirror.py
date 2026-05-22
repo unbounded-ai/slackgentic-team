@@ -2028,6 +2028,211 @@ class SessionMirrorTests(unittest.TestCase):
         self.assertIsNone(render_session_event(tool_event))
         self.assertEqual(render_session_event(text_event), "done")
 
+    def test_render_claude_event_surfaces_ask_user_question(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "AskUserQuestion",
+                            "input": {
+                                "questions": [
+                                    {
+                                        "header": "Install method",
+                                        "question": "Which install method should the README recommend?",
+                                        "multiSelect": False,
+                                        "options": [
+                                            {
+                                                "label": "uv tool install",
+                                                "description": "Modern, fast",
+                                            },
+                                            {
+                                                "label": "pipx install",
+                                                "description": "Long-standing standard",
+                                            },
+                                        ],
+                                    },
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        )
+
+        rendered = render_session_event(event)
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("asking a question in the terminal", rendered)
+        self.assertIn("Install method", rendered)
+        self.assertIn("Which install method should the README recommend?", rendered)
+        self.assertIn("`uv tool install` — Modern, fast", rendered)
+        self.assertIn("`pipx install` — Long-standing standard", rendered)
+
+    def test_render_claude_event_handles_multi_tab_ask_user_question(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "AskUserQuestion",
+                            "input": {
+                                "questions": [
+                                    {
+                                        "header": "Auth method",
+                                        "question": "Pick the auth method.",
+                                        "multiSelect": False,
+                                        "options": [{"label": "OAuth"}, {"label": "API key"}],
+                                    },
+                                    {
+                                        "header": "Storage",
+                                        "question": "Pick storage backends.",
+                                        "multiSelect": True,
+                                        "options": [
+                                            {"label": "Postgres"},
+                                            {"label": "Redis"},
+                                        ],
+                                    },
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        )
+
+        rendered = render_session_event(event)
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("Auth method", rendered)
+        self.assertIn("Storage", rendered)
+        self.assertIn("(select all that apply)", rendered)
+        self.assertNotIn("Auth method (select all that apply)", rendered)
+        self.assertIn("`OAuth`", rendered)
+        self.assertIn("`Postgres`", rendered)
+
+    def test_render_claude_event_handles_string_ask_user_question_options(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "AskUserQuestion",
+                            "input": {
+                                "questions": [
+                                    {
+                                        "header": "Pick",
+                                        "question": "Pick one.",
+                                        "options": ["red", "blue"],
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            },
+        )
+
+        rendered = render_session_event(event)
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("`red`", rendered)
+        self.assertIn("`blue`", rendered)
+
+    def test_render_claude_event_skips_slackgentic_mcp_request_user_input(self):
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "mcp__slackgentic__request_user_input",
+                            "input": {
+                                "question": "Pick",
+                                "options": ["yes", "no"],
+                            },
+                        }
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNone(render_session_event(event))
+
+    def test_render_codex_event_surfaces_native_request_user_input(self):
+        event = AgentEvent(
+            provider=Provider.CODEX,
+            session_id="s1",
+            timestamp=None,
+            event_type="response_item",
+            metadata={
+                "payload": {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "arguments": json.dumps(
+                        {
+                            "header": "Migration target",
+                            "question": "Which database should we migrate to?",
+                            "options": [
+                                {"label": "Postgres", "description": "Default"},
+                                {"label": "MySQL"},
+                            ],
+                        }
+                    ),
+                }
+            },
+        )
+
+        rendered = render_session_event(event)
+
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("Codex is asking a question in the terminal", rendered)
+        self.assertIn("Migration target", rendered)
+        self.assertIn("Which database should we migrate to?", rendered)
+        self.assertIn("`Postgres` — Default", rendered)
+        self.assertIn("`MySQL`", rendered)
+
+    def test_render_codex_event_skips_slackgentic_mcp_request_user_input(self):
+        event = AgentEvent(
+            provider=Provider.CODEX,
+            session_id="s1",
+            timestamp=None,
+            event_type="response_item",
+            metadata={
+                "payload": {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "namespace": "mcp__slackgentic__",
+                    "arguments": json.dumps({"question": "Pick", "options": ["yes", "no"]}),
+                }
+            },
+        )
+
+        self.assertIsNone(render_session_event(event))
+
     def test_render_claude_event_hides_slackgentic_channel_user_event(self):
         event = AgentEvent(
             provider=Provider.CLAUDE,
@@ -2105,6 +2310,25 @@ class SessionMirrorTests(unittest.TestCase):
         self.assertEqual(rendered, "I saw this:\n\nDone.")
         assert rendered is not None
         self.assertNotIn("channel source", rendered)
+
+    def test_render_claude_event_drops_synthetic_no_response_record(self):
+        # The mirror used to surface this synthetic record verbatim into the
+        # Slack thread. Treat it as nothing-to-render — the agent did not
+        # actually speak.
+        event = AgentEvent(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            timestamp=None,
+            event_type="assistant",
+            metadata={
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "No response requested."}],
+                }
+            },
+        )
+
+        self.assertIsNone(render_session_event(event))
 
     def test_codex_parent_warns_when_session_lacks_remote_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:

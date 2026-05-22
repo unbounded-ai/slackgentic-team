@@ -323,5 +323,46 @@ class ClaudeProviderTests(unittest.TestCase):
             self.assertEqual(sessions[0].status, SessionStatus.DONE)
 
 
+class IsSyntheticClaudeAssistantRecordTests(unittest.TestCase):
+    def test_detects_synthetic_model_marker(self):
+        from agent_harness.providers.claude import is_synthetic_claude_assistant_record
+
+        record = {
+            "type": "assistant",
+            "message": {
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "anything at all"}],
+            },
+        }
+
+        self.assertTrue(is_synthetic_claude_assistant_record(record))
+
+    def test_detects_no_response_text_without_model_marker(self):
+        from agent_harness.providers.claude import is_synthetic_claude_assistant_record
+
+        record = {
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "No response requested."}],
+            },
+        }
+
+        self.assertTrue(is_synthetic_claude_assistant_record(record))
+
+    def test_genuine_assistant_message_is_not_synthetic(self):
+        from agent_harness.providers.claude import is_synthetic_claude_assistant_record
+
+        record = {
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "Here is the answer."}],
+            },
+        }
+
+        self.assertFalse(is_synthetic_claude_assistant_record(record))
+
+
 if __name__ == "__main__":
     unittest.main()

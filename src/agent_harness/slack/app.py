@@ -32,6 +32,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    ORIGINAL_TASK_METADATA_KEY,
     PR_URL_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
@@ -145,8 +146,11 @@ from agent_harness.sessions.mirror import (
     SessionMirror,
 )
 from agent_harness.slack import (
+    IDLE_RELEASE_PROMPT_TEXT,
     AgentRosterStatus,
     build_channel_overview_blocks,
+    build_idle_release_dismissed_blocks,
+    build_idle_release_prompt_blocks,
     build_setup_modal,
     build_task_thread_blocks,
     build_team_roster_blocks,
@@ -285,9 +289,9 @@ THREAD_CONTEXT_DELEGATE_PROMPT = (
     "or a concise status update. If no changes are needed, say so."
 )
 THREAD_CONTEXT_DELEGATE_VISIBLE_PROMPT = "continue using the thread context above."
-QUEUED_THREAD_FOLLOWUPS_METADATA_KEY = "queued_thread_followups"
 ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY = "active_thread_followup_message_ts"
 ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY = "active_thread_followup_message_ts_values"
+IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY = "idle_release_prompt_message_ts"
 LINKED_THREAD_ROUTE_INTENT_RE = re.compile(
     r"\b(?:this|the)\s+unrelated\s+thread\b"
     r"|\binstead\s+of\s+(?:this|the\s+current|current)\s+(?:thread|one)\b"
@@ -915,6 +919,23 @@ class SlackTeamController:
                 PendingWorkRequestStatus.CANCELLED,
             )
             return False
+        if self._is_pending_for_dead_thread(pending):
+            # The destination thread is no longer alive — every task in it is
+            # done or cancelled, and any parent/delegating task is also
+            # finished. Reviving here would post "Capacity is available now."
+            # into a thread the user has already closed out, dragging an
+            # agent back to a discussion that wrapped hours or days ago.
+            LOGGER.info(
+                "cancelling stale pending work request %s; thread %s/%s has no live work",
+                pending.pending_id,
+                pending.channel_id,
+                pending.thread_ts,
+            )
+            self.store.update_pending_work_request_status(
+                pending.pending_id,
+                PendingWorkRequestStatus.CANCELLED,
+            )
+            return False
         author_agent = None
         if pending.author_agent_id:
             author_agent = self.store.get_team_agent(pending.author_agent_id)
@@ -985,6 +1006,45 @@ class SlackTeamController:
         deferred_work_id = pending.extra_metadata.get("deferred_work_id")
         if isinstance(deferred_work_id, str) and deferred_work_id:
             self.store.update_deferred_work_last_task(deferred_work_id, last_task_id=task_id)
+
+    def _is_pending_for_dead_thread(self, pending: PendingWorkRequest) -> bool:
+        # Scheduled/deferred pendings drive future-tense work that is supposed
+        # to land in its own fresh thread; never treat those as stale.
+        if pending.extra_metadata.get("scheduled_work_id"):
+            return False
+        if pending.extra_metadata.get("deferred_work_id"):
+            return False
+        parent_task_id = pending.extra_metadata.get("parent_task_id")
+        if not isinstance(parent_task_id, str) or not parent_task_id:
+            parent_task_id = pending.extra_metadata.get("delegated_from_task_id")
+        if isinstance(parent_task_id, str) and parent_task_id:
+            parent_task = self.store.get_agent_task(parent_task_id)
+            if parent_task is None:
+                # The parent row is gone; play it safe and revive normally.
+                return False
+            if parent_task.status not in {
+                AgentTaskStatus.DONE,
+                AgentTaskStatus.CANCELLED,
+            }:
+                return False
+        elif not pending.thread_ts:
+            # No parent and no thread anchor — nothing to declare dead.
+            return False
+        if not pending.thread_ts:
+            return False
+        thread_tasks = [
+            task
+            for task in self.store.list_agent_tasks(include_done=True)
+            if task.channel_id == pending.channel_id and task.thread_ts == pending.thread_ts
+        ]
+        if not thread_tasks:
+            # Fresh thread (top-level request that found no idle agents and
+            # never produced a thread reply). Still eligible for revival.
+            return False
+        return all(
+            task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}
+            for task in thread_tasks
+        )
 
     def _post_text(self, target: SlackReplyTarget, text: str) -> None:
         if target.thread_ts:
@@ -1564,13 +1624,16 @@ class SlackTeamController:
                 continue
             if task.status == AgentTaskStatus.QUEUED:
                 label = "Queued"
-                detail = _shorten(_task_roster_summary(task), 140)
+                detail = _task_roster_detail(task)
             elif self._task_is_runtime_running(task.task_id):
                 label = "Working"
-                detail = _shorten(_task_roster_summary(task), 140)
+                detail = _task_roster_detail(task)
             else:
                 label = "Occupied"
-                detail = _shorten(f"Open thread: {_task_roster_summary(task)}", 140)
+                detail = (
+                    f"Open thread: {_shorten(_task_roster_summary(task), 140)}\n"
+                    f"*Original Task:* {_shorten(_task_original_prompt(task), 180)}"
+                )
             statuses[agent.agent_id] = AgentRosterStatus(
                 label,
                 detail,
@@ -1592,7 +1655,7 @@ class SlackTeamController:
                 continue
             statuses[agent.agent_id] = AgentRosterStatus(
                 "Working",
-                _shorten(_task_roster_summary(task), 140),
+                _task_roster_detail(task),
                 dangerous_mode=_task_dangerous_mode(task),
                 pr_urls=pr_urls_from_metadata(task.metadata),
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
@@ -2183,10 +2246,6 @@ class SlackTeamController:
             is_running = getattr(self.runtime, "is_task_running", None)
             if callable(is_running) and is_running(task.task_id):
                 continue
-            if _queued_thread_followups(task.metadata):
-                if self._resume_queued_thread_followup_task(task):
-                    resumed += 1
-                continue
             if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
                 continue
             if self._managed_task_session_is_alive(task):
@@ -2217,31 +2276,6 @@ class SlackTeamController:
             if started:
                 resumed += 1
         return resumed
-
-    def resume_stranded_queued_thread_followups(self) -> int:
-        if self.runtime is None:
-            return 0
-        is_running = getattr(self.runtime, "is_task_running", None)
-        resumed = 0
-        for task in self.store.list_agent_tasks():
-            if task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
-                continue
-            if not task.thread_ts:
-                continue
-            if not _queued_thread_followups(task.metadata):
-                continue
-            if callable(is_running) and is_running(task.task_id):
-                continue
-            if self._resume_queued_thread_followup_task(task):
-                resumed += 1
-        return resumed
-
-    def _resume_queued_thread_followup_task(self, task: AgentTask) -> bool:
-        agent = self.store.get_team_agent(task.agent_id)
-        if agent is None or not task.thread_ts:
-            return False
-        thread = SlackThreadRef(task.channel_id, task.thread_ts, task.parent_message_ts)
-        return self._resume_queued_thread_followups(task, agent, thread)
 
     def _managed_task_session_is_alive(self, task: AgentTask) -> bool:
         if task.session_provider is None or not task.session_id:
@@ -3164,12 +3198,7 @@ class SlackTeamController:
             return True
         if agent:
             started = self._start_thread_followup(target_task, event, followup_text, agent)
-            latest = self.store.get_agent_task(target_task.task_id) or target_task
-            if (
-                started
-                and message_ts
-                and not _queued_thread_followups_contain_message_ts(latest.metadata, message_ts)
-            ):
+            if started and message_ts:
                 self._mark_message_in_progress(channel_id, message_ts)
             return started
         if task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
@@ -3196,10 +3225,22 @@ class SlackTeamController:
                 stopped = bool(self.runtime.stop_task(task.task_id, status=None))
         self._mark_message_complete(thread.channel_id, message_ts)
         if stopped:
-            self._discard_queued_thread_followups(task, thread)
             self.gateway.post_thread_reply(
                 thread,
                 "Interrupted the current run. Send the next instruction here to continue.",
+            )
+            self.refresh_or_post_roster(thread.channel_id)
+            return
+        # No live worker to interrupt. If the task is still marked ACTIVE/QUEUED
+        # in the DB, that's an orphaned-state mismatch (e.g. the worker exited
+        # without transitioning the row). Stop should resolve it instead of
+        # leaving stale state that confuses follow-up routing.
+        latest = self.store.get_agent_task(task.task_id) or task
+        if latest.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}:
+            self._abandon_orphaned_task(latest)
+            self.gateway.post_thread_reply(
+                thread,
+                "Cleared the stale active state on this task. Send the next instruction here to continue.",
             )
         else:
             self.gateway.post_thread_reply(
@@ -4078,6 +4119,7 @@ class SlackTeamController:
         request_message_ts: str | None = None,
         try_live_send: bool = True,
     ) -> bool:
+        previous_task = self._dismiss_idle_release_prompt(previous_task, thread)
         previous_task = self._record_task_pr_urls(previous_task, agent, thread, request.prompt)
         if (
             try_live_send
@@ -4111,14 +4153,41 @@ class SlackTeamController:
                 request_message_ts=request_message_ts,
             ):
                 return True
-            queued_count = self._queue_running_task_followup(
-                previous_task,
-                request,
-                requested_by_slack_user=requested_by_slack_user,
-                request_message_ts=request_message_ts,
+            # Live delivery failed and we could not interrupt the running
+            # worker to inject the new prompt. Rather than stash the message
+            # in a metadata queue (which silently delays delivery and turned
+            # the inbox into a graveyard), terminate the worker and resume
+            # the session fresh so the user's instruction is the next thing
+            # the agent sees.
+            LOGGER.warning(
+                "could not deliver same-thread follow-up live; terminating worker for fresh resume on task %s",
+                previous_task.task_id,
             )
-            self._post_queued_followup_notice(agent, thread, request.prompt, queued_count)
-            return True
+            stop_succeeded = True
+            if self.runtime is not None:
+                try:
+                    stop_succeeded = bool(
+                        self.runtime.stop_task(previous_task.task_id, status=None)
+                    )
+                except Exception:
+                    stop_succeeded = False
+                    LOGGER.debug(
+                        "failed to stop worker before fresh same-thread resume",
+                        exc_info=True,
+                    )
+            if not stop_succeeded:
+                # The worker did not exit even after the escalation in
+                # stop_task; the runtime's slot for this task_id is still
+                # occupied, so start_task below would silently refuse the
+                # fresh resume and the user's message would disappear into
+                # the task row with no worker to pick it up. Tell the user
+                # so they can retry instead of waiting forever.
+                LOGGER.warning(
+                    "fresh same-thread resume blocked for task %s; surfacing delivery failure to Slack",
+                    previous_task.task_id,
+                )
+                self._post_followup_delivery_failed_notice(thread, agent)
+                return False
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         metadata = metadata_with_pr_urls(metadata, request.prompt)
@@ -4146,6 +4215,25 @@ class SlackTeamController:
         self.store.upsert_agent_task(task)
         self._restore_task_action_buttons_if_active(task)
         return self._start_runtime_task(task, agent, thread)
+
+    def _post_followup_delivery_failed_notice(
+        self,
+        thread: SlackThreadRef,
+        agent,
+    ) -> None:
+        handle = getattr(agent, "handle", None) or "the agent"
+        text = (
+            f"I couldn't deliver your message to @{handle} — the previous run "
+            "is stuck and a fresh resume could not be started. Please send the "
+            "message again in a moment."
+        )
+        try:
+            self.gateway.post_thread_reply(thread, text)
+        except Exception:
+            LOGGER.debug(
+                "failed to post same-thread follow-up delivery failure notice",
+                exc_info=True,
+            )
 
     def _send_live_managed_task_followup(
         self,
@@ -4232,90 +4320,6 @@ class SlackTeamController:
             return task
         return self.store.get_agent_task(task.task_id) or updated
 
-    def _queue_running_task_followup(
-        self,
-        task: AgentTask,
-        request: WorkRequest,
-        *,
-        requested_by_slack_user: str | None,
-        request_message_ts: str | None,
-    ) -> int:
-        latest = self.store.get_agent_task(task.task_id) or task
-        metadata = metadata_with_pr_urls(latest.metadata, request.prompt)
-        queued = _queued_thread_followups(metadata)
-        new_entry: dict[str, object] = {
-            "prompt": request.prompt,
-            "message_ts": request_message_ts,
-            "requested_by_slack_user": requested_by_slack_user,
-            "created_at": utc_now().isoformat(),
-        }
-        # 1. Slack can redeliver the same event_callback (same message_ts) when
-        #    the daemon is mid-shutdown or its ack is delayed. Treat that as a
-        #    duplicate and refresh the existing entry instead of stacking it.
-        if isinstance(request_message_ts, str) and request_message_ts:
-            for existing in queued:
-                if existing.get("message_ts") == request_message_ts:
-                    existing.update(new_entry)
-                    metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
-                    updated = replace(latest, metadata=metadata, updated_at=utc_now())
-                    self.store.upsert_agent_task(updated)
-                    self._mark_message_queued(latest.channel_id, request_message_ts)
-                    return len(queued)
-        # 2. Users who re-send the same text within the queue window (e.g. "do
-        #    you see hooks?" twice, 53s apart, because the first reply was
-        #    silently dropped) should not get the agent to answer the same
-        #    question twice. Collapse onto the most recent message_ts.
-        normalized = request.prompt.strip()
-        if normalized and queued:
-            last = queued[-1]
-            last_prompt = last.get("prompt")
-            if isinstance(last_prompt, str) and last_prompt.strip() == normalized:
-                last.update(new_entry)
-                metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
-                updated = replace(latest, metadata=metadata, updated_at=utc_now())
-                self.store.upsert_agent_task(updated)
-                self._mark_message_queued(latest.channel_id, request_message_ts)
-                return len(queued)
-        queued = [*queued, new_entry][-20:]
-        metadata[QUEUED_THREAD_FOLLOWUPS_METADATA_KEY] = queued
-        updated = replace(latest, metadata=metadata, updated_at=utc_now())
-        self.store.upsert_agent_task(updated)
-        self._mark_message_queued(latest.channel_id, request_message_ts)
-        return len(queued)
-
-    def _post_queued_followup_notice(
-        self,
-        agent,
-        thread: SlackThreadRef,
-        prompt: str,
-        queued_count: int,
-    ) -> None:
-        if queued_count > 1 and not _looks_like_direct_question(prompt):
-            return
-        try:
-            self.gateway.post_thread_reply(
-                thread,
-                _queued_followup_notice(agent.handle, prompt, queued_count),
-            )
-        except Exception:
-            LOGGER.debug("failed to post queued follow-up notice", exc_info=True)
-
-    def _discard_queued_thread_followups(
-        self,
-        task: AgentTask,
-        thread: SlackThreadRef,
-    ) -> None:
-        latest = self.store.get_agent_task(task.task_id) or task
-        queued = _queued_thread_followups(latest.metadata)
-        if not queued:
-            return
-        metadata = dict(latest.metadata)
-        metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
-        updated = replace(latest, metadata=metadata, updated_at=utc_now())
-        self.store.upsert_agent_task(updated)
-        for message_ts in _queued_thread_followup_message_ts_values(queued):
-            self._clear_message_status_reactions(thread.channel_id, message_ts)
-
     def _interrupt_running_task_for_followup(
         self,
         task: AgentTask,
@@ -4331,18 +4335,10 @@ class SlackTeamController:
         send = getattr(self.runtime, "send_to_interrupted_task", None)
         if not callable(interrupt) or not callable(send):
             return False
-        latest = self.store.get_agent_task(task.task_id) or task
-        queued = _queued_thread_followups(latest.metadata)
-        prompts = [item["prompt"] for item in queued if isinstance(item.get("prompt"), str)]
-        prompts.append(request.prompt)
-        prompts = [prompt for prompt in prompts if prompt.strip()]
-        if not prompts:
+        if not request.prompt.strip():
             return False
-        message_ts_values = _queued_thread_followup_message_ts_values(queued)
-        if request_message_ts:
-            message_ts_values.append(request_message_ts)
-        message_ts_values = list(dict.fromkeys(message_ts_values))
-        prompt = _queued_followup_prompt(prompts)
+        prompt = _live_thread_followup_prompt(request.prompt)
+        latest = self.store.get_agent_task(task.task_id) or task
         try:
             interrupted = bool(interrupt(task.task_id))
         except Exception:
@@ -4363,22 +4359,16 @@ class SlackTeamController:
         if not sent:
             return False
         metadata = dict(latest.metadata)
-        metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
-        active_message_ts_values = list(
-            dict.fromkeys(
-                [
-                    *_active_thread_followup_message_ts_values(metadata),
-                    *message_ts_values,
-                ]
-            )
-        )
+        active_message_ts_values = _active_thread_followup_message_ts_values(metadata)
+        if request_message_ts and request_message_ts not in active_message_ts_values:
+            active_message_ts_values.append(request_message_ts)
         if active_message_ts_values:
             metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = (
                 active_message_ts_values
             )
             metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
-        metadata = metadata_with_pr_urls(metadata, *prompts)
+        metadata = metadata_with_pr_urls(metadata, prompt)
         metadata = self._with_linked_thread_context(
             metadata,
             prompt,
@@ -4387,15 +4377,13 @@ class SlackTeamController:
         updated = replace(
             latest,
             prompt=prompt,
-            requested_by_slack_user=requested_by_slack_user
-            or _last_queued_requested_by(queued)
-            or latest.requested_by_slack_user,
+            requested_by_slack_user=requested_by_slack_user or latest.requested_by_slack_user,
             updated_at=utc_now(),
             metadata=metadata,
         )
         self.store.upsert_agent_task(updated)
-        for message_ts in message_ts_values:
-            self._mark_message_in_progress(thread.channel_id, message_ts)
+        if request_message_ts:
+            self._mark_message_in_progress(thread.channel_id, request_message_ts)
         self.refresh_or_post_roster(thread.channel_id)
         return True
 
@@ -4413,117 +4401,16 @@ class SlackTeamController:
         metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY, None)
         updated = replace(latest, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
+        # Just clear the pending status reactions on these messages instead of
+        # adding :white_check_mark:. A finished run does not mean the user's
+        # specific follow-up was actually addressed, and the prior behavior of
+        # stamping a checkmark on every interrupted/queued follow-up — even
+        # when the agent never responded to it — made the indicator dishonest.
+        # :white_check_mark: stays reserved for explicit completion: "stop",
+        # task release, or `_reconcile_pending_thread_reactions` warning.
         for message_ts in message_ts_values:
-            self._mark_message_complete(thread.channel_id, message_ts)
+            self._clear_pending_message_status_reactions(thread.channel_id, message_ts)
         return self.store.get_agent_task(task.task_id) or updated
-
-    def _resume_queued_thread_followups(
-        self,
-        task: AgentTask,
-        agent,
-        thread: SlackThreadRef,
-    ) -> bool:
-        if self.runtime is None:
-            return False
-        latest = self.store.get_agent_task(task.task_id) or task
-        queued = _queued_thread_followups(latest.metadata)
-        if not queued:
-            return False
-        prompts = [item["prompt"] for item in queued if isinstance(item.get("prompt"), str)]
-        if not prompts:
-            return False
-        metadata = dict(latest.metadata)
-        metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
-        message_ts_values = _queued_thread_followup_message_ts_values(queued)
-        active_message_ts_values = list(
-            dict.fromkeys(
-                [
-                    *_active_thread_followup_message_ts_values(metadata),
-                    *message_ts_values,
-                ]
-            )
-        )
-        if active_message_ts_values:
-            metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = (
-                active_message_ts_values
-            )
-            metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
-        else:
-            metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY, None)
-            metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
-        for message_ts in message_ts_values:
-            self._mark_message_in_progress(thread.channel_id, message_ts)
-        metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
-        prompt = _queued_followup_prompt(prompts)
-        metadata = metadata_with_pr_urls(metadata, *prompts)
-        metadata = self._with_linked_thread_context(
-            metadata,
-            prompt,
-            current_thread=thread,
-        )
-        requested_by_slack_user = (
-            _last_queued_requested_by(queued) or latest.requested_by_slack_user
-        )
-        resumed = replace(
-            latest,
-            prompt=prompt,
-            status=AgentTaskStatus.ACTIVE,
-            requested_by_slack_user=requested_by_slack_user,
-            updated_at=utc_now(),
-            metadata=metadata,
-        )
-        self.store.upsert_agent_task(resumed)
-        self._restore_task_action_buttons_if_active(resumed)
-        started = self.runtime.start_task(resumed, agent, thread)
-        if not started:
-            self.store.upsert_agent_task(latest)
-        return started
-
-    def _send_queued_thread_followups_to_interrupted_task(
-        self,
-        task: AgentTask,
-        thread: SlackThreadRef,
-    ) -> bool:
-        if self.runtime is None:
-            return False
-        send = getattr(self.runtime, "send_to_interrupted_task", None)
-        if not callable(send):
-            return False
-        latest = self.store.get_agent_task(task.task_id) or task
-        queued = _queued_thread_followups(latest.metadata)
-        if not queued:
-            return False
-        prompts = [item["prompt"] for item in queued if isinstance(item.get("prompt"), str)]
-        if not prompts:
-            return False
-        prompt = _queued_followup_prompt(prompts)
-        if not send(latest.task_id, prompt):
-            return False
-        metadata = dict(latest.metadata)
-        metadata.pop(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY, None)
-        message_ts_values = _queued_thread_followup_message_ts_values(queued)
-        if message_ts_values:
-            metadata[ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY] = message_ts_values
-            metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
-        metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
-        metadata = metadata_with_pr_urls(metadata, *prompts)
-        metadata = self._with_linked_thread_context(
-            metadata,
-            prompt,
-            current_thread=thread,
-        )
-        updated = replace(
-            latest,
-            prompt=prompt,
-            requested_by_slack_user=_last_queued_requested_by(queued)
-            or latest.requested_by_slack_user,
-            updated_at=utc_now(),
-            metadata=metadata,
-        )
-        self.store.upsert_agent_task(updated)
-        for message_ts in message_ts_values:
-            self._mark_message_in_progress(thread.channel_id, message_ts)
-        return True
 
     def handle_runtime_task_done(
         self,
@@ -4548,8 +4435,6 @@ class SlackTeamController:
             )
         task = self._complete_active_thread_followup(task, thread)
         self._clear_completed_run_pending_reactions(task, thread)
-        if self._resume_queued_thread_followups(task, agent, thread):
-            return
         if task_is_child:
             task = self.store.get_agent_task(task.task_id) or task
         else:
@@ -4558,15 +4443,25 @@ class SlackTeamController:
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
         if not isinstance(delegate_to_agent_id, str) or not isinstance(delegate_prompt, str):
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         if not delegate_prompt.strip() or not thread.thread_ts:
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         target_agent = self.store.get_team_agent(delegate_to_agent_id)
         if target_agent is None:
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         if target_agent.agent_id == agent.agent_id:
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         if target_agent.agent_id in self._busy_agent_ids_for_assignment():
+            if not task_is_child:
+                self._post_idle_release_prompt(task, agent, thread)
             return
         visible_prompt = task.metadata.get("delegate_visible_prompt")
         if not isinstance(visible_prompt, str) or not visible_prompt.strip():
@@ -4666,6 +4561,68 @@ class SlackTeamController:
         self._restore_task_action_buttons_if_active(held)
         return self.store.get_agent_task(current.task_id) or held
 
+    def _post_idle_release_prompt(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+    ) -> None:
+        if not thread.thread_ts:
+            return
+        current = self.store.get_agent_task(task.task_id) or task
+        if current.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return
+        existing_ts = current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+        if isinstance(existing_ts, str) and existing_ts:
+            return
+        try:
+            posted = self.gateway.post_thread_reply(
+                thread,
+                IDLE_RELEASE_PROMPT_TEXT,
+                blocks=build_idle_release_prompt_blocks(current),
+            )
+        except Exception:
+            LOGGER.debug("failed to post idle release prompt", exc_info=True)
+            return
+        message_ts = getattr(posted, "ts", None)
+        if not message_ts:
+            return
+        latest = self.store.get_agent_task(current.task_id) or current
+        if latest.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return
+        metadata = dict(latest.metadata)
+        metadata[IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY] = message_ts
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+
+    def _dismiss_idle_release_prompt(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        message_ts = current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+        if not isinstance(message_ts, str) or not message_ts:
+            return current
+        channel_id = thread.channel_id or current.channel_id
+        if channel_id:
+            try:
+                self.gateway.update_message(
+                    channel_id,
+                    message_ts,
+                    " ",
+                    blocks=build_idle_release_dismissed_blocks(current),
+                )
+            except Exception:
+                LOGGER.debug("failed to dismiss idle release prompt", exc_info=True)
+        metadata = dict(current.metadata)
+        metadata.pop(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, None)
+        if metadata == current.metadata:
+            return current
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return self.store.get_agent_task(current.task_id) or updated
+
     def handle_runtime_agent_control(
         self,
         task: AgentTask,
@@ -4678,7 +4635,7 @@ class SlackTeamController:
             return self._update_task_roster_summary(task, agent, thread, roster_summary)
         reaction_name = parse_agent_reaction_signal(signal)
         if reaction_name is not None:
-            return self._react_to_latest_user_message(task, thread, reaction_name)
+            return self._react_to_latest_thread_message(task, agent, thread, reaction_name)
         if signal == AGENT_THREAD_DONE_SIGNAL:
             return self._complete_task_thread(thread.channel_id, thread.thread_ts)
         if is_agent_timer_signal(signal):
@@ -4722,23 +4679,31 @@ class SlackTeamController:
                 task.parent_message_ts,
                 format_agent_assignment(
                     agent,
-                    _task_roster_summary(task),
+                    _task_original_prompt(task),
                     task.requested_by_slack_user,
                     dangerous_mode=_task_dangerous_mode(task),
+                    latest_summary=_task_roster_summary(task),
                 ),
                 blocks=_task_thread_blocks(task, agent),
             )
         except Exception:
             LOGGER.debug("failed to refresh task thread header", exc_info=True)
 
-    def _react_to_latest_user_message(
+    def _react_to_latest_thread_message(
         self,
         task: AgentTask,
+        agent,
         thread: SlackThreadRef,
         reaction_name: str,
     ) -> bool:
         current = self.store.get_agent_task(task.task_id) or task
-        message_ts = _latest_user_message_ts_for_reaction(current.metadata)
+        user_message_ts = _latest_user_message_ts_for_reaction(current.metadata)
+        message_ts = self._latest_reactable_message_ts(
+            task,
+            agent,
+            thread,
+            fallback_ts=user_message_ts,
+        )
         if not message_ts:
             return False
         try:
@@ -4746,12 +4711,44 @@ class SlackTeamController:
         except Exception:
             LOGGER.debug("failed to add agent-requested Slack reaction", exc_info=True)
             return False
-        if reaction_name in TASK_STATUS_REACTIONS:
+        if reaction_name in TASK_STATUS_REACTIONS and message_ts == user_message_ts:
             self.store.set_setting(
                 _message_status_reaction_setting_key(thread.channel_id, message_ts),
                 reaction_name,
             )
         return True
+
+    def _latest_reactable_message_ts(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        *,
+        fallback_ts: str | None,
+    ) -> str | None:
+        if not thread.channel_id or not thread.thread_ts:
+            return fallback_ts
+        try:
+            messages = self.gateway.thread_messages(
+                thread.channel_id,
+                thread.thread_ts,
+                limit=20,
+            )
+        except Exception:
+            LOGGER.debug("failed to fetch thread messages for reaction", exc_info=True)
+            messages = []
+        skip_ts = {thread.thread_ts}
+        if task.parent_message_ts:
+            skip_ts.add(task.parent_message_ts)
+        for message in reversed(messages):
+            ts = message.get("ts")
+            if not isinstance(ts, str) or not ts or ts in skip_ts:
+                continue
+            record = self._agent_authored_message_record(thread.channel_id, ts)
+            if record and _record_string(record, "agent_id") == agent.agent_id:
+                continue
+            return ts
+        return fallback_ts
 
     def _schedule_agent_timer(
         self,
@@ -5902,6 +5899,7 @@ class SlackTeamController:
         metadata: dict[str, object] = {
             "parent_task_id": parent_task.task_id,
             "parent_agent_id": parent_task.agent_id,
+            ORIGINAL_TASK_METADATA_KEY: _task_original_prompt(parent_task),
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
@@ -5910,7 +5908,7 @@ class SlackTeamController:
             metadata[PR_URL_METADATA_KEY] = parent_pr_urls[0]
             metadata[PR_URLS_METADATA_KEY] = list(parent_pr_urls)
         context = self._thread_context(channel_id, thread_ts)
-        prompt_context = f"Original task: {_task_assignment_prompt(parent_task)}"
+        prompt_context = f"Original task: {_task_original_prompt(parent_task)}"
         if context:
             metadata["thread_context"] = f"{prompt_context}\n{context}"
         else:
@@ -6119,9 +6117,6 @@ class SlackTeamController:
     def _mark_message_acknowledged(self, channel_id: str, message_ts: str | None) -> None:
         self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_ACKNOWLEDGED)
 
-    def _mark_message_queued(self, channel_id: str, message_ts: str | None) -> None:
-        self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_QUEUED)
-
     def _mark_message_in_progress(self, channel_id: str, message_ts: str | None) -> None:
         self._set_task_status_reaction(channel_id, message_ts, TASK_REACTION_IN_PROGRESS)
 
@@ -6134,6 +6129,7 @@ class SlackTeamController:
     ) -> None:
         task = self.store.get_agent_task(task.task_id) or task
         self._remove_task_action_buttons_if_resolved(task)
+        task = self._clear_idle_release_prompt_on_close(task, thread)
         if include_thread and task.thread_ts:
             self._mark_message_complete(thread.channel_id, task.thread_ts)
         for message_ts in _task_request_message_ts_values(task):
@@ -6141,6 +6137,37 @@ class SlackTeamController:
                 continue
             self._clear_message_status_reactions(thread.channel_id, message_ts)
         self._reconcile_pending_thread_reactions(task, thread)
+
+    def _clear_idle_release_prompt_on_close(
+        self,
+        task: AgentTask,
+        thread: SlackThreadRef,
+    ) -> AgentTask:
+        current = self.store.get_agent_task(task.task_id) or task
+        message_ts = current.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+        if not isinstance(message_ts, str) or not message_ts:
+            return current
+        channel_id = thread.channel_id or current.channel_id
+        if channel_id:
+            try:
+                self.gateway.update_message(
+                    channel_id,
+                    message_ts,
+                    " ",
+                    blocks=build_idle_release_dismissed_blocks(current),
+                )
+            except Exception:
+                LOGGER.debug(
+                    "failed to clear idle release prompt on task close",
+                    exc_info=True,
+                )
+        metadata = dict(current.metadata)
+        metadata.pop(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY, None)
+        if metadata == current.metadata:
+            return current
+        updated = replace(current, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return self.store.get_agent_task(current.task_id) or updated
 
     def _reconcile_pending_thread_reactions(
         self,
@@ -6459,8 +6486,6 @@ class SlackTeamController:
             if _metadata_has_message_ts(task.metadata, message_ts):
                 return True
             if message_ts in _active_thread_followup_message_ts_values(task.metadata):
-                return True
-            if _queued_thread_followups_contain_message_ts(task.metadata, message_ts):
                 return True
         return False
 
@@ -6973,52 +6998,6 @@ class PMInitiativeRunner:
                     break
 
 
-class QueuedFollowupRunner:
-    def __init__(
-        self,
-        store: Store,
-        controller: SlackTeamController,
-        *,
-        poll_seconds: float = 5.0,
-    ):
-        self.store = store
-        self.controller = controller
-        self.poll_seconds = poll_seconds
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="slackgentic-queued-followups",
-        )
-        self._thread.start()
-
-    def stop(self) -> bool:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-            return not self._thread.is_alive()
-        return True
-
-    def sync_once(self) -> int:
-        return self.controller.resume_stranded_queued_thread_followups()
-
-    def _run(self) -> None:
-        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
-        while not self._stop.wait(self.poll_seconds):
-            try:
-                self.sync_once()
-                backoff.reset()
-            except Exception:
-                log_loop_failure(LOGGER, "failed to resume queued Slackgentic follow-ups", backoff)
-                if backoff.wait(self._stop):
-                    break
-
 
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
@@ -7139,12 +7118,6 @@ class SocketModeSlackApp:
             poll_seconds=max(config.poll_seconds, 30.0),
         )
         self.pm_watchdog.start()
-        self.queued_followups = QueuedFollowupRunner(
-            self.store,
-            self.controller,
-            poll_seconds=max(config.poll_seconds, 2.0),
-        )
-        self.queued_followups.start()
         self.slack_message_backfill = SlackMessageBackfill(
             self.store,
             self.gateway,
@@ -7178,7 +7151,6 @@ class SocketModeSlackApp:
         self.awake_keeper.stop()
         all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
         all_stopped = self.slack_message_backfill.stop() and all_stopped
-        all_stopped = self.queued_followups.stop() and all_stopped
         all_stopped = self.pm_watchdog.stop() and all_stopped
         all_stopped = self.deferred_work.stop() and all_stopped
         all_stopped = self.scheduled_work.stop() and all_stopped
@@ -7675,39 +7647,6 @@ def _metadata_has_message_ts(metadata: dict[str, object], message_ts: str) -> bo
     return False
 
 
-def _queued_thread_followups(metadata: dict[str, object]) -> list[dict[str, object]]:
-    raw = metadata.get(QUEUED_THREAD_FOLLOWUPS_METADATA_KEY)
-    if not isinstance(raw, list):
-        return []
-    queued: list[dict[str, object]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        prompt = item.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            continue
-        queued.append(dict(item))
-    return queued
-
-
-def _queued_thread_followup_message_ts_values(queued: list[dict[str, object]]) -> list[str]:
-    values: list[str] = []
-    for item in queued:
-        message_ts = item.get("message_ts")
-        if isinstance(message_ts, str) and message_ts:
-            values.append(message_ts)
-    return list(dict.fromkeys(values))
-
-
-def _queued_thread_followups_contain_message_ts(
-    metadata: dict[str, object],
-    message_ts: str,
-) -> bool:
-    return message_ts in _queued_thread_followup_message_ts_values(
-        _queued_thread_followups(metadata)
-    )
-
-
 def _active_thread_followup_message_ts_values(metadata: dict[str, object]) -> list[str]:
     values: list[str] = []
     raw_values = metadata.get(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_VALUES_METADATA_KEY)
@@ -7734,34 +7673,6 @@ def _latest_user_message_ts_for_reaction(metadata: dict[str, object]) -> str | N
     return None
 
 
-def _queued_followup_prompt(prompts: list[str]) -> str:
-    if len(prompts) == 1:
-        question_instruction = (
-            " If it asks a direct question, answer it explicitly before continuing "
-            "or scheduling a delayed follow-up."
-            if _looks_like_direct_question(prompts[0])
-            else ""
-        )
-        return (
-            "The user sent this follow-up while you were already working. "
-            f"Treat it as the latest instruction and continue.{question_instruction}\n\n"
-            f"{prompts[0]}"
-        )
-    formatted = "\n\n".join(f"{index}. {prompt}" for index, prompt in enumerate(prompts, start=1))
-    question_instruction = (
-        " If any follow-up asks a direct question, answer it explicitly before continuing "
-        "or scheduling a delayed follow-up."
-        if any(_looks_like_direct_question(prompt) for prompt in prompts)
-        else ""
-    )
-    return (
-        "The user sent these follow-ups while you were already working. "
-        "Treat later messages as newer instructions and continue from the latest direction."
-        f"{question_instruction}\n\n"
-        f"{formatted}"
-    )
-
-
 def _live_thread_followup_prompt(prompt: str) -> str:
     if not _looks_like_direct_question(prompt):
         return prompt
@@ -7770,16 +7681,6 @@ def _live_thread_followup_prompt(prompt: str) -> str:
         "It asks a direct question; answer it explicitly in Slack before continuing "
         "implementation work, opening a PR, or scheduling a delayed follow-up.\n\n"
         f"{prompt}"
-    )
-
-
-def _queued_followup_notice(handle: str, prompt: str, queued_count: int) -> str:
-    kind = "question" if _looks_like_direct_question(prompt) else "follow-up"
-    count = "" if queued_count <= 1 else f" There are now {queued_count} queued follow-ups."
-    return (
-        f"@{handle} is still in a running turn, and I could not deliver that {kind} live, "
-        "so I queued it as a fallback. It will be sent when the run finishes; say `stop` "
-        f"here to interrupt the run and clear queued follow-ups.{count}"
     )
 
 
@@ -7811,14 +7712,6 @@ def _looks_like_direct_question(text: str) -> bool:
         "would ",
     )
     return compact.startswith(starters)
-
-
-def _last_queued_requested_by(queued: list[dict[str, object]]) -> str | None:
-    for item in reversed(queued):
-        requested_by = item.get("requested_by_slack_user")
-        if isinstance(requested_by, str) and requested_by:
-            return requested_by
-    return None
 
 
 def _pending_request_message_ts(pending: PendingWorkRequest) -> str | None:
@@ -7897,6 +7790,13 @@ def _task_roster_summary(task: AgentTask) -> str:
     return _task_assignment_prompt(task)
 
 
+def _task_roster_detail(task: AgentTask) -> str:
+    return (
+        f"{_shorten(_task_roster_summary(task), 140)}\n"
+        f"*Original Task:* {_shorten(_task_original_prompt(task), 180)}"
+    )
+
+
 def _roster_summary_line(value: str) -> str:
     return _shorten(value, 160)
 
@@ -7910,6 +7810,13 @@ def _external_session_dangerous_mode(session) -> bool:
 def _task_assignment_prompt(task: AgentTask) -> str:
     prompt = task.metadata.get(ASSIGNMENT_PROMPT_METADATA_KEY)
     return prompt if isinstance(prompt, str) and prompt.strip() else task.prompt
+
+
+def _task_original_prompt(task: AgentTask) -> str:
+    original_task = task.metadata.get(ORIGINAL_TASK_METADATA_KEY)
+    if isinstance(original_task, str) and original_task.strip():
+        return original_task.strip()
+    return _task_assignment_prompt(task)
 
 
 def _work_request_from_scheduled_work(scheduled: ScheduledWork) -> WorkRequest:

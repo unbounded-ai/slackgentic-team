@@ -34,6 +34,7 @@ from agent_harness.permissions import (
     task_permission_mode,
 )
 from agent_harness.pr_links import pr_urls_from_metadata
+from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
 from agent_harness.schedules import AGENT_SCHEDULE_SIGNAL_PREFIX
 from agent_harness.sessions.claude_channel import (
@@ -62,6 +63,9 @@ MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
 MANAGED_RUN_PROGRESS_WARNING_TIMEOUT = timedelta(minutes=5)
 MANAGED_RUN_STALL_TIMEOUT = timedelta(minutes=15)
+CLAUDE_EFFORT_SETTING = "effortLevel"
+CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+CLAUDE_DEFAULT_EFFORT = "xhigh"
 FAST_STREAM_POLL_SECONDS = 0.1
 MIN_STREAM_POLL_SECONDS = 0.01
 TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS = 5.0
@@ -266,6 +270,11 @@ class ManagedTaskRuntime:
             safe_auto_extra_roots=_safe_auto_extra_roots(provider, cwd, default_cwd),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
+            claude_effort=(
+                _claude_effort_from_settings(cwd, self.home)
+                if provider == Provider.CLAUDE
+                else None
+            ),
         )
         process = self.process_factory(request)
         try:
@@ -355,6 +364,7 @@ class ManagedTaskRuntime:
         status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
         *,
         join_timeout: float = 2.0,
+        kill_join_timeout: float | None = None,
     ) -> bool:
         running = self._get_running(task_id)
         if running is None:
@@ -374,11 +384,26 @@ class ManagedTaskRuntime:
             self._remove_running_task(task_id, running)
             return True
         running.worker.join(timeout=max(0.0, join_timeout))
-        if running.worker.is_alive():
-            LOGGER.warning("managed task worker did not stop for %s", task_id)
-            return False
-        self._remove_running_task(task_id, running)
-        return True
+        if not running.worker.is_alive():
+            self._remove_running_task(task_id, running)
+            return True
+        # SIGTERM did not free the worker. Escalate to a hard kill so a hung
+        # provider process cannot indefinitely block restart of this task.
+        LOGGER.warning(
+            "managed task worker for %s did not exit on terminate; escalating to kill",
+            task_id,
+        )
+        try:
+            running.process.kill()
+        except Exception:
+            LOGGER.debug("failed to escalate kill for managed task %s", task_id, exc_info=True)
+        escalation_timeout = kill_join_timeout if kill_join_timeout is not None else join_timeout
+        running.worker.join(timeout=max(0.0, escalation_timeout))
+        if not running.worker.is_alive():
+            self._remove_running_task(task_id, running)
+            return True
+        LOGGER.warning("managed task worker did not stop for %s", task_id)
+        return False
 
     def interrupt_task(self, task_id: str) -> bool:
         running = self._get_running(task_id)
@@ -1503,11 +1528,19 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "table. If you need multiple tables, send separate messages."
         ),
         (
-            "When a lightweight acknowledgement is better than a message, you may react to "
-            "the Slack user's latest message by putting a hidden line on its own line in "
-            f"the exact form `{AGENT_REACTION_SIGNAL_PREFIX}<emoji-name>`, for example "
-            f"`{AGENT_REACTION_SIGNAL_PREFIX}thumbsup`. Use this sparingly, only when it "
-            "feels right; Slackgentic hides the line and adds the reaction."
+            "Slack reactions are a natural way to acknowledge the most recent message in "
+            "this thread, from the user or from another agent, without sending a new "
+            "reply. Add a hidden line on its own line in the exact form "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}<emoji-name>` and Slackgentic will hide the "
+            "line and react to that latest message. Reach for one when it fits the "
+            f"moment: `{AGENT_REACTION_SIGNAL_PREFIX}eyes` when you're picking something "
+            f"up, `{AGENT_REACTION_SIGNAL_PREFIX}thumbsup` to agree with a teammate, "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}white_check_mark` to confirm something is "
+            f"done, `{AGENT_REACTION_SIGNAL_PREFIX}tada` when a teammate ships something, "
+            f"`{AGENT_REACTION_SIGNAL_PREFIX}thinking_face` when a call is genuinely "
+            "close. Aim for roughly one reaction every few of your replies, not on "
+            "every message, and skip it when a real reply already covers what you'd "
+            "say."
         ),
         (
             "When the user explicitly asks for another agent, someone else, a review, "
@@ -1526,6 +1559,16 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             f"exactly `{AGENT_THREAD_DONE_SIGNAL}`. Slackgentic hides that line and "
             "marks the whole thread done. Do not use this signal just because your "
             "current task is complete; use it only when the entire thread should be closed."
+        ),
+        (
+            "When you believe the work the Slack user asked for is done and you have "
+            "nothing else queued, send one short Slack-visible closing message that names "
+            "what landed in a single line and asks whether there is anything else or "
+            "whether you should be released. Then stop. Do not emit "
+            f"`{AGENT_THREAD_DONE_SIGNAL}`, do not open a new turn on your own, and do "
+            "not silently exit — Slackgentic will surface a release button under your "
+            "closing message so the Slack user can free you up with one click or reply "
+            "with the next step."
         ),
         (
             "When you hand work to a specific agent, use that agent's exact Slackgentic "
@@ -1612,6 +1655,48 @@ def _safe_auto_extra_roots(provider: Provider, cwd: Path, default_cwd: Path) -> 
     if not (_path_is_relative_to(resolved_cwd, root) or _path_is_relative_to(root, resolved_cwd)):
         return ()
     return (root,)
+
+
+def _claude_effort_from_settings(cwd: Path, home: Path) -> str:
+    effort: str | None = None
+    for path in _claude_settings_paths(cwd, home):
+        value = _claude_effort_from_settings_file(path)
+        if value is not None:
+            effort = value
+    return effort or CLAUDE_DEFAULT_EFFORT
+
+
+def _claude_settings_paths(cwd: Path, home: Path) -> tuple[Path, ...]:
+    paths: list[Path] = [
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+    ]
+    for root in reversed((cwd, *cwd.parents)):
+        paths.append(root / ".claude" / "settings.json")
+        paths.append(root / ".claude" / "settings.local.json")
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(_resolved_path(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return tuple(deduped)
+
+
+def _claude_effort_from_settings_file(path: Path) -> str | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(CLAUDE_EFFORT_SETTING)
+    if not isinstance(value, str):
+        return None
+    effort = value.strip().lower()
+    return effort if effort in CLAUDE_EFFORT_LEVELS else None
 
 
 def _macos_tcc_protected_cwd_issue(
@@ -2417,6 +2502,8 @@ def _claude_transcript_messages_from_path(
             continue
         if record.get("type") != "assistant":
             continue
+        if is_synthetic_claude_assistant_record(record):
+            continue
         timestamp = parse_timestamp(record.get("timestamp"))
         if since is not None and timestamp is not None and timestamp < since:
             continue
@@ -2472,6 +2559,8 @@ def _render_claude_json_line(line: str) -> str | None:
         result = event.get("result")
         return _clean_terminal_output(str(result)) if result else None
     if event_type == "assistant":
+        if is_synthetic_claude_assistant_record(event):
+            return None
         return _claude_assistant_message_text(event)
     if event_type == "error":
         message = event.get("message") or event.get("error")

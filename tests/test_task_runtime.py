@@ -687,8 +687,8 @@ class TaskRuntimeTests(unittest.TestCase):
         prompt = build_task_prompt(agent, task)
 
         self.assertIn(AGENT_REACTION_SIGNAL_PREFIX, prompt)
-        self.assertIn("lightweight acknowledgement", prompt)
-        self.assertIn("Use this sparingly", prompt)
+        self.assertIn("from the user or from another agent", prompt)
+        self.assertIn("not on every message", prompt)
 
     def test_build_task_prompt_prefers_slackgentic_pr_mcp(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
@@ -901,6 +901,150 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 self.assertEqual(launched[0].cwd, project)
                 self.assertEqual(launched[0].safe_auto_extra_roots, (root.resolve(),))
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_passes_claude_effort_from_user_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            settings_dir = home / ".claude"
+            settings_dir.mkdir()
+            (settings_dir / "settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_prefers_project_claude_effort_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            (home / ".claude").mkdir()
+            (home / ".claude" / "settings.json").write_text(json.dumps({"effortLevel": "low"}))
+            (project / ".claude").mkdir(parents=True)
+            (project / ".claude" / "settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_defaults_claude_effort_when_settings_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_defaults_claude_effort_when_settings_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            settings_dir = home / ".claude"
+            settings_dir.mkdir()
+            (settings_dir / "settings.json").write_text(json.dumps({"effortLevel": "unknown"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "work carefully", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+
+                self.assertEqual(launched[0].claude_effort, "xhigh")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
                 store.close()
@@ -1119,6 +1263,23 @@ class TaskRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(chunks, ["Not stuck - continuing now."])
+        self.assertEqual(buffer, "")
+
+    def test_claude_json_output_skips_synthetic_no_response_marker(self):
+        # Claude's CLI emits a synthetic assistant record whenever a resume
+        # has nothing to say. The runtime stream renderer must NOT surface
+        # that synthetic text — otherwise the user sees the bot post
+        # "No response requested." in their Slack thread out of nowhere.
+        chunks, buffer = _process_output_chunks(
+            Provider.CLAUDE,
+            (
+                '{"type":"assistant","message":{"model":"<synthetic>",'
+                '"content":[{"type":"text","text":"No response requested."}]}}\n'
+                '{"type":"result","subtype":"success","is_error":false,"result":"Done"}\n'
+            ),
+        )
+
+        self.assertEqual(chunks, ["Done"])
         self.assertEqual(buffer, "")
 
     def test_codex_long_message_splits_at_paragraph_boundary(self):
@@ -1822,6 +1983,80 @@ class TaskRuntimeTests(unittest.TestCase):
                     ["before release", "release cleared — posts again"],
                 )
             finally:
+                store.close()
+
+    def test_runtime_stop_task_escalates_to_kill_when_terminate_does_not_exit(self):
+        class TerminateIgnoredProcess(OneShotProcess):
+            def __init__(self, request):
+                super().__init__(request)
+                self.alive = True
+                self.reading = threading.Event()
+                self.release = threading.Event()
+                self.terminate_called = False
+                self.kill_called = False
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                self.reading.set()
+                self.release.wait(timeout=5.0)
+                return ""
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                # SIGTERM is ignored; the read loop keeps blocking.
+                self.terminate_called = True
+
+            def kill(self):
+                # SIGKILL frees the worker.
+                self.kill_called = True
+                self.alive = False
+                self.release.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            processes: list[TerminateIgnoredProcess] = []
+
+            def process_factory(request):
+                process = TerminateIgnoredProcess(request)
+                processes.append(process)
+                return process
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "needs kill to stop", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+                with self.assertLogs("agent_harness.runtime.tasks", level="WARNING") as logs:
+                    self.assertTrue(
+                        runtime.stop_task(
+                            task.task_id,
+                            status=None,
+                            join_timeout=0.05,
+                            kill_join_timeout=1.0,
+                        )
+                    )
+                self.assertTrue(processes[0].terminate_called)
+                self.assertTrue(processes[0].kill_called)
+                self.assertTrue(
+                    any("escalating to kill" in message for message in logs.output),
+                    logs.output,
+                )
+                self.assertFalse(runtime.has_running_tasks())
+            finally:
+                for process in processes:
+                    process.release.set()
                 store.close()
 
     def test_runtime_stop_task_keeps_unjoined_worker_visible_until_exit(self):
