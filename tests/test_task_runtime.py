@@ -2581,6 +2581,76 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_send_to_task_delivers_live_to_managed_claude(self):
+        # Managed Claude is launched with --input-format=stream-json, so the
+        # worker's stdin stays open across turns. send_to_task should hand a
+        # follow-up to the live worker without going through kill+resume.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "ship it", "C1")
+                store.upsert_agent_task(task)
+
+                sent: list[str] = []
+
+                class CapturingClaudeProcess(HoldingProcess):
+                    def send(self, message: str) -> None:
+                        sent.append(message)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=CapturingClaudeProcess,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertTrue(runtime.send_to_task(task.task_id, "next instruction"))
+                self.assertEqual(sent, ["next instruction"])
+
+                runtime.stop_task(task.task_id)
+            finally:
+                store.close()
+
+    def test_runtime_send_to_task_still_rejects_managed_codex_followup(self):
+        # Codex --print closes stdin after the initial prompt, so a non-CLI
+        # send_to_task must keep returning False for Codex managed runs even
+        # after the Claude path was opened up.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "ship it", "C1")
+                store.upsert_agent_task(task)
+
+                sent: list[str] = []
+
+                class CapturingCodexProcess(HoldingProcess):
+                    def send(self, message: str) -> None:
+                        sent.append(message)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=CapturingCodexProcess,
+                    poll_seconds=0.01,
+                )
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+
+                self.assertFalse(runtime.send_to_task(task.task_id, "next instruction"))
+                self.assertEqual(sent, [])
+
+                runtime.stop_task(task.task_id)
+            finally:
+                store.close()
+
     def test_runtime_interrupt_sends_escape_but_keeps_task_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

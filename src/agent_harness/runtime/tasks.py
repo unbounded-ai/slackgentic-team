@@ -348,7 +348,12 @@ class ManagedTaskRuntime:
         running = self._get_running(task_id)
         if running is None:
             return False
-        if not allow_cli and _provider_for_running(running) in {Provider.CODEX, Provider.CLAUDE}:
+        provider = _provider_for_running(running)
+        # Codex --print closes stdin after the initial prompt, so a live send
+        # is impossible until allow_cli=True signals the interactive follow-up
+        # path. Claude --input-format=stream-json keeps stdin open and accepts
+        # follow-up user turns at any time, so we let those through.
+        if not allow_cli and provider == Provider.CODEX:
             return False
         try:
             running.process.send(message)

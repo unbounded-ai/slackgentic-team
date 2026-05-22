@@ -80,10 +80,16 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             args.extend(["-C", str(request.cwd), "-"])
         return request.codex_binary, args
     if request.provider == Provider.CLAUDE:
+        # --input-format stream-json keeps Claude alive across turns: each user
+        # follow-up is a JSON message on stdin instead of a fresh subprocess.
+        # The initial prompt is written to stdin by ManagedAgentProcess.start
+        # below, so it is not passed as an argv positional here.
         args = [
             "--print",
             "--verbose",
             "--output-format",
+            "stream-json",
+            "--input-format",
             "stream-json",
         ]
         merged_allowed: list[str] = []
@@ -112,9 +118,15 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             args.extend(["--effort", request.claude_effort])
         if request.worktree:
             args.extend(["--worktree", request.worktree])
-        args.append(request.prompt)
         return request.claude_binary, args
     raise ValueError(f"unsupported provider: {request.provider}")
+
+
+def _claude_stream_json_user_turn(text: str) -> str:
+    # stream-json input mode expects one JSON value per line. The Claude CLI
+    # treats each user-shaped value as a new conversation turn.
+    payload = {"type": "user", "message": {"role": "user", "content": text}}
+    return json.dumps(payload) + "\n"
 
 
 def _codex_trust_override(cwd: Path) -> str:
@@ -186,7 +198,9 @@ class ManagedAgentProcess:
         if self._reads_prompt_from_stdin():
             from pexpect.popen_spawn import PopenSpawn
 
-            # Large Slack-derived prompts can exceed PTY line-buffer limits before Codex starts.
+            # Large Slack-derived prompts can exceed PTY line-buffer limits before
+            # the provider starts; pipe-backed stdin avoids that. Claude also uses
+            # this path so we can keep its stdin open across follow-up turns.
             self.child = PopenSpawn(
                 [command, *args],
                 cwd=str(self.request.cwd),
@@ -195,6 +209,11 @@ class ManagedAgentProcess:
                 codec_errors="replace",
                 timeout=0.1,
             )
+            if self._uses_stream_json_stdin():
+                self.child.send(_claude_stream_json_user_turn(self.request.prompt))
+                # No sendeof: Claude --input-format=stream-json stays alive
+                # waiting for more user turns. send() below appends them.
+                return
             self.child.send(self.request.prompt)
             if not self.request.prompt.endswith("\n"):
                 self.child.send("\n")
@@ -212,11 +231,19 @@ class ManagedAgentProcess:
         )
 
     def _reads_prompt_from_stdin(self) -> bool:
+        if self.request.provider == Provider.CLAUDE:
+            return True
         return self.request.provider == Provider.CODEX and not self.request.resume_session_id
+
+    def _uses_stream_json_stdin(self) -> bool:
+        return self.request.provider == Provider.CLAUDE
 
     def send(self, message: str) -> None:
         if self.child is None:
             raise RuntimeError("process is not started")
+        if self._uses_stream_json_stdin():
+            self.child.send(_claude_stream_json_user_turn(message))
+            return
         self.child.sendline(message)
 
     def interrupt(self) -> None:
