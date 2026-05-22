@@ -683,7 +683,14 @@ class ManagedTaskRuntime:
         last_warning = running.progress_warning_monotonic
         if last_warning is not None and last_warning >= last_visible:
             return False
-        return time.monotonic() - last_visible >= timeout_seconds
+        now = time.monotonic()
+        if now - last_visible < timeout_seconds:
+            return False
+        # The warning's wording only fits when the worker has gone silent in
+        # every channel. A worker still producing provider output or appending
+        # to its transcript is making progress; posting the warning then is
+        # noise the stall timeout already covers if real silence sets in.
+        return now - running.last_activity_monotonic >= timeout_seconds
 
     def _handle_managed_task_progress_warning(self, running: RunningTask) -> None:
         running.progress_warning_monotonic = time.monotonic()
