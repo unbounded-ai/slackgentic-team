@@ -2352,6 +2352,49 @@ class TaskRuntimeTests(unittest.TestCase):
                     runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
                 store.close()
 
+    def test_runtime_skips_progress_warning_when_activity_is_recent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                task = replace(
+                    create_agent_task(agent, "keep going", "C1"),
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-progress",
+                )
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    agent_progress_timeout=timedelta(seconds=5),
+                )
+                stale = time.monotonic() - 60
+                fresh = time.monotonic()
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=HoldingProcess(None),
+                    thread=SlackThreadRef("C1", "171.000001"),
+                    worker=threading.Thread(),
+                    started_monotonic=stale,
+                    last_output_monotonic=fresh,
+                    last_activity_monotonic=fresh,
+                    last_visible_message_monotonic=stale,
+                )
+
+                # Provider/transcript activity within the window keeps the
+                # warning quiet even though Slack-visible progress is stale.
+                self.assertFalse(runtime._managed_task_progress_warning_due(running))
+
+                # Once all activity goes silent past the timeout, the warning
+                # fires so the user still hears about a genuinely silent run.
+                running.last_activity_monotonic = stale
+                self.assertTrue(runtime._managed_task_progress_warning_due(running))
+            finally:
+                store.close()
+
     def test_runtime_restarts_stalled_session_with_status_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
