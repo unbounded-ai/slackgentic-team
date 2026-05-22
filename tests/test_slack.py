@@ -287,7 +287,9 @@ class SlackTests(unittest.TestCase):
         self.assertEqual(section_ids, ["team.section.engineers", "team.section.pms"])
 
         engineer_header = next(
-            block for block in blocks if block.get("block_id") == f"team.agent.{engineers[0].agent_id}"
+            block
+            for block in blocks
+            if block.get("block_id") == f"team.agent.{engineers[0].agent_id}"
         )
         pm_header = next(block for block in blocks if block.get("block_id") == "team.agent.pm-1")
         self.assertFalse(engineer_header["text"]["text"].startswith("PM · "))
@@ -299,12 +301,12 @@ class SlackTests(unittest.TestCase):
         blocks = build_team_roster_blocks([engineer, pm])
 
         engineer_actions = next(
-            block for block in blocks
+            block
+            for block in blocks
             if block.get("block_id") == f"team.agent.actions.{engineer.agent_id}"
         )
         pm_actions = next(
-            block for block in blocks
-            if block.get("block_id") == "team.agent.actions.pm-1"
+            block for block in blocks if block.get("block_id") == "team.agent.actions.pm-1"
         )
         engineer_labels = [el["text"]["text"] for el in engineer_actions["elements"]]
         pm_labels = [el["text"]["text"] for el in pm_actions["elements"]]

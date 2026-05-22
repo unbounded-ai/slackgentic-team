@@ -2892,7 +2892,9 @@ class SlackTeamController:
         )
         if action == "pm_initiative.start":
             if initiative.status != PmInitiativeStatus.AWAITING_APPROVAL:
-                self._strip_pm_plan_buttons(initiative, message_ts, status_label=initiative.status.value)
+                self._strip_pm_plan_buttons(
+                    initiative, message_ts, status_label=initiative.status.value
+                )
                 return
             promoted = self._execute_pm_plan(initiative, approver_slack_user=actor)
             if promoted is not None:
@@ -2903,7 +2905,9 @@ class SlackTeamController:
                 PmInitiativeStatus.AWAITING_APPROVAL,
                 PmInitiativeStatus.PLANNING,
             }:
-                self._strip_pm_plan_buttons(initiative, message_ts, status_label=initiative.status.value)
+                self._strip_pm_plan_buttons(
+                    initiative, message_ts, status_label=initiative.status.value
+                )
                 return
             self.store.set_pm_initiative_pending_plan(
                 initiative.initiative_id,
@@ -7005,7 +7009,6 @@ class PMInitiativeRunner:
                 log_loop_failure(LOGGER, "failed to run Slackgentic PM watchdog", backoff)
                 if backoff.wait(self._stop):
                     break
-
 
 
 class SocketModeSlackApp:

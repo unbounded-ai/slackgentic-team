@@ -432,9 +432,7 @@ class Store:
         if "pending_plan_json" not in columns:
             self.conn.execute("ALTER TABLE pm_initiatives ADD COLUMN pending_plan_json TEXT")
         if "pending_plan_message_ts" not in columns:
-            self.conn.execute(
-                "ALTER TABLE pm_initiatives ADD COLUMN pending_plan_message_ts TEXT"
-            )
+            self.conn.execute("ALTER TABLE pm_initiatives ADD COLUMN pending_plan_message_ts TEXT")
 
     def upsert_session(self, session: AgentSession) -> None:
         self.conn.execute(
@@ -2953,9 +2951,7 @@ def _pm_initiative_from_row(row: sqlite3.Row) -> PmInitiative:
         watchdog_last_run_at=parse_timestamp(row["watchdog_last_run_at"]),
         pending_plan_json=row["pending_plan_json"] if "pending_plan_json" in columns else None,
         pending_plan_message_ts=(
-            row["pending_plan_message_ts"]
-            if "pending_plan_message_ts" in columns
-            else None
+            row["pending_plan_message_ts"] if "pending_plan_message_ts" in columns else None
         ),
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),

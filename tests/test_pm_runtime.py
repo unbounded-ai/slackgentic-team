@@ -258,9 +258,7 @@ class PmRuntimeTests(unittest.TestCase):
                 )
                 controller.handle_block_action(
                     {
-                        "actions": [
-                            {"action_id": "pm_initiative.start", "value": action_value}
-                        ],
+                        "actions": [{"action_id": "pm_initiative.start", "value": action_value}],
                         "channel": {"id": "C1"},
                         "message": {"ts": "171.plan"},
                         "user": {"id": "U2"},
@@ -283,9 +281,7 @@ class PmRuntimeTests(unittest.TestCase):
                 assert child_deferred is not None
                 self.assertEqual(child_deferred.status, DeferredWorkStatus.WAITING_DEPS)
                 # The root subtask was dispatched to the (now idle) agent.
-                self.assertTrue(
-                    any(t.task_id != pm_task.task_id for t, *_ in runtime.started)
-                )
+                self.assertTrue(any(t.task_id != pm_task.task_id for t, *_ in runtime.started))
             finally:
                 store.close()
 
@@ -339,9 +335,7 @@ class PmRuntimeTests(unittest.TestCase):
                 )
                 controller.handle_block_action(
                     {
-                        "actions": [
-                            {"action_id": "pm_initiative.cancel", "value": action_value}
-                        ],
+                        "actions": [{"action_id": "pm_initiative.cancel", "value": action_value}],
                         "channel": {"id": "C1"},
                         "message": {"ts": "171.plan"},
                         "user": {"id": "U2"},
