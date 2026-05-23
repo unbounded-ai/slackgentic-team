@@ -2411,7 +2411,7 @@ def _codex_exec_chunks(
     for line in lines:
         message = _render_codex_exec_line(line.strip())
         if message:
-            rendered.extend(_slack_chunks(message, limit=limit))
+            rendered.extend(_chunks_preserving_control_signals(message, limit=limit))
     return rendered, next_buffer
 
 
@@ -2699,8 +2699,57 @@ def _claude_json_chunks(
     for line in lines:
         message = _render_claude_json_line(line.strip())
         if message:
-            rendered.extend(_slack_chunks(message, limit=limit))
+            rendered.extend(_chunks_preserving_control_signals(message, limit=limit))
     return rendered, next_buffer
+
+
+_SIGNAL_LINE_PREFIXES: tuple[str, ...] = (
+    AGENT_PM_PLAN_SIGNAL_PREFIX,
+    AGENT_DEFERRED_SIGNAL_PREFIX,
+    AGENT_SCHEDULE_SIGNAL_PREFIX,
+    AGENT_TIMER_SIGNAL_PREFIX,
+    AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
+    AGENT_REACTION_SIGNAL_PREFIX,
+)
+
+
+def _line_starts_with_control_prefix(line: str) -> bool:
+    upper = line.lstrip().upper()
+    return any(upper.startswith(prefix) for prefix in _SIGNAL_LINE_PREFIXES)
+
+
+def _chunks_preserving_control_signals(message: str, *, limit: int) -> list[str]:
+    """Split `message` into Slack-sized chunks WITHOUT cutting through
+    a long control-signal line.
+
+    `_slack_chunks` only knows about word/line boundaries — given an
+    11k-character `SLACKGENTIC: PM_PLAN <json>` line it will happily
+    split mid-JSON, and the dispatcher sees a truncated body that
+    fails `json.loads` with "Unterminated string". Pull oversized
+    control-signal lines out first so each one survives intact (and
+    becomes its own atomic chunk that `_post_agent_chunk` re-extracts
+    and dispatches). Short signal lines stay in the message and go
+    through normal chunking — that preserves the per-chunk ordering
+    and `hide_visible_text` semantics the deferred-signal callers
+    (THREAD_DONE, SCHEDULE) rely on.
+    """
+    lines = message.splitlines(keepends=True)
+    oversized_signals: list[str] = []
+    safe_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if len(stripped) > limit and _line_starts_with_control_prefix(stripped):
+            oversized_signals.append(stripped)
+        else:
+            safe_lines.append(line)
+
+    chunks: list[str] = []
+    for signal in oversized_signals:
+        chunks.append(f"{signal}\n")
+    safe_message = "".join(safe_lines).strip()
+    if safe_message:
+        chunks.extend(_slack_chunks(safe_message, limit=limit))
+    return chunks
 
 
 def _render_claude_json_line(line: str) -> str | None:
