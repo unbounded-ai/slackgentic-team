@@ -1097,6 +1097,158 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_roster_work_now_with_pm_target_creates_initiative(self):
+        """The roster modal's `Assign work` → `now` flow must route PM-kind
+        targets through PM-initiative creation. Without the redirect, the
+        brief becomes a worker task with no `pm_initiative_id` and the
+        PM_PLAN signal it later emits cannot find an approval card."""
+        from agent_harness.pm import PM_INITIATIVE_ID_METADATA_KEY
+        from agent_harness.team import hire_team_agents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                engineer = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(engineer)
+                pm_agent = hire_team_agents(
+                    [engineer],
+                    1,
+                    Provider.CLAUDE,
+                    seed="pm-test",
+                    kind=TeamAgentKind.PM,
+                )[0]
+                store.upsert_team_agent(pm_agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        pm_agent,
+                        prompt="plan the multi-tenancy operator",
+                        timing="now",
+                        dangerous=True,
+                    )
+                )
+
+                self.assertIsNone(response)
+                initiatives = store.list_pm_initiatives()
+                self.assertEqual(len(initiatives), 1)
+                self.assertEqual(initiatives[0].pm_agent_id, pm_agent.agent_id)
+                self.assertEqual(len(runtime.started), 1)
+                started_task, started_agent, _ = runtime.started[0]
+                self.assertEqual(started_agent.handle, pm_agent.handle)
+                self.assertEqual(
+                    started_task.metadata[PM_INITIATIVE_ID_METADATA_KEY],
+                    initiatives[0].initiative_id,
+                )
+            finally:
+                store.close()
+
+    def test_roster_work_scheduled_with_pm_target_returns_modal_error(self):
+        """Scheduling or deferring a PM-kind agent does not fit the PM
+        model (PMs plan a fresh initiative each time they are engaged).
+        The roster modal must surface a clear error instead of silently
+        queuing a worker task."""
+        from agent_harness.team import hire_team_agents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                engineer = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(engineer)
+                pm_agent = hire_team_agents(
+                    [engineer],
+                    1,
+                    Provider.CLAUDE,
+                    seed="pm-test",
+                    kind=TeamAgentKind.PM,
+                )[0]
+                store.upsert_team_agent(pm_agent)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                response = controller.handle_view_submission(
+                    _roster_work_submission_payload(
+                        pm_agent,
+                        prompt="plan the multi-tenancy operator",
+                        timing="daily",
+                        repeat_time="09:00",
+                        timezone="America/Chicago",
+                    )
+                )
+
+                self.assertEqual(response["response_action"], "errors")
+                self.assertIn(
+                    f"@{pm_agent.handle}",
+                    response["errors"]["roster_work_prompt"],
+                )
+                self.assertIn("PM", response["errors"]["roster_work_prompt"])
+                self.assertEqual(store.list_scheduled_work(), [])
+                self.assertEqual(store.list_pm_initiatives(), [])
+            finally:
+                store.close()
+
+    def test_multi_specific_request_with_pm_target_rejects_batch(self):
+        """`@<pm> @<worker> plan X` must not silently fan out to the PM as a
+        worker task. Reject the batch with a clear Slack message so the
+        user addresses the PM in its own thread."""
+        from agent_harness.team import hire_team_agents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                engineer = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(engineer)
+                pm_agent = hire_team_agents(
+                    [engineer],
+                    1,
+                    Provider.CLAUDE,
+                    seed="pm-test",
+                    kind=TeamAgentKind.PM,
+                )[0]
+                store.upsert_team_agent(pm_agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": (
+                                f"@{engineer.handle} @{pm_agent.handle} "
+                                "plan the multi-tenancy operator"
+                            ),
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.started, [])
+                self.assertEqual(store.list_pm_initiatives(), [])
+                rejection = next(
+                    item for item in gateway.thread_replies if f"@{pm_agent.handle}" in item["text"]
+                )
+                self.assertIn("PM", rejection["text"])
+            finally:
+                store.close()
+
     def test_roster_work_success_can_run_after_view_ack(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
