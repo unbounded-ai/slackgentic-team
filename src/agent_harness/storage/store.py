@@ -2546,6 +2546,36 @@ class Store:
             self.conn.commit()
         return int(cursor.rowcount)
 
+    def cancel_pending_pm_subtask_work(self, initiative_id: str) -> int:
+        """Cancel non-terminal deferred_work for all subtasks of one initiative.
+
+        Used by the replan path: DONE rows stay intact so the recap still
+        shows what already finished, but anything still WAITING_DEPS / READY
+        / CLAIMED is moved to CANCELLED so the deferred-work poller stops
+        dispatching it.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE deferred_work_requests
+                SET status = ?, updated_at = ?
+                WHERE status IN (?, ?, ?)
+                  AND deferred_id IN (
+                    SELECT deferred_id FROM pm_subtasks WHERE initiative_id = ?
+                  )
+                """,
+                (
+                    DeferredWorkStatus.CANCELLED.value,
+                    utc_now().isoformat(),
+                    DeferredWorkStatus.WAITING_DEPS.value,
+                    DeferredWorkStatus.READY.value,
+                    DeferredWorkStatus.CLAIMED.value,
+                    initiative_id,
+                ),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
     def cancel_deferred_work_for_thread(self, channel_id: str, thread_ts: str) -> int:
         with self._lock:
             cursor = self.conn.execute(

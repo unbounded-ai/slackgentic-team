@@ -21,14 +21,20 @@ from agent_harness.pm import (
     ParsedPmPlan,
     ParsedPmSubtask,
     build_pm_resolution_prompt,
+    critical_path_depth,
+    estimate_pm_plan,
     expand_codesign_plan,
     extract_pm_request_body,
     filter_pm_agents,
     filter_worker_agents,
+    find_dependency_cycle,
     is_agent_pm_plan_signal,
     looks_like_pm_request,
+    looks_like_pm_status_request,
     message_targets_pm_agent,
     parse_agent_pm_plan_signal,
+    parse_pm_extension_request,
+    parse_pm_replan_request,
     topological_sort,
 )
 from agent_harness.storage.store import Store
@@ -200,7 +206,12 @@ class PmPlanSignalTests(unittest.TestCase):
             ],
         }
         result = parse_agent_pm_plan_signal(self._build_signal(payload), known_handles=[])
-        self.assertEqual(result.error, "plan contains a dependency cycle")
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertTrue(result.error.startswith("plan contains a dependency cycle"))
+        self.assertIn("'a'", result.error)
+        self.assertIn("'b'", result.error)
+        self.assertIn("->", result.error)
 
     def test_rejects_unknown_target_handle(self):
         payload = {
@@ -580,6 +591,183 @@ class PmAgentFilterTests(unittest.TestCase):
         agents = [pm, eng]
         self.assertEqual([a.handle for a in filter_pm_agents(agents)], ["alice"])
         self.assertEqual([a.handle for a in filter_worker_agents(agents)], ["bob"])
+
+
+class FindDependencyCycleTests(unittest.TestCase):
+    def test_returns_empty_for_acyclic_graph(self):
+        self.assertEqual(find_dependency_cycle([("a", ())]), [])
+        self.assertEqual(find_dependency_cycle([("a", ()), ("b", ("a",)), ("c", ("b",))]), [])
+
+    def test_finds_two_node_cycle(self):
+        cycle = find_dependency_cycle([("a", ("b",)), ("b", ("a",))])
+        self.assertEqual(cycle[0], cycle[-1])
+        self.assertEqual({"a", "b"}, set(cycle))
+        self.assertEqual(len(cycle), 3)
+
+    def test_finds_three_node_cycle(self):
+        cycle = find_dependency_cycle([("a", ("b",)), ("b", ("c",)), ("c", ("a",))])
+        self.assertEqual(cycle[0], cycle[-1])
+        self.assertEqual({"a", "b", "c"}, set(cycle))
+        self.assertEqual(len(cycle), 4)
+
+
+class CriticalPathDepthTests(unittest.TestCase):
+    def _plan(self, *subtasks: ParsedPmSubtask) -> ParsedPmPlan:
+        return ParsedPmPlan(title="T", summary="S", subtasks=tuple(subtasks))
+
+    def _subtask(self, local_id: str, deps: tuple[str, ...] = ()) -> ParsedPmSubtask:
+        return ParsedPmSubtask(
+            local_id=local_id,
+            title=local_id,
+            request=WorkRequest(prompt="x", assignment_mode=AssignmentMode.ANYONE),
+            depends_on=deps,
+            after_delay_seconds=0,
+        )
+
+    def test_depth_of_single_root_is_one(self):
+        plan = self._plan(self._subtask("a"))
+        self.assertEqual(critical_path_depth(plan), 1)
+
+    def test_depth_of_linear_chain(self):
+        plan = self._plan(
+            self._subtask("a"),
+            self._subtask("b", ("a",)),
+            self._subtask("c", ("b",)),
+        )
+        self.assertEqual(critical_path_depth(plan), 3)
+
+    def test_depth_uses_longest_branch(self):
+        plan = self._plan(
+            self._subtask("a"),
+            self._subtask("b", ("a",)),
+            self._subtask("c", ("a",)),
+            self._subtask("d", ("b", "c")),
+        )
+        self.assertEqual(critical_path_depth(plan), 3)
+
+
+class EstimatePmPlanTests(unittest.TestCase):
+    def test_counts_subtasks_and_dangerous(self):
+        plan = ParsedPmPlan(
+            title="T",
+            summary="S",
+            subtasks=(
+                ParsedPmSubtask(
+                    local_id="a",
+                    title="A",
+                    request=WorkRequest(
+                        prompt="x",
+                        assignment_mode=AssignmentMode.ANYONE,
+                        permission_mode=PermissionMode.DANGEROUS,
+                    ),
+                    depends_on=(),
+                    after_delay_seconds=0,
+                ),
+                ParsedPmSubtask(
+                    local_id="b",
+                    title="B",
+                    request=WorkRequest(
+                        prompt="x",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    depends_on=("a",),
+                    after_delay_seconds=0,
+                ),
+            ),
+        )
+        estimate = estimate_pm_plan(plan)
+        self.assertEqual(estimate.subtask_count, 2)
+        self.assertEqual(estimate.critical_path_depth, 2)
+        self.assertEqual(estimate.dangerous_count, 1)
+        self.assertEqual(estimate.co_design_count, 0)
+        self.assertGreater(estimate.max_wall_clock_seconds, estimate.min_wall_clock_seconds)
+
+
+class PmStatusCommandDetectorTests(unittest.TestCase):
+    def test_matches_pm_status(self):
+        for command in ("pm status", "PM status", "pm plan", "pm dag", "pm state"):
+            self.assertTrue(looks_like_pm_status_request(command), command)
+
+    def test_matches_with_bot_mention(self):
+        self.assertTrue(looks_like_pm_status_request("<@UBOT> pm status"))
+
+    def test_matches_slash_command(self):
+        self.assertTrue(looks_like_pm_status_request("/status"))
+
+    def test_does_not_match_arbitrary_text(self):
+        self.assertFalse(looks_like_pm_status_request("what is the status of the deploy?"))
+        self.assertFalse(looks_like_pm_status_request("plan the migration"))
+
+
+class PmReplanCommandDetectorTests(unittest.TestCase):
+    def test_matches_pm_replan_with_body(self):
+        body = parse_pm_replan_request("pm replan: also handle the cache invalidation")
+        self.assertEqual(body, "also handle the cache invalidation")
+
+    def test_matches_bare_replan(self):
+        body = parse_pm_replan_request("pm replan")
+        self.assertEqual(body, "")
+
+    def test_no_match_for_unrelated_text(self):
+        self.assertIsNone(parse_pm_replan_request("please update the spec"))
+
+    def test_handles_bot_mention_prefix(self):
+        body = parse_pm_replan_request("<@UBOT> pm replan: try claude this time")
+        self.assertEqual(body, "try claude this time")
+
+
+class PmExtensionCommandDetectorTests(unittest.TestCase):
+    def test_matches_pm_extend(self):
+        self.assertEqual(
+            parse_pm_extension_request("pm extend: also lint the new module"),
+            "also lint the new module",
+        )
+
+    def test_requires_body(self):
+        self.assertIsNone(parse_pm_extension_request("pm extend"))
+        self.assertIsNone(parse_pm_extension_request("pm extend:"))
+
+    def test_no_match_for_unrelated(self):
+        self.assertIsNone(parse_pm_extension_request("status please"))
+
+
+class PmPlanParserAllowsExternalIdsTests(unittest.TestCase):
+    def _build_signal(self, payload):
+        return f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}"
+
+    def test_extension_allows_existing_id_as_dep(self):
+        payload = {
+            "title": "T",
+            "summary": "S",
+            "subtasks": [
+                {"id": "new1", "title": "new", "task": "x", "depends_on": ["existing_s1"]},
+            ],
+        }
+        result = parse_agent_pm_plan_signal(
+            self._build_signal(payload),
+            known_handles=[],
+            allowed_external_dep_ids=("existing_s1",),
+        )
+        self.assertIsNone(result.error)
+        assert result.plan is not None
+        self.assertEqual(result.plan.subtasks[0].depends_on, ("existing_s1",))
+
+    def test_extension_rejects_id_collision_with_existing(self):
+        payload = {
+            "title": "T",
+            "summary": "S",
+            "subtasks": [
+                {"id": "existing_s1", "title": "dup", "task": "x"},
+            ],
+        }
+        result = parse_agent_pm_plan_signal(
+            self._build_signal(payload),
+            known_handles=[],
+            allowed_external_dep_ids=("existing_s1",),
+        )
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertIn("collides", result.error)
 
 
 if __name__ == "__main__":  # pragma: no cover

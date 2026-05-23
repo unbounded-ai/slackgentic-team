@@ -22,6 +22,12 @@ PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY = "pm_resolution_original_text"
 PM_RESOLUTION_ATTEMPTS_METADATA_KEY = "pm_resolution_attempts"
 PM_INITIATIVE_ID_METADATA_KEY = "pm_initiative_id"
 PM_SUBTASK_LOCAL_ID_METADATA_KEY = "pm_subtask_local_id"
+# Marks the resolver task as an extension run. Stored on agent_task.metadata
+# so that the PM_PLAN parser knows to allow depends_on references to the
+# existing subtasks listed in the metadata value.
+PM_EXTENSION_KNOWN_IDS_METADATA_KEY = "pm_extension_known_ids"
+PM_EXTENSION_CONTEXT_METADATA_KEY = "pm_extension_context"
+PM_REPLAN_CONTEXT_METADATA_KEY = "pm_replan_context"
 MAX_PM_RESOLUTION_ATTEMPTS = 3
 MAX_PM_SUBTASKS = 20
 MIN_PM_SUBTASKS = 1
@@ -118,6 +124,10 @@ def build_pm_resolution_prompt(
     initiative_id: str,
     now: datetime | None = None,
     validation_error: str | None = None,
+    replan_context: str | None = None,
+    prior_plan_summary: str | None = None,
+    extension_known_ids: tuple[str, ...] = (),
+    extension_context: str | None = None,
 ) -> str:
     reference = now or utc_now()
     handles = ", ".join(f"@{handle}" for handle in agent_handles) or "(no active agents)"
@@ -219,6 +229,37 @@ def build_pm_resolution_prompt(
                 ),
             ]
         )
+    if replan_context or prior_plan_summary:
+        lines.append("")
+        lines.append(
+            "This is a REPLAN. An earlier plan for this initiative already ran. "
+            "Subtasks that finished are listed below — do NOT include them in the "
+            "new plan. Build the new DAG to cover only the remaining work, "
+            "incorporating any new context the user provided."
+        )
+        if prior_plan_summary:
+            lines.append("")
+            lines.append("Prior plan state:")
+            lines.append(prior_plan_summary)
+        if replan_context:
+            lines.append("")
+            lines.append(f"User replan instructions: {replan_context}")
+    if extension_known_ids:
+        known_ids_text = ", ".join(repr(item) for item in extension_known_ids)
+        lines.append("")
+        lines.append(
+            "This is an EXTENSION. The initiative already has running subtasks "
+            "and you are ADDING new work. Reuse existing subtask ids only in "
+            "`depends_on`; never redeclare them."
+        )
+        lines.append(f"Existing subtask ids you may reference: {known_ids_text}")
+        if prior_plan_summary:
+            lines.append("")
+            lines.append("Current plan state:")
+            lines.append(prior_plan_summary)
+        if extension_context:
+            lines.append("")
+            lines.append(f"User extension instructions: {extension_context}")
     return "\n".join(lines)
 
 
@@ -226,6 +267,7 @@ def parse_agent_pm_plan_signal(
     signal: str,
     *,
     known_handles: list[str] | tuple[str, ...],
+    allowed_external_dep_ids: tuple[str, ...] = (),
 ) -> AgentPmParseResult:
     stripped = signal.strip()
     if not stripped.upper().startswith(AGENT_PM_PLAN_SIGNAL_PREFIX):
@@ -239,13 +281,18 @@ def parse_agent_pm_plan_signal(
         return AgentPmParseResult(error=f"invalid PM_PLAN JSON: {exc.msg}")
     if not isinstance(payload, dict):
         return AgentPmParseResult(error="PM_PLAN JSON must be an object")
-    return _parse_plan_payload(payload, known_handles=known_handles)
+    return _parse_plan_payload(
+        payload,
+        known_handles=known_handles,
+        allowed_external_dep_ids=allowed_external_dep_ids,
+    )
 
 
 def _parse_plan_payload(
     payload: dict[str, object],
     *,
     known_handles: list[str] | tuple[str, ...],
+    allowed_external_dep_ids: tuple[str, ...] = (),
 ) -> AgentPmParseResult:
     title_raw = payload.get("title")
     if not isinstance(title_raw, str) or not title_raw.strip():
@@ -264,6 +311,7 @@ def _parse_plan_payload(
         return AgentPmParseResult(
             error=f"plan may include at most {MAX_PM_SUBTASKS} subtasks (got {len(subtasks_raw)})"
         )
+    external_dep_ids = frozenset(allowed_external_dep_ids)
     parsed_by_id: dict[str, ParsedPmSubtask] = {}
     declaration_order: list[str] = []
     for index, item in enumerate(subtasks_raw):
@@ -274,11 +322,18 @@ def _parse_plan_payload(
             return AgentPmParseResult(
                 error=f"subtask ids must be unique within a plan (duplicate {parsed.local_id!r})"
             )
+        if parsed.local_id in external_dep_ids:
+            return AgentPmParseResult(
+                error=(
+                    f"subtask id {parsed.local_id!r} collides with an existing "
+                    "subtask in this initiative; pick a new id"
+                )
+            )
         parsed_by_id[parsed.local_id] = parsed
         declaration_order.append(parsed.local_id)
     for subtask in parsed_by_id.values():
         for dep in subtask.depends_on:
-            if dep not in parsed_by_id:
+            if dep not in parsed_by_id and dep not in external_dep_ids:
                 return AgentPmParseResult(
                     error=(
                         f"subtask {subtask.local_id!r} depends_on {dep!r}, "
@@ -289,10 +344,19 @@ def _parse_plan_payload(
                 return AgentPmParseResult(
                     error=f"subtask {subtask.local_id!r} cannot depend on itself"
                 )
-    sorted_ids = topological_sort(
-        [(local_id, parsed_by_id[local_id].depends_on) for local_id in declaration_order]
-    )
+    dag_nodes = [
+        (
+            local_id,
+            tuple(dep for dep in parsed_by_id[local_id].depends_on if dep in parsed_by_id),
+        )
+        for local_id in declaration_order
+    ]
+    sorted_ids = topological_sort(dag_nodes)
     if sorted_ids is None:
+        cycle = find_dependency_cycle(dag_nodes)
+        if cycle:
+            cycle_text = " -> ".join(f"{node!r}" for node in cycle)
+            return AgentPmParseResult(error=f"plan contains a dependency cycle: {cycle_text}")
         return AgentPmParseResult(error="plan contains a dependency cycle")
     sorted_subtasks = tuple(parsed_by_id[local_id] for local_id in sorted_ids)
     return AgentPmParseResult(
@@ -589,6 +653,84 @@ def expand_codesign_plan(plan: ParsedPmPlan) -> ParsedPmPlan:
 
 PM_TAG_LEAD_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*(?P<rest>.*)$", re.DOTALL)
 
+# Inline commands the user can drop into a PM initiative thread to get a
+# direct rendering of the plan without going through the PM agent. Matched
+# on the whole stripped message (after dropping a leading Slack mention),
+# case-insensitive. Only triggers when there is no other text on the line.
+_PM_STATUS_COMMAND_RE = re.compile(
+    r"^/?(?:pm[\s:_-]+)?(?:status|plan|dag|tree|state)\??\s*$",
+    re.IGNORECASE,
+)
+
+
+# Replan command. Matches against the stripped message (after dropping a
+# leading Slack mention), and the body — if any — is treated as the user's
+# new context to hand to the resolver.
+_PM_REPLAN_RE = re.compile(
+    r"^/?(?:pm[\s:_-]+)?(?:replan|reroute|redo)\b[\s:,-]*(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+_PM_EXTEND_RE = re.compile(
+    r"^/?(?:pm[\s:_-]+)?(?:extend|add|append)\b[\s:,-]*(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_pm_extension_request(text: str) -> str | None:
+    """Return the extension body if ``text`` is a ``pm extend`` command, else None.
+
+    A body is required — extension without instructions is rejected upstream.
+    """
+    if not text or not text.strip():
+        return None
+    stripped = text.strip()
+    bot_match = PM_TAG_LEAD_RE.match(stripped)
+    if bot_match:
+        stripped = (bot_match.group("rest") or "").strip()
+    if not stripped:
+        return None
+    match = _PM_EXTEND_RE.match(stripped)
+    if not match:
+        return None
+    body = (match.group("rest") or "").strip()
+    if not body:
+        return None
+    return body
+
+
+def parse_pm_replan_request(text: str) -> str | None:
+    """Return the replan body if ``text`` is a ``pm replan`` command, else None.
+
+    The body may be empty — the PM still gets the failure snapshot. Returns
+    None when the message is not a replan command at all.
+    """
+    if not text or not text.strip():
+        return None
+    stripped = text.strip()
+    bot_match = PM_TAG_LEAD_RE.match(stripped)
+    if bot_match:
+        stripped = (bot_match.group("rest") or "").strip()
+    if not stripped:
+        return None
+    match = _PM_REPLAN_RE.match(stripped)
+    if not match:
+        return None
+    return (match.group("rest") or "").strip()
+
+
+def looks_like_pm_status_request(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    stripped = text.strip()
+    bot_match = PM_TAG_LEAD_RE.match(stripped)
+    if bot_match:
+        stripped = (bot_match.group("rest") or "").strip()
+    if not stripped:
+        return False
+    return bool(_PM_STATUS_COMMAND_RE.match(stripped))
+
 
 def message_targets_pm_agent(
     text: str,
@@ -636,6 +778,63 @@ def filter_worker_agents(agents: list[TeamAgent] | tuple[TeamAgent, ...]) -> lis
     return [agent for agent in agents if agent.kind != TeamAgentKind.PM]
 
 
+@dataclass(frozen=True)
+class PmPlanEstimate:
+    """Rough cost/time budget for an approved plan.
+
+    The numbers are best-effort guides surfaced at the approval gate — they
+    are NOT enforced and the watchdog does not cancel based on them. They
+    only help the user decide whether to approve a plan or trim it first.
+    """
+
+    subtask_count: int
+    critical_path_depth: int
+    dangerous_count: int
+    co_design_count: int
+    min_wall_clock_seconds: int
+    max_wall_clock_seconds: int
+
+
+# Rough per-subtask wall-clock band used to estimate plan duration.
+# Wide on purpose; the goal is "is this a 10-minute plan or an hour-long
+# plan?" not a precise prediction.
+_PM_SUBTASK_MIN_SECONDS = 120
+_PM_SUBTASK_MAX_SECONDS = 900
+
+
+def critical_path_depth(plan: ParsedPmPlan) -> int:
+    """Return the length of the longest dependency chain in ``plan``.
+
+    A plan with no dependencies has depth 1; a chain a -> b -> c has depth 3.
+    """
+    depth: dict[str, int] = {}
+    by_id = {item.local_id: item for item in plan.subtasks}
+    for subtask in plan.subtasks:
+        if not subtask.depends_on:
+            depth[subtask.local_id] = 1
+            continue
+        best = 0
+        for dep in subtask.depends_on:
+            if dep in by_id:
+                best = max(best, depth.get(dep, 1))
+        depth[subtask.local_id] = best + 1
+    return max(depth.values(), default=0)
+
+
+def estimate_pm_plan(plan: ParsedPmPlan) -> PmPlanEstimate:
+    depth = critical_path_depth(plan)
+    dangerous = sum(1 for item in plan.subtasks if item.request.dangerous_mode)
+    co_design = sum(1 for item in plan.subtasks if item.is_co_design)
+    return PmPlanEstimate(
+        subtask_count=len(plan.subtasks),
+        critical_path_depth=depth,
+        dangerous_count=dangerous,
+        co_design_count=co_design,
+        min_wall_clock_seconds=depth * _PM_SUBTASK_MIN_SECONDS,
+        max_wall_clock_seconds=len(plan.subtasks) * _PM_SUBTASK_MAX_SECONDS,
+    )
+
+
 def topological_sort(
     nodes: list[tuple[str, tuple[str, ...]]],
 ) -> list[str] | None:
@@ -666,3 +865,57 @@ def topological_sort(
     if len(ordered) != len(nodes):
         return None
     return ordered
+
+
+def find_dependency_cycle(
+    nodes: list[tuple[str, tuple[str, ...]]],
+) -> list[str]:
+    """Return one cycle as ``[a, b, ..., a]``, or ``[]`` if the graph is acyclic.
+
+    Used to give the user (and the PM resolver retry) a concrete cycle to
+    inspect instead of a bare "contains a cycle" message.
+    """
+    graph: dict[str, list[str]] = {name: [] for name, _ in nodes}
+    for name, deps in nodes:
+        for dep in deps:
+            if dep in graph:
+                graph[name].append(dep)
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = dict.fromkeys(graph, WHITE)
+    parent: dict[str, str | None] = dict.fromkeys(graph, None)
+    cycle_edge: tuple[str, str] | None = None
+    for start in graph:
+        if color[start] != WHITE or cycle_edge is not None:
+            continue
+        stack: list[tuple[str, int]] = [(start, 0)]
+        color[start] = GRAY
+        while stack:
+            node, next_index = stack[-1]
+            neighbours = graph[node]
+            if next_index >= len(neighbours):
+                color[node] = BLACK
+                stack.pop()
+                continue
+            stack[-1] = (node, next_index + 1)
+            nxt = neighbours[next_index]
+            if color[nxt] == WHITE:
+                color[nxt] = GRAY
+                parent[nxt] = node
+                stack.append((nxt, 0))
+            elif color[nxt] == GRAY:
+                cycle_edge = (node, nxt)
+                stack.clear()
+                break
+    if cycle_edge is None:
+        return []
+    src, dst = cycle_edge
+    path = [src]
+    cursor = src
+    while cursor != dst:
+        nxt_parent = parent[cursor]
+        if nxt_parent is None:
+            return [dst, src, dst]
+        cursor = nxt_parent
+        path.append(cursor)
+    path.append(src)
+    return list(reversed(path))

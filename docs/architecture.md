@@ -251,8 +251,12 @@ After validation, the controller does *not* immediately dispatch the
 plan. Instead, the initiative is moved to `awaiting_approval` with the
 expanded plan serialized into `pm_initiatives.pending_plan_json`, and the
 plan ack message is posted with a *Start executing* (primary) and
-*Cancel* (danger) button row. The watchdog skips initiatives in
-`planning` or `awaiting_approval`, so nothing runs until a human chooses.
+*Cancel* (danger) button row. The ack also includes a rough plan
+estimate (`estimate_pm_plan`) — subtask count, critical-path depth,
+dangerous-mode count, co-design fan-outs, and a wall-clock band — so the
+user has a sense of the cost before approving. The watchdog only polls
+initiatives in `active`, so nothing escalates until a human starts
+execution.
 
 When the user clicks *Start executing*, the block-action handler
 deserializes the parked plan, promotes the initiative to `active`,
@@ -283,7 +287,30 @@ fingerprint:
 
 The watchdog only reads state and posts in Slack. Dispatch belongs to the
 deferred-work poller; this separation keeps the watchdog safe even when it
-sees a transient false positive.
+sees a transient false positive. When a post to the initiative thread
+fails with `channel_not_found`, `thread_not_found`, `message_not_found`,
+`is_archived`, or `not_in_channel`, the watchdog interprets the thread as
+permanently gone and moves the initiative to `cancelled` instead of
+looping against the dead thread. The watchdog's `last_run_at` heartbeat
+is only stamped after a successful evaluation, so a monitoring check on a
+stale heartbeat still notices a thrown exception.
+
+In-thread commands a user can drop into an initiative thread:
+
+- `pm status` (also `pm plan`, `pm dag`, `pm state`, `/status`) — the
+  controller renders the current DAG with per-subtask status, owner, and
+  deps directly in Slack without consulting the PM agent. The same
+  renderer feeds the `[PM HARNESS: initiative state]` prefix that PM
+  agents see on every follow-up.
+- `pm replan: <new context>` — cancels every non-DONE subtask, resets
+  the initiative to `planning`, and re-runs the PM resolver with the
+  prior plan snapshot plus the user's new instructions. Only available
+  when a PM-kind agent is still attached to the initiative.
+- `pm extend: <new work>` — keeps the existing subtasks running and asks
+  the PM to plan an extension. The new plan may reference existing
+  subtask ids in `depends_on` (allowed via
+  `parse_agent_pm_plan_signal(..., allowed_external_dep_ids=…)`). The
+  extension still goes through the normal approval gate.
 
 Marking the initiative thread done cascades through
 `cancel_pm_initiative_for_thread` and the existing
