@@ -141,6 +141,106 @@ class PmDispatchTests(unittest.TestCase):
                 store.close()
 
 
+class PmChunkDispatchTests(unittest.TestCase):
+    def test_post_agent_chunk_with_pm_plan_signal_parks_plan_immediately(self):
+        """End-to-end: a PM agent emits a chunk containing the PM_PLAN
+        control line, ManagedTaskRuntime._post_agent_chunk extracts the
+        signal, and SlackTeamController.handle_runtime_agent_control
+        parks the plan + posts the approval card — all on the SAME chunk,
+        without waiting for the managed process to exit.
+
+        Regression test: PM_PLAN was previously queued in
+        `running.control_signals` and only flushed when the worker
+        completed. With managed Claude staying alive across turns
+        (--input-format stream-json), the queue was never flushed and
+        the approval card never posted, even though the extractor
+        correctly stripped the signal line.
+        """
+        import threading
+
+        from agent_harness.config import AgentCommandConfig
+        from agent_harness.runtime.tasks import ManagedTaskRuntime, RunningTask
+        from tests.test_task_runtime import OneShotProcess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Ship feature X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                )
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=controller.handle_runtime_agent_control,
+                )
+                running = RunningTask(
+                    task=pm_task,
+                    agent=agent,
+                    process=OneShotProcess(None),
+                    thread=thread_ref,
+                    worker=threading.Thread(),
+                )
+
+                plan_signal = _build_plan_signal(
+                    initiative.initiative_id,
+                    handles=[agent.handle],
+                )
+                chunk = f"Plan ready — two subtasks: investigate, then implement.\n{plan_signal}\n"
+
+                runtime._post_agent_chunk(running, chunk)
+
+                refreshed = store.get_pm_initiative(initiative.initiative_id)
+                assert refreshed is not None
+                self.assertEqual(refreshed.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertIsNotNone(refreshed.pending_plan_json)
+                approval_reply = next(
+                    item
+                    for item in gateway.thread_replies
+                    if "Start executing" in (item.get("text") or "")
+                )
+                self.assertIsNotNone(approval_reply.get("blocks"))
+                self.assertNotIn(
+                    "SLACKGENTIC: PM_PLAN",
+                    " ".join(item.get("text") or "" for item in gateway.thread_replies),
+                    msg=(
+                        "PM_PLAN control line must not leak into Slack — the "
+                        "extractor should have stripped it before the agent "
+                        "chunk was posted."
+                    ),
+                )
+            finally:
+                store.close()
+
+
 class PmRuntimeTests(unittest.TestCase):
     def test_pm_plan_signal_parks_for_approval_without_firing(self):
         with tempfile.TemporaryDirectory() as tmp:

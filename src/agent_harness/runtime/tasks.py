@@ -33,7 +33,7 @@ from agent_harness.permissions import (
     claude_safe_auto_permission_request_allowed,
     task_permission_mode,
 )
-from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX
+from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX, is_agent_pm_plan_signal
 from agent_harness.pr_links import pr_urls_from_metadata
 from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
@@ -839,7 +839,17 @@ class ManagedTaskRuntime:
         deferred_signals: list[str] = []
         terminal_signals: list[str] = []
         for signal in control_signals:
-            if is_agent_roster_status_signal(signal) or is_agent_reaction_signal(signal):
+            if (
+                is_agent_roster_status_signal(signal)
+                or is_agent_reaction_signal(signal)
+                or is_agent_pm_plan_signal(signal)
+            ):
+                # PM_PLAN must dispatch in the same chunk it arrives in:
+                # managed Claude keeps its process alive across turns with
+                # `--input-format stream-json`, so the deferred queue is
+                # only flushed when the process exits — a plan parked for
+                # human approval would never reach the dispatcher there
+                # and the approval card would never post.
                 self._handle_immediate_agent_control_signal(running, signal)
             elif signal == AGENT_THREAD_DONE_SIGNAL:
                 terminal_signals.append(signal)
