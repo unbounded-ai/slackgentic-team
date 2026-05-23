@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -44,6 +45,8 @@ from agent_harness.models import (
     PendingWorkRequest,
     PendingWorkRequestStatus,
     PermissionMode,
+    PmInitiative,
+    PmInitiativeStatus,
     Provider,
     ScheduledTimer,
     ScheduledTimerStatus,
@@ -53,6 +56,7 @@ from agent_harness.models import (
     SessionDependency,
     SessionStatus,
     SlackThreadRef,
+    TeamAgentKind,
     TeamAgentStatus,
     WorkDependency,
     WorkDependencyKind,
@@ -65,6 +69,33 @@ from agent_harness.models import (
     parse_timestamp,
     scheduled_work_dependency_id,
     utc_now,
+)
+from agent_harness.pm import (
+    MAX_PM_RESOLUTION_ATTEMPTS,
+    MAX_PM_SUBTASKS,
+    PM_EXTENSION_CONTEXT_METADATA_KEY,
+    PM_EXTENSION_KNOWN_IDS_METADATA_KEY,
+    PM_INITIATIVE_ID_METADATA_KEY,
+    PM_REPLAN_CONTEXT_METADATA_KEY,
+    PM_RESOLUTION_ATTEMPTS_METADATA_KEY,
+    PM_RESOLUTION_METADATA_KEY,
+    PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
+    ParsedPmPlan,
+    PmPlanEstimate,
+    build_pm_resolution_prompt,
+    deserialize_parsed_pm_plan,
+    estimate_pm_plan,
+    expand_codesign_plan,
+    extract_pm_request_body,
+    filter_pm_agents,
+    is_agent_pm_plan_signal,
+    looks_like_pm_request,
+    looks_like_pm_status_request,
+    message_targets_pm_agent,
+    parse_agent_pm_plan_signal,
+    parse_pm_extension_request,
+    parse_pm_replan_request,
+    serialize_parsed_pm_plan,
 )
 from agent_harness.pr_links import metadata_with_pr_urls, pr_urls_from_metadata
 from agent_harness.providers import ClaudeProvider, CodexProvider
@@ -218,6 +249,41 @@ SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
 SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
 SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
+_PM_BLOCKER_PREFIX = "pm.blocker."
+_PM_APPROVAL_BLOCKER_SECONDS = 5 * 60
+_PM_STALLED_TASK_SECONDS = 30 * 60
+# Slack errors that indicate the initiative thread is permanently gone.
+# A retry loop against a dead thread is pure noise, so the watchdog cancels
+# the initiative once it sees one of these.
+_PM_DEAD_THREAD_SLACK_ERRORS = frozenset(
+    {
+        "channel_not_found",
+        "thread_not_found",
+        "message_not_found",
+        "is_archived",
+        "not_in_channel",
+    }
+)
+
+
+def _pm_blocker_setting_key(initiative_id: str, local_id: str, kind: str) -> str:
+    safe_local = re.sub(r"[^A-Za-z0-9_.-]", "_", local_id) or "_"
+    safe_kind = re.sub(r"[^A-Za-z0-9_.:-]", "_", kind) or "_"
+    return f"{_PM_BLOCKER_PREFIX}{initiative_id}.{safe_local}.{safe_kind}"
+
+
+def _slack_error_code(exc: Exception) -> str | None:
+    """Return the Slack ``error`` field for a SlackApiError, or None."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    try:
+        code = response.get("error")
+    except Exception:
+        return None
+    return code if isinstance(code, str) else None
+
+
 SLACK_BACKFILL_FETCH_LIMIT = 500
 SLACK_BACKFILL_KNOWN_THREAD_LIMIT = 200
 SLACK_BACKFILL_GRACE_SECONDS = 5.0
@@ -353,6 +419,8 @@ class SlackTeamController:
             self._external_session_detach_from_action(decoded, channel_id)
         elif action_name.startswith("update."):
             self._update_from_action(decoded, channel_id, message_ts)
+        elif action_name.startswith("pm_initiative."):
+            self._pm_initiative_from_action(decoded, payload, channel_id, message_ts)
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
             self.session_bridge.handle_agent_request_block_action(decoded, channel_id, message_ts)
 
@@ -646,6 +714,8 @@ class SlackTeamController:
         command = parse_team_command(text)
         if command:
             self.handle_team_command(command, target)
+            return
+        if self._handle_pm_request(event, channel_id, text):
             return
         if self._handle_deferred_work_request(event, channel_id, text):
             return
@@ -1103,6 +1173,132 @@ class SlackTeamController:
                         "or ask someone else."
                     )
         return CAPACITY_MESSAGE
+
+    def _handle_pm_request(self, event: dict, channel_id: str, text: str) -> bool:
+        # If this message is already a reply inside an active agent thread, let
+        # the task-thread-reply path handle it (so status questions for an
+        # existing PM thread go to that PM, not a brand-new initiative).
+        thread_ts = event.get("thread_ts")
+        if (
+            thread_ts
+            and thread_ts != event.get("ts")
+            and self.store.get_original_agent_task_by_thread(channel_id, thread_ts) is not None
+        ):
+            return False
+        raw_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
+        active_agents = self.store.list_team_agents()
+        pm_agents = filter_pm_agents(active_agents)
+        targeted_pm_handle: str | None = None
+        if pm_agents:
+            targeted_pm_handle = message_targets_pm_agent(
+                raw_text, [agent.handle for agent in pm_agents]
+            )
+        if targeted_pm_handle:
+            project_body = _strip_handle_prefix(raw_text, targeted_pm_handle)
+            if not project_body:
+                return False
+        else:
+            if not looks_like_pm_request(raw_text):
+                return False
+            project_body = extract_pm_request_body(raw_text)
+            if not project_body:
+                return False
+        thread = self._request_thread_anchor(event, channel_id, text)
+        if not active_agents:
+            self._post_capacity_message(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts)
+            )
+            return True
+        title = _shorten(project_body, 80) or "PM initiative"
+        initiative = self.store.create_pm_initiative(
+            SlackThreadRef(channel_id, thread.thread_ts, thread.message_ts),
+            title=title,
+            summary=project_body,
+            requested_by_slack_user=event.get("user"),
+        )
+        resolver_prompt = build_pm_resolution_prompt(
+            project_body,
+            [agent.handle for agent in active_agents],
+            initiative_id=initiative.initiative_id,
+            now=utc_now(),
+        )
+        if targeted_pm_handle:
+            request = WorkRequest(
+                prompt=resolver_prompt,
+                assignment_mode=AssignmentMode.SPECIFIC,
+                requested_handle=targeted_pm_handle,
+            )
+        elif pm_agents:
+            # No specific PM tagged but PM-kind agents exist. Pin the resolver
+            # to a PM (preferring an idle one) so the PM owns the initiative
+            # end-to-end; worker agents never run PM resolvers when PMs exist.
+            idle_agent_ids = {agent.agent_id for agent in self.store.idle_team_agents()}
+            idle_pms = [agent for agent in pm_agents if agent.agent_id in idle_agent_ids]
+            chosen_pms = idle_pms or pm_agents
+            pm_handles = sorted(agent.handle for agent in chosen_pms)
+            digest_handle = pm_handles[hash(initiative.initiative_id) % len(pm_handles)]
+            request = WorkRequest(
+                prompt=resolver_prompt,
+                assignment_mode=AssignmentMode.SPECIFIC,
+                requested_handle=digest_handle,
+            )
+        else:
+            request = WorkRequest(
+                prompt=resolver_prompt,
+                assignment_mode=AssignmentMode.ANYONE,
+            )
+        extra_metadata = self._with_linked_thread_context(
+            {
+                PM_RESOLUTION_METADATA_KEY: True,
+                PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: project_body,
+                PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                ASSIGNMENT_PROMPT_METADATA_KEY: project_body,
+                "request_message_ts": event.get("ts"),
+            },
+            project_body,
+            current_thread=thread,
+        )
+        self._mark_message_acknowledged(channel_id, event.get("ts"))
+        result = assign_work_request(
+            self.store,
+            request,
+            channel_id,
+            requested_by_slack_user=event.get("user"),
+            extra_metadata=extra_metadata,
+            exclude_agent_ids=self._busy_agent_ids_for_assignment(),
+        )
+        if result is None:
+            self.store.update_pm_initiative_status(
+                initiative.initiative_id, PmInitiativeStatus.CANCELLED
+            )
+            self._post_assignment_unavailable(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts),
+                request,
+                requested_by_slack_user=event.get("user"),
+                extra_metadata=extra_metadata,
+            )
+            return True
+        posted = self.gateway.post_thread_reply(
+            thread,
+            (
+                f"@{result.agent.handle} is the PM for this initiative and will "
+                f"break it into subtasks: `{_shorten(project_body, 180)}`"
+            ),
+            persona=result.agent,
+            icon_url=self._agent_icon_url(result.agent),
+        )
+        self.store.update_agent_task_thread(result.task.task_id, thread.thread_ts, posted.ts)
+        self.store.update_pm_initiative_owner(
+            initiative.initiative_id,
+            pm_agent_id=result.agent.agent_id,
+            pm_task_id=result.task.task_id,
+        )
+        task = self.store.get_agent_task(result.task.task_id) or result.task
+        if self.runtime:
+            self.runtime.start_task(task, result.agent, thread)
+        self._mark_message_in_progress(channel_id, event.get("ts"))
+        return True
 
     def _handle_deferred_work_request(self, event: dict, channel_id: str, text: str) -> bool:
         deferred_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
@@ -1752,7 +1948,13 @@ class SlackTeamController:
         path = Path(configured).expanduser()
         return path if path.exists() and path.is_dir() else None
 
-    def hire_agents(self, count: int, provider: Provider | None = None):
+    def hire_agents(
+        self,
+        count: int,
+        provider: Provider | None = None,
+        *,
+        kind: TeamAgentKind = TeamAgentKind.ENGINEER,
+    ):
         if not self._can_hire(count):
             raise ValueError(AGENT_LIMIT_MESSAGE)
         active_agents = self.store.list_team_agents()
@@ -1764,6 +1966,7 @@ class SlackTeamController:
             balance_agents=active_agents,
             avatar_agents=active_agents,
             randomize_identities=True,
+            kind=kind,
         )
         for agent in hired:
             self._release_inactive_handle(agent.handle)
@@ -2225,6 +2428,8 @@ class SlackTeamController:
         count = int(payload.get("count") or 1)
         provider_text = payload.get("provider")
         provider = Provider(provider_text) if provider_text else None
+        kind_text = payload.get("kind")
+        kind = TeamAgentKind(kind_text) if kind_text else TeamAgentKind.ENGINEER
         if not self._can_hire(count):
             thread_ts = roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
             self._post_text(
@@ -2232,7 +2437,7 @@ class SlackTeamController:
                 f"{AGENT_LIMIT_MESSAGE} Max team size is {MAX_TEAM_AGENTS}.",
             )
             return
-        hired = self.hire_agents(count, provider)
+        hired = self.hire_agents(count, provider, kind=kind)
         ts = roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
         if not ts:
             ts = self.post_roster(channel_id)
@@ -2698,6 +2903,82 @@ class SlackTeamController:
             self._resume_pending_work_requests(channel_id)
             self.refresh_or_post_roster(channel_id)
 
+    def _pm_initiative_from_action(
+        self,
+        payload: dict,
+        slack_payload: dict,
+        channel_id: str,
+        message_ts: str | None,
+    ) -> None:
+        action = payload.get("action") or ""
+        initiative_id = str(payload.get("initiative_id") or "")
+        if not initiative_id:
+            return
+        initiative = self.store.get_pm_initiative(initiative_id)
+        if initiative is None:
+            return
+        actor = (slack_payload.get("user") or {}).get("id")
+        thread = SlackThreadRef(
+            channel_id=initiative.channel_id,
+            thread_ts=initiative.thread_ts,
+        )
+        if action == "pm_initiative.start":
+            if initiative.status != PmInitiativeStatus.AWAITING_APPROVAL:
+                self._strip_pm_plan_buttons(
+                    initiative, message_ts, status_label=initiative.status.value
+                )
+                return
+            promoted = self._execute_pm_plan(initiative, approver_slack_user=actor)
+            if promoted is not None:
+                self._strip_pm_plan_buttons(promoted, message_ts, status_label="approved")
+            return
+        if action == "pm_initiative.cancel":
+            if initiative.status not in {
+                PmInitiativeStatus.AWAITING_APPROVAL,
+                PmInitiativeStatus.PLANNING,
+            }:
+                self._strip_pm_plan_buttons(
+                    initiative, message_ts, status_label=initiative.status.value
+                )
+                return
+            self.store.set_pm_initiative_pending_plan(
+                initiative.initiative_id,
+                plan_json=None,
+                status=PmInitiativeStatus.CANCELLED,
+            )
+            mention = f"<@{actor}> " if actor else ""
+            self.gateway.post_thread_reply(
+                thread,
+                f"{mention}cancelled this PM initiative. No subtasks were started.",
+            )
+            self._strip_pm_plan_buttons(initiative, message_ts, status_label="cancelled")
+            return
+
+    def _strip_pm_plan_buttons(
+        self,
+        initiative: PmInitiative,
+        message_ts: str | None,
+        *,
+        status_label: str,
+    ) -> None:
+        target_ts = message_ts or initiative.pending_plan_message_ts
+        if not target_ts:
+            return
+        suffix = f"\n\n_Plan {status_label}._"
+        try:
+            existing = self.gateway.thread_messages(
+                initiative.channel_id, initiative.thread_ts, limit=200
+            )
+        except Exception:
+            existing = []
+        original_text = ""
+        for message in existing:
+            if message.get("ts") == target_ts:
+                original_text = message.get("text") or ""
+                break
+        new_text = (original_text or f"PM plan for `{initiative.initiative_id}`") + suffix
+        self._try_update_message(initiative.channel_id, target_ts, new_text)
+
     def _schedule_from_action(
         self,
         payload: dict,
@@ -2930,6 +3211,12 @@ class SlackTeamController:
         if agent is None and task.status in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
             return True
         self._mark_message_acknowledged(channel_id, message_ts)
+        if self._maybe_post_pm_status_command(task, channel_id, thread_ts, message_ts, text):
+            return True
+        if self._maybe_start_pm_replan(task, channel_id, thread_ts, message_ts, text):
+            return True
+        if self._maybe_start_pm_extension(task, channel_id, thread_ts, message_ts, text):
+            return True
         active_task = self._active_thread_task_for_agent(task, channel_id, thread_ts)
         target_task = active_task or task
         if _is_stop_command(text):
@@ -2952,15 +3239,16 @@ class SlackTeamController:
             return True
         if self._record_dependency_if_requested(task.task_id, event, text, agent):
             return True
+        followup_text = self._wrap_pm_followup_text(target_task, agent, text)
         if self.runtime and self.runtime.send_to_task(
             target_task.task_id,
-            _live_thread_followup_prompt(text),
+            _live_thread_followup_prompt(followup_text),
         ):
             self._remember_request_message_for_task(target_task, message_ts)
             self._mark_message_in_progress(channel_id, message_ts)
             return True
         if agent:
-            started = self._start_thread_followup(target_task, event, text, agent)
+            started = self._start_thread_followup(target_task, event, followup_text, agent)
             if started and message_ts:
                 self._mark_message_in_progress(channel_id, message_ts)
             return started
@@ -4407,6 +4695,8 @@ class SlackTeamController:
             return self._schedule_user_work_from_agent(task, agent, thread, signal)
         if is_agent_deferred_signal(signal):
             return self._create_deferred_work_from_agent(task, agent, thread, signal)
+        if is_agent_pm_plan_signal(signal):
+            return self._create_pm_initiative_from_agent(task, agent, thread, signal)
         return False
 
     def _update_task_roster_summary(
@@ -4871,6 +5161,877 @@ class SlackTeamController:
             return ([], f"unsupported dependency kind: {dep.kind}")
         return (resolved, None)
 
+    def _create_pm_initiative_from_agent(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        if not isinstance(initiative_id, str) or not initiative_id:
+            self.gateway.post_thread_reply(
+                thread,
+                "I received a PM plan but could not match it to an initiative. Discarding.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        initiative = self.store.get_pm_initiative(initiative_id)
+        if initiative is None:
+            self.gateway.post_thread_reply(
+                thread,
+                f"I received a PM plan for unknown initiative `{initiative_id}`. Discarding.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        if initiative.status != PmInitiativeStatus.PLANNING:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"PM initiative `{initiative_id}` is already {initiative.status.value}; "
+                    "ignoring late PM plan."
+                ),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        active_agents = self.store.list_team_agents()
+        extension_known_ids = self._task_extension_known_ids(task)
+        parsed = parse_agent_pm_plan_signal(
+            signal,
+            known_handles=[item.handle for item in active_agents],
+            allowed_external_dep_ids=extension_known_ids,
+        )
+        if parsed.plan is None:
+            return self._retry_pm_resolution(task, agent, thread, parsed.error or "invalid PM plan")
+        plan = expand_codesign_plan(parsed.plan)
+        # Park the plan until the requester approves it. Subtasks are NOT
+        # inserted yet; nothing dispatches until the "Start executing" button
+        # fires _execute_pm_plan.
+        parked = self.store.set_pm_initiative_pending_plan(
+            initiative.initiative_id,
+            plan_json=serialize_parsed_pm_plan(plan),
+            status=PmInitiativeStatus.AWAITING_APPROVAL,
+        )
+        if parked is None:
+            return True
+        plan_text = _format_pm_plan_ack(
+            parked, plan, requested_by=initiative.requested_by_slack_user
+        )
+        plan_blocks = _pm_plan_approval_blocks(parked, plan_text)
+        posted = self.gateway.post_thread_reply(
+            thread,
+            plan_text,
+            persona=agent,
+            icon_url=self._agent_icon_url(agent),
+            blocks=plan_blocks,
+        )
+        # Remember the message ts so we can strip the buttons once the user
+        # acts on the plan.
+        with suppress(Exception):
+            self.store.set_pm_initiative_pending_plan(
+                parked.initiative_id,
+                plan_json=parked.pending_plan_json,
+                status=PmInitiativeStatus.AWAITING_APPROVAL,
+                pending_plan_message_ts=posted.ts,
+            )
+        # PM-kind agents stay assigned to the initiative so the user can keep
+        # asking the same PM about status, blockers, and changes. Worker-kind
+        # resolvers (the fallback when no PM agent is hired) free their seat
+        # for the dispatched subtasks once the user approves the plan.
+        if agent.kind != TeamAgentKind.PM:
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+        resolved_task = self.store.get_agent_task(task.task_id) or task
+        self._remove_task_action_buttons_if_resolved(resolved_task)
+        for message_ts in _task_request_message_ts_values(resolved_task):
+            self._mark_message_complete(thread.channel_id, message_ts)
+        self.refresh_or_post_roster(thread.channel_id)
+        return True
+
+    def _execute_pm_plan(
+        self,
+        initiative: PmInitiative,
+        *,
+        approver_slack_user: str | None = None,
+    ) -> PmInitiative | None:
+        """Approve a parked plan: insert subtasks, promote to ACTIVE, fire roots.
+
+        Returns the active initiative on success, or ``None`` if the plan
+        could not be applied (invalid JSON, persistence failure, etc.). On
+        failure the initiative is moved to CANCELLED and a Slack-visible
+        message is posted in its thread.
+        """
+        if not initiative.pending_plan_json:
+            return None
+        thread = SlackThreadRef(
+            channel_id=initiative.channel_id,
+            thread_ts=initiative.thread_ts,
+        )
+        try:
+            plan = deserialize_parsed_pm_plan(initiative.pending_plan_json)
+        except Exception as exc:
+            LOGGER.exception(
+                "failed to deserialize PM plan for initiative %s", initiative.initiative_id
+            )
+            self.store.set_pm_initiative_pending_plan(
+                initiative.initiative_id,
+                plan_json=None,
+                status=PmInitiativeStatus.CANCELLED,
+            )
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not load the parked PM plan for `{initiative.initiative_id}`: {exc}.",
+            )
+            return None
+        promoted = self.store.set_pm_initiative_pending_plan(
+            initiative.initiative_id,
+            plan_json=None,
+            status=PmInitiativeStatus.ACTIVE,
+        )
+        if promoted is None:
+            return None
+        # Pre-seed `existing_subtasks` with whatever the initiative already
+        # has so that an extension plan's new subtasks can reference
+        # already-running subtasks by local id. Each new subtask is appended
+        # to `inserted` as it is persisted so later siblings can also
+        # reference it. `next_sort_order` continues past the prior range.
+        prior_subtasks = self.store.list_pm_subtasks(initiative.initiative_id)
+        next_sort_order = max((item.sort_order for item in prior_subtasks), default=-1) + 1
+        try:
+            inserted: list[object] = list(prior_subtasks)
+            for offset, subtask in enumerate(plan.subtasks):
+                inserted.append(
+                    self.store.add_pm_subtask_dispatch(
+                        initiative=promoted,
+                        local_id=subtask.local_id,
+                        title=subtask.title,
+                        request=subtask.request,
+                        plan_depends_on=subtask.depends_on,
+                        existing_subtasks=list(inserted),
+                        after_delay_seconds=subtask.after_delay_seconds,
+                        sort_order=next_sort_order + offset,
+                    )
+                )
+        except Exception as exc:
+            LOGGER.exception(
+                "failed to persist PM subtasks for initiative %s", initiative.initiative_id
+            )
+            self.store.update_pm_initiative_status(
+                initiative.initiative_id, PmInitiativeStatus.CANCELLED
+            )
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not save the PM plan for `{initiative.initiative_id}`: {exc}.",
+            )
+            return None
+        mention = f"<@{approver_slack_user}>" if approver_slack_user else "Approved"
+        self.gateway.post_thread_reply(
+            thread,
+            f"{mention} — starting execution. I will keep this thread updated as "
+            "subtasks fire and finish.",
+        )
+        # Best-effort: fire any root subtasks immediately rather than waiting
+        # for the next DeferredWorkRunner tick.
+        try:
+            for deferred in self.store.list_due_deferred_work(limit=MAX_PM_SUBTASKS):
+                self.fire_due_deferred_work(deferred)
+        except Exception:
+            LOGGER.debug("failed to eagerly fire PM root subtasks", exc_info=True)
+        return promoted
+
+    def _retry_pm_resolution(
+        self,
+        task: AgentTask,
+        agent,
+        thread: SlackThreadRef,
+        error: str,
+    ) -> bool:
+        if not task.metadata.get(PM_RESOLUTION_METADATA_KEY):
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not save that PM plan: {error}.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return False
+        attempts = int(task.metadata.get(PM_RESOLUTION_ATTEMPTS_METADATA_KEY) or 0)
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        if attempts >= MAX_PM_RESOLUTION_ATTEMPTS or not self.runtime:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    "I could not produce a valid PM plan after "
+                    f"{MAX_PM_RESOLUTION_ATTEMPTS} attempts: {error}. "
+                    "Cancelling this initiative."
+                ),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            if isinstance(initiative_id, str) and initiative_id:
+                self.store.update_pm_initiative_status(initiative_id, PmInitiativeStatus.CANCELLED)
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.refresh_or_post_roster(thread.channel_id)
+            return True
+        original_text = task.metadata.get(PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
+        if not isinstance(original_text, str) or not original_text.strip():
+            original_text = task.prompt
+        active_agents = self.store.list_team_agents()
+        extension_known_ids = self._task_extension_known_ids(task)
+        extension_context_raw = task.metadata.get(PM_EXTENSION_CONTEXT_METADATA_KEY)
+        extension_context = (
+            extension_context_raw if isinstance(extension_context_raw, str) else None
+        )
+        replan_context_raw = task.metadata.get(PM_REPLAN_CONTEXT_METADATA_KEY)
+        replan_context = replan_context_raw if isinstance(replan_context_raw, str) else None
+        prior_summary: str | None = None
+        if isinstance(initiative_id, str) and initiative_id:
+            prior_summary = self._build_pm_initiative_plan_view(initiative_id)
+        retry_prompt = build_pm_resolution_prompt(
+            original_text,
+            [item.handle for item in active_agents],
+            initiative_id=str(initiative_id) if initiative_id else "",
+            now=utc_now(),
+            validation_error=error,
+            replan_context=replan_context,
+            extension_known_ids=extension_known_ids,
+            extension_context=extension_context,
+            prior_plan_summary=prior_summary if (replan_context or extension_known_ids) else None,
+        )
+        metadata = dict(task.metadata)
+        metadata[PM_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
+        retry_task = replace(
+            task,
+            prompt=retry_prompt,
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(retry_task)
+        started = self.runtime.start_task(retry_task, agent, thread)
+        if not started:
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    "I could not restart PM plan validation "
+                    f"(last validation error: {error}), so I cancelled this initiative."
+                ),
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            if isinstance(initiative_id, str) and initiative_id:
+                self.store.update_pm_initiative_status(initiative_id, PmInitiativeStatus.CANCELLED)
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.refresh_or_post_roster(thread.channel_id)
+        return True
+
+    def _maybe_start_pm_replan(
+        self,
+        task: AgentTask,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str | None,
+        text: str,
+    ) -> bool:
+        """Re-run the PM resolver after a failure or course-correction.
+
+        Cancels every non-DONE subtask, resets the initiative to PLANNING,
+        and starts a fresh resolver task carrying the user's new context
+        plus a snapshot of what already finished. The PM's new plan goes
+        through the same approval gate as the original.
+        """
+        replan_body = parse_pm_replan_request(text)
+        if replan_body is None:
+            return False
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        if not isinstance(initiative_id, str) or not initiative_id:
+            return False
+        initiative = self.store.get_pm_initiative(initiative_id)
+        if initiative is None or initiative.status in {
+            PmInitiativeStatus.DONE,
+            PmInitiativeStatus.CANCELLED,
+        }:
+            return False
+        if self.runtime is None:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                "Replan is unavailable because the runtime is not connected.",
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        agent = self.store.get_team_agent(task.agent_id)
+        if (
+            agent is None
+            or getattr(agent, "kind", None) != TeamAgentKind.PM
+            or task.status != AgentTaskStatus.ACTIVE
+        ):
+            # Only PM-kind agents stay assigned past plan approval. For
+            # worker-fallback resolvers the agent is back to general duty and
+            # restarting the task would race with whatever it is doing now.
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                (
+                    "Replan needs a PM-kind agent still attached to this initiative. "
+                    "Hire a PM (`team hire --kind pm`) and start a new `pm: ...` "
+                    "initiative instead."
+                ),
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        # Snapshot the prior plan BEFORE we cancel anything so the resolver
+        # sees what already finished and can build on it.
+        prior_summary = self._build_pm_initiative_plan_view(initiative_id)
+        cancelled = 0
+        try:
+            cancelled = self.store.cancel_pending_pm_subtask_work(initiative_id)
+        except Exception:
+            LOGGER.exception(
+                "failed to cancel pending PM subtasks during replan for %s",
+                initiative_id,
+            )
+        self.store.set_pm_initiative_pending_plan(
+            initiative_id,
+            plan_json=None,
+            status=PmInitiativeStatus.PLANNING,
+        )
+        original_text = task.metadata.get(PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
+        if not isinstance(original_text, str) or not original_text.strip():
+            original_text = initiative.summary or initiative.title
+        active_agents = self.store.list_team_agents()
+        retry_prompt = build_pm_resolution_prompt(
+            original_text,
+            [item.handle for item in active_agents],
+            initiative_id=initiative_id,
+            now=utc_now(),
+            replan_context=replan_body or None,
+            prior_plan_summary=prior_summary,
+        )
+        metadata = dict(task.metadata)
+        metadata[PM_RESOLUTION_METADATA_KEY] = True
+        metadata[PM_RESOLUTION_ATTEMPTS_METADATA_KEY] = 0
+        metadata[PM_INITIATIVE_ID_METADATA_KEY] = initiative_id
+        metadata[PM_REPLAN_CONTEXT_METADATA_KEY] = replan_body
+        # A replan run resets extension state so the new prompt is unambiguous.
+        metadata.pop(PM_EXTENSION_KNOWN_IDS_METADATA_KEY, None)
+        metadata.pop(PM_EXTENSION_CONTEXT_METADATA_KEY, None)
+        retry_task = replace(
+            task,
+            prompt=retry_prompt,
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(retry_task)
+        thread = SlackThreadRef(channel_id, thread_ts, task.parent_message_ts)
+        started = self.runtime.start_task(retry_task, agent, thread)
+        if not started:
+            self.store.update_pm_initiative_status(initiative_id, PmInitiativeStatus.CANCELLED)
+            self.gateway.post_thread_reply(
+                thread,
+                "I could not restart PM planning, so I cancelled this initiative.",
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        cancelled_text = f" Cancelled {cancelled} in-flight subtask(s)." if cancelled else ""
+        self.gateway.post_thread_reply(
+            thread,
+            f"Replanning this initiative.{cancelled_text} I will park the new plan "
+            "for approval before any new subtasks run.",
+        )
+        self._mark_message_in_progress(channel_id, message_ts)
+        return True
+
+    def _task_extension_known_ids(self, task: AgentTask) -> tuple[str, ...]:
+        raw = task.metadata.get(PM_EXTENSION_KNOWN_IDS_METADATA_KEY)
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        return tuple(item for item in raw if isinstance(item, str) and item)
+
+    def _maybe_start_pm_extension(
+        self,
+        task: AgentTask,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str | None,
+        text: str,
+    ) -> bool:
+        """Add new subtasks to an ACTIVE initiative without cancelling existing work.
+
+        The PM agent receives the current DAG plus the user's extension
+        instructions and emits a fresh PM_PLAN whose ``depends_on`` entries
+        may reference existing subtask ids. The new plan goes through the
+        normal approval gate; existing subtasks keep running.
+        """
+        extension_body = parse_pm_extension_request(text)
+        if extension_body is None:
+            return False
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        if not isinstance(initiative_id, str) or not initiative_id:
+            return False
+        initiative = self.store.get_pm_initiative(initiative_id)
+        if initiative is None:
+            return False
+        if initiative.status != PmInitiativeStatus.ACTIVE:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                (
+                    f"Extension only applies to ACTIVE initiatives — this one is "
+                    f"{initiative.status.value}."
+                ),
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        if self.runtime is None:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                "Extension is unavailable because the runtime is not connected.",
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        agent = self.store.get_team_agent(task.agent_id)
+        if (
+            agent is None
+            or getattr(agent, "kind", None) != TeamAgentKind.PM
+            or task.status != AgentTaskStatus.ACTIVE
+        ):
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                (
+                    "Extension needs a PM-kind agent still attached to this initiative. "
+                    "Hire a PM and start a new `pm: ...` initiative instead."
+                ),
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        existing = self.store.list_pm_subtasks(initiative_id)
+        if not existing:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                "Extension needs at least one existing subtask. Approve the first plan first.",
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        existing_ids = tuple(item.local_id for item in existing)
+        prior_summary = self._build_pm_initiative_plan_view(initiative_id)
+        # Park the extension request: drop back to PLANNING so the PM_PLAN
+        # handler treats the next signal as a fresh plan to park for approval.
+        self.store.set_pm_initiative_pending_plan(
+            initiative_id,
+            plan_json=None,
+            status=PmInitiativeStatus.PLANNING,
+        )
+        original_text = task.metadata.get(PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
+        if not isinstance(original_text, str) or not original_text.strip():
+            original_text = initiative.summary or initiative.title
+        active_agents = self.store.list_team_agents()
+        retry_prompt = build_pm_resolution_prompt(
+            original_text,
+            [item.handle for item in active_agents],
+            initiative_id=initiative_id,
+            now=utc_now(),
+            extension_known_ids=existing_ids,
+            extension_context=extension_body,
+            prior_plan_summary=prior_summary,
+        )
+        metadata = dict(task.metadata)
+        metadata[PM_RESOLUTION_METADATA_KEY] = True
+        metadata[PM_RESOLUTION_ATTEMPTS_METADATA_KEY] = 0
+        metadata[PM_INITIATIVE_ID_METADATA_KEY] = initiative_id
+        metadata[PM_EXTENSION_KNOWN_IDS_METADATA_KEY] = list(existing_ids)
+        metadata[PM_EXTENSION_CONTEXT_METADATA_KEY] = extension_body
+        # An extension run resets replan state so the new prompt is unambiguous.
+        metadata.pop(PM_REPLAN_CONTEXT_METADATA_KEY, None)
+        retry_task = replace(
+            task,
+            prompt=retry_prompt,
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(retry_task)
+        thread = SlackThreadRef(channel_id, thread_ts, task.parent_message_ts)
+        started = self.runtime.start_task(retry_task, agent, thread)
+        if not started:
+            # Restore the initiative to ACTIVE — we cleared pending_plan_json
+            # but the existing subtasks are still running.
+            self.store.update_pm_initiative_status(initiative_id, PmInitiativeStatus.ACTIVE)
+            self.gateway.post_thread_reply(
+                thread,
+                "I could not restart the PM agent to plan the extension. "
+                "Existing subtasks keep running unchanged.",
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        self.gateway.post_thread_reply(
+            thread,
+            "Planning the extension. I will park the new subtasks for approval "
+            "before they run; existing subtasks keep running.",
+        )
+        self._mark_message_in_progress(channel_id, message_ts)
+        return True
+
+    def _maybe_post_pm_status_command(
+        self,
+        task: AgentTask,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str | None,
+        text: str,
+    ) -> bool:
+        """Render the DAG directly when a user types a ``pm status``-style command.
+
+        Skips the agent round-trip so the answer is instant. Only fires inside a
+        thread whose oldest task is a PM resolver (which carries the initiative
+        id on its metadata); other threads fall through.
+        """
+        if not looks_like_pm_status_request(text):
+            return False
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        if not isinstance(initiative_id, str) or not initiative_id:
+            return False
+        view = self._build_pm_initiative_plan_view(initiative_id)
+        if view is None:
+            return False
+        self.gateway.post_thread_reply(
+            SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+            view,
+        )
+        self._mark_message_complete(channel_id, message_ts)
+        return True
+
+    def _wrap_pm_followup_text(
+        self,
+        task: AgentTask,
+        agent,
+        text: str,
+    ) -> str:
+        """Prepend a ``[PM HARNESS: initiative state]`` snapshot for PM owners.
+
+        The PM persona prompt promises the agent will see this snapshot on
+        every follow-up so it can answer status questions without re-reading
+        the whole thread. Engineer-kind resolvers (used only when no PM agent
+        is hired) do not get the snapshot — the original behavior is preserved.
+        """
+        if agent is None or getattr(agent, "kind", None) != TeamAgentKind.PM:
+            return text
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        if not isinstance(initiative_id, str) or not initiative_id:
+            return text
+        snapshot = self._build_pm_initiative_snapshot(initiative_id)
+        if not snapshot:
+            return text
+        return f"{snapshot}\n\n{text}"
+
+    def _build_pm_initiative_snapshot(self, initiative_id: str) -> str | None:
+        view = self._build_pm_initiative_plan_view(
+            initiative_id, header="[PM HARNESS: initiative state]"
+        )
+        if view is None:
+            return None
+        return view
+
+    def _build_pm_initiative_plan_view(
+        self,
+        initiative_id: str,
+        *,
+        header: str | None = None,
+    ) -> str | None:
+        """Render the current DAG with per-subtask status, owner, and deps.
+
+        Used by:
+        - the PM agent follow-up snapshot (with the ``[PM HARNESS: ...]`` header)
+        - the on-demand ``pm status`` command in initiative threads
+        - the terminal recap posted by the watchdog
+        """
+        initiative = self.store.get_pm_initiative(initiative_id)
+        if initiative is None:
+            return None
+        subtasks = self.store.list_pm_subtasks(initiative_id)
+        lines: list[str] = []
+        if header:
+            lines.append(header)
+        lines.extend(
+            [
+                f"id: {initiative.initiative_id}",
+                f"title: {initiative.title}",
+                f"status: {initiative.status.value}",
+            ]
+        )
+        if not subtasks:
+            lines.append("subtasks: (none yet — still in planning)")
+            return "\n".join(lines)
+        counts: dict[str, int] = {}
+        rows: list[str] = []
+        for subtask in subtasks:
+            deferred = self.store.get_deferred_work(subtask.deferred_id)
+            if deferred is None:
+                rows.append(f"  - {subtask.local_id}: {subtask.title} (missing)")
+                counts["missing"] = counts.get("missing", 0) + 1
+                continue
+            owner = "unassigned"
+            if deferred.last_task_id:
+                worker_task = self.store.get_agent_task(deferred.last_task_id)
+                if worker_task is not None:
+                    worker_agent = self.store.get_team_agent(worker_task.agent_id)
+                    if worker_agent is not None:
+                        owner = f"@{worker_agent.handle}"
+            status_value = deferred.status.value
+            counts[status_value] = counts.get(status_value, 0) + 1
+            deps_text = (
+                f"deps: {', '.join(subtask.depends_on)}" if subtask.depends_on else "deps: none"
+            )
+            rows.append(
+                f"  - {subtask.local_id}: {subtask.title} "
+                f"[{status_value}, owner={owner}, {deps_text}]"
+            )
+        if counts:
+            summary = ", ".join(
+                f"{count} {state}" for state, count in sorted(counts.items(), key=lambda kv: kv[0])
+            )
+            lines.append(f"subtasks ({summary}):")
+        else:
+            lines.append("subtasks:")
+        lines.extend(rows)
+        return "\n".join(lines)
+
+    def watch_pm_initiatives(self) -> int:
+        active = self.store.list_pm_initiatives(
+            statuses=(PmInitiativeStatus.ACTIVE,),
+            limit=50,
+        )
+        surfaced = 0
+        for initiative in active:
+            try:
+                surfaced += self._watch_one_pm_initiative(initiative)
+            except Exception:
+                # Do NOT mark watchdog_last_run_at on failure: a monitor that
+                # checks for a stale heartbeat needs to notice that this tick
+                # never produced a clean evaluation.
+                LOGGER.debug(
+                    "failed to evaluate PM initiative %s",
+                    initiative.initiative_id,
+                    exc_info=True,
+                )
+                continue
+            try:
+                self.store.mark_pm_initiative_watchdog_run(initiative.initiative_id)
+            except Exception:
+                LOGGER.debug(
+                    "failed to mark PM initiative watchdog run %s",
+                    initiative.initiative_id,
+                    exc_info=True,
+                )
+        return surfaced
+
+    def _watch_one_pm_initiative(self, initiative: PmInitiative) -> int:
+        if initiative.status != PmInitiativeStatus.ACTIVE:
+            # PLANNING: resolver is still running. AWAITING_APPROVAL: the user
+            # has not pressed Start executing yet. DONE / CANCELLED: terminal.
+            # The query in watch_pm_initiatives already filters to ACTIVE, so
+            # this guard only catches a status change between query and call.
+            return 0
+        subtasks = self.store.list_pm_subtasks(initiative.initiative_id)
+        if not subtasks:
+            # Active without subtasks means the plan was applied but the rows
+            # disappeared — surface once and cancel.
+            self._surface_pm_blocker(
+                initiative,
+                local_id="*",
+                kind="missing_subtasks",
+                message=(
+                    f"PM initiative `{initiative.initiative_id}` has no subtasks. Cancelling."
+                ),
+            )
+            self.store.update_pm_initiative_status(
+                initiative.initiative_id, PmInitiativeStatus.CANCELLED
+            )
+            return 1
+        surfaced = 0
+        all_terminal = True
+        all_done = True
+        per_subtask: list[tuple[object, DeferredWork | None, AgentTask | None]] = []
+        for subtask in subtasks:
+            deferred = self.store.get_deferred_work(subtask.deferred_id)
+            task = None
+            if deferred is not None and deferred.last_task_id:
+                task = self.store.get_agent_task(deferred.last_task_id)
+            per_subtask.append((subtask, deferred, task))
+            if deferred is None:
+                continue
+            if deferred.status not in {DeferredWorkStatus.DONE, DeferredWorkStatus.CANCELLED}:
+                all_terminal = False
+                all_done = False
+                continue
+            if deferred.status == DeferredWorkStatus.CANCELLED:
+                all_done = False
+                continue
+            if task is not None and task.status == AgentTaskStatus.ACTIVE:
+                all_terminal = False
+                all_done = False
+        if all_terminal:
+            self._post_pm_initiative_recap(initiative, per_subtask, all_done=all_done)
+            new_status = PmInitiativeStatus.DONE if all_done else PmInitiativeStatus.CANCELLED
+            self.store.update_pm_initiative_status(initiative.initiative_id, new_status)
+            self._clear_pm_surfaced_keys(initiative.initiative_id)
+            return 1
+        now = utc_now()
+        for subtask, deferred, task in per_subtask:
+            if task is None or deferred is None:
+                continue
+            if task.status != AgentTaskStatus.ACTIVE:
+                continue
+            if not task.thread_ts:
+                continue
+            for pending in self.store.list_pending_slack_agent_requests():
+                if pending["thread_channel_id"] != task.channel_id:
+                    continue
+                if pending["thread_ts"] != task.thread_ts:
+                    continue
+                created_raw = pending["created_at"]
+                created_at = parse_timestamp(created_raw) if isinstance(created_raw, str) else None
+                if created_at is None:
+                    continue
+                age = (now - created_at).total_seconds()
+                if age < _PM_APPROVAL_BLOCKER_SECONDS:
+                    continue
+                method = pending["method"] or "approval"
+                surfaced += int(
+                    self._surface_pm_blocker(
+                        initiative,
+                        local_id=subtask.local_id,
+                        kind=f"approval:{method}",
+                        message=(
+                            f":warning: PM initiative `{initiative.initiative_id}` subtask "
+                            f"`{subtask.local_id}` is waiting on `{method}` approval/input for "
+                            f"{int(age // 60)} min. @{self._handle_for_agent_id(task.agent_id)} "
+                            "is blocked."
+                        ),
+                    )
+                )
+            updated_at = task.updated_at
+            if updated_at is None:
+                continue
+            inactive_for = (now - updated_at).total_seconds()
+            if inactive_for < _PM_STALLED_TASK_SECONDS:
+                continue
+            is_running = getattr(self.runtime, "is_task_running", None)
+            if callable(is_running) and is_running(task.task_id):
+                continue
+            surfaced += int(
+                self._surface_pm_blocker(
+                    initiative,
+                    local_id=subtask.local_id,
+                    kind="stalled_task",
+                    message=(
+                        f":warning: PM initiative `{initiative.initiative_id}` subtask "
+                        f"`{subtask.local_id}` has been ACTIVE for "
+                        f"{int(inactive_for // 60)} min with no recent activity. "
+                        f"@{self._handle_for_agent_id(task.agent_id)} may need a nudge."
+                    ),
+                )
+            )
+        return surfaced
+
+    def _post_pm_initiative_recap(
+        self,
+        initiative: PmInitiative,
+        per_subtask,
+        *,
+        all_done: bool,
+    ) -> None:
+        emoji = ":white_check_mark:" if all_done else ":no_entry:"
+        status_word = "complete" if all_done else "cancelled"
+        lines = [
+            f"{emoji} PM initiative *{initiative.title}* (`{initiative.initiative_id}`) {status_word}.",
+        ]
+        for subtask, deferred, task in per_subtask:
+            if deferred is None:
+                state = "missing"
+            elif deferred.status == DeferredWorkStatus.DONE and (
+                task is None or task.status == AgentTaskStatus.DONE
+            ):
+                state = "done"
+            elif deferred.status == DeferredWorkStatus.CANCELLED or (
+                task is not None and task.status == AgentTaskStatus.CANCELLED
+            ):
+                state = "cancelled"
+            else:
+                state = task.status.value if task is not None else deferred.status.value
+            lines.append(f"- `{subtask.local_id}` — {subtask.title}: {state}")
+        thread = SlackThreadRef(initiative.channel_id, initiative.thread_ts, initiative.message_ts)
+        try:
+            self.gateway.post_thread_reply(thread, "\n".join(lines))
+        except Exception as exc:
+            if _slack_error_code(exc) in _PM_DEAD_THREAD_SLACK_ERRORS:
+                LOGGER.warning(
+                    "PM initiative %s recap thread unreachable (%s); skipping recap",
+                    initiative.initiative_id,
+                    _slack_error_code(exc),
+                )
+                return
+            raise
+
+    def _surface_pm_blocker(
+        self,
+        initiative: PmInitiative,
+        *,
+        local_id: str,
+        kind: str,
+        message: str,
+    ) -> bool:
+        key = _pm_blocker_setting_key(initiative.initiative_id, local_id, kind)
+        if self.store.get_setting(key):
+            return False
+        thread = SlackThreadRef(initiative.channel_id, initiative.thread_ts, initiative.message_ts)
+        try:
+            mention_user = initiative.requested_by_slack_user
+            text = message
+            if mention_user and f"<@{mention_user}>" not in text:
+                text = f"<@{mention_user}> {text}"
+            self.gateway.post_thread_reply(thread, text)
+        except Exception as exc:
+            if _slack_error_code(exc) in _PM_DEAD_THREAD_SLACK_ERRORS:
+                LOGGER.warning(
+                    "PM initiative %s thread is unreachable (%s); cancelling",
+                    initiative.initiative_id,
+                    _slack_error_code(exc),
+                )
+                # Pin the dedup key so a watchdog tick can't loop on the same
+                # blocker, and move the initiative to CANCELLED so subsequent
+                # ticks skip it entirely.
+                with suppress(Exception):
+                    self.store.set_setting(key, utc_now().isoformat())
+                with suppress(Exception):
+                    self.store.update_pm_initiative_status(
+                        initiative.initiative_id, PmInitiativeStatus.CANCELLED
+                    )
+                return False
+            LOGGER.debug("failed to surface PM blocker", exc_info=True)
+            return False
+        self.store.set_setting(key, utc_now().isoformat())
+        return True
+
+    def _clear_pm_surfaced_keys(self, initiative_id: str) -> None:
+        prefix = f"{_PM_BLOCKER_PREFIX}{initiative_id}."
+        try:
+            keys = list(self.store.list_settings(prefix=prefix).keys())
+        except Exception:
+            return
+        for key in keys:
+            try:
+                self.store.delete_setting(key)
+            except Exception:
+                LOGGER.debug("failed to clear PM blocker setting %s", key, exc_info=True)
+
+    def _handle_for_agent_id(self, agent_id: str | None) -> str:
+        if not agent_id:
+            return "agent"
+        agent = self.store.get_team_agent(agent_id)
+        if agent is None:
+            return agent_id
+        return agent.handle
+
     def evaluate_pending_deferred_work(self, deferred_id: str | None = None) -> int:
         promoted = 0
         promoted_channels: set[str] = set()
@@ -5092,12 +6253,17 @@ class SlackTeamController:
             channel_id,
             thread_ts,
         )
+        cancelled_pm_initiatives = self.store.cancel_pm_initiative_for_thread(
+            channel_id,
+            thread_ts,
+        )
         if (
             not completed
             and not cancelled
             and not cancelled_timers
             and not cancelled_scheduled_work
             and not cancelled_deferred_work
+            and not cancelled_pm_initiatives
         ):
             return False
         # Threads outside this one may have just satisfied a dependency.
@@ -6197,6 +7363,59 @@ class DeferredWorkRunner:
                     break
 
 
+class PMInitiativeRunner:
+    """Watchdog for PM initiatives.
+
+    Surfaces blockers without ever starting or stopping tasks. Dispatch is
+    owned by ``DeferredWorkRunner``. The watchdog only reads state and posts.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        controller: SlackTeamController,
+        *,
+        poll_seconds: float = 30.0,
+    ):
+        self.store = store
+        self.controller = controller
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-pm-watchdog",
+        )
+        self._thread.start()
+
+    def stop(self) -> bool:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
+
+    def sync_once(self) -> int:
+        return self.controller.watch_pm_initiatives()
+
+    def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=120.0)
+        while not self._stop.wait(self.poll_seconds):
+            try:
+                self.sync_once()
+                backoff.reset()
+            except Exception:
+                log_loop_failure(LOGGER, "failed to run Slackgentic PM watchdog", backoff)
+                if backoff.wait(self._stop):
+                    break
+
+
 class SocketModeSlackApp:
     def __init__(self, config: AppConfig):
         if not config.slack.bot_token or not config.slack.app_token:
@@ -6310,6 +7529,12 @@ class SocketModeSlackApp:
             poll_seconds=max(config.poll_seconds, 1.0),
         )
         self.deferred_work.start()
+        self.pm_watchdog = PMInitiativeRunner(
+            self.store,
+            self.controller,
+            poll_seconds=max(config.poll_seconds, 30.0),
+        )
+        self.pm_watchdog.start()
         self.slack_message_backfill = SlackMessageBackfill(
             self.store,
             self.gateway,
@@ -6343,6 +7568,7 @@ class SocketModeSlackApp:
         self.awake_keeper.stop()
         all_stopped = self.claude_permission_auto_resolver.stop() and all_stopped
         all_stopped = self.slack_message_backfill.stop() and all_stopped
+        all_stopped = self.pm_watchdog.stop() and all_stopped
         all_stopped = self.deferred_work.stop() and all_stopped
         all_stopped = self.scheduled_work.stop() and all_stopped
         all_stopped = self.scheduled_timers.stop() and all_stopped
@@ -6727,6 +7953,15 @@ def _shorten(value: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
+
+
+def _strip_handle_prefix(text: str, handle: str) -> str:
+    """Drop a leading ``@handle`` or ``handle:`` from ``text`` and return the rest."""
+    pattern = re.compile(
+        rf"^\s*@?{re.escape(handle)}\b[\s:,-]*",
+        re.IGNORECASE,
+    )
+    return pattern.sub("", text, count=1).strip()
 
 
 def _reaction_event_dedupe_id(event: dict) -> str:
@@ -7170,6 +8405,107 @@ def _format_agent_busy_dependency(
     if schedule_id is not None:
         return "scheduled task"
     return "current task"
+
+
+def _format_pm_plan_ack(
+    initiative: PmInitiative,
+    plan: ParsedPmPlan,
+    *,
+    requested_by: str | None = None,
+) -> str:
+    mention = f"<@{requested_by}>" if requested_by else "you"
+    estimate = estimate_pm_plan(plan)
+    lines = [
+        f":clipboard: PM plan ready for *{plan.title}* (`{initiative.initiative_id}`).",
+        plan.summary,
+        "",
+        f"{mention} — review the plan below. I will *not* start any subtasks "
+        "until you click *Start executing*.",
+        "",
+        f"Estimate: {_format_pm_plan_estimate(estimate)}.",
+        "",
+        "Subtasks:",
+    ]
+    for index, subtask in enumerate(plan.subtasks, start=1):
+        target = "anyone"
+        if (
+            subtask.request.assignment_mode == AssignmentMode.SPECIFIC
+            and subtask.request.requested_handle
+        ):
+            target = f"@{subtask.request.requested_handle}"
+        deps = ", ".join(subtask.depends_on) if subtask.depends_on else "none"
+        kind = subtask.request.task_kind.value
+        danger = " (dangerous)" if subtask.request.dangerous_mode else ""
+        lines.append(
+            f"{index}. `{subtask.local_id}` — {subtask.title} → {target} ({kind}{danger}); "
+            f"deps: {deps}"
+        )
+    return "\n".join(lines)
+
+
+def _format_pm_plan_estimate(estimate: PmPlanEstimate) -> str:
+    parts = [
+        f"{estimate.subtask_count} subtasks",
+        f"critical path {estimate.critical_path_depth} deep",
+    ]
+    if estimate.co_design_count:
+        parts.append(f"{estimate.co_design_count} co-design fan-out(s)")
+    if estimate.dangerous_count:
+        parts.append(f"{estimate.dangerous_count} dangerous-mode")
+    parts.append(
+        "rough wall-clock "
+        f"{_format_pm_duration(estimate.min_wall_clock_seconds)}-"
+        f"{_format_pm_duration(estimate.max_wall_clock_seconds)}"
+    )
+    return ", ".join(parts)
+
+
+def _format_pm_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    remainder = minutes % 60
+    if remainder == 0:
+        return f"{hours}h"
+    return f"{hours}h{remainder:02d}m"
+
+
+def _pm_plan_approval_blocks(
+    initiative: PmInitiative,
+    plan_text: str,
+) -> list[dict]:
+    return [
+        {
+            "type": "section",
+            "block_id": f"pm.plan.{initiative.initiative_id}",
+            "text": {"type": "mrkdwn", "text": plan_text},
+        },
+        {
+            "type": "actions",
+            "block_id": f"pm.plan.actions.{initiative.initiative_id}",
+            "elements": [
+                _slack_button(
+                    "Start executing",
+                    "pm_initiative.start",
+                    encode_action_value(
+                        "pm_initiative.start", initiative_id=initiative.initiative_id
+                    ),
+                    style="primary",
+                ),
+                _slack_button(
+                    "Cancel",
+                    "pm_initiative.cancel",
+                    encode_action_value(
+                        "pm_initiative.cancel", initiative_id=initiative.initiative_id
+                    ),
+                    style="danger",
+                ),
+            ],
+        },
+    ]
 
 
 def _format_deferred_ready_message(deferred: DeferredWork) -> str:
@@ -7740,15 +9076,13 @@ def _multi_specific_prompt(text: str, known_handles: set[str]) -> tuple[str, lis
 
 
 def _channel_work_request(text: str, agents) -> WorkRequest | None:
+    # New tasks require an explicit trigger: a "somebody"/anyone prefix or a
+    # leading @handle. We intentionally do NOT prepend "somebody" to bare
+    # verb-led messages like "do gate it" — that fallback caused conversational
+    # phrases to be misread as new work.
     canonical_text = canonicalize_agent_mentions(text, agents)
     known_handles = [agent.handle for agent in agents]
-    request = parse_work_request(canonical_text, known_handles)
-    if request is not None:
-        return request
-    cleaned = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", canonical_text).strip()
-    if not cleaned:
-        return None
-    return parse_work_request(f"somebody {cleaned}", known_handles)
+    return parse_work_request(canonical_text, known_handles)
 
 
 def _usage_request_kind(text: str) -> str | None:

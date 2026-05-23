@@ -84,6 +84,74 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_team_agent_kind_round_trip(self):
+        from dataclasses import replace as _replace
+
+        from agent_harness.models import TeamAgentKind
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                worker, claude = build_initial_model_team(codex_count=1, claude_count=1)
+                pm_agent = _replace(claude, kind=TeamAgentKind.PM)
+                store.upsert_team_agent(worker)
+                store.upsert_team_agent(pm_agent)
+                listed = {a.handle: a for a in store.list_team_agents()}
+                self.assertEqual(listed[worker.handle].kind, TeamAgentKind.ENGINEER)
+                self.assertEqual(listed[pm_agent.handle].kind, TeamAgentKind.PM)
+                self.assertTrue(listed[pm_agent.handle].is_pm)
+            finally:
+                store.close()
+
+    def test_team_agent_kind_migration_adds_column(self):
+        import sqlite3
+
+        from agent_harness.models import TeamAgentKind
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """
+                CREATE TABLE team_agents (
+                    agent_id TEXT PRIMARY KEY,
+                    handle TEXT NOT NULL UNIQUE,
+                    full_name TEXT NOT NULL,
+                    initials TEXT NOT NULL,
+                    color_hex TEXT NOT NULL,
+                    avatar_slug TEXT NOT NULL,
+                    icon_emoji TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    personality TEXT NOT NULL,
+                    voice TEXT NOT NULL,
+                    unique_strength TEXT NOT NULL,
+                    reaction_names_json TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL,
+                    provider_preference TEXT,
+                    status TEXT NOT NULL,
+                    hired_at TEXT,
+                    fired_at TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO team_agents VALUES "
+                "('a1','alice','Alice','AL','#000','a',':robot:','eng','p','v','s','[]',"
+                "0,'claude','active',NULL,NULL,'{}')"
+            )
+            conn.commit()
+            conn.close()
+            store = Store(path)
+            try:
+                store.init_schema()
+                listed = store.list_team_agents()
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(listed[0].kind, TeamAgentKind.ENGINEER)
+            finally:
+                store.close()
+
     def test_deferred_work_round_trip_and_ready_promotion(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

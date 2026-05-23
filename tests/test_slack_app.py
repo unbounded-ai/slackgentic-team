@@ -32,6 +32,7 @@ from agent_harness.models import (
     ScheduledWorkKind,
     SessionStatus,
     SlackThreadRef,
+    TeamAgentKind,
     TeamAgentStatus,
     WorkDependency,
     WorkDependencyKind,
@@ -452,6 +453,44 @@ class SlackAppTests(unittest.TestCase):
 
         self.assertEqual(submitted, [])
         self.assertEqual(handled, [request])
+
+    def test_hire_pm_button_creates_pm_kind_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 1):
+                    store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.000001"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire",
+                                    count=1,
+                                    provider=Provider.CLAUDE.value,
+                                    kind=TeamAgentKind.PM.value,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 3)
+                new_agent = agents[-1]
+                self.assertEqual(new_agent.kind, TeamAgentKind.PM)
+                self.assertEqual(new_agent.provider_preference, Provider.CLAUDE)
+                self.assertTrue(new_agent.is_pm)
+            finally:
+                store.close()
 
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1174,7 +1213,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "#dangerous-mode write a tiny validation note",
+                            "text": "somebody #dangerous-mode write a tiny validation note",
                             "ts": "171.000001",
                         }
                     }
@@ -1521,7 +1560,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "repair the status view",
+                            "text": "somebody repair the status view",
                             "ts": "171.000001",
                         }
                     }
@@ -1621,7 +1660,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "write the status update",
+                            "text": "somebody write the status update",
                             "ts": "171.000001",
                         }
                     }
@@ -3436,7 +3475,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "tablet service should be multi-tablet",
+                            "text": "somebody make the tablet service multi-tablet",
                             "ts": "171.000001",
                         }
                     }
@@ -4098,7 +4137,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "Update the README",
+                            "text": "somebody update the README",
                             "ts": "171.000001",
                         }
                     }
@@ -4143,8 +4182,8 @@ class SlackAppTests(unittest.TestCase):
                             "channel": "C1",
                             "user": "U1",
                             "text": (
-                                "Can you explain how this works with "
-                                "https://github.com/acme/app/pull/42?"
+                                "somebody explain how this works with "
+                                "https://github.com/acme/app/pull/42"
                             ),
                             "ts": "171.000001",
                         }
@@ -4206,7 +4245,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Fix this issue {linked_url}",
+                            "text": f"somebody fix this issue {linked_url}",
                             "ts": "171.000001",
                         }
                     }
@@ -4266,7 +4305,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Fix the threading bug from {linked_url}",
+                            "text": f"somebody fix the threading bug from {linked_url}",
                             "ts": "1712345680.000001",
                         }
                     }
@@ -4400,7 +4439,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Fix the threading bug from {linked_url}",
+                            "text": f"somebody fix the threading bug from {linked_url}",
                             "ts": "1712345680.000001",
                         }
                     }
@@ -4456,7 +4495,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": f"Look at {linked_url} and fix it",
+                            "text": f"somebody look at {linked_url} and fix it",
                             "ts": "1712345680.000002",
                         }
                     }
@@ -4509,7 +4548,7 @@ class SlackAppTests(unittest.TestCase):
                             "channel": "C1",
                             "user": "U1",
                             "thread_ts": "1712345680.000003",
-                            "text": f"Please look at {linked_url}",
+                            "text": f"somebody look at {linked_url}",
                             "ts": "1712345680.000004",
                         }
                     }
@@ -4615,7 +4654,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update the README",
+                        "text": "somebody update the README",
                         "ts": "171.000001",
                     }
                 }
@@ -4649,7 +4688,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update docs after wake",
+                        "text": "somebody update docs after wake",
                         "ts": "171.000010",
                     }
                 )
@@ -4667,7 +4706,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(recovered, 1)
                 self.assertEqual(len(store.list_agent_tasks()), 1)
-                self.assertEqual(store.list_agent_tasks()[0].prompt, "Update docs after wake")
+                self.assertEqual(store.list_agent_tasks()[0].prompt, "update docs after wake")
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "181.000000")
             finally:
@@ -4694,7 +4733,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update docs after interrupted restart",
+                        "text": "somebody update docs after interrupted restart",
                         "ts": "171.000010",
                         "reactions": [{"name": "white_check_mark"}],
                     }
@@ -4715,7 +4754,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(len(store.list_agent_tasks()), 1)
                 self.assertEqual(
                     store.list_agent_tasks()[0].prompt,
-                    "Update docs after interrupted restart",
+                    "update docs after interrupted restart",
                 )
                 self.assertEqual(len(runtime.started), 1)
             finally:
@@ -4791,7 +4830,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "Update docs when someone is available",
+                            "text": "somebody update the docs",
                             "ts": "171.000010",
                         }
                     }
@@ -4804,7 +4843,7 @@ class SlackAppTests(unittest.TestCase):
                         "type": "message",
                         "channel": "C1",
                         "user": "U1",
-                        "text": "Update docs when someone is available",
+                        "text": "somebody update the docs",
                         "ts": "171.000010",
                         "reactions": [{"name": "white_check_mark"}],
                     }
@@ -5006,7 +5045,7 @@ class SlackAppTests(unittest.TestCase):
                             "type": "message",
                             "channel": "C1",
                             "user": "U1",
-                            "text": "#dangerous-mode Update the README",
+                            "text": "somebody #dangerous-mode update the README",
                             "ts": "171.000001",
                         }
                     }
@@ -5014,7 +5053,7 @@ class SlackAppTests(unittest.TestCase):
 
                 tasks = store.list_agent_tasks()
                 self.assertEqual(len(tasks), 1)
-                self.assertEqual(tasks[0].prompt, "Update the README")
+                self.assertEqual(tasks[0].prompt, "update the README")
                 self.assertTrue(tasks[0].metadata[DANGEROUS_MODE_METADATA_KEY])
                 started_task, _, _ = runtime.started[0]
                 self.assertTrue(started_task.metadata[DANGEROUS_MODE_METADATA_KEY])

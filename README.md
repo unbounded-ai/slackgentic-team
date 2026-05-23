@@ -166,6 +166,63 @@ Agents can schedule one-off follow-ups in the same thread. Slackgentic stores
 those timers in the daemon state database, so the wakeup is not tied to a
 provider process or an open terminal session.
 
+### PM Initiatives
+
+For larger projects, hand the team a project description and let a
+PM-flavored agent break it into a DAG of subtasks. There are two entry
+points:
+
+```text
+pm: ship the new logging stack
+pm plan the migration to FastAPI
+@alice plan the storage refactor
+```
+
+The first two use the `pm:` / `pm <verb>` shortcut and route to whichever
+PM-kind agent is hired (or fall back to a worker if none are). The third
+addresses a specific PM-kind agent by handle — tagging a PM agent always
+activates PM mode, even without the `pm` keyword. Hire a PM with
+`team hire --kind pm` (use `--provider claude` or `--provider codex` to
+pick the model).
+
+A PM-kind agent owns its initiative end-to-end: it can ask one or two
+clarifying questions in the thread before committing to a plan, answers
+status questions in the same thread (every reply receives a fresh
+`[PM HARNESS: initiative state]` snapshot of the subtask DAG), and stays
+assigned for the life of the initiative. PM-kind agents are reserved
+for PM duties — the worker router never picks them up for regular
+subtasks.
+
+The PM emits a structured plan (title, summary, up to 20 subtasks with
+sibling dependencies). Subtasks may optionally include a `co_designers`
+list of two or more handles, in which case the PM fans the subtask out
+into one draft per co-designer running in parallel and follows up with
+an automatic synthesis stage. The plan is parked for approval — the
+approval message includes a rough cost estimate (subtask count, critical
+path depth, dangerous-mode count, and a wall-clock band) so a user can
+trim before approving. No subtask runs until the user clicks *Start
+executing* on the plan message (or *Cancel* to drop it). Once approved,
+each subtask becomes a deferred-work row, dispatched the moment its
+dependencies satisfy. A watchdog polls active initiatives and surfaces
+blockers in the initiative thread — stalled approvals, stuck tasks, or
+plan failures — but never starts or stops work on its own. When every
+subtask finishes, the watchdog posts a recap and closes the initiative.
+
+At any time during a live initiative, drop `pm status` (or `pm plan`,
+`status`, `dag`) into the initiative thread to get an instant DAG render
+without going through the PM agent. The reply lists each subtask with
+its current deferred-work status, the worker that owns it, and its
+dependencies. The PM agent also receives the same snapshot as a
+`[PM HARNESS: initiative state]` prefix on every follow-up.
+
+Need to course-correct after a subtask fails? Reply with
+`pm replan: <new context>` in the initiative thread (PM-owned initiatives
+only). The PM agent receives the failure surface and the remaining
+subtask state, re-plans from there, and parks a fresh approval gate.
+
+Marking the PM thread done cancels every non-terminal subtask in the
+initiative.
+
 Users can schedule future work directly from Slack too:
 
 ```text

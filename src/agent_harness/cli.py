@@ -9,7 +9,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_harness.models import AgentTaskKind, Provider
+from agent_harness.models import AgentTaskKind, Provider, TeamAgentKind
 from agent_harness.providers import ClaudeProvider, CodexProvider
 from agent_harness.providers.usage import (
     collect_daily_usage,
@@ -103,6 +103,12 @@ def main(argv: list[str] | None = None) -> int:
     team_hire.add_argument("count", type=int, nargs="?", default=1)
     team_hire.add_argument("--db", type=Path, required=True)
     team_hire.add_argument("--provider", choices=["auto", "codex", "claude"], default="auto")
+    team_hire.add_argument(
+        "--kind",
+        choices=["engineer", "pm"],
+        default="engineer",
+        help="Agent persona kind. 'pm' agents always act as program managers.",
+    )
     team_hire.add_argument("--json", action="store_true")
 
     team_fire = team_sub.add_parser("fire", help="Fire an agent by handle")
@@ -521,6 +527,7 @@ def _team(args: argparse.Namespace) -> int:
                 balance_agents=active_agents,
                 avatar_agents=active_agents,
                 randomize_identities=True,
+                kind=TeamAgentKind(args.kind),
             )
             for agent in hired:
                 store.upsert_team_agent(agent)

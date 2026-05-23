@@ -16,6 +16,7 @@ from agent_harness.models import (
     Provider,
     SlackThreadRef,
     TeamAgent,
+    TeamAgentKind,
 )
 from agent_harness.pr_links import pr_urls_from_metadata, slack_pr_links
 from agent_harness.team import (
@@ -212,13 +213,16 @@ def build_team_roster_blocks(
     agents: list[TeamAgent],
     statuses: dict[str, AgentRosterStatus] | None = None,
 ) -> list[dict[str, Any]]:
+    engineers = [agent for agent in agents if not agent.is_pm]
+    pms = [agent for agent in agents if agent.is_pm]
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*Agent team*  {len(agents)} active lightweight handles\n"
+                    f"*Agent team*  {len(agents)} active lightweight handles "
+                    f"({len(engineers)} engineers, {len(pms)} PMs)\n"
                     f"{_provider_breakdown_text(agents)}"
                 ),
             },
@@ -244,6 +248,26 @@ def build_team_roster_blocks(
                     encode_action_value("team.hire", count=1, provider=Provider.CLAUDE.value),
                 ),
                 _button(
+                    "Hire PM (Codex)",
+                    "team.hire.pm.codex",
+                    encode_action_value(
+                        "team.hire",
+                        count=1,
+                        provider=Provider.CODEX.value,
+                        kind=TeamAgentKind.PM.value,
+                    ),
+                ),
+                _button(
+                    "Hire PM (Claude)",
+                    "team.hire.pm.claude",
+                    encode_action_value(
+                        "team.hire",
+                        count=1,
+                        provider=Provider.CLAUDE.value,
+                        kind=TeamAgentKind.PM.value,
+                    ),
+                ),
+                _button(
                     "Add Work",
                     "roster.work.assign",
                     encode_action_value("roster.work.open", mode="now"),
@@ -251,89 +275,124 @@ def build_team_roster_blocks(
             ],
         },
     ]
-    for agent in _sorted_roster_agents(agents, statuses):
-        status = statuses.get(agent.agent_id) if statuses else None
-        status_text = _agent_status_text(status)
-        elements = []
-        if status and status.task_id:
-            elements.append(
-                _button(
-                    "Free up",
-                    "task.done",
-                    encode_action_value("task.done", task_id=status.task_id),
-                    "primary",
-                )
-            )
-        elif status and status.session_provider and status.session_id:
-            elements.append(
-                _button(
-                    "Detach",
-                    "external.session.detach",
-                    encode_action_value(
-                        "external.session.detach",
-                        provider=status.session_provider.value,
-                        session_id=status.session_id,
-                    ),
-                )
-            )
-        if status and status.thread_url:
-            elements.append(
-                _button(
-                    "Open thread",
-                    "thread.open",
-                    encode_action_value("thread.open"),
-                    url=status.thread_url,
-                )
-            )
-        if _agent_accepts_new_work(status):
-            elements.append(
-                _button(
-                    "Assign",
-                    "roster.work.assign",
-                    encode_action_value(
-                        "roster.work.open",
-                        mode="now",
-                        agent_id=agent.agent_id,
-                        handle=agent.handle,
-                    ),
-                )
-            )
+    if engineers:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": "team.section.engineers",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f":hammer_and_wrench: *Engineers* — {len(engineers)}",
+                    }
+                ],
+            }
+        )
+        for agent in _sorted_roster_agents(engineers, statuses):
+            blocks.extend(_agent_roster_blocks(agent, statuses))
+    if pms:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": "team.section.pms",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f":clipboard: *Program managers* — {len(pms)}",
+                    }
+                ],
+            }
+        )
+        for agent in _sorted_roster_agents(pms, statuses):
+            blocks.extend(_agent_roster_blocks(agent, statuses))
+    return blocks
+
+
+def _agent_roster_blocks(
+    agent: TeamAgent,
+    statuses: dict[str, AgentRosterStatus] | None,
+) -> list[dict[str, Any]]:
+    status = statuses.get(agent.agent_id) if statuses else None
+    status_text = _agent_status_text(status)
+    elements: list[dict[str, Any]] = []
+    if status and status.task_id:
         elements.append(
             _button(
-                "Fire",
-                "team.fire",
-                encode_action_value("team.fire", agent_id=agent.agent_id, handle=agent.handle),
-                "danger",
+                "Free up",
+                "task.done",
+                encode_action_value("task.done", task_id=status.task_id),
+                "primary",
             )
         )
-        blocks.append(
-            {
-                "type": "header",
-                "block_id": f"team.agent.{agent.agent_id}",
-                "text": {
-                    "type": "plain_text",
-                    "text": _plain_text_header(agent_identity_label(agent)),
-                },
-            }
+    elif status and status.session_provider and status.session_id:
+        elements.append(
+            _button(
+                "Detach",
+                "external.session.detach",
+                encode_action_value(
+                    "external.session.detach",
+                    provider=status.session_provider.value,
+                    session_id=status.session_id,
+                ),
+            )
         )
-        blocks.append(
-            {
-                "type": "section",
-                "block_id": f"team.status.{agent.agent_id}",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": status_text,
-                },
-            }
+    if status and status.thread_url:
+        elements.append(
+            _button(
+                "Open thread",
+                "thread.open",
+                encode_action_value("thread.open"),
+                url=status.thread_url,
+            )
         )
-        blocks.append(
-            {
-                "type": "actions",
-                "block_id": f"team.agent.actions.{agent.agent_id}",
-                "elements": elements,
-            }
+    if _agent_accepts_new_work(status):
+        assign_label = "Assign Project" if agent.is_pm else "Assign"
+        elements.append(
+            _button(
+                assign_label,
+                "roster.work.assign",
+                encode_action_value(
+                    "roster.work.open",
+                    mode="now",
+                    agent_id=agent.agent_id,
+                    handle=agent.handle,
+                ),
+            )
         )
-    return blocks
+    elements.append(
+        _button(
+            "Fire",
+            "team.fire",
+            encode_action_value("team.fire", agent_id=agent.agent_id, handle=agent.handle),
+            "danger",
+        )
+    )
+    header_label = agent_identity_label(agent)
+    if agent.is_pm:
+        header_label = f"PM · {header_label}"
+    return [
+        {
+            "type": "header",
+            "block_id": f"team.agent.{agent.agent_id}",
+            "text": {
+                "type": "plain_text",
+                "text": _plain_text_header(header_label),
+            },
+        },
+        {
+            "type": "section",
+            "block_id": f"team.status.{agent.agent_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": status_text,
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"team.agent.actions.{agent.agent_id}",
+            "elements": elements,
+        },
+    ]
 
 
 def _sorted_roster_agents(

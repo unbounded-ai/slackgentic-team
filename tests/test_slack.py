@@ -7,6 +7,7 @@ from agent_harness.models import (
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     Provider,
+    TeamAgentKind,
 )
 from agent_harness.slack import (
     AgentRosterStatus,
@@ -255,10 +256,64 @@ class SlackTests(unittest.TestCase):
                 "team.hire.auto",
                 "team.hire.codex",
                 "team.hire.claude",
+                "team.hire.pm.codex",
+                "team.hire.pm.claude",
                 "roster.work.assign",
             ],
         )
         self.assertEqual(len(action_ids), len(set(action_ids)))
+
+    def test_roster_hire_pm_buttons_carry_kind_in_payload(self):
+        blocks = build_team_roster_blocks(build_initial_model_team(codex_count=1, claude_count=1))
+        action_block = next(block for block in blocks if block.get("type") == "actions")
+        by_id = {element["action_id"]: element for element in action_block["elements"]}
+
+        pm_codex = decode_action_value(by_id["team.hire.pm.codex"]["value"])
+        pm_claude = decode_action_value(by_id["team.hire.pm.claude"]["value"])
+        engineer_codex = decode_action_value(by_id["team.hire.codex"]["value"])
+
+        self.assertEqual(pm_codex["kind"], TeamAgentKind.PM.value)
+        self.assertEqual(pm_codex["provider"], Provider.CODEX.value)
+        self.assertEqual(pm_claude["kind"], TeamAgentKind.PM.value)
+        self.assertEqual(pm_claude["provider"], Provider.CLAUDE.value)
+        self.assertNotIn("kind", engineer_codex)
+
+    def test_roster_groups_engineers_and_pms_separately(self):
+        engineers = build_initial_model_team(codex_count=1, claude_count=0)
+        pm = replace(engineers[0], agent_id="pm-1", handle="pm-one", kind=TeamAgentKind.PM)
+        blocks = build_team_roster_blocks([engineers[0], pm])
+
+        section_ids = [block.get("block_id") for block in blocks if block.get("type") == "context"]
+        self.assertEqual(section_ids, ["team.section.engineers", "team.section.pms"])
+
+        engineer_header = next(
+            block
+            for block in blocks
+            if block.get("block_id") == f"team.agent.{engineers[0].agent_id}"
+        )
+        pm_header = next(block for block in blocks if block.get("block_id") == "team.agent.pm-1")
+        self.assertFalse(engineer_header["text"]["text"].startswith("PM · "))
+        self.assertTrue(pm_header["text"]["text"].startswith("PM · "))
+
+    def test_roster_renders_assign_project_for_pms(self):
+        engineer = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        pm = replace(engineer, agent_id="pm-1", handle="pm-one", kind=TeamAgentKind.PM)
+        blocks = build_team_roster_blocks([engineer, pm])
+
+        engineer_actions = next(
+            block
+            for block in blocks
+            if block.get("block_id") == f"team.agent.actions.{engineer.agent_id}"
+        )
+        pm_actions = next(
+            block for block in blocks if block.get("block_id") == "team.agent.actions.pm-1"
+        )
+        engineer_labels = [el["text"]["text"] for el in engineer_actions["elements"]]
+        pm_labels = [el["text"]["text"] for el in pm_actions["elements"]]
+        self.assertIn("Assign", engineer_labels)
+        self.assertNotIn("Assign Project", engineer_labels)
+        self.assertIn("Assign Project", pm_labels)
+        self.assertNotIn("Assign", pm_labels)
 
     def test_task_blocks_only_include_finish_button(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

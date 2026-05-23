@@ -134,6 +134,24 @@ class TeamTests(unittest.TestCase):
         hired = hire_team_agents(agents, 1)
         self.assertEqual(hired[0].provider_preference, Provider.CLAUDE)
 
+    def test_hire_team_agents_sets_pm_kind(self):
+        from agent_harness.models import TeamAgentKind
+
+        existing = build_initial_model_team(codex_count=1, claude_count=1)
+        hired = hire_team_agents(existing, 1, kind=TeamAgentKind.PM)
+        self.assertEqual(len(hired), 1)
+        self.assertEqual(hired[0].kind, TeamAgentKind.PM)
+        self.assertEqual(hired[0].role, "program manager")
+        self.assertTrue(hired[0].is_pm)
+
+    def test_hire_team_agents_defaults_to_engineer_kind(self):
+        from agent_harness.models import TeamAgentKind
+
+        existing = build_initial_model_team(codex_count=1, claude_count=0)
+        hired = hire_team_agents(existing, 1)
+        self.assertEqual(hired[0].kind, TeamAgentKind.ENGINEER)
+        self.assertFalse(hired[0].is_pm)
+
     def test_assignment_seeds_roster_summary_from_assignment_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -342,6 +360,44 @@ class TeamTests(unittest.TestCase):
     def test_reaction_defaults_to_non_random_acknowledgement(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         self.assertEqual(choose_reaction(agent, "please look when you can"), "eyes")
+
+    def test_pick_idle_agent_excludes_pm_kind_in_anyone_mode(self):
+        from agent_harness.models import TeamAgentKind
+
+        pool = build_initial_model_team(codex_count=1, claude_count=1)
+        pm = replace(pool[0], kind=TeamAgentKind.PM)
+        worker = pool[1]
+        request = WorkRequest(prompt="do work", assignment_mode=AssignmentMode.ANYONE)
+        picked = pick_idle_agent([pm, worker], request)
+        self.assertIsNotNone(picked)
+        assert picked is not None
+        self.assertEqual(picked.handle, worker.handle)
+
+    def test_pick_idle_agent_returns_none_when_only_pm_kind_for_anyone(self):
+        from agent_harness.models import TeamAgentKind
+
+        pm = replace(
+            build_initial_model_team(codex_count=1, claude_count=0)[0],
+            kind=TeamAgentKind.PM,
+        )
+        request = WorkRequest(prompt="do work", assignment_mode=AssignmentMode.ANYONE)
+        self.assertIsNone(pick_idle_agent([pm], request))
+
+    def test_pick_idle_agent_routes_specific_to_pm_kind(self):
+        from agent_harness.models import TeamAgentKind
+
+        pool = build_initial_model_team(codex_count=1, claude_count=1)
+        pm = replace(pool[0], kind=TeamAgentKind.PM)
+        worker = pool[1]
+        request = WorkRequest(
+            prompt="plan",
+            assignment_mode=AssignmentMode.SPECIFIC,
+            requested_handle=pm.handle,
+        )
+        picked = pick_idle_agent([pm, worker], request)
+        self.assertIsNotNone(picked)
+        assert picked is not None
+        self.assertEqual(picked.handle, pm.handle)
 
     def test_handoff_request_uses_plain_target_handle_on_new_paragraph(self):
         sender, target = build_initial_model_team(codex_count=2, claude_count=0)
