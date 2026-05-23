@@ -26,6 +26,7 @@ from agent_harness.models import (
     Provider,
     SlackThreadRef,
     TeamAgent,
+    TeamAgentKind,
     parse_timestamp,
     utc_now,
 )
@@ -33,7 +34,7 @@ from agent_harness.permissions import (
     claude_safe_auto_permission_request_allowed,
     task_permission_mode,
 )
-from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX
+from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX, is_agent_pm_plan_signal
 from agent_harness.pr_links import pr_urls_from_metadata
 from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
@@ -69,6 +70,11 @@ MANAGED_RUN_STALL_TIMEOUT = timedelta(minutes=15)
 CLAUDE_EFFORT_SETTING = "effortLevel"
 CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_DEFAULT_EFFORT = "xhigh"
+# PM-kind agents always run at their provider's highest thinking budget;
+# they reason about a multi-subtask DAG and a single bad plan blocks
+# every downstream worker.
+PM_CLAUDE_EFFORT = "max"
+PM_CODEX_REASONING_EFFORT = "high"
 FAST_STREAM_POLL_SECONDS = 0.1
 MIN_STREAM_POLL_SECONDS = 0.01
 TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS = 5.0
@@ -257,6 +263,16 @@ class ManagedTaskRuntime:
         mode = task_permission_mode(task)
         if self.commands.dangerous_by_default and mode != PermissionMode.DANGEROUS:
             mode = PermissionMode.DANGEROUS
+        is_pm_agent = agent.kind == TeamAgentKind.PM
+        if provider == Provider.CLAUDE:
+            claude_effort = (
+                PM_CLAUDE_EFFORT if is_pm_agent else _claude_effort_from_settings(cwd, self.home)
+            )
+        else:
+            claude_effort = None
+        codex_reasoning_effort = (
+            PM_CODEX_REASONING_EFFORT if (is_pm_agent and provider == Provider.CODEX) else None
+        )
         request = LaunchRequest(
             provider=provider,
             prompt=build_task_prompt(agent, task),
@@ -275,11 +291,8 @@ class ManagedTaskRuntime:
             safe_auto_extra_roots=_safe_auto_extra_roots(provider, cwd, default_cwd),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
-            claude_effort=(
-                _claude_effort_from_settings(cwd, self.home)
-                if provider == Provider.CLAUDE
-                else None
-            ),
+            claude_effort=claude_effort,
+            codex_reasoning_effort=codex_reasoning_effort,
         )
         process = self.process_factory(request)
         try:
@@ -839,7 +852,17 @@ class ManagedTaskRuntime:
         deferred_signals: list[str] = []
         terminal_signals: list[str] = []
         for signal in control_signals:
-            if is_agent_roster_status_signal(signal) or is_agent_reaction_signal(signal):
+            if (
+                is_agent_roster_status_signal(signal)
+                or is_agent_reaction_signal(signal)
+                or is_agent_pm_plan_signal(signal)
+            ):
+                # PM_PLAN must dispatch in the same chunk it arrives in:
+                # managed Claude keeps its process alive across turns with
+                # `--input-format stream-json`, so the deferred queue is
+                # only flushed when the process exits — a plan parked for
+                # human approval would never reach the dispatcher there
+                # and the approval card would never post.
                 self._handle_immediate_agent_control_signal(running, signal)
             elif signal == AGENT_THREAD_DONE_SIGNAL:
                 terminal_signals.append(signal)
@@ -2401,7 +2424,7 @@ def _codex_exec_chunks(
     for line in lines:
         message = _render_codex_exec_line(line.strip())
         if message:
-            rendered.extend(_slack_chunks(message, limit=limit))
+            rendered.extend(_chunks_preserving_control_signals(message, limit=limit))
     return rendered, next_buffer
 
 
@@ -2689,8 +2712,57 @@ def _claude_json_chunks(
     for line in lines:
         message = _render_claude_json_line(line.strip())
         if message:
-            rendered.extend(_slack_chunks(message, limit=limit))
+            rendered.extend(_chunks_preserving_control_signals(message, limit=limit))
     return rendered, next_buffer
+
+
+_SIGNAL_LINE_PREFIXES: tuple[str, ...] = (
+    AGENT_PM_PLAN_SIGNAL_PREFIX,
+    AGENT_DEFERRED_SIGNAL_PREFIX,
+    AGENT_SCHEDULE_SIGNAL_PREFIX,
+    AGENT_TIMER_SIGNAL_PREFIX,
+    AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
+    AGENT_REACTION_SIGNAL_PREFIX,
+)
+
+
+def _line_starts_with_control_prefix(line: str) -> bool:
+    upper = line.lstrip().upper()
+    return any(upper.startswith(prefix) for prefix in _SIGNAL_LINE_PREFIXES)
+
+
+def _chunks_preserving_control_signals(message: str, *, limit: int) -> list[str]:
+    """Split `message` into Slack-sized chunks WITHOUT cutting through
+    a long control-signal line.
+
+    `_slack_chunks` only knows about word/line boundaries — given an
+    11k-character `SLACKGENTIC: PM_PLAN <json>` line it will happily
+    split mid-JSON, and the dispatcher sees a truncated body that
+    fails `json.loads` with "Unterminated string". Pull oversized
+    control-signal lines out first so each one survives intact (and
+    becomes its own atomic chunk that `_post_agent_chunk` re-extracts
+    and dispatches). Short signal lines stay in the message and go
+    through normal chunking — that preserves the per-chunk ordering
+    and `hide_visible_text` semantics the deferred-signal callers
+    (THREAD_DONE, SCHEDULE) rely on.
+    """
+    lines = message.splitlines(keepends=True)
+    oversized_signals: list[str] = []
+    safe_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if len(stripped) > limit and _line_starts_with_control_prefix(stripped):
+            oversized_signals.append(stripped)
+        else:
+            safe_lines.append(line)
+
+    chunks: list[str] = []
+    for signal in oversized_signals:
+        chunks.append(f"{signal}\n")
+    safe_message = "".join(safe_lines).strip()
+    if safe_message:
+        chunks.extend(_slack_chunks(safe_message, limit=limit))
+    return chunks
 
 
 def _render_claude_json_line(line: str) -> str | None:

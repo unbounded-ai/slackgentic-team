@@ -95,6 +95,23 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--sandbox", args)
         self.assertIn("workspace-write", args)
         self.assertNotIn("--ask-for-approval", args)
+        self.assertFalse(
+            any("model_reasoning_effort" in arg for arg in args),
+            "default Codex launch should not override model_reasoning_effort",
+        )
+
+    def test_codex_command_sets_reasoning_effort_when_provided(self):
+        command, args = build_command(
+            LaunchRequest(
+                provider=Provider.CODEX,
+                prompt="plan it",
+                cwd=Path("/tmp/repo"),
+                codex_reasoning_effort="high",
+            )
+        )
+
+        self.assertEqual(command, "codex")
+        self.assertIn('model_reasoning_effort="high"', args)
 
     def test_codex_command_adds_safe_auto_extra_roots(self):
         command, args = build_command(

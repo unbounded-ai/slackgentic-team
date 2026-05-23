@@ -1093,6 +1093,109 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_forces_pm_claude_agent_to_max_effort(self):
+        from agent_harness.models import TeamAgentKind
+        from agent_harness.team import hire_team_agents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            settings_dir = home / ".claude"
+            settings_dir.mkdir()
+            # Even an explicit non-max user setting must be overridden for PMs.
+            (settings_dir / "settings.json").write_text(json.dumps({"effortLevel": "medium"}))
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                worker = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(worker)
+                pm_agent = hire_team_agents(
+                    [worker],
+                    1,
+                    Provider.CLAUDE,
+                    seed="effort-pm",
+                    kind=TeamAgentKind.PM,
+                )[0]
+                store.upsert_team_agent(pm_agent)
+                task = create_agent_task(pm_agent, "plan the migration", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(
+                    runtime.start_task(task, pm_agent, SlackThreadRef("C1", "171.000001"))
+                )
+                self.assertEqual(launched[0].claude_effort, "max")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_runtime_forces_pm_codex_agent_to_high_reasoning_effort(self):
+        from agent_harness.models import TeamAgentKind
+        from agent_harness.team import hire_team_agents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                worker = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(worker)
+                pm_agent = hire_team_agents(
+                    [worker],
+                    1,
+                    Provider.CODEX,
+                    seed="effort-pm-codex",
+                    kind=TeamAgentKind.PM,
+                )[0]
+                store.upsert_team_agent(pm_agent)
+                task = create_agent_task(pm_agent, "plan the migration", "C1")
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    home=home,
+                )
+
+                self.assertTrue(
+                    runtime.start_task(task, pm_agent, SlackThreadRef("C1", "171.000001"))
+                )
+                self.assertEqual(launched[0].codex_reasoning_effort, "high")
+                # Worker Codex agents stay at the model's default.
+                worker_task = create_agent_task(worker, "do the thing", "C1")
+                store.upsert_agent_task(worker_task)
+                self.assertTrue(
+                    runtime.start_task(worker_task, worker, SlackThreadRef("C1", "171.000002"))
+                )
+                self.assertIsNone(launched[-1].codex_reasoning_effort)
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
+
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

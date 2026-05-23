@@ -727,6 +727,26 @@ class SlackTeamController:
         thread = self._request_thread_anchor(event, channel_id, text)
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
         if multi_requests:
+            pm_targets_in_multi = [
+                req.requested_handle
+                for req in multi_requests
+                if self._pm_agent_for_request_target(req) is not None
+            ]
+            if pm_targets_in_multi:
+                self._mark_message_acknowledged(channel_id, event.get("ts"))
+                handles_text = ", ".join(f"@{h}" for h in pm_targets_in_multi)
+                noun = "PMs" if len(pm_targets_in_multi) > 1 else "a PM"
+                self.gateway.post_thread_reply(
+                    thread,
+                    (
+                        f"{handles_text} {'are' if len(pm_targets_in_multi) > 1 else 'is'} "
+                        f"{noun} and must plan in their own thread. Address PMs "
+                        "alone (`pm: <brief>` or `@<pm-handle> <brief>` on its "
+                        "own line) so each PM initiative gets its own approval "
+                        "card."
+                    ),
+                )
+                return
             self._mark_message_acknowledged(channel_id, event.get("ts"))
             self._start_specific_requests_in_thread(
                 multi_requests,
@@ -741,6 +761,25 @@ class SlackTeamController:
             return
         request = _channel_work_request(text, active_agents)
         if request is None:
+            return
+        pm_target = self._pm_agent_for_request_target(request)
+        if pm_target is not None:
+            # Defensive: `_handle_pm_request` already routes recognised
+            # `@<pm-handle>` text through PM creation. If a brief somehow
+            # reaches this fallback while still targeting a PM, redirect
+            # rather than silently bypass the PM contract.
+            self._mark_message_acknowledged(channel_id, event.get("ts"))
+            dispatched = self._dispatch_pm_initiative(
+                channel_id=channel_id,
+                project_body=request.prompt.strip() or request.prompt,
+                requested_by_slack_user=event.get("user"),
+                thread=thread,
+                targeted_pm_handle=pm_target.handle,
+                request_message_ts=event.get("ts"),
+                text_for_linked_context=text,
+            )
+            if dispatched:
+                self._mark_message_in_progress(channel_id, event.get("ts"))
             return
         self._mark_message_acknowledged(channel_id, event.get("ts"))
         extra_metadata = self._with_linked_thread_context(
@@ -1228,6 +1267,39 @@ class SlackTeamController:
         else:
             return False
         thread = self._request_thread_anchor(event, channel_id, text)
+        self._mark_message_acknowledged(channel_id, event.get("ts"))
+        dispatched = self._dispatch_pm_initiative(
+            channel_id=channel_id,
+            project_body=project_body,
+            requested_by_slack_user=event.get("user"),
+            thread=thread,
+            targeted_pm_handle=targeted_pm_handle,
+            request_message_ts=event.get("ts"),
+        )
+        if dispatched:
+            self._mark_message_in_progress(channel_id, event.get("ts"))
+        return dispatched
+
+    def _dispatch_pm_initiative(
+        self,
+        *,
+        channel_id: str,
+        project_body: str,
+        requested_by_slack_user: str | None,
+        thread: SlackThreadRef,
+        targeted_pm_handle: str | None,
+        request_message_ts: str | None,
+        text_for_linked_context: str | None = None,
+    ) -> bool:
+        """Create a PM initiative and dispatch the resolver task.
+
+        Single chokepoint for every entry point that wants to hand a brief
+        to a PM-kind agent (text routing, roster modal, multi-specific
+        guards). Callers are responsible for posting the thread parent
+        before invoking this helper.
+        """
+        active_agents = self.store.list_team_agents()
+        pm_agents = filter_pm_agents(active_agents)
         if not active_agents:
             self._post_capacity_message(
                 SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts)
@@ -1238,7 +1310,7 @@ class SlackTeamController:
             SlackThreadRef(channel_id, thread.thread_ts, thread.message_ts),
             title=title,
             summary=project_body,
-            requested_by_slack_user=event.get("user"),
+            requested_by_slack_user=requested_by_slack_user,
         )
         resolver_prompt = build_pm_resolution_prompt(
             project_body,
@@ -1278,17 +1350,16 @@ class SlackTeamController:
                 PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
                 PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
                 ASSIGNMENT_PROMPT_METADATA_KEY: project_body,
-                "request_message_ts": event.get("ts"),
+                "request_message_ts": request_message_ts,
             },
-            project_body,
+            text_for_linked_context or project_body,
             current_thread=thread,
         )
-        self._mark_message_acknowledged(channel_id, event.get("ts"))
         result = assign_work_request(
             self.store,
             request,
             channel_id,
-            requested_by_slack_user=event.get("user"),
+            requested_by_slack_user=requested_by_slack_user,
             extra_metadata=extra_metadata,
             exclude_agent_ids=self._busy_agent_ids_for_assignment(),
         )
@@ -1299,7 +1370,7 @@ class SlackTeamController:
             self._post_assignment_unavailable(
                 SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts),
                 request,
-                requested_by_slack_user=event.get("user"),
+                requested_by_slack_user=requested_by_slack_user,
                 extra_metadata=extra_metadata,
             )
             return True
@@ -1321,8 +1392,24 @@ class SlackTeamController:
         task = self.store.get_agent_task(result.task.task_id) or result.task
         if self.runtime:
             self.runtime.start_task(task, result.agent, thread)
-        self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
+
+    def _pm_agent_for_request_target(self, request: WorkRequest):
+        """Return the PM-kind TeamAgent the request targets, or None.
+
+        Used by every assignment entry point to detect when a brief that
+        looks like worker work is actually being handed to a PM agent —
+        in which case the entry point must redirect through
+        :meth:`_dispatch_pm_initiative` instead of falling through to
+        worker dispatch (the PM model requires an ``pm_initiatives`` row
+        so the ``PM_PLAN`` signal can land an approval card).
+        """
+        if request.assignment_mode != AssignmentMode.SPECIFIC or not request.requested_handle:
+            return None
+        agent = self.store.get_team_agent(request.requested_handle)
+        if agent is None or agent.kind != TeamAgentKind.PM:
+            return None
+        return agent
 
     def _handle_deferred_work_request(self, event: dict, channel_id: str, text: str) -> bool:
         deferred_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
@@ -2575,6 +2662,20 @@ class SlackTeamController:
         if dependency_error is not None:
             return _view_errors("roster_work_dependency", dependency_error)
 
+        pm_target = self._pm_agent_for_request_target(request)
+        if pm_target is not None and (
+            timing in {"once", "daily", "weekly"} or dependency is not None
+        ):
+            return _view_errors(
+                "roster_work_prompt",
+                (
+                    f"@{pm_target.handle} is a PM and plans a fresh initiative "
+                    "each time it is engaged. Schedule or defer a worker agent "
+                    "instead, or set timing to 'now' to start the PM "
+                    "immediately."
+                ),
+            )
+
         run_at_text = (_view_plain_value(values, "roster_work_run_at", "value") or "").strip()
         delay_seconds, delay_error = _optional_delay_seconds(
             _view_plain_value(values, "roster_work_delay", "value")
@@ -2762,6 +2863,24 @@ class SlackTeamController:
         *,
         requested_by_slack_user: str | None,
     ) -> bool:
+        pm_target = self._pm_agent_for_request_target(request)
+        if pm_target is not None:
+            # PM agents must always own a `pm_initiatives` row so the
+            # PM_PLAN signal they emit can find an approval card to attach
+            # to. Worker-style assignment bypasses that contract — redirect
+            # through the PM dispatcher via a posted roster work parent
+            # that becomes the initiative thread.
+            thread = self._create_roster_work_parent(channel_id, request, "PM brief")
+            dispatched = self._dispatch_pm_initiative(
+                channel_id=channel_id,
+                project_body=request.prompt.strip() or request.prompt,
+                requested_by_slack_user=requested_by_slack_user,
+                thread=thread,
+                targeted_pm_handle=pm_target.handle,
+                request_message_ts=thread.message_ts,
+            )
+            self.refresh_or_post_roster(channel_id)
+            return dispatched
         result = assign_work_request(
             self.store,
             request,
@@ -5548,6 +5667,14 @@ class SlackTeamController:
         )
         self.store.upsert_agent_task(retry_task)
         thread = SlackThreadRef(channel_id, thread_ts, task.parent_message_ts)
+        # PM-kind agents keep their resolver task ACTIVE past approval so
+        # the user can keep asking questions or replanning. That means
+        # the runtime still holds a live worker for `retry_task.task_id`
+        # and `start_task` would refuse to overlay a fresh resolver run
+        # on top of it (the slot is occupied). Stop the prior worker
+        # first so the fresh prompt actually launches.
+        with suppress(Exception):
+            self.runtime.stop_task(retry_task.task_id, status=None)
         started = self.runtime.start_task(retry_task, agent, thread)
         if not started:
             self.store.update_pm_initiative_status(initiative_id, PmInitiativeStatus.CANCELLED)
