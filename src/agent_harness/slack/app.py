@@ -5667,6 +5667,14 @@ class SlackTeamController:
         )
         self.store.upsert_agent_task(retry_task)
         thread = SlackThreadRef(channel_id, thread_ts, task.parent_message_ts)
+        # PM-kind agents keep their resolver task ACTIVE past approval so
+        # the user can keep asking questions or replanning. That means
+        # the runtime still holds a live worker for `retry_task.task_id`
+        # and `start_task` would refuse to overlay a fresh resolver run
+        # on top of it (the slot is occupied). Stop the prior worker
+        # first so the fresh prompt actually launches.
+        with suppress(Exception):
+            self.runtime.stop_task(retry_task.task_id, status=None)
         started = self.runtime.start_task(retry_task, agent, thread)
         if not started:
             self.store.update_pm_initiative_status(initiative_id, PmInitiativeStatus.CANCELLED)
