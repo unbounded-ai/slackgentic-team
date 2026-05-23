@@ -492,6 +492,63 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_pm_routing_handles_backtick_quoted_pm_handle(self):
+        """Backtick-quoted `@<pm-handle>` mentions are not recognised by
+        message_targets_pm_agent but DO parse via parse_work_request. Without
+        the fallback branch in _handle_pm_request, the brief would create a
+        worker task with no `pm_initiative_id` and the PM_PLAN signal it
+        later emitted would have nothing to attach to."""
+        from agent_harness.pm import PM_INITIATIVE_ID_METADATA_KEY
+        from agent_harness.team import hire_team_agents
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                engineer = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(engineer)
+                pm_agent = hire_team_agents(
+                    [engineer],
+                    1,
+                    Provider.CLAUDE,
+                    seed="pm-test",
+                    kind=TeamAgentKind.PM,
+                )[0]
+                store.upsert_team_agent(pm_agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"`@{pm_agent.handle}` plan multi-tenancy",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                initiatives = store.list_pm_initiatives()
+                self.assertEqual(len(initiatives), 1)
+                self.assertEqual(initiatives[0].pm_agent_id, pm_agent.agent_id)
+                self.assertEqual(len(runtime.started), 1)
+                started_task, started_agent, _ = runtime.started[0]
+                self.assertEqual(started_agent.handle, pm_agent.handle)
+                self.assertEqual(
+                    started_task.metadata[PM_INITIATIVE_ID_METADATA_KEY],
+                    initiatives[0].initiative_id,
+                )
+            finally:
+                store.close()
+
     def test_hire_button_adds_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

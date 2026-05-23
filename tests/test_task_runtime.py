@@ -22,6 +22,7 @@ from agent_harness.models import (
     Provider,
     SlackThreadRef,
 )
+from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX
 from agent_harness.runtime.tasks import (
     AGENT_REACTION_SIGNAL_PREFIX,
     AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
@@ -1692,6 +1693,14 @@ class TaskRuntimeTests(unittest.TestCase):
         visible, signals = _extract_agent_control_signals(f"Deferred.\n{signal}\n")
 
         self.assertEqual(visible, "Deferred.")
+        self.assertEqual(signals, [signal])
+
+    def test_agent_pm_plan_signal_is_stripped_from_visible_text(self):
+        signal = f'{AGENT_PM_PLAN_SIGNAL_PREFIX}{{"title":"x","summary":"y","subtasks":[]}}'
+
+        visible, signals = _extract_agent_control_signals(f"Plan below for approval.\n{signal}\n")
+
+        self.assertEqual(visible, "Plan below for approval.")
         self.assertEqual(signals, [signal])
 
     def test_parse_agent_timer_signal_accepts_delay(self):

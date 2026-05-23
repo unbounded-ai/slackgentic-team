@@ -33,6 +33,7 @@ from agent_harness.permissions import (
     claude_safe_auto_permission_request_allowed,
     task_permission_mode,
 )
+from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX
 from agent_harness.pr_links import pr_urls_from_metadata
 from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
@@ -1907,6 +1908,9 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
             signals.append(line.strip())
             continue
         if normalized.startswith(AGENT_DEFERRED_SIGNAL_PREFIX):
+            signals.append(line.strip())
+            continue
+        if normalized.startswith(AGENT_PM_PLAN_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
         visible_lines.append(line)

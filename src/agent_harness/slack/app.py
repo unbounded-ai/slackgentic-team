@@ -1197,12 +1197,36 @@ class SlackTeamController:
             project_body = _strip_handle_prefix(raw_text, targeted_pm_handle)
             if not project_body:
                 return False
-        else:
-            if not looks_like_pm_request(raw_text):
-                return False
+        elif looks_like_pm_request(raw_text):
             project_body = extract_pm_request_body(raw_text)
             if not project_body:
                 return False
+        elif pm_agents:
+            # Also intercept generic `@<pm-handle> ...` work requests that
+            # message_targets_pm_agent does not recognize (e.g. ones carrying
+            # `#dangerous-mode` tags or backtick-quoted handles). Without
+            # this branch the brief falls through to the worker-task path,
+            # the PM runs without an initiative row, and the resulting
+            # PM_PLAN signal has nothing to attach to.
+            parsed_request = _channel_work_request(text, active_agents)
+            if (
+                parsed_request is None
+                or parsed_request.assignment_mode != AssignmentMode.SPECIFIC
+                or not parsed_request.requested_handle
+            ):
+                return False
+            pm_agent_match = next(
+                (agent for agent in pm_agents if agent.handle == parsed_request.requested_handle),
+                None,
+            )
+            if pm_agent_match is None:
+                return False
+            targeted_pm_handle = pm_agent_match.handle
+            project_body = parsed_request.prompt.strip()
+            if not project_body:
+                return False
+        else:
+            return False
         thread = self._request_thread_anchor(event, channel_id, text)
         if not active_agents:
             self._post_capacity_message(
