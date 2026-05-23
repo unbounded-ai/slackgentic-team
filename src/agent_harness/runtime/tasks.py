@@ -26,6 +26,7 @@ from agent_harness.models import (
     Provider,
     SlackThreadRef,
     TeamAgent,
+    TeamAgentKind,
     parse_timestamp,
     utc_now,
 )
@@ -69,6 +70,11 @@ MANAGED_RUN_STALL_TIMEOUT = timedelta(minutes=15)
 CLAUDE_EFFORT_SETTING = "effortLevel"
 CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_DEFAULT_EFFORT = "xhigh"
+# PM-kind agents always run at their provider's highest thinking budget;
+# they reason about a multi-subtask DAG and a single bad plan blocks
+# every downstream worker.
+PM_CLAUDE_EFFORT = "max"
+PM_CODEX_REASONING_EFFORT = "high"
 FAST_STREAM_POLL_SECONDS = 0.1
 MIN_STREAM_POLL_SECONDS = 0.01
 TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS = 5.0
@@ -257,6 +263,16 @@ class ManagedTaskRuntime:
         mode = task_permission_mode(task)
         if self.commands.dangerous_by_default and mode != PermissionMode.DANGEROUS:
             mode = PermissionMode.DANGEROUS
+        is_pm_agent = agent.kind == TeamAgentKind.PM
+        if provider == Provider.CLAUDE:
+            claude_effort = (
+                PM_CLAUDE_EFFORT if is_pm_agent else _claude_effort_from_settings(cwd, self.home)
+            )
+        else:
+            claude_effort = None
+        codex_reasoning_effort = (
+            PM_CODEX_REASONING_EFFORT if (is_pm_agent and provider == Provider.CODEX) else None
+        )
         request = LaunchRequest(
             provider=provider,
             prompt=build_task_prompt(agent, task),
@@ -275,11 +291,8 @@ class ManagedTaskRuntime:
             safe_auto_extra_roots=_safe_auto_extra_roots(provider, cwd, default_cwd),
             codex_binary=self.commands.codex_binary,
             claude_binary=self.commands.claude_binary,
-            claude_effort=(
-                _claude_effort_from_settings(cwd, self.home)
-                if provider == Provider.CLAUDE
-                else None
-            ),
+            claude_effort=claude_effort,
+            codex_reasoning_effort=codex_reasoning_effort,
         )
         process = self.process_factory(request)
         try:

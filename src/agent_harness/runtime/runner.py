@@ -36,6 +36,7 @@ class LaunchRequest:
     codex_binary: str = "codex"
     claude_binary: str = "claude"
     claude_effort: str | None = None
+    codex_reasoning_effort: str | None = None
 
     @property
     def dangerous(self) -> bool:
@@ -52,6 +53,13 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
         else:
             args.extend(["--json", "--color", "never", "--skip-git-repo-check"])
         args.extend(["-c", _codex_trust_override(request.cwd)])
+        if request.codex_reasoning_effort:
+            args.extend(
+                [
+                    "-c",
+                    f"model_reasoning_effort={json.dumps(request.codex_reasoning_effort)}",
+                ]
+            )
         extra_roots = _safe_auto_extra_roots(request)
         if mode == PermissionMode.DANGEROUS:
             args.extend(_codex_dangerous_overrides())
