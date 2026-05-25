@@ -35,6 +35,7 @@ from agent_harness.pm import (
     parse_agent_pm_plan_signal,
     parse_pm_extension_request,
     parse_pm_replan_request,
+    render_pm_plan_dag,
     topological_sort,
 )
 from agent_harness.storage.store import Store
@@ -254,6 +255,41 @@ class PmPlanSignalTests(unittest.TestCase):
         self.assertIn("SLACKGENTIC: PM_PLAN", prompt)
         self.assertIn("validation_error", prompt) if False else None  # placeholder
         self.assertIn("previous PM_PLAN control line was invalid: bad", prompt)
+
+    def test_render_pm_plan_dag_shows_roots_and_edges(self):
+        plan = ParsedPmPlan(
+            title="T",
+            summary="S",
+            subtasks=(
+                ParsedPmSubtask(
+                    local_id="investigate",
+                    title="Investigate",
+                    request=WorkRequest(prompt="x", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(),
+                    after_delay_seconds=0,
+                ),
+                ParsedPmSubtask(
+                    local_id="design",
+                    title="Design",
+                    request=WorkRequest(prompt="x", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=("investigate",),
+                    after_delay_seconds=0,
+                ),
+                ParsedPmSubtask(
+                    local_id="implement",
+                    title="Implement",
+                    request=WorkRequest(prompt="x", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=("design",),
+                    after_delay_seconds=0,
+                ),
+            ),
+        )
+
+        chart = render_pm_plan_dag(plan)
+
+        self.assertIn("roots: investigate", chart)
+        self.assertIn("investigate -> design", chart)
+        self.assertIn("design -> implement", chart)
 
 
 class PmStoreTests(unittest.TestCase):
