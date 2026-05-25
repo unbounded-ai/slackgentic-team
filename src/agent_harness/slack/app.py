@@ -374,6 +374,13 @@ class _PmReservedTask:
     extra_depends_on: tuple[WorkDependency, ...]
 
 
+@dataclass(frozen=True)
+class _PmCapacityShortfall:
+    required_workers: int
+    available_workers: int
+    hire_count: int
+
+
 class SlackTeamController:
     def __init__(
         self,
@@ -5475,6 +5482,13 @@ class SlackTeamController:
                 f"I could not load the parked PM plan for `{initiative.initiative_id}`: {exc}.",
             )
             return None
+        shortfall = self._pm_plan_capacity_shortfall(plan)
+        if shortfall is not None:
+            self.gateway.post_thread_reply(
+                thread,
+                _format_pm_capacity_shortfall_message(shortfall),
+            )
+            return None
         promoted = self.store.set_pm_initiative_pending_plan(
             initiative.initiative_id,
             plan_json=None,
@@ -5522,14 +5536,19 @@ class SlackTeamController:
     ) -> None:
         """Create every PM subtask thread and reserve its agent before execution."""
         active_agents = self.store.list_team_agents()
-        worker_agents = filter_worker_agents(active_agents)
+        busy_agent_ids = self._pm_busy_worker_agent_ids()
+        worker_agents = [
+            agent
+            for agent in filter_worker_agents(active_agents)
+            if agent.agent_id not in busy_agent_ids
+        ]
         initial_busy = {
             agent.agent_id: self.store.active_task_for_agent(agent.agent_id)
-            for agent in active_agents
+            for agent in worker_agents
         }
         assigned_counts: dict[str, int] = {
             agent.agent_id: 1 if initial_busy.get(agent.agent_id) is not None else 0
-            for agent in active_agents
+            for agent in worker_agents
         }
         prior_subtasks = self.store.list_pm_subtasks(initiative.initiative_id)
         inserted: list[object] = list(prior_subtasks)
@@ -5580,6 +5599,29 @@ class SlackTeamController:
             inserted.append(saved)
             last_reserved_by_agent[agent.agent_id] = saved
             assigned_counts[agent.agent_id] = assigned_counts.get(agent.agent_id, 0) + 1
+
+    def _pm_plan_capacity_shortfall(self, plan: ParsedPmPlan) -> _PmCapacityShortfall | None:
+        required_workers = _pm_plan_parallel_worker_demand(plan)
+        if required_workers <= 0:
+            return None
+        active_workers = filter_worker_agents(self.store.list_team_agents())
+        busy_agent_ids = self._pm_busy_worker_agent_ids()
+        available_workers = sum(
+            1 for agent in active_workers if agent.agent_id not in busy_agent_ids
+        )
+        hire_count = max(0, required_workers - available_workers)
+        if hire_count <= 0:
+            return None
+        return _PmCapacityShortfall(
+            required_workers=required_workers,
+            available_workers=available_workers,
+            hire_count=hire_count,
+        )
+
+    def _pm_busy_worker_agent_ids(self) -> set[str]:
+        busy = {task.agent_id for task in self.store.list_agent_tasks()}
+        busy.update(self._busy_agent_ids_for_assignment())
+        return busy
 
     def _select_pm_subtask_agent(
         self,
@@ -9119,6 +9161,35 @@ def _format_pm_subtask_parent_text(
         lines.append(f"*PM thread:* <{pm_thread_url}|open status thread>")
     lines.append(f"*Original Task:* {subtask.request.prompt}")
     return "\n".join(lines)
+
+
+def _format_pm_capacity_shortfall_message(shortfall: _PmCapacityShortfall) -> str:
+    required = shortfall.required_workers
+    available = shortfall.available_workers
+    hire_count = shortfall.hire_count
+    required_word = "agent" if required == 1 else "agents"
+    available_word = "agent" if available == 1 else "agents"
+    available_verb = "is" if available == 1 else "are"
+    hire_word = "agent" if hire_count == 1 else "agents"
+    return (
+        "I can't start this PM plan yet because there are not enough free worker "
+        f"agents. The plan needs {required} available worker {required_word} at "
+        f"its widest parallel step, but only {available} worker {available_word} "
+        f"{available_verb} free right now. Hire {hire_count} more {hire_word} "
+        f"(`team hire {hire_count}`), then click *Start executing* again."
+    )
+
+
+def _pm_plan_parallel_worker_demand(plan: ParsedPmPlan) -> int:
+    """Return the widest same-depth worker demand in a topologically sorted plan."""
+    depth_by_id: dict[str, int] = {}
+    width_by_depth: dict[int, int] = {}
+    for subtask in plan.subtasks:
+        dep_depths = [depth_by_id[dep] for dep in subtask.depends_on if dep in depth_by_id]
+        depth = (max(dep_depths) + 1) if dep_depths else 1
+        depth_by_id[subtask.local_id] = depth
+        width_by_depth[depth] = width_by_depth.get(depth, 0) + 1
+    return max(width_by_depth.values(), default=0)
 
 
 def _pm_subtask_parent_blocks(text: str) -> list[dict]:
