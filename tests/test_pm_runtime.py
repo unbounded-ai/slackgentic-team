@@ -638,45 +638,65 @@ class PmEntrySurfaceTests(unittest.TestCase):
 
 
 class PmStallRecoveryTests(unittest.TestCase):
-    def test_pm_resolver_stalls_then_recovers_with_status_prompt(self):
-        """A PM that posts the plan and then sits idle (waiting for the
-        human to click `Start executing`) is treated as a stall by the
-        15-minute guard. Verify the recovery prompt fires and asks the
-        PM to post a Slack-visible status update so the user knows
-        what is happening, instead of leaving the run silently dead.
+    def test_pm_resolver_stops_after_parking_plan_not_stall_recovered(self):
+        """Parking a plan is a terminal resolver action.
 
-        This walks the actual `ManagedTaskRuntime` stall path with a
-        short timeout, end-to-end."""
+        The PM initiative may still be waiting for the human to press Start
+        executing, but the managed PM worker must not stay ACTIVE and later
+        trip the stall recovery prompt.
+        """
         import time
 
         from agent_harness.config import AgentCommandConfig
-        from agent_harness.models import Provider
         from agent_harness.runtime.tasks import (
             MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
             ManagedTaskRuntime,
         )
-        from tests.test_task_runtime import OneShotProcess, SessionThenHoldingProcess
 
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             requests = []
             processes = []
 
+            class PlanThenHoldingProcess:
+                def __init__(self, request):
+                    self.request = request
+                    self.reads = 0
+                    self.alive = True
+
+                def start(self):
+                    pass
+
+                def read_available(self, max_reads=20, timeout=0.05):
+                    if self.reads:
+                        return ""
+                    self.reads += 1
+                    plan_signal = _build_plan_signal(
+                        initiative.initiative_id,
+                        handles=[pm_agent.handle, engineer.handle],
+                    )
+                    message = "Plan ready.\n" + plan_signal
+                    return (
+                        '{"type":"thread.started","thread_id":"codex-thread-1"}\n'
+                        '{"type":"event_msg","payload":{"type":"agent_message","message":'
+                        f"{json.dumps(message)}"
+                        "}}\n"
+                    )
+
+                def is_alive(self):
+                    return self.alive
+
+                def terminate(self):
+                    self.alive = False
+
             def process_factory(request):
                 requests.append(request)
-                process = (
-                    SessionThenHoldingProcess(request)
-                    if len(requests) == 1
-                    else OneShotProcess(request)
-                )
+                process = PlanThenHoldingProcess(request)
                 processes.append(process)
                 return process
 
             try:
                 store.init_schema()
-                from agent_harness.models import TeamAgentKind
-                from agent_harness.team import build_initial_model_team, hire_team_agents
-
                 engineer = build_initial_model_team(codex_count=1, claude_count=0)[0]
                 store.upsert_team_agent(engineer)
                 pm_agent = hire_team_agents(
@@ -687,9 +707,27 @@ class PmStallRecoveryTests(unittest.TestCase):
                     kind=TeamAgentKind.PM,
                 )[0]
                 store.upsert_team_agent(pm_agent)
-                pm_task = create_agent_task(pm_agent, "plan the migration", "C1")
+                thread_ref = SlackThreadRef("C1", "171.000001", "171.000001")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Plan the migration",
+                    summary="plan the migration",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(pm_agent, "plan the migration", "C1"),
+                    thread_ts=thread_ref.thread_ts,
+                    parent_message_ts=thread_ref.message_ts,
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "plan the migration",
+                    },
+                )
                 store.upsert_agent_task(pm_task)
                 gateway = FakeGateway()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
                 runtime = ManagedTaskRuntime(
                     store,
                     gateway,
@@ -699,39 +737,40 @@ class PmStallRecoveryTests(unittest.TestCase):
                     agent_progress_timeout=timedelta(minutes=30),
                     agent_stall_timeout=timedelta(seconds=0),
                     max_stall_recoveries=1,
+                    on_agent_control=controller.handle_runtime_agent_control,
                 )
+                controller.runtime = runtime
 
-                runtime.start_task(pm_task, pm_agent, SlackThreadRef("C1", "171.000001"))
+                runtime.start_task(pm_task, pm_agent, thread_ref)
                 for _ in range(200):
-                    last_reply = (
-                        gateway.thread_replies[-1].get("text") if gateway.thread_replies else None
-                    )
-                    if len(requests) >= 2 and last_reply == "Done":
+                    parked = store.get_pm_initiative(initiative.initiative_id)
+                    current_task = store.get_agent_task(pm_task.task_id)
+                    if (
+                        parked is not None
+                        and parked.status == PmInitiativeStatus.AWAITING_APPROVAL
+                        and current_task is not None
+                        and current_task.status == AgentTaskStatus.DONE
+                        and not runtime.has_running_tasks()
+                    ):
                         break
                     time.sleep(0.01)
 
-                self.assertEqual(len(requests), 2)
-                # Recovery prompt asks the PM to surface its status.
-                self.assertIn("observed no activity", requests[1].prompt)
-                self.assertIn(
-                    "First post a concise Slack-visible status update",
-                    requests[1].prompt,
-                )
-                self.assertIn("Original task: plan the migration", requests[1].prompt)
-                # Stall counter advanced so a second stall would not
-                # silently restart again forever.
-                recovered_task = store.get_agent_task(pm_task.task_id)
-                assert recovered_task is not None
+                self.assertEqual(len(requests), 1)
+                self.assertFalse(processes[0].is_alive())
+                parked = store.get_pm_initiative(initiative.initiative_id)
+                assert parked is not None
+                self.assertEqual(parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                resolved_task = store.get_agent_task(pm_task.task_id)
+                assert resolved_task is not None
+                self.assertEqual(resolved_task.status, AgentTaskStatus.DONE)
                 self.assertEqual(
-                    recovered_task.metadata.get(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY),
-                    1,
+                    resolved_task.metadata.get(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY),
+                    None,
                 )
-                # A Slack-visible note acknowledges the restart so the
-                # user is not left guessing.
                 reply_texts = [item.get("text") or "" for item in gateway.thread_replies]
-                self.assertTrue(
-                    any("restarted it with a status request" in text for text in reply_texts),
-                    f"replies were: {reply_texts!r}",
+                self.assertTrue(any("Start executing" in text for text in reply_texts))
+                self.assertFalse(
+                    any("restarted it with a status request" in text for text in reply_texts)
                 )
             finally:
                 if "runtime" in locals():
@@ -1007,7 +1046,17 @@ class PmRuntimeTests(unittest.TestCase):
                 self.assertIn("investigate", pm_status_messages[-1])
                 self.assertIn(":large_blue_circle: active", pm_status_messages[-1])
                 self.assertIn(":bookmark_tabs: reserved", pm_status_messages[-1])
+                self.assertIn(f"owner=@{agent.handle}", pm_status_messages[-1])
+                self.assertNotIn("owner=unassigned", pm_status_messages[-1])
                 self.assertIn("<https://example.slack.com/archives/C1/p", pm_status_messages[-1])
+                status_reply = next(
+                    item
+                    for item in gateway.thread_replies
+                    if item["thread"].thread_ts == "171.thread"
+                    and item["text"].startswith("PM initiative status")
+                )
+                self.assertFalse(status_reply["unfurl_links"])
+                self.assertFalse(status_reply["unfurl_media"])
             finally:
                 store.close()
 
@@ -1083,21 +1132,22 @@ class PmRuntimeTests(unittest.TestCase):
                     agent,
                     SlackThreadRef("C1", root_task.thread_ts or "", root_task.parent_message_ts),
                 )
-                child_ready = store.get_deferred_work(child_deferred.deferred_id)
-                assert child_ready is not None
-                self.assertEqual(child_ready.status, DeferredWorkStatus.READY)
-                controller.fire_due_deferred_work(child_ready)
+                child_started = store.get_deferred_work(child_deferred.deferred_id)
+                assert child_started is not None
+                self.assertEqual(child_started.status, DeferredWorkStatus.DONE)
 
                 self.assertEqual(runtime.started[-1][0].task_id, child_task.task_id)
                 self.assertEqual(runtime.started[-1][2].thread_ts, child_task.thread_ts)
                 self.assertNotEqual(runtime.started[-1][2].thread_ts, "171.thread")
+                finished_root = store.get_agent_task(root_task.task_id)
+                assert finished_root is not None
+                self.assertEqual(finished_root.status, AgentTaskStatus.DONE)
                 self.assertTrue(
                     any(
                         update["text"].startswith("PM initiative status")
                         and "done" in update["text"]
-                        and "ready" in update["text"]
+                        and "owner=@" in update["text"]
                         and ":white_check_mark:" in update["text"]
-                        and ":large_green_circle:" in update["text"]
                         for update in gateway.updates
                     )
                 )
@@ -1463,6 +1513,54 @@ class PmRuntimeTests(unittest.TestCase):
                         for item in gateway.thread_replies
                     )
                 )
+            finally:
+                store.close()
+
+    def test_pm_watchdog_fires_ready_subtasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref, title="T", summary="S", requested_by_slack_user="U1"
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id, PmInitiativeStatus.ACTIVE
+                )
+                refreshed_initiative = store.get_pm_initiative(initiative.initiative_id)
+                assert refreshed_initiative is not None
+                subtask = store.add_pm_subtask_dispatch(
+                    initiative=refreshed_initiative,
+                    local_id="s1",
+                    title="Ready",
+                    request=WorkRequest(prompt="ready task", assignment_mode=AssignmentMode.ANYONE),
+                    plan_depends_on=(),
+                    existing_subtasks=[],
+                    after_delay_seconds=0,
+                    sort_order=0,
+                )
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                runner = PMInitiativeRunner(store, controller, poll_seconds=0.01)
+                runner.sync_once()
+
+                self.assertEqual(len(runtime.started), 1)
+                started_task, _started_agent, started_thread = runtime.started[0]
+                self.assertEqual(started_thread.thread_ts, "171.thread")
+                self.assertEqual(started_task.prompt, "ready task")
+                fired = store.get_deferred_work(subtask.deferred_id)
+                assert fired is not None
+                self.assertEqual(fired.status, DeferredWorkStatus.DONE)
             finally:
                 store.close()
 
@@ -1892,6 +1990,71 @@ class PmReplanRuntimeTests(unittest.TestCase):
                 started_task, _, _ = runtime.started[0]
                 self.assertIn("REPLAN", started_task.prompt)
                 self.assertIn("take a different approach", started_task.prompt)
+            finally:
+                store.close()
+
+    def test_pm_replan_does_not_hijack_busy_pm_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                team = build_initial_model_team(1, 0)
+                agent = replace(team[0], kind=TeamAgentKind.PM)
+                store.upsert_team_agent(agent)
+                provider = agent.provider_preference or Provider.CODEX
+                store.upsert_session(
+                    AgentSession(
+                        provider=provider,
+                        session_id="busy-pm",
+                        transcript_path=Path(tmp) / "busy-pm.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting(
+                    f"external_session_agent.{provider.value}.busy-pm",
+                    agent.agent_id,
+                )
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(thread_ref, title="T", summary="ship X")
+                store.update_pm_initiative_status(
+                    initiative.initiative_id, PmInitiativeStatus.ACTIVE
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.DONE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "ship X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store, gateway, default_channel_id="C1", runtime=runtime
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "pm replan: take a different approach",
+                            "ts": "171.000020",
+                            "thread_ts": "171.thread",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.started, [])
+                refreshed = store.get_pm_initiative(initiative.initiative_id)
+                assert refreshed is not None
+                self.assertEqual(refreshed.status, PmInitiativeStatus.ACTIVE)
+                self.assertIn("is busy right now", gateway.thread_replies[-1]["text"])
             finally:
                 store.close()
 

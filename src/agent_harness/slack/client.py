@@ -235,12 +235,18 @@ class SlackGateway:
         icon_url: str | None = None,
         icon_emoji: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
+        unfurl_links: bool | None = None,
+        unfurl_media: bool | None = None,
     ) -> PostedMessage:
         kwargs = {
             "channel": thread.channel_id,
             "thread_ts": thread.thread_ts,
             "text": normalize_slack_mrkdwn(text),
         }
+        if unfurl_links is not None:
+            kwargs["unfurl_links"] = unfurl_links
+        if unfurl_media is not None:
+            kwargs["unfurl_media"] = unfurl_media
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
         auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks:
@@ -330,12 +336,18 @@ class SlackGateway:
         ts: str,
         text: str,
         blocks: list[dict[str, Any]] | None = None,
+        unfurl_links: bool | None = None,
+        unfurl_media: bool | None = None,
     ) -> None:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
             "ts": ts,
             "text": normalize_slack_mrkdwn(text),
         }
+        if unfurl_links is not None:
+            kwargs["unfurl_links"] = unfurl_links
+        if unfurl_media is not None:
+            kwargs["unfurl_media"] = unfurl_media
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
         auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks is not None:

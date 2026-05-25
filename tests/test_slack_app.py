@@ -145,8 +145,25 @@ class FakeGateway:
         )
         return PostedMessage(channel_id=channel_id, ts=ts, thread_ts=thread_ts)
 
-    def update_message(self, channel_id, ts, text, blocks=None):
-        self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
+    def update_message(
+        self,
+        channel_id,
+        ts,
+        text,
+        blocks=None,
+        unfurl_links=None,
+        unfurl_media=None,
+    ):
+        self.updates.append(
+            {
+                "channel_id": channel_id,
+                "ts": ts,
+                "text": text,
+                "blocks": blocks,
+                "unfurl_links": unfurl_links,
+                "unfurl_media": unfurl_media,
+            }
+        )
 
     def permalink(self, channel_id, message_ts):
         return f"https://example.slack.com/archives/{channel_id}/p{message_ts.replace('.', '')}"
@@ -154,7 +171,16 @@ class FakeGateway:
     def pin_message(self, channel_id, message_ts):
         self.pins.append((channel_id, message_ts))
 
-    def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
+    def post_thread_reply(
+        self,
+        thread,
+        text,
+        persona=None,
+        icon_url=None,
+        blocks=None,
+        unfurl_links=None,
+        unfurl_media=None,
+    ):
         ts = f"1712345679.{len(self.thread_replies):06d}"
         self.thread_replies.append(
             {
@@ -163,6 +189,8 @@ class FakeGateway:
                 "persona": persona,
                 "icon_url": icon_url,
                 "blocks": blocks,
+                "unfurl_links": unfurl_links,
+                "unfurl_media": unfurl_media,
                 "ts": ts,
             }
         )
