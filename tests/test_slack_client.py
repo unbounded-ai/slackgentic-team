@@ -297,6 +297,14 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertFalse(gateway.client.updates[0]["unfurl_links"])
         self.assertFalse(gateway.client.updates[0]["unfurl_media"])
 
+    def test_update_message_can_clear_attachments(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        gateway.update_message("C1", "171.000001", "done", attachments=[])
+
+        self.assertEqual(gateway.client.updates[0]["attachments"], [])
+
     def test_update_message_renders_markdown_table_as_block(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = FakeSlackClient()

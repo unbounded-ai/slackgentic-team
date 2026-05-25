@@ -120,12 +120,16 @@ from agent_harness.runtime.health import LoopBackoff, ProcessCpuWatchdog, log_lo
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_MAX_STALL_RECOVERIES,
     MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
+    MANAGED_RUN_STALL_TIMEOUT,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     managed_run_resume_attempts,
+    managed_run_stall_recoveries,
+    managed_run_started_age,
     parse_agent_reaction_signal,
     parse_agent_roster_status_signal,
     should_resume_managed_run,
@@ -2439,13 +2443,6 @@ class SlackTeamController:
                 continue
             if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
                 continue
-            if self._managed_task_session_is_alive(task):
-                LOGGER.info(
-                    "leaving managed task %s ACTIVE; session %s is still alive",
-                    task.task_id,
-                    task.session_id,
-                )
-                continue
             if not should_resume_managed_run(task, now=now):
                 LOGGER.info(
                     "skipping resume of orphaned task %s (age/attempt bounds exceeded: attempts=%d)",
@@ -2468,14 +2465,6 @@ class SlackTeamController:
                 resumed += 1
         return resumed
 
-    def _managed_task_session_is_alive(self, task: AgentTask) -> bool:
-        if task.session_provider is None or not task.session_id:
-            return False
-        session = self.store.get_session(task.session_provider, task.session_id)
-        if session is None:
-            return False
-        return session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}
-
     def _abandon_orphaned_task(self, task: AgentTask) -> None:
         metadata = dict(task.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
@@ -2489,8 +2478,23 @@ class SlackTeamController:
         try:
             self.store.upsert_agent_task(cancelled)
             self.store.delete_managed_thread_task(task.task_id)
+            if task.session_provider is not None and task.session_id:
+                clear_managed_session(self.store, task.session_provider, task.session_id)
+            self._refresh_after_task_terminal_state(cancelled)
         except Exception:
             LOGGER.debug("failed to abandon stale orphaned task %s", task.task_id, exc_info=True)
+
+    def _refresh_after_task_terminal_state(self, task: AgentTask) -> None:
+        try:
+            self.evaluate_pending_deferred_work()
+            if self.runtime is not None:
+                self._fire_due_deferred_work_now(limit=MAX_PM_SUBTASKS)
+        except Exception:
+            LOGGER.debug(
+                "failed to advance deferred work after task terminal transition",
+                exc_info=True,
+            )
+        self._refresh_pm_status_for_task(task)
 
     def _ensure_initial_team(self, codex_count: int, claude_count: int) -> None:
         if self.store.list_team_agents(include_fired=True):
@@ -6356,9 +6360,10 @@ class SlackTeamController:
                 view,
                 unfurl_links=False,
                 unfurl_media=False,
+                attachments=[],
             )
         except TypeError as exc:
-            if "unfurl" not in str(exc):
+            if "unfurl" not in str(exc) and "attachments" not in str(exc):
                 LOGGER.debug(
                     "failed to update PM status Slack message %s in %s",
                     ts,
@@ -6942,6 +6947,7 @@ class SlackTeamController:
             return False
         thread = SlackThreadRef(channel_id, thread_ts)
         completed = 0
+        completed_tasks: list[AgentTask] = []
         for thread_task in self.store.list_agent_tasks(include_done=True):
             if (
                 thread_task.channel_id == channel_id
@@ -6950,10 +6956,22 @@ class SlackTeamController:
             ):
                 if self.runtime:
                     self.runtime.stop_task(thread_task.task_id, AgentTaskStatus.DONE)
+                    latest = self.store.get_agent_task(thread_task.task_id)
+                    if latest is not None and latest.status not in {
+                        AgentTaskStatus.DONE,
+                        AgentTaskStatus.CANCELLED,
+                    }:
+                        self.store.update_agent_task_status(
+                            thread_task.task_id,
+                            AgentTaskStatus.DONE,
+                        )
                 else:
                     self.store.update_agent_task_status(thread_task.task_id, AgentTaskStatus.DONE)
                 self._mark_task_complete(thread_task, thread, include_thread=True)
                 completed += 1
+                completed_tasks.append(
+                    self.store.get_agent_task(thread_task.task_id) or thread_task
+                )
 
         cancelled = 0
         for pending in self.store.list_pending_work_requests(channel_id=channel_id, limit=500):
@@ -6990,9 +7008,13 @@ class SlackTeamController:
         # Threads outside this one may have just satisfied a dependency.
         try:
             self.evaluate_pending_deferred_work()
+            if self.runtime is not None:
+                self._fire_due_deferred_work_now(limit=MAX_PM_SUBTASKS)
         except Exception:
             LOGGER.debug("failed to evaluate deferred work after thread completion", exc_info=True)
         self._resume_pending_work_requests(channel_id)
+        for completed_task in completed_tasks:
+            self._refresh_pm_status_for_task(completed_task)
         self.refresh_or_post_roster(channel_id)
         return True
 
@@ -9345,6 +9367,14 @@ def _format_deferred_ready_message(deferred: DeferredWork) -> str:
 def _pm_deferred_display_status(deferred: DeferredWork, task: AgentTask | None) -> str:
     if task is not None:
         if task.status == AgentTaskStatus.ACTIVE:
+            recoveries = managed_run_stall_recoveries(task)
+            if recoveries >= MANAGED_RUN_MAX_STALL_RECOVERIES:
+                return "stalled"
+            if recoveries > 0:
+                return "recovering"
+            age = managed_run_started_age(task)
+            if age is not None and age > MANAGED_RUN_STALL_TIMEOUT:
+                return "stalled"
             return "active"
         if task.status == AgentTaskStatus.DONE:
             return "done"
@@ -9382,6 +9412,8 @@ def _pm_subtask_status_label(status: str) -> str:
         "ready": ":large_green_circle: ready",
         "starting": ":rocket: starting",
         "active": ":large_blue_circle: active",
+        "recovering": ":arrows_counterclockwise: recovering",
+        "stalled": ":warning: stalled",
         "queued": ":inbox_tray: queued",
         "done": ":white_check_mark: done",
         "cancelled": ":no_entry: cancelled",
@@ -9394,13 +9426,15 @@ def _pm_subtask_status_sort_key(status: str) -> tuple[int, str]:
     order = {
         "missing": 0,
         "cancelled": 1,
-        "active": 2,
-        "starting": 3,
-        "ready": 4,
-        "reserved": 5,
-        "waiting_deps": 6,
-        "queued": 7,
-        "done": 8,
+        "stalled": 2,
+        "recovering": 3,
+        "active": 4,
+        "starting": 5,
+        "ready": 6,
+        "reserved": 7,
+        "waiting_deps": 8,
+        "queued": 9,
+        "done": 10,
     }
     return (order.get(status, 99), status)
 

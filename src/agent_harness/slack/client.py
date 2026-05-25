@@ -338,6 +338,7 @@ class SlackGateway:
         blocks: list[dict[str, Any]] | None = None,
         unfurl_links: bool | None = None,
         unfurl_media: bool | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
@@ -348,6 +349,8 @@ class SlackGateway:
             kwargs["unfurl_links"] = unfurl_links
         if unfurl_media is not None:
             kwargs["unfurl_media"] = unfurl_media
+        if attachments is not None:
+            kwargs["attachments"] = attachments
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
         auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks is not None:

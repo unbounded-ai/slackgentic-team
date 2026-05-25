@@ -34,7 +34,11 @@ from agent_harness.permissions import (
     claude_safe_auto_permission_request_allowed,
     task_permission_mode,
 )
-from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX, is_agent_pm_plan_signal
+from agent_harness.pm import (
+    AGENT_PM_PLAN_SIGNAL_PREFIX,
+    PM_SUBTASK_LOCAL_ID_METADATA_KEY,
+    is_agent_pm_plan_signal,
+)
 from agent_harness.pr_links import pr_urls_from_metadata
 from agent_harness.providers.claude import is_synthetic_claude_assistant_record
 from agent_harness.runtime.runner import LaunchRequest, ManagedAgentProcess
@@ -1725,6 +1729,15 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "host-tool escalation for command, file, network, or sandbox access; this "
             "run is already launched with no-approval permissions. Only ask Slack when "
             "you need an actual user decision."
+        )
+    if isinstance(task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY), str):
+        lines.append(
+            "This is a single-purpose PM subtask thread. When this subtask's deliverable "
+            "is complete, write the final Slack-visible result and then add a final hidden "
+            f"line exactly `{AGENT_THREAD_DONE_SIGNAL}`. That closes only this subtask "
+            "thread and lets dependent PM subtasks start. If the deliverable was already "
+            "posted earlier in the thread, say that briefly and still add the hidden "
+            f"`{AGENT_THREAD_DONE_SIGNAL}` line."
         )
     lines.extend(
         [

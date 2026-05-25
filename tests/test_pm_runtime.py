@@ -29,6 +29,13 @@ from agent_harness.pm import (
     PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
     PM_SUBTASK_LOCAL_ID_METADATA_KEY,
 )
+from agent_harness.runtime.tasks import (
+    AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_MAX_STALL_RECOVERIES,
+    MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
+    MANAGED_RUN_STARTED_METADATA_KEY,
+    build_task_prompt,
+)
 from agent_harness.slack.app import (
     PMInitiativeRunner,
     SlackTeamController,
@@ -1030,6 +1037,9 @@ class PmRuntimeTests(unittest.TestCase):
                     child_task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY),
                     "implement",
                 )
+                prompt = build_task_prompt(agent, root_task)
+                self.assertIn("single-purpose PM subtask thread", prompt)
+                self.assertIn(AGENT_THREAD_DONE_SIGNAL, prompt)
                 started_subtasks = [
                     item for item in runtime.started if item[0].task_id != pm_task.task_id
                 ]
@@ -1148,9 +1158,168 @@ class PmRuntimeTests(unittest.TestCase):
                         and "done" in update["text"]
                         and "owner=@" in update["text"]
                         and ":white_check_mark:" in update["text"]
+                        and update["attachments"] == []
                         for update in gateway.updates
                     )
                 )
+            finally:
+                store.close()
+
+    def test_pm_subtask_thread_done_signal_starts_dependent_subtask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Ship feature X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                signal = _build_plan_signal(initiative.initiative_id, handles=[agent.handle])
+                controller.handle_runtime_agent_control(pm_task, agent, thread_ref, signal)
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": json.dumps(
+                                    {
+                                        "v": 1,
+                                        "action": "pm_initiative.start",
+                                        "initiative_id": initiative.initiative_id,
+                                    }
+                                ),
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.plan"},
+                        "user": {"id": "U2"},
+                    }
+                )
+                subtasks = store.list_pm_subtasks(initiative.initiative_id)
+                root_deferred = store.get_deferred_work(subtasks[0].deferred_id)
+                child_deferred = store.get_deferred_work(subtasks[1].deferred_id)
+                assert root_deferred is not None
+                assert child_deferred is not None
+                root_task = store.get_agent_task(root_deferred.last_task_id or "")
+                child_task = store.get_agent_task(child_deferred.last_task_id or "")
+                assert root_task is not None
+                assert child_task is not None
+
+                handled = controller.handle_runtime_agent_control(
+                    root_task,
+                    agent,
+                    SlackThreadRef("C1", root_task.thread_ts or "", root_task.parent_message_ts),
+                    AGENT_THREAD_DONE_SIGNAL,
+                )
+
+                self.assertTrue(handled)
+                finished_root = store.get_agent_task(root_task.task_id)
+                assert finished_root is not None
+                self.assertEqual(finished_root.status, AgentTaskStatus.DONE)
+                child_started = store.get_deferred_work(child_deferred.deferred_id)
+                assert child_started is not None
+                self.assertEqual(child_started.status, DeferredWorkStatus.DONE)
+                self.assertEqual(runtime.started[-1][0].task_id, child_task.task_id)
+                self.assertEqual(runtime.started[-1][2].thread_ts, child_task.thread_ts)
+                self.assertTrue(
+                    any(
+                        update["text"].startswith("PM initiative status")
+                        and ":white_check_mark: done" in update["text"]
+                        and ":large_blue_circle: active" in update["text"]
+                        for update in gateway.updates
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_pm_status_marks_exhausted_stall_recovery_as_stalled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id, PmInitiativeStatus.ACTIVE
+                )
+                refreshed = store.get_pm_initiative(initiative.initiative_id)
+                assert refreshed is not None
+                subtask = store.add_pm_subtask_dispatch(
+                    initiative=refreshed,
+                    local_id="draft",
+                    title="Draft design",
+                    request=WorkRequest(
+                        prompt="Draft the design.",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    plan_depends_on=(),
+                    existing_subtasks=[],
+                    after_delay_seconds=0,
+                    sort_order=0,
+                )
+                task = replace(
+                    create_agent_task(agent, "Draft the design.", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.subtask",
+                    parent_message_ts="171.subtask",
+                    metadata={
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_SUBTASK_LOCAL_ID_METADATA_KEY: "draft",
+                        MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat(),
+                        MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY: (
+                            MANAGED_RUN_MAX_STALL_RECOVERIES
+                        ),
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.update_deferred_work_last_task(subtask.deferred_id, last_task_id=task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=FakeRuntime(),
+                )
+
+                view = controller._build_pm_initiative_plan_view(initiative.initiative_id)
+
+                assert view is not None
+                self.assertIn("draft: Draft design [:warning: stalled", view)
             finally:
                 store.close()
 
