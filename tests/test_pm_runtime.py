@@ -1001,6 +1001,8 @@ class PmRuntimeTests(unittest.TestCase):
                 ]
                 self.assertTrue(pm_status_messages)
                 self.assertIn("investigate", pm_status_messages[-1])
+                self.assertIn(":large_blue_circle: active", pm_status_messages[-1])
+                self.assertIn(":bookmark_tabs: reserved", pm_status_messages[-1])
                 self.assertIn("<https://example.slack.com/archives/C1/p", pm_status_messages[-1])
             finally:
                 store.close()
@@ -1090,6 +1092,8 @@ class PmRuntimeTests(unittest.TestCase):
                         update["text"].startswith("PM initiative status")
                         and "done" in update["text"]
                         and "ready" in update["text"]
+                        and ":white_check_mark:" in update["text"]
+                        and ":large_green_circle:" in update["text"]
                         for update in gateway.updates
                     )
                 )
@@ -1304,6 +1308,13 @@ class PmRuntimeTests(unittest.TestCase):
                 self.assertEqual(final.status, PmInitiativeStatus.DONE)
                 # A recap message was posted in the initiative thread.
                 self.assertTrue(any("complete" in r["text"] for r in gateway.thread_replies))
+                self.assertTrue(
+                    any(
+                        "PM initiative status" in item["text"]
+                        and "status: :white_check_mark: done" in item["text"]
+                        for item in gateway.thread_replies
+                    )
+                )
             finally:
                 store.close()
 

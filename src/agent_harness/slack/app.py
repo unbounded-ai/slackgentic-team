@@ -6168,7 +6168,7 @@ class SlackTeamController:
             [
                 f"id: {initiative.initiative_id}",
                 f"title: {initiative.title}",
-                f"status: {initiative.status.value}",
+                f"status: {_pm_initiative_status_label(initiative.status)}",
             ]
         )
         if not subtasks:
@@ -6179,7 +6179,10 @@ class SlackTeamController:
         for subtask in subtasks:
             deferred = self.store.get_deferred_work(subtask.deferred_id)
             if deferred is None:
-                rows.append(f"  - {subtask.local_id}: {subtask.title} (missing)")
+                rows.append(
+                    f"  - {subtask.local_id}: {subtask.title} "
+                    f"[{_pm_subtask_status_label('missing')}]"
+                )
                 counts["missing"] = counts.get("missing", 0) + 1
                 continue
             owner = "unassigned"
@@ -6201,11 +6204,15 @@ class SlackTeamController:
             link_text = f", thread: <{thread_url}|open>" if thread_url else ""
             rows.append(
                 f"  - {subtask.local_id}: {subtask.title} "
-                f"[{status_value}, owner={owner}, {deps_text}{link_text}]"
+                f"[{_pm_subtask_status_label(status_value)}, owner={owner}, "
+                f"{deps_text}{link_text}]"
             )
         if counts:
             summary = ", ".join(
-                f"{count} {state}" for state, count in sorted(counts.items(), key=lambda kv: kv[0])
+                f"{count} {_pm_subtask_status_label(state)}"
+                for state, count in sorted(
+                    counts.items(), key=lambda kv: _pm_subtask_status_sort_key(kv[0])
+                )
             )
             lines.append(f"subtasks ({summary}):")
         else:
@@ -6313,6 +6320,7 @@ class SlackTeamController:
             self.store.update_pm_initiative_status(
                 initiative.initiative_id, PmInitiativeStatus.CANCELLED
             )
+            self._post_or_update_pm_status_message(initiative.initiative_id)
             return 1
         surfaced = 0
         all_terminal = True
@@ -6340,6 +6348,7 @@ class SlackTeamController:
             self._post_pm_initiative_recap(initiative, per_subtask, all_done=all_done)
             new_status = PmInitiativeStatus.DONE if all_done else PmInitiativeStatus.CANCELLED
             self.store.update_pm_initiative_status(initiative.initiative_id, new_status)
+            self._post_or_update_pm_status_message(initiative.initiative_id)
             self._clear_pm_surfaced_keys(initiative.initiative_id)
             return 1
         now = utc_now()
@@ -9149,6 +9158,48 @@ def _pm_deferred_display_status(deferred: DeferredWork, task: AgentTask | None) 
     if deferred.status == DeferredWorkStatus.WAITING_DEPS:
         return "waiting_deps"
     return deferred.status.value
+
+
+def _pm_initiative_status_label(status: PmInitiativeStatus) -> str:
+    labels = {
+        PmInitiativeStatus.PLANNING: ":memo: planning",
+        PmInitiativeStatus.AWAITING_APPROVAL: ":hourglass_flowing_sand: awaiting approval",
+        PmInitiativeStatus.ACTIVE: ":large_blue_circle: active",
+        PmInitiativeStatus.DONE: ":white_check_mark: done",
+        PmInitiativeStatus.CANCELLED: ":no_entry: cancelled",
+    }
+    return labels.get(status, status.value)
+
+
+def _pm_subtask_status_label(status: str) -> str:
+    labels = {
+        "missing": ":warning: missing",
+        "reserved": ":bookmark_tabs: reserved",
+        "waiting_deps": ":hourglass_flowing_sand: waiting_deps",
+        "ready": ":large_green_circle: ready",
+        "starting": ":rocket: starting",
+        "active": ":large_blue_circle: active",
+        "queued": ":inbox_tray: queued",
+        "done": ":white_check_mark: done",
+        "cancelled": ":no_entry: cancelled",
+        "claimed": ":rocket: claimed",
+    }
+    return labels.get(status, status)
+
+
+def _pm_subtask_status_sort_key(status: str) -> tuple[int, str]:
+    order = {
+        "missing": 0,
+        "cancelled": 1,
+        "active": 2,
+        "starting": 3,
+        "ready": 4,
+        "reserved": 5,
+        "waiting_deps": 6,
+        "queued": 7,
+        "done": 8,
+    }
+    return (order.get(status, 99), status)
 
 
 def _weekday_label(value) -> str | None:
