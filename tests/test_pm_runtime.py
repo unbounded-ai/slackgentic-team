@@ -1136,6 +1136,14 @@ class PmRuntimeTests(unittest.TestCase):
                 child_task = store.get_agent_task(child_deferred.last_task_id or "")
                 assert root_task is not None
                 assert child_task is not None
+                assert root_task.thread_ts is not None
+                gateway.thread_history_messages[("C1", root_task.thread_ts)] = [
+                    {
+                        "username": "Avery",
+                        "text": "Root result: preserve dependency thread context.",
+                        "ts": "171.ctx",
+                    }
+                ]
 
                 controller.handle_runtime_task_done(
                     root_task,
@@ -1148,6 +1156,10 @@ class PmRuntimeTests(unittest.TestCase):
 
                 self.assertEqual(runtime.started[-1][0].task_id, child_task.task_id)
                 self.assertEqual(runtime.started[-1][2].thread_ts, child_task.thread_ts)
+                child_context = runtime.started[-1][0].metadata.get("thread_context")
+                self.assertIsInstance(child_context, str)
+                self.assertIn("PM dependency subtask `investigate`", child_context)
+                self.assertIn("Root result: preserve dependency thread context.", child_context)
                 self.assertNotEqual(runtime.started[-1][2].thread_ts, "171.thread")
                 finished_root = store.get_agent_task(root_task.task_id)
                 assert finished_root is not None
@@ -1256,6 +1268,89 @@ class PmRuntimeTests(unittest.TestCase):
                         for update in gateway.updates
                     )
                 )
+            finally:
+                store.close()
+
+    def test_pm_cancelled_dependency_blocks_downstream_subtask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Ship feature X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                signal = _build_plan_signal(initiative.initiative_id, handles=[agent.handle])
+                controller.handle_runtime_agent_control(pm_task, agent, thread_ref, signal)
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": json.dumps(
+                                    {
+                                        "v": 1,
+                                        "action": "pm_initiative.start",
+                                        "initiative_id": initiative.initiative_id,
+                                    }
+                                ),
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.plan"},
+                        "user": {"id": "U2"},
+                    }
+                )
+                subtasks = store.list_pm_subtasks(initiative.initiative_id)
+                root_deferred = store.get_deferred_work(subtasks[0].deferred_id)
+                child_deferred = store.get_deferred_work(subtasks[1].deferred_id)
+                assert root_deferred is not None
+                assert child_deferred is not None
+                root_task = store.get_agent_task(root_deferred.last_task_id or "")
+                child_task = store.get_agent_task(child_deferred.last_task_id or "")
+                assert root_task is not None
+                assert child_task is not None
+
+                store.update_agent_task_status(root_task.task_id, AgentTaskStatus.CANCELLED)
+                started_before = len(runtime.started)
+
+                promoted = controller.evaluate_pending_deferred_work(child_deferred.deferred_id)
+
+                self.assertEqual(promoted, 0)
+                self.assertEqual(len(runtime.started), started_before)
+                still_waiting = store.get_deferred_work(child_deferred.deferred_id)
+                assert still_waiting is not None
+                self.assertEqual(still_waiting.status, DeferredWorkStatus.WAITING_DEPS)
+                blocker_text = "\n".join(reply["text"] for reply in gateway.thread_replies)
+                self.assertIn("dependency `investigate` was cancelled", blocker_text)
+                self.assertIn("will not start downstream work", blocker_text)
             finally:
                 store.close()
 

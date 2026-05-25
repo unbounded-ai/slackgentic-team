@@ -6687,6 +6687,28 @@ class SlackTeamController:
         for row in rows:
             if row.status != DeferredWorkStatus.WAITING_DEPS:
                 continue
+            cancelled_dependency = self._pm_cancelled_dependency(row)
+            if cancelled_dependency is not None:
+                dep, upstream = cancelled_dependency
+                subtask = self.store.get_pm_subtask_by_deferred_id(row.deferred_id)
+                initiative = (
+                    self.store.get_pm_initiative(subtask.initiative_id) if subtask else None
+                )
+                blocked_local_id = dep.local_id or upstream.deferred_id
+                if subtask is not None and initiative is not None:
+                    self._surface_pm_blocker(
+                        initiative,
+                        local_id=subtask.local_id,
+                        kind=f"cancelled_dependency:{blocked_local_id}",
+                        message=(
+                            f":warning: PM initiative `{initiative.initiative_id}` subtask "
+                            f"`{subtask.local_id}` is waiting because dependency "
+                            f"`{blocked_local_id}` was cancelled. I will not start downstream "
+                            "work until that prerequisite is rerun or the PM plan is updated."
+                        ),
+                    )
+                self._refresh_pm_status_for_deferred(row.deferred_id)
+                continue
             satisfied, _missing = self.store.evaluate_deferred_dependencies(row)
             if not satisfied:
                 continue
@@ -6714,6 +6736,26 @@ class SlackTeamController:
         for channel_id in promoted_channels:
             self._refresh_existing_roster(channel_id)
         return promoted
+
+    def _pm_cancelled_dependency(
+        self,
+        deferred: DeferredWork,
+    ) -> tuple[WorkDependency, DeferredWork] | None:
+        if self.store.get_pm_subtask_by_deferred_id(deferred.deferred_id) is None:
+            return None
+        for dep in deferred.depends_on:
+            if dep.kind != WorkDependencyKind.SUBTASK or not dep.task_id:
+                continue
+            upstream = self.store.get_deferred_work(dep.task_id)
+            if upstream is None:
+                continue
+            if upstream.status == DeferredWorkStatus.CANCELLED:
+                return dep, upstream
+            if upstream.last_task_id:
+                task = self.store.get_agent_task(upstream.last_task_id)
+                if task is not None and task.status == AgentTaskStatus.CANCELLED:
+                    return dep, upstream
+        return None
 
     def _fire_due_deferred_work_now(self, *, limit: int = 50) -> int:
         fired = 0
@@ -6860,6 +6902,7 @@ class SlackTeamController:
             )
             self._refresh_pm_status_for_deferred(deferred.deferred_id)
             return True
+        task = self._task_with_pm_dependency_thread_context(deferred, task)
         self.gateway.post_thread_reply(
             thread,
             "Dependencies are satisfied. Starting this PM subtask now.",
@@ -6886,6 +6929,49 @@ class SlackTeamController:
         )
         self._refresh_pm_status_for_deferred(deferred.deferred_id)
         return True
+
+    def _task_with_pm_dependency_thread_context(
+        self,
+        deferred: DeferredWork,
+        task: AgentTask,
+    ) -> AgentTask:
+        dependency_context = self._pm_dependency_thread_context(deferred)
+        if not dependency_context:
+            return task
+        latest = self.store.get_agent_task(task.task_id) or task
+        existing = latest.metadata.get("thread_context")
+        if isinstance(existing, str) and dependency_context in existing:
+            return latest
+        metadata = dict(latest.metadata)
+        if isinstance(existing, str) and existing.strip():
+            thread_context = f"{existing.strip()}\n\n{dependency_context}"
+        else:
+            thread_context = dependency_context
+        metadata["thread_context"] = thread_context[-20000:]
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return updated
+
+    def _pm_dependency_thread_context(self, deferred: DeferredWork) -> str | None:
+        sections: list[str] = []
+        for dep in deferred.depends_on:
+            if dep.kind != WorkDependencyKind.SUBTASK or not dep.task_id:
+                continue
+            upstream = self.store.get_deferred_work(dep.task_id)
+            if upstream is None:
+                continue
+            context = self._thread_context(upstream.channel_id, upstream.thread_ts)
+            if not context and upstream.message_ts and upstream.message_ts != upstream.thread_ts:
+                context = self._thread_context(upstream.channel_id, upstream.message_ts)
+            if not context:
+                continue
+            subtask = self.store.get_pm_subtask_by_deferred_id(upstream.deferred_id)
+            local_id = dep.local_id or (subtask.local_id if subtask else upstream.deferred_id)
+            title = subtask.title if subtask else upstream.description or upstream.prompt
+            sections.append(f"PM dependency subtask `{local_id}` — {title}\n{context}")
+        if not sections:
+            return None
+        return "\n\n".join(sections)[-20000:]
 
     def fire_due_scheduled_timer(self, timer: ScheduledTimer) -> bool:
         agent = self.store.get_team_agent(timer.agent_id)
