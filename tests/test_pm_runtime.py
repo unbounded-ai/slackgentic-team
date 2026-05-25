@@ -23,6 +23,7 @@ from agent_harness.pm import (
     PM_RESOLUTION_ATTEMPTS_METADATA_KEY,
     PM_RESOLUTION_METADATA_KEY,
     PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
+    PM_SUBTASK_LOCAL_ID_METADATA_KEY,
 )
 from agent_harness.slack.app import (
     PMInitiativeRunner,
@@ -53,6 +54,28 @@ def _build_plan_signal(initiative_id: str, *, handles: list[str]) -> str:
                 "depends_on": ["investigate"],
             },
         ],
+    }
+    return f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}"
+
+
+def _build_large_plan_signal() -> str:
+    subtasks = []
+    for index in range(20):
+        local_id = f"s{index:02d}"
+        title = f"Step {index:02d} " + ("with detailed approval context " * 8)
+        subtasks.append(
+            {
+                "id": local_id,
+                "title": title,
+                "task": f"Complete {local_id}.",
+                "target": "somebody",
+                "depends_on": [f"s{index - 1:02d}"] if index else [],
+            }
+        )
+    payload = {
+        "title": "Large PM plan",
+        "summary": "A plan large enough to require multiple Slack section blocks.",
+        "subtasks": subtasks,
     }
     return f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}"
 
@@ -308,6 +331,9 @@ class PmFullLifecycleTests(unittest.TestCase):
                     pm_task.metadata[PM_INITIATIVE_ID_METADATA_KEY],
                     initiative.initiative_id,
                 )
+                self.assertIn("Active Slackgentic worker handles:", pm_task.prompt)
+                self.assertIn(f"@{engineer.handle}", pm_task.prompt)
+                self.assertNotIn(f"@{pm_agent.handle}", pm_task.prompt)
                 # The real ManagedTaskRuntime marks a task ACTIVE when it
                 # starts the worker; FakeRuntime is a record-only stub, so
                 # mirror that side effect here. The replan path (step 5)
@@ -379,6 +405,14 @@ class PmFullLifecycleTests(unittest.TestCase):
                 assert approved is not None
                 self.assertEqual(approved.status, PmInitiativeStatus.ACTIVE)
                 self.assertIsNone(approved.pending_plan_json)
+                strip_updates = [
+                    update for update in gateway.updates if update["ts"] == approval_reply["ts"]
+                ]
+                self.assertTrue(strip_updates)
+                self.assertTrue(strip_updates[-1]["blocks"])
+                self.assertFalse(
+                    any(block.get("type") == "actions" for block in strip_updates[-1]["blocks"])
+                )
                 subtasks = store.list_pm_subtasks(initiative.initiative_id)
                 self.assertEqual(
                     [s.local_id for s in subtasks],
@@ -765,6 +799,97 @@ class PmRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_large_pm_plan_keeps_start_button_and_renders_dag_chart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Large PM plan",
+                    summary="Plan many steps.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Large PM plan",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=FakeRuntime(),
+                )
+
+                handled = controller.handle_runtime_agent_control(
+                    pm_task,
+                    agent,
+                    thread_ref,
+                    _build_large_plan_signal(),
+                )
+
+                self.assertTrue(handled)
+                plan_message = gateway.thread_replies[-1]
+                self.assertIn("DAG chart:", plan_message["text"])
+                self.assertIn("s00 -> s01", plan_message["text"])
+                blocks = plan_message["blocks"]
+                self.assertIsNotNone(blocks)
+                assert blocks is not None
+                section_lengths = [
+                    len(block["text"]["text"]) for block in blocks if block.get("type") == "section"
+                ]
+                self.assertGreater(len(section_lengths), 1)
+                self.assertTrue(all(length <= 3000 for length in section_lengths))
+                action_ids = [
+                    element["action_id"]
+                    for block in blocks
+                    if block.get("type") == "actions"
+                    for element in block.get("elements", [])
+                ]
+                self.assertIn("pm_initiative.start", action_ids)
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": json.dumps(
+                                    {
+                                        "v": 1,
+                                        "action": "pm_initiative.start",
+                                        "initiative_id": initiative.initiative_id,
+                                    }
+                                ),
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": plan_message["ts"]},
+                        "user": {"id": "U2"},
+                    }
+                )
+                strip_updates = [
+                    update for update in gateway.updates if update["ts"] == plan_message["ts"]
+                ]
+                self.assertTrue(strip_updates)
+                self.assertLessEqual(len(strip_updates[-1]["text"]), 2602)
+                self.assertFalse(
+                    any(block.get("type") == "actions" for block in strip_updates[-1]["blocks"])
+                )
+            finally:
+                store.close()
+
     def test_pm_initiative_start_button_dispatches_root_subtasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -841,8 +966,133 @@ class PmRuntimeTests(unittest.TestCase):
                 child_deferred = store.get_deferred_work(subtasks[1].deferred_id)
                 assert child_deferred is not None
                 self.assertEqual(child_deferred.status, DeferredWorkStatus.WAITING_DEPS)
-                # The root subtask was dispatched to the (now idle) agent.
-                self.assertTrue(any(t.task_id != pm_task.task_id for t, *_ in runtime.started))
+                subtask_posts = [
+                    item for item in gateway.posts if item["text"].startswith("PM subtask `")
+                ]
+                self.assertEqual(len(subtask_posts), 2)
+                self.assertEqual(root_deferred.thread_ts, subtask_posts[0]["ts"])
+                self.assertEqual(child_deferred.thread_ts, subtask_posts[1]["ts"])
+                self.assertNotEqual(root_deferred.thread_ts, "171.thread")
+                self.assertIsNotNone(root_deferred.last_task_id)
+                self.assertIsNotNone(child_deferred.last_task_id)
+                root_task = store.get_agent_task(root_deferred.last_task_id or "")
+                child_task = store.get_agent_task(child_deferred.last_task_id or "")
+                assert root_task is not None
+                assert child_task is not None
+                self.assertEqual(
+                    root_task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY),
+                    "investigate",
+                )
+                self.assertEqual(
+                    child_task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY),
+                    "implement",
+                )
+                started_subtasks = [
+                    item for item in runtime.started if item[0].task_id != pm_task.task_id
+                ]
+                self.assertEqual(len(started_subtasks), 1)
+                self.assertEqual(started_subtasks[0][2].thread_ts, root_task.thread_ts)
+                self.assertNotEqual(started_subtasks[0][2].thread_ts, "171.thread")
+                pm_status_messages = [
+                    item["text"]
+                    for item in gateway.thread_replies
+                    if item["thread"].thread_ts == "171.thread"
+                    and item["text"].startswith("PM initiative status")
+                ]
+                self.assertTrue(pm_status_messages)
+                self.assertIn("investigate", pm_status_messages[-1])
+                self.assertIn("<https://example.slack.com/archives/C1/p", pm_status_messages[-1])
+            finally:
+                store.close()
+
+    def test_pm_dependent_subtask_starts_in_precreated_thread_after_root_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Ship feature X",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                runtime = FakeRuntime()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                signal = _build_plan_signal(initiative.initiative_id, handles=[agent.handle])
+                controller.handle_runtime_agent_control(pm_task, agent, thread_ref, signal)
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": json.dumps(
+                                    {
+                                        "v": 1,
+                                        "action": "pm_initiative.start",
+                                        "initiative_id": initiative.initiative_id,
+                                    }
+                                ),
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.plan"},
+                        "user": {"id": "U2"},
+                    }
+                )
+                subtasks = store.list_pm_subtasks(initiative.initiative_id)
+                root_deferred = store.get_deferred_work(subtasks[0].deferred_id)
+                child_deferred = store.get_deferred_work(subtasks[1].deferred_id)
+                assert root_deferred is not None
+                assert child_deferred is not None
+                root_task = store.get_agent_task(root_deferred.last_task_id or "")
+                child_task = store.get_agent_task(child_deferred.last_task_id or "")
+                assert root_task is not None
+                assert child_task is not None
+
+                controller.handle_runtime_task_done(
+                    root_task,
+                    agent,
+                    SlackThreadRef("C1", root_task.thread_ts or "", root_task.parent_message_ts),
+                )
+                child_ready = store.get_deferred_work(child_deferred.deferred_id)
+                assert child_ready is not None
+                self.assertEqual(child_ready.status, DeferredWorkStatus.READY)
+                controller.fire_due_deferred_work(child_ready)
+
+                self.assertEqual(runtime.started[-1][0].task_id, child_task.task_id)
+                self.assertEqual(runtime.started[-1][2].thread_ts, child_task.thread_ts)
+                self.assertNotEqual(runtime.started[-1][2].thread_ts, "171.thread")
+                self.assertTrue(
+                    any(
+                        update["text"].startswith("PM initiative status")
+                        and "done" in update["text"]
+                        and "ready" in update["text"]
+                        for update in gateway.updates
+                    )
+                )
             finally:
                 store.close()
 

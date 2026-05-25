@@ -175,7 +175,7 @@ def build_pm_resolution_prompt(
         "",
         f"Initiative id: {initiative_id}",
         f"Current UTC time: {reference.isoformat()}",
-        f"Active Slackgentic agent handles: {handles}",
+        f"Active Slackgentic worker handles: {handles}",
         "",
         f"User project: {text.strip()}",
         "",
@@ -649,6 +649,32 @@ def expand_codesign_plan(plan: ParsedPmPlan) -> ParsedPmPlan:
             )
         )
     return ParsedPmPlan(title=plan.title, summary=plan.summary, subtasks=tuple(expanded))
+
+
+def render_pm_plan_dag(plan: ParsedPmPlan) -> str:
+    """Return a compact Slack-friendly DAG chart for a parsed PM plan."""
+    if not plan.subtasks:
+        return "(empty plan)"
+    children: dict[str, list[str]] = {subtask.local_id: [] for subtask in plan.subtasks}
+    roots: list[str] = []
+    for subtask in plan.subtasks:
+        if not subtask.depends_on:
+            roots.append(subtask.local_id)
+        for dep in subtask.depends_on:
+            if dep in children:
+                children[dep].append(subtask.local_id)
+    lines: list[str] = []
+    if roots:
+        lines.append("roots: " + ", ".join(roots))
+    for subtask in plan.subtasks:
+        outgoing = children.get(subtask.local_id) or []
+        if outgoing:
+            for child in outgoing:
+                lines.append(f"{subtask.local_id} -> {child}")
+    if len(plan.subtasks) == 1:
+        only = plan.subtasks[0]
+        return f"{only.local_id}: {only.title}"
+    return "\n".join(dict.fromkeys(lines))
 
 
 PM_TAG_LEAD_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*(?P<rest>.*)$", re.DOTALL)

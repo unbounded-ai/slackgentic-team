@@ -2402,6 +2402,8 @@ class Store:
         after_delay_seconds: int,
         sort_order: int,
         description: str | None = None,
+        thread: SlackThreadRef | None = None,
+        extra_deferred_depends_on: tuple[WorkDependency, ...] = (),
     ) -> PmSubtask:
         """Insert one PM subtask + its deferred_work row in a single transaction.
 
@@ -2430,6 +2432,7 @@ class Store:
                     description=f"subtask {sibling.local_id}",
                 )
             )
+        resolved_deps.extend(extra_deferred_depends_on)
         now = utc_now()
         deferred_id = f"defer_{uuid.uuid4().hex[:12]}"
         if resolved_deps:
@@ -2440,11 +2443,16 @@ class Store:
             status = DeferredWorkStatus.READY
             fire_at = now + timedelta(seconds=after_delay_seconds) if after_delay_seconds else now
             deps_satisfied_at = now
+        target_thread = thread or SlackThreadRef(
+            initiative.channel_id,
+            initiative.thread_ts,
+            initiative.message_ts,
+        )
         deferred = DeferredWork(
             deferred_id=deferred_id,
-            channel_id=initiative.channel_id,
-            thread_ts=initiative.thread_ts,
-            message_ts=initiative.message_ts,
+            channel_id=target_thread.channel_id,
+            thread_ts=target_thread.thread_ts,
+            message_ts=target_thread.message_ts,
             prompt=request.prompt,
             assignment_mode=request.assignment_mode,
             requested_handle=request.requested_handle,
@@ -2522,6 +2530,18 @@ class Store:
                 (initiative_id,),
             ).fetchall()
         return [_pm_subtask_from_row(row) for row in rows]
+
+    def get_pm_subtask_by_deferred_id(self, deferred_id: str) -> PmSubtask | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM pm_subtasks
+                WHERE deferred_id = ?
+                LIMIT 1
+                """,
+                (deferred_id,),
+            ).fetchone()
+        return _pm_subtask_from_row(row) if row else None
 
     def cancel_pm_initiative_for_thread(self, channel_id: str, thread_ts: str) -> int:
         with self._lock:
