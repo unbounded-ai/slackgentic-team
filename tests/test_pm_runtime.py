@@ -1418,7 +1418,7 @@ class PmRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_pm_approval_prompts_to_hire_when_external_sessions_fill_capacity(self):
+    def test_pm_approval_ignores_external_sessions_for_capacity_slots(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -1515,20 +1515,91 @@ class PmRuntimeTests(unittest.TestCase):
 
                 still_parked = store.get_pm_initiative(initiative.initiative_id)
                 assert still_parked is not None
-                self.assertEqual(still_parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
-                self.assertIsNotNone(still_parked.pending_plan_json)
-                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
-                self.assertEqual(runtime.started, [])
-                capacity_message = gateway.thread_replies[-1]["text"]
-                self.assertIn("not enough free worker agents", capacity_message)
-                self.assertIn("needs 3 available worker agents", capacity_message)
-                self.assertIn("only 0 worker agents are free", capacity_message)
-                self.assertIn("Hire 3 more agents", capacity_message)
-                self.assertIn("`team hire 3`", capacity_message)
+                self.assertEqual(still_parked.status, PmInitiativeStatus.ACTIVE)
+                self.assertEqual(len(store.list_pm_subtasks(initiative.initiative_id)), 3)
+                self.assertFalse(
+                    any(
+                        "not enough free worker agents" in reply["text"]
+                        for reply in gateway.thread_replies
+                    )
+                )
+                started_worker_ids = {
+                    task.agent_id
+                    for task, _agent, _thread in runtime.started
+                    if task.task_id != pm_task.task_id
+                }
+                self.assertEqual(started_worker_ids, {agent.agent_id for agent in workers})
+            finally:
+                store.close()
 
-                hired = hire_team_agents([*workers, pm_agent], 3)
-                for agent in hired:
+    def test_pm_approval_prompts_to_hire_when_active_tasks_fill_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                workers = build_initial_model_team(3, 0)
+                pm_agent = hire_team_agents(workers, 1, kind=TeamAgentKind.PM)[0]
+                for agent in [*workers, pm_agent]:
                     store.upsert_team_agent(agent)
+                for index, worker in enumerate(workers):
+                    busy_task = replace(
+                        create_agent_task(worker, f"busy task {index}", "C1"),
+                        status=AgentTaskStatus.ACTIVE,
+                        thread_ts=f"171.busy{index}",
+                        parent_message_ts=f"171.busy{index}",
+                    )
+                    store.upsert_agent_task(busy_task)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Capacity constrained plan",
+                    summary="Run three independent tasks.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(pm_agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Capacity constrained plan",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                payload = {
+                    "title": "Capacity constrained plan",
+                    "summary": "Run three independent tasks.",
+                    "subtasks": [
+                        {
+                            "id": f"root{index}",
+                            "title": f"Root {index}",
+                            "task": f"Run independent task {index}.",
+                            "target": "somebody",
+                            "depends_on": [],
+                        }
+                        for index in range(3)
+                    ],
+                }
+                handled = controller.handle_runtime_agent_control(
+                    pm_task,
+                    pm_agent,
+                    thread_ref,
+                    f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+                self.assertTrue(handled)
+                plan_message = gateway.thread_replies[-1]
+
                 controller.handle_block_action(
                     {
                         "actions": [
@@ -1549,16 +1620,18 @@ class PmRuntimeTests(unittest.TestCase):
                     }
                 )
 
-                active = store.get_pm_initiative(initiative.initiative_id)
-                assert active is not None
-                self.assertEqual(active.status, PmInitiativeStatus.ACTIVE)
-                self.assertEqual(len(store.list_pm_subtasks(initiative.initiative_id)), 3)
-                started_worker_ids = {
-                    task.agent_id
-                    for task, _agent, _thread in runtime.started
-                    if task.task_id != pm_task.task_id
-                }
-                self.assertEqual(started_worker_ids, {agent.agent_id for agent in hired})
+                still_parked = store.get_pm_initiative(initiative.initiative_id)
+                assert still_parked is not None
+                self.assertEqual(still_parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertIsNotNone(still_parked.pending_plan_json)
+                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
+                self.assertEqual(runtime.started, [])
+                capacity_message = gateway.thread_replies[-1]["text"]
+                self.assertIn("not enough free worker agents", capacity_message)
+                self.assertIn("needs 3 available worker agents", capacity_message)
+                self.assertIn("only 0 worker agents are free", capacity_message)
+                self.assertIn("Hire 3 more agents", capacity_message)
+                self.assertIn("`team hire 3`", capacity_message)
             finally:
                 store.close()
 

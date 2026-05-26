@@ -5634,7 +5634,8 @@ class SlackTeamController:
 
     def _pm_busy_worker_agent_ids(self) -> set[str]:
         busy = {task.agent_id for task in self.store.list_agent_tasks()}
-        busy.update(self._busy_agent_ids_for_assignment())
+        busy.update(self._scheduled_busy_agent_ids())
+        busy.update(self._deferred_busy_agent_ids())
         return busy
 
     def _select_pm_subtask_agent(
