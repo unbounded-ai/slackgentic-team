@@ -392,7 +392,7 @@ python3.13 -m venv .venv && source .venv/bin/activate && pip install -e '.[dev]'
 Checks:
 
 ```sh
-python -m unittest discover -s tests
+PYTHONPATH=src python -m pytest -n auto tests
 python -m compileall src tests
 ruff check src tests
 ruff format --check src tests

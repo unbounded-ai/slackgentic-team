@@ -33,7 +33,7 @@ jobs:
         run: python -m ruff format --check src tests
 
       - name: Test
-        run: PYTHONPATH=src python -m unittest discover -s tests
+        run: PYTHONPATH=src python -m pytest -n auto tests
 
       - name: Compile
         run: PYTHONPATH=src python -m compileall src tests
