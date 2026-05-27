@@ -71,11 +71,15 @@ def build_service_spec(
     executable: Path | None = None,
     working_directory: Path | None = None,
     config_file: Path | None = None,
+    ignored_external_session_cwds: list[str] | tuple[str, ...] | None = None,
 ) -> ServiceSpec:
     resolved_executable = executable or _current_slackgentic_executable()
     args = ["slack", "serve"]
     if config_file:
         args.extend(["--config-file", str(config_file.expanduser().resolve())])
+    for cwd_pattern in ignored_external_session_cwds or ():
+        if cwd_pattern.strip():
+            args.extend(["--ignore-external-session-cwd", cwd_pattern.strip()])
     return ServiceSpec(
         name=name,
         executable=resolved_executable,

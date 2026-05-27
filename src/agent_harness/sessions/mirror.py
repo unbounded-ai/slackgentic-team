@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import getpass
 import html
 import json
@@ -90,6 +91,7 @@ class SessionMirror:
         ]
         | None = None,
         home: Path | None = None,
+        ignored_cwd_patterns: Iterable[str] = (),
     ):
         self.store = store
         self.gateway = gateway
@@ -102,6 +104,9 @@ class SessionMirror:
         self.on_external_session_occupancy_change = on_external_session_occupancy_change
         self.on_agent_message = on_agent_message
         self.home = home or Path.home()
+        self.ignored_cwd_patterns = tuple(
+            pattern.strip() for pattern in ignored_cwd_patterns if pattern.strip()
+        )
         self._todo_mirror = TodoMirror(store, gateway, home=self.home)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -151,6 +156,8 @@ class SessionMirror:
                 if self.store.get_setting(_ignored_external_session_key(session)):
                     if session.status != SessionStatus.ACTIVE:
                         self.store.upsert_session(session)
+                    continue
+                if self._skip_ignored_cwd_session(session, channel_id):
                     continue
                 if self._external_terminal_session_closed(session, channel_id):
                     self.store.set_setting(
@@ -650,6 +657,13 @@ class SessionMirror:
             or self._thread_for_session(session, channel_id) is not None
         )
 
+    def _skip_ignored_cwd_session(self, session: AgentSession, channel_id: str) -> bool:
+        if not _cwd_matches_ignored_patterns(session.cwd, self.ignored_cwd_patterns):
+            return False
+        self.store.upsert_session(session)
+        self._clear_external_tracking(session, channel_id)
+        return True
+
     def _skip_internal_session(self, session: AgentSession, channel_id: str) -> bool:
         if not _is_codex_subagent_session(session):
             return False
@@ -927,6 +941,31 @@ def _capacity_message(provider: Provider, waiting_count: int) -> str:
         f"{waiting_count} {label} {plural} waiting. "
         "Hire one matching agent and Slackgentic will backfill the transcript."
     )
+
+
+def _cwd_matches_ignored_patterns(cwd: Path | None, patterns: Iterable[str]) -> bool:
+    if cwd is None:
+        return False
+    normalized = _normalized_path_text(cwd)
+    for pattern in patterns:
+        normalized_pattern = _normalized_path_text(Path(pattern).expanduser())
+        if not normalized_pattern:
+            continue
+        if any(char in normalized_pattern for char in "*?[]"):
+            if fnmatch.fnmatch(normalized, normalized_pattern):
+                return True
+            continue
+        if (
+            normalized == normalized_pattern
+            or normalized.endswith(f"/{normalized_pattern}")
+            or f"/{normalized_pattern}/" in normalized
+        ):
+            return True
+    return False
+
+
+def _normalized_path_text(path: Path) -> str:
+    return path.as_posix().strip().strip("/")
 
 
 def _managed_prompt_from_session_transcript(
