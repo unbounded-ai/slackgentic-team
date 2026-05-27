@@ -48,6 +48,7 @@ from agent_harness.models import (
     PermissionMode,
     PmInitiative,
     PmInitiativeStatus,
+    PmSubtask,
     Provider,
     ScheduledTimer,
     ScheduledTimerStatus,
@@ -119,12 +120,16 @@ from agent_harness.runtime.health import LoopBackoff, ProcessCpuWatchdog, log_lo
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_MAX_STALL_RECOVERIES,
     MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
+    MANAGED_RUN_STALL_TIMEOUT,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     managed_run_resume_attempts,
+    managed_run_stall_recoveries,
+    managed_run_started_age,
     parse_agent_reaction_signal,
     parse_agent_roster_status_signal,
     should_resume_managed_run,
@@ -372,6 +377,13 @@ class _PmReservedTask:
     task: AgentTask
     thread: SlackThreadRef
     extra_depends_on: tuple[WorkDependency, ...]
+
+
+@dataclass(frozen=True)
+class _PmCapacityShortfall:
+    required_workers: int
+    available_workers: int
+    hire_count: int
 
 
 class SlackTeamController:
@@ -2431,13 +2443,6 @@ class SlackTeamController:
                 continue
             if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
                 continue
-            if self._managed_task_session_is_alive(task):
-                LOGGER.info(
-                    "leaving managed task %s ACTIVE; session %s is still alive",
-                    task.task_id,
-                    task.session_id,
-                )
-                continue
             if not should_resume_managed_run(task, now=now):
                 LOGGER.info(
                     "skipping resume of orphaned task %s (age/attempt bounds exceeded: attempts=%d)",
@@ -2460,14 +2465,6 @@ class SlackTeamController:
                 resumed += 1
         return resumed
 
-    def _managed_task_session_is_alive(self, task: AgentTask) -> bool:
-        if task.session_provider is None or not task.session_id:
-            return False
-        session = self.store.get_session(task.session_provider, task.session_id)
-        if session is None:
-            return False
-        return session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}
-
     def _abandon_orphaned_task(self, task: AgentTask) -> None:
         metadata = dict(task.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
@@ -2481,8 +2478,23 @@ class SlackTeamController:
         try:
             self.store.upsert_agent_task(cancelled)
             self.store.delete_managed_thread_task(task.task_id)
+            if task.session_provider is not None and task.session_id:
+                clear_managed_session(self.store, task.session_provider, task.session_id)
+            self._refresh_after_task_terminal_state(cancelled)
         except Exception:
             LOGGER.debug("failed to abandon stale orphaned task %s", task.task_id, exc_info=True)
+
+    def _refresh_after_task_terminal_state(self, task: AgentTask) -> None:
+        try:
+            self.evaluate_pending_deferred_work()
+            if self.runtime is not None:
+                self._fire_due_deferred_work_now(limit=MAX_PM_SUBTASKS)
+        except Exception:
+            LOGGER.debug(
+                "failed to advance deferred work after task terminal transition",
+                exc_info=True,
+            )
+        self._refresh_pm_status_for_task(task)
 
     def _ensure_initial_team(self, codex_count: int, claude_count: int) -> None:
         if self.store.list_team_agents(include_fired=True):
@@ -4668,6 +4680,7 @@ class SlackTeamController:
             clear_managed_session(self.store, task.session_provider, task.session_id)
         try:
             self.evaluate_pending_deferred_work()
+            self._fire_due_deferred_work_now(limit=MAX_PM_SUBTASKS)
         except Exception:
             LOGGER.debug(
                 "failed to evaluate deferred work after runtime task done",
@@ -5427,18 +5440,26 @@ class SlackTeamController:
                 status=PmInitiativeStatus.AWAITING_APPROVAL,
                 pending_plan_message_ts=posted.ts,
             )
-        # PM-kind agents stay assigned to the initiative so the user can keep
-        # asking the same PM about status, blockers, and changes. Worker-kind
-        # resolvers (the fallback when no PM agent is hired) free their seat
-        # for the dispatched subtasks once the user approves the plan.
-        if agent.kind != TeamAgentKind.PM:
-            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+        # The PM stays attached through the initiative metadata, but the live
+        # resolver worker is done once the approval card is parked. Keeping it
+        # active lets the managed-run stall watchdog post confusing recovery
+        # prompts while the system is correctly waiting for Start executing or
+        # already executing subtasks.
+        self._finish_pm_resolver_task_after_plan(task)
         resolved_task = self.store.get_agent_task(task.task_id) or task
         self._remove_task_action_buttons_if_resolved(resolved_task)
         for message_ts in _task_request_message_ts_values(resolved_task):
             self._mark_message_complete(thread.channel_id, message_ts)
         self.refresh_or_post_roster(thread.channel_id)
         return True
+
+    def _finish_pm_resolver_task_after_plan(self, task: AgentTask) -> None:
+        if self.runtime is not None:
+            stop_task = getattr(self.runtime, "stop_task", None)
+            if callable(stop_task):
+                with suppress(Exception):
+                    stop_task(task.task_id, AgentTaskStatus.DONE)
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
 
     def _execute_pm_plan(
         self,
@@ -5473,6 +5494,13 @@ class SlackTeamController:
             self.gateway.post_thread_reply(
                 thread,
                 f"I could not load the parked PM plan for `{initiative.initiative_id}`: {exc}.",
+            )
+            return None
+        shortfall = self._pm_plan_capacity_shortfall(plan)
+        if shortfall is not None:
+            self.gateway.post_thread_reply(
+                thread,
+                _format_pm_capacity_shortfall_message(shortfall),
             )
             return None
         promoted = self.store.set_pm_initiative_pending_plan(
@@ -5522,14 +5550,19 @@ class SlackTeamController:
     ) -> None:
         """Create every PM subtask thread and reserve its agent before execution."""
         active_agents = self.store.list_team_agents()
-        worker_agents = filter_worker_agents(active_agents)
+        busy_agent_ids = self._pm_busy_worker_agent_ids()
+        worker_agents = [
+            agent
+            for agent in filter_worker_agents(active_agents)
+            if agent.agent_id not in busy_agent_ids
+        ]
         initial_busy = {
             agent.agent_id: self.store.active_task_for_agent(agent.agent_id)
-            for agent in active_agents
+            for agent in worker_agents
         }
         assigned_counts: dict[str, int] = {
             agent.agent_id: 1 if initial_busy.get(agent.agent_id) is not None else 0
-            for agent in active_agents
+            for agent in worker_agents
         }
         prior_subtasks = self.store.list_pm_subtasks(initiative.initiative_id)
         inserted: list[object] = list(prior_subtasks)
@@ -5580,6 +5613,30 @@ class SlackTeamController:
             inserted.append(saved)
             last_reserved_by_agent[agent.agent_id] = saved
             assigned_counts[agent.agent_id] = assigned_counts.get(agent.agent_id, 0) + 1
+
+    def _pm_plan_capacity_shortfall(self, plan: ParsedPmPlan) -> _PmCapacityShortfall | None:
+        required_workers = _pm_plan_parallel_worker_demand(plan)
+        if required_workers <= 0:
+            return None
+        active_workers = filter_worker_agents(self.store.list_team_agents())
+        busy_agent_ids = self._pm_busy_worker_agent_ids()
+        available_workers = sum(
+            1 for agent in active_workers if agent.agent_id not in busy_agent_ids
+        )
+        hire_count = max(0, required_workers - available_workers)
+        if hire_count <= 0:
+            return None
+        return _PmCapacityShortfall(
+            required_workers=required_workers,
+            available_workers=available_workers,
+            hire_count=hire_count,
+        )
+
+    def _pm_busy_worker_agent_ids(self) -> set[str]:
+        busy = {task.agent_id for task in self.store.list_agent_tasks()}
+        busy.update(self._scheduled_busy_agent_ids())
+        busy.update(self._deferred_busy_agent_ids())
+        return busy
 
     def _select_pm_subtask_agent(
         self,
@@ -5869,9 +5926,9 @@ class SlackTeamController:
         if (
             agent is None
             or getattr(agent, "kind", None) != TeamAgentKind.PM
-            or task.status != AgentTaskStatus.ACTIVE
+            or task.status not in {AgentTaskStatus.ACTIVE, AgentTaskStatus.DONE}
         ):
-            # Only PM-kind agents stay assigned past plan approval. For
+            # Only PM-kind agents stay attached past plan approval. For
             # worker-fallback resolvers the agent is back to general duty and
             # restarting the task would race with whatever it is doing now.
             self.gateway.post_thread_reply(
@@ -5880,6 +5937,17 @@ class SlackTeamController:
                     "Replan needs a PM-kind agent still attached to this initiative. "
                     "Hire a PM (`team hire --kind pm`) and start a new `pm: ...` "
                     "initiative instead."
+                ),
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        if self._pm_owner_is_busy(agent, task):
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                (
+                    f"@{agent.handle} is busy right now, so I did not start replanning. "
+                    "Try again when that PM is free, or hire another PM and start a new "
+                    "`pm: ...` initiative."
                 ),
             )
             self._mark_message_complete(channel_id, message_ts)
@@ -6006,13 +6074,24 @@ class SlackTeamController:
         if (
             agent is None
             or getattr(agent, "kind", None) != TeamAgentKind.PM
-            or task.status != AgentTaskStatus.ACTIVE
+            or task.status not in {AgentTaskStatus.ACTIVE, AgentTaskStatus.DONE}
         ):
             self.gateway.post_thread_reply(
                 SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
                 (
                     "Extension needs a PM-kind agent still attached to this initiative. "
                     "Hire a PM and start a new `pm: ...` initiative instead."
+                ),
+            )
+            self._mark_message_complete(channel_id, message_ts)
+            return True
+        if self._pm_owner_is_busy(agent, task):
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts, task.parent_message_ts),
+                (
+                    f"@{agent.handle} is busy right now, so I did not start planning "
+                    "the extension. Try again when that PM is free, or hire another PM "
+                    "and start a new `pm: ...` initiative."
                 ),
             )
             self._mark_message_complete(channel_id, message_ts)
@@ -6083,6 +6162,12 @@ class SlackTeamController:
         )
         self._mark_message_in_progress(channel_id, message_ts)
         return True
+
+    def _pm_owner_is_busy(self, agent: TeamAgent, task: AgentTask) -> bool:
+        active = self.store.active_task_for_agent(agent.agent_id)
+        if active is not None and active.task_id != task.task_id:
+            return True
+        return agent.agent_id in self._busy_agent_ids_for_assignment()
 
     def _maybe_post_pm_status_command(
         self,
@@ -6185,16 +6270,10 @@ class SlackTeamController:
                 )
                 counts["missing"] = counts.get("missing", 0) + 1
                 continue
-            owner = "unassigned"
             worker_task = None
             if deferred.last_task_id:
                 worker_task = self.store.get_agent_task(deferred.last_task_id)
-                if worker_task is not None:
-                    worker_agent = self.store.get_team_agent(worker_task.agent_id)
-                    if worker_agent is not None:
-                        owner = f"@{worker_agent.handle}"
-            elif deferred.requested_handle:
-                owner = f"@{deferred.requested_handle}"
+            owner = self._pm_subtask_owner_label(subtask, deferred, worker_task)
             status_value = _pm_deferred_display_status(deferred, worker_task)
             counts[status_value] = counts.get(status_value, 0) + 1
             deps_text = (
@@ -6246,16 +6325,97 @@ class SlackTeamController:
             return None
         key = _pm_status_message_setting_key(initiative_id)
         existing_ts = self.store.get_setting(key)
-        if existing_ts and self._try_update_message(initiative.channel_id, existing_ts, view):
+        if existing_ts and self._try_update_pm_status_message(
+            initiative.channel_id,
+            existing_ts,
+            view,
+        ):
             return existing_ts
         thread = SlackThreadRef(initiative.channel_id, initiative.thread_ts, initiative.message_ts)
         try:
-            posted = self.gateway.post_thread_reply(thread, view)
+            posted = self._post_pm_status_reply(thread, view)
         except Exception:
             LOGGER.debug("failed to post PM status message", exc_info=True)
             return None
         self.store.set_setting(key, posted.ts)
         return posted.ts
+
+    def _post_pm_status_reply(self, thread: SlackThreadRef, view: str):
+        try:
+            return self.gateway.post_thread_reply(
+                thread,
+                view,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+        except TypeError as exc:
+            if "unfurl" not in str(exc):
+                raise
+            return self.gateway.post_thread_reply(thread, view)
+
+    def _try_update_pm_status_message(self, channel_id: str, ts: str, view: str) -> bool:
+        try:
+            self.gateway.update_message(
+                channel_id,
+                ts,
+                view,
+                unfurl_links=False,
+                unfurl_media=False,
+                attachments=[],
+            )
+        except TypeError as exc:
+            if "unfurl" not in str(exc) and "attachments" not in str(exc):
+                LOGGER.debug(
+                    "failed to update PM status Slack message %s in %s",
+                    ts,
+                    channel_id,
+                    exc_info=True,
+                )
+                return False
+            try:
+                self.gateway.update_message(channel_id, ts, view)
+            except Exception:
+                LOGGER.debug(
+                    "failed to update PM status Slack message %s in %s",
+                    ts,
+                    channel_id,
+                    exc_info=True,
+                )
+                return False
+            return True
+        except Exception:
+            LOGGER.debug(
+                "failed to update PM status Slack message %s in %s",
+                ts,
+                channel_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def _pm_subtask_owner_label(
+        self,
+        subtask: PmSubtask,
+        deferred: DeferredWork,
+        task: AgentTask | None,
+    ) -> str:
+        if task is not None:
+            agent = self.store.get_team_agent(task.agent_id)
+            if agent is not None:
+                return f"@{agent.handle}"
+        for thread_task in reversed(
+            self.store.list_thread_agent_tasks(deferred.channel_id, deferred.thread_ts)
+        ):
+            if (
+                thread_task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY) == subtask.initiative_id
+                and thread_task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY) == subtask.local_id
+            ):
+                agent = self.store.get_team_agent(thread_task.agent_id)
+                if agent is not None:
+                    return f"@{agent.handle}"
+        if deferred.requested_handle:
+            return f"@{deferred.requested_handle}"
+        return "unassigned"
 
     def _refresh_pm_status_for_deferred(self, deferred_id: str) -> None:
         subtask = self.store.get_pm_subtask_by_deferred_id(deferred_id)
@@ -6322,6 +6482,15 @@ class SlackTeamController:
             )
             self._post_or_update_pm_status_message(initiative.initiative_id)
             return 1
+        if self.runtime is not None:
+            try:
+                self.evaluate_pending_deferred_work()
+                self._fire_due_deferred_work_now(limit=MAX_PM_SUBTASKS)
+            except Exception:
+                LOGGER.debug(
+                    "failed to advance PM deferred work during watchdog tick",
+                    exc_info=True,
+                )
         surfaced = 0
         all_terminal = True
         all_done = True
@@ -6519,6 +6688,28 @@ class SlackTeamController:
         for row in rows:
             if row.status != DeferredWorkStatus.WAITING_DEPS:
                 continue
+            cancelled_dependency = self._pm_cancelled_dependency(row)
+            if cancelled_dependency is not None:
+                dep, upstream = cancelled_dependency
+                subtask = self.store.get_pm_subtask_by_deferred_id(row.deferred_id)
+                initiative = (
+                    self.store.get_pm_initiative(subtask.initiative_id) if subtask else None
+                )
+                blocked_local_id = dep.local_id or upstream.deferred_id
+                if subtask is not None and initiative is not None:
+                    self._surface_pm_blocker(
+                        initiative,
+                        local_id=subtask.local_id,
+                        kind=f"cancelled_dependency:{blocked_local_id}",
+                        message=(
+                            f":warning: PM initiative `{initiative.initiative_id}` subtask "
+                            f"`{subtask.local_id}` is waiting because dependency "
+                            f"`{blocked_local_id}` was cancelled. I will not start downstream "
+                            "work until that prerequisite is rerun or the PM plan is updated."
+                        ),
+                    )
+                self._refresh_pm_status_for_deferred(row.deferred_id)
+                continue
             satisfied, _missing = self.store.evaluate_deferred_dependencies(row)
             if not satisfied:
                 continue
@@ -6546,6 +6737,37 @@ class SlackTeamController:
         for channel_id in promoted_channels:
             self._refresh_existing_roster(channel_id)
         return promoted
+
+    def _pm_cancelled_dependency(
+        self,
+        deferred: DeferredWork,
+    ) -> tuple[WorkDependency, DeferredWork] | None:
+        if self.store.get_pm_subtask_by_deferred_id(deferred.deferred_id) is None:
+            return None
+        for dep in deferred.depends_on:
+            if dep.kind != WorkDependencyKind.SUBTASK or not dep.task_id:
+                continue
+            upstream = self.store.get_deferred_work(dep.task_id)
+            if upstream is None:
+                continue
+            if upstream.status == DeferredWorkStatus.CANCELLED:
+                return dep, upstream
+            if upstream.last_task_id:
+                task = self.store.get_agent_task(upstream.last_task_id)
+                if task is not None and task.status == AgentTaskStatus.CANCELLED:
+                    return dep, upstream
+        return None
+
+    def _fire_due_deferred_work_now(self, *, limit: int = 50) -> int:
+        fired = 0
+        for deferred in self.store.list_due_deferred_work(limit=limit):
+            if deferred.last_task_id:
+                task = self.store.get_agent_task(deferred.last_task_id)
+                if task is not None and task.status == AgentTaskStatus.ACTIVE:
+                    continue
+            if self.fire_due_deferred_work(deferred):
+                fired += 1
+        return fired
 
     def fire_due_deferred_work(self, deferred: DeferredWork) -> bool:
         claimed = self.store.claim_deferred_work(deferred.deferred_id)
@@ -6681,6 +6903,7 @@ class SlackTeamController:
             )
             self._refresh_pm_status_for_deferred(deferred.deferred_id)
             return True
+        task = self._task_with_pm_dependency_thread_context(deferred, task)
         self.gateway.post_thread_reply(
             thread,
             "Dependencies are satisfied. Starting this PM subtask now.",
@@ -6707,6 +6930,49 @@ class SlackTeamController:
         )
         self._refresh_pm_status_for_deferred(deferred.deferred_id)
         return True
+
+    def _task_with_pm_dependency_thread_context(
+        self,
+        deferred: DeferredWork,
+        task: AgentTask,
+    ) -> AgentTask:
+        dependency_context = self._pm_dependency_thread_context(deferred)
+        if not dependency_context:
+            return task
+        latest = self.store.get_agent_task(task.task_id) or task
+        existing = latest.metadata.get("thread_context")
+        if isinstance(existing, str) and dependency_context in existing:
+            return latest
+        metadata = dict(latest.metadata)
+        if isinstance(existing, str) and existing.strip():
+            thread_context = f"{existing.strip()}\n\n{dependency_context}"
+        else:
+            thread_context = dependency_context
+        metadata["thread_context"] = thread_context[-20000:]
+        updated = replace(latest, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated)
+        return updated
+
+    def _pm_dependency_thread_context(self, deferred: DeferredWork) -> str | None:
+        sections: list[str] = []
+        for dep in deferred.depends_on:
+            if dep.kind != WorkDependencyKind.SUBTASK or not dep.task_id:
+                continue
+            upstream = self.store.get_deferred_work(dep.task_id)
+            if upstream is None:
+                continue
+            context = self._thread_context(upstream.channel_id, upstream.thread_ts)
+            if not context and upstream.message_ts and upstream.message_ts != upstream.thread_ts:
+                context = self._thread_context(upstream.channel_id, upstream.message_ts)
+            if not context:
+                continue
+            subtask = self.store.get_pm_subtask_by_deferred_id(upstream.deferred_id)
+            local_id = dep.local_id or (subtask.local_id if subtask else upstream.deferred_id)
+            title = subtask.title if subtask else upstream.description or upstream.prompt
+            sections.append(f"PM dependency subtask `{local_id}` — {title}\n{context}")
+        if not sections:
+            return None
+        return "\n\n".join(sections)[-20000:]
 
     def fire_due_scheduled_timer(self, timer: ScheduledTimer) -> bool:
         agent = self.store.get_team_agent(timer.agent_id)
@@ -6768,6 +7034,7 @@ class SlackTeamController:
             return False
         thread = SlackThreadRef(channel_id, thread_ts)
         completed = 0
+        completed_tasks: list[AgentTask] = []
         for thread_task in self.store.list_agent_tasks(include_done=True):
             if (
                 thread_task.channel_id == channel_id
@@ -6776,10 +7043,22 @@ class SlackTeamController:
             ):
                 if self.runtime:
                     self.runtime.stop_task(thread_task.task_id, AgentTaskStatus.DONE)
+                    latest = self.store.get_agent_task(thread_task.task_id)
+                    if latest is not None and latest.status not in {
+                        AgentTaskStatus.DONE,
+                        AgentTaskStatus.CANCELLED,
+                    }:
+                        self.store.update_agent_task_status(
+                            thread_task.task_id,
+                            AgentTaskStatus.DONE,
+                        )
                 else:
                     self.store.update_agent_task_status(thread_task.task_id, AgentTaskStatus.DONE)
                 self._mark_task_complete(thread_task, thread, include_thread=True)
                 completed += 1
+                completed_tasks.append(
+                    self.store.get_agent_task(thread_task.task_id) or thread_task
+                )
 
         cancelled = 0
         for pending in self.store.list_pending_work_requests(channel_id=channel_id, limit=500):
@@ -6816,9 +7095,13 @@ class SlackTeamController:
         # Threads outside this one may have just satisfied a dependency.
         try:
             self.evaluate_pending_deferred_work()
+            if self.runtime is not None:
+                self._fire_due_deferred_work_now(limit=MAX_PM_SUBTASKS)
         except Exception:
             LOGGER.debug("failed to evaluate deferred work after thread completion", exc_info=True)
         self._resume_pending_work_requests(channel_id)
+        for completed_task in completed_tasks:
+            self._refresh_pm_status_for_task(completed_task)
         self.refresh_or_post_roster(channel_id)
         return True
 
@@ -9121,6 +9404,35 @@ def _format_pm_subtask_parent_text(
     return "\n".join(lines)
 
 
+def _format_pm_capacity_shortfall_message(shortfall: _PmCapacityShortfall) -> str:
+    required = shortfall.required_workers
+    available = shortfall.available_workers
+    hire_count = shortfall.hire_count
+    required_word = "agent" if required == 1 else "agents"
+    available_word = "agent" if available == 1 else "agents"
+    available_verb = "is" if available == 1 else "are"
+    hire_word = "agent" if hire_count == 1 else "agents"
+    return (
+        "I can't start this PM plan yet because there are not enough free worker "
+        f"agents. The plan needs {required} available worker {required_word} at "
+        f"its widest parallel step, but only {available} worker {available_word} "
+        f"{available_verb} free right now. Hire {hire_count} more {hire_word} "
+        f"(`team hire {hire_count}`), then click *Start executing* again."
+    )
+
+
+def _pm_plan_parallel_worker_demand(plan: ParsedPmPlan) -> int:
+    """Return the widest same-depth worker demand in a topologically sorted plan."""
+    depth_by_id: dict[str, int] = {}
+    width_by_depth: dict[int, int] = {}
+    for subtask in plan.subtasks:
+        dep_depths = [depth_by_id[dep] for dep in subtask.depends_on if dep in depth_by_id]
+        depth = (max(dep_depths) + 1) if dep_depths else 1
+        depth_by_id[subtask.local_id] = depth
+        width_by_depth[depth] = width_by_depth.get(depth, 0) + 1
+    return max(width_by_depth.values(), default=0)
+
+
 def _pm_subtask_parent_blocks(text: str) -> list[dict]:
     return [
         {
@@ -9142,6 +9454,14 @@ def _format_deferred_ready_message(deferred: DeferredWork) -> str:
 def _pm_deferred_display_status(deferred: DeferredWork, task: AgentTask | None) -> str:
     if task is not None:
         if task.status == AgentTaskStatus.ACTIVE:
+            recoveries = managed_run_stall_recoveries(task)
+            if recoveries >= MANAGED_RUN_MAX_STALL_RECOVERIES:
+                return "stalled"
+            if recoveries > 0:
+                return "recovering"
+            age = managed_run_started_age(task)
+            if age is not None and age > MANAGED_RUN_STALL_TIMEOUT:
+                return "stalled"
             return "active"
         if task.status == AgentTaskStatus.DONE:
             return "done"
@@ -9179,6 +9499,8 @@ def _pm_subtask_status_label(status: str) -> str:
         "ready": ":large_green_circle: ready",
         "starting": ":rocket: starting",
         "active": ":large_blue_circle: active",
+        "recovering": ":arrows_counterclockwise: recovering",
+        "stalled": ":warning: stalled",
         "queued": ":inbox_tray: queued",
         "done": ":white_check_mark: done",
         "cancelled": ":no_entry: cancelled",
@@ -9191,13 +9513,15 @@ def _pm_subtask_status_sort_key(status: str) -> tuple[int, str]:
     order = {
         "missing": 0,
         "cancelled": 1,
-        "active": 2,
-        "starting": 3,
-        "ready": 4,
-        "reserved": 5,
-        "waiting_deps": 6,
-        "queued": 7,
-        "done": 8,
+        "stalled": 2,
+        "recovering": 3,
+        "active": 4,
+        "starting": 5,
+        "ready": 6,
+        "reserved": 7,
+        "waiting_deps": 8,
+        "queued": 9,
+        "done": 10,
     }
     return (order.get(status, 99), status)
 
@@ -9926,6 +10250,8 @@ def _task_should_show_action_buttons(task: AgentTask) -> bool:
 
 
 def _is_subtask(task: AgentTask) -> bool:
+    if isinstance(task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY), str):
+        return True
     parent_task_id = task.metadata.get("parent_task_id")
     if isinstance(parent_task_id, str):
         if parent_task_id != task.task_id:

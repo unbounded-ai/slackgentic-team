@@ -145,8 +145,27 @@ class FakeGateway:
         )
         return PostedMessage(channel_id=channel_id, ts=ts, thread_ts=thread_ts)
 
-    def update_message(self, channel_id, ts, text, blocks=None):
-        self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
+    def update_message(
+        self,
+        channel_id,
+        ts,
+        text,
+        blocks=None,
+        unfurl_links=None,
+        unfurl_media=None,
+        attachments=None,
+    ):
+        self.updates.append(
+            {
+                "channel_id": channel_id,
+                "ts": ts,
+                "text": text,
+                "blocks": blocks,
+                "unfurl_links": unfurl_links,
+                "unfurl_media": unfurl_media,
+                "attachments": attachments,
+            }
+        )
 
     def permalink(self, channel_id, message_ts):
         return f"https://example.slack.com/archives/{channel_id}/p{message_ts.replace('.', '')}"
@@ -154,7 +173,16 @@ class FakeGateway:
     def pin_message(self, channel_id, message_ts):
         self.pins.append((channel_id, message_ts))
 
-    def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
+    def post_thread_reply(
+        self,
+        thread,
+        text,
+        persona=None,
+        icon_url=None,
+        blocks=None,
+        unfurl_links=None,
+        unfurl_media=None,
+    ):
         ts = f"1712345679.{len(self.thread_replies):06d}"
         self.thread_replies.append(
             {
@@ -163,6 +191,8 @@ class FakeGateway:
                 "persona": persona,
                 "icon_url": icon_url,
                 "blocks": blocks,
+                "unfurl_links": unfurl_links,
+                "unfurl_media": unfurl_media,
                 "ts": ts,
             }
         )
@@ -8391,6 +8421,56 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_startup_reconcile_restarts_interrupted_managed_run_with_live_session_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "continue after restart", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    session_provider=Provider.CODEX,
+                    session_id="codex-thread-1",
+                    metadata={MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat()},
+                )
+                store.upsert_agent_task(task)
+                store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="codex-thread-1",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        cwd=Path(tmp),
+                        started_at=utc_now(),
+                        last_seen_at=utc_now(),
+                        status=SessionStatus.ACTIVE,
+                        control_mode=ControlMode.MANAGED,
+                    )
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                resumed = controller.cancel_orphaned_active_tasks()
+
+                self.assertEqual(resumed, 1)
+                self.assertEqual(len(runtime.started), 1)
+                restarted, _restarted_agent, _restarted_thread = runtime.started[0]
+                self.assertEqual(restarted.task_id, task.task_id)
+                self.assertEqual(restarted.session_id, "codex-thread-1")
+                self.assertEqual(managed_run_resume_attempts(restarted), 1)
+            finally:
+                store.close()
+
     def test_restarted_managed_run_exit_keeps_root_task_occupied(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -8523,7 +8603,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_startup_reconcile_keeps_stale_marker_when_session_still_alive(self):
+    def test_startup_reconcile_abandons_stale_marker_when_session_row_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -8574,12 +8654,12 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(runtime.started, [])
                 persisted = store.get_agent_task(task.task_id)
                 assert persisted is not None
-                self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
-                self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
             finally:
                 store.close()
 
-    def test_startup_reconcile_keeps_exhausted_attempts_when_session_alive(self):
+    def test_startup_reconcile_abandons_exhausted_attempts_when_session_row_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -8627,11 +8707,11 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(runtime.started, [])
                 persisted = store.get_agent_task(task.task_id)
                 assert persisted is not None
-                self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+                self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
             finally:
                 store.close()
 
-    def test_startup_reconcile_roster_shows_agent_busy_when_task_kept_active(self):
+    def test_startup_reconcile_roster_releases_agent_when_stale_marker_abandoned(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -8676,7 +8756,7 @@ class SlackAppTests(unittest.TestCase):
                 controller.cancel_orphaned_active_tasks()
                 controller.post_roster("C1")
 
-                self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
+                self.assertIn("1 available, 0 occupied", gateway.posts[-1]["text"])
             finally:
                 store.close()
 
