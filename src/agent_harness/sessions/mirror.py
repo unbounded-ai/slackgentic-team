@@ -176,6 +176,9 @@ class SessionMirror:
                     continue
                 active_session_keys.add(_external_session_key(session.provider, session.session_id))
                 if not self._should_sync_session(session, channel_id):
+                    if session.status == SessionStatus.IDLE:
+                        self._mark_session_not_pending(session)
+                        self._update_capacity_notice_if_clear(channel_id, session.provider)
                     continue
                 sync_sessions.append((provider, session))
         self._cleanup_inactive_external_sessions(active_session_keys, channel_id)
@@ -576,6 +579,10 @@ class SessionMirror:
         return matches[0][1]
 
     def _live_target_matches_session(self, session: AgentSession, target) -> bool:
+        if session.provider == Provider.CODEX:
+            if not _session_could_belong_to_live_target(session, target):
+                return False
+            return _is_latest_live_session_for_cwd(self.store, session, target)
         if session.provider != Provider.CLAUDE:
             return True
         if not _session_can_use_live_target(session):

@@ -1027,6 +1027,113 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_pending_idle_thread_without_live_target_is_pruned_from_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                store.set_setting("external_session_pending.codex.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.codex", "170.000001")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
+                self.assertEqual(gateway.posts, [])
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn(
+                    "Codex capacity for sessions started outside Slack is available now.",
+                    gateway.updates[0][2],
+                )
+            finally:
+                store.close()
+
+    def test_older_codex_session_does_not_keep_newer_live_target_same_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                old_started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                new_started = old_started + timedelta(hours=3)
+                old_session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="old",
+                    transcript_path=Path(tmp) / "old-codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=old_started,
+                    last_seen_at=old_started,
+                )
+                new_session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="new",
+                    transcript_path=Path(tmp) / "new-codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=new_started,
+                    last_seen_at=new_started,
+                )
+                store.upsert_session(old_session)
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "old",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                store.set_setting("external_session_live_target.codex.old", "123")
+                store.set_setting("external_session_pending.codex.old", "now")
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([old_session, new_session], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [],
+                        provider_targets=[
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp),
+                                command="codex --remote ws://127.0.0.1:47684",
+                                started_at=new_started,
+                            )
+                        ],
+                    ),
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_live_target.codex.old"))
+                self.assertIsNone(store.get_setting("external_session_pending.codex.old"))
+                self.assertIsNotNone(store.get_setting("external_session_pending.codex.new"))
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("1 Codex session is waiting", gateway.posts[0][1])
+            finally:
+                store.close()
+
     def test_external_sessions_do_not_overfill_available_provider_team(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
