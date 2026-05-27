@@ -144,6 +144,12 @@ def main(argv: list[str] | None = None) -> int:
     service_install.add_argument("--no-codex-app-server", action="store_true")
     service_install.add_argument("--codex-app-server-url", default="ws://127.0.0.1:47684")
     service_install.add_argument("--codex-binary", type=Path)
+    service_install.add_argument(
+        "--ignore-external-session-cwd",
+        action="append",
+        dest="ignored_external_session_cwds",
+        help="Ignore observed external agent sessions whose cwd matches this path pattern.",
+    )
     service_uninstall = service_sub.add_parser("uninstall", help="Stop and remove the service")
     service_uninstall.add_argument("--name", default="slackgentic-team")
     service_start = service_sub.add_parser("start", help="Start installed services")
@@ -165,6 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     service_print.add_argument("--no-codex-app-server", action="store_true")
     service_print.add_argument("--codex-app-server-url", default="ws://127.0.0.1:47684")
     service_print.add_argument("--codex-binary", type=Path)
+    service_print.add_argument(
+        "--ignore-external-session-cwd",
+        action="append",
+        dest="ignored_external_session_cwds",
+        help="Ignore observed external agent sessions whose cwd matches this path pattern.",
+    )
 
     run_once = sub.add_parser("index-once", help="Index local sessions into SQLite")
     run_once.add_argument("--db", type=Path)
@@ -198,6 +210,12 @@ def main(argv: list[str] | None = None) -> int:
     slack_serve.add_argument("--config-file", type=Path)
     slack_serve.add_argument("--db", type=Path)
     slack_serve.add_argument("--home", type=Path)
+    slack_serve.add_argument(
+        "--ignore-external-session-cwd",
+        action="append",
+        dest="ignored_external_session_cwds",
+        help="Ignore observed external agent sessions whose cwd matches this path pattern.",
+    )
     slack_reset_state = slack_sub.add_parser(
         "reset-state",
         help="Delete local SQLite runtime state while preserving Slack credentials",
@@ -356,6 +374,21 @@ def main(argv: list[str] | None = None) -> int:
         }
         if overrides:
             config = AppConfig.model_validate({**config.model_dump(), **overrides})
+        ignored_external_session_cwds = getattr(args, "ignored_external_session_cwds", None)
+        if ignored_external_session_cwds is not None:
+            config = config.model_copy(
+                update={
+                    "sessions": config.sessions.model_copy(
+                        update={
+                            "ignored_external_session_cwds": tuple(
+                                cwd.strip()
+                                for cwd in ignored_external_session_cwds
+                                if cwd and cwd.strip()
+                            )
+                        }
+                    )
+                }
+            )
         if args.slack_command == "reset-state":
             return _reset_slack_state(config, yes=args.yes)
         if args.slack_command == "close-channel":
@@ -414,6 +447,7 @@ def _service(args: argparse.Namespace) -> int:
             name=args.name,
             working_directory=args.workdir,
             config_file=args.config_file,
+            ignored_external_session_cwds=args.ignored_external_session_cwds,
         )
         specs = [daemon_spec]
         if not args.no_codex_app_server:

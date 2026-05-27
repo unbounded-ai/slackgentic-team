@@ -8338,6 +8338,7 @@ class SocketModeSlackApp:
             ),
             on_agent_message=self.controller.handle_mirrored_session_agent_message,
             home=config.home,
+            ignored_cwd_patterns=config.sessions.ignored_external_session_cwds,
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()

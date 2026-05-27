@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import tempfile
@@ -19,6 +20,9 @@ class ConfigTests(unittest.TestCase):
                     "SLACKGENTIC_INSTANCE": "riley",
                     "SLACKGENTIC_SLASH_COMMAND": "/slackgentic-riley",
                     "SLACKGENTIC_CODEX_AGENTS": "2",
+                    "SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS": json.dumps(
+                        ["/workspace/repos/example-project/.local"]
+                    ),
                     "SLACKGENTIC_UPDATE_REPOSITORY": "example-org/example-repo",
                     "SLACKGENTIC_UPDATE_CHECK_INTERVAL_SECONDS": "120",
                     "SLACKGENTIC_STATE_DB": str(Path(tmp) / "file.sqlite"),
@@ -31,6 +35,9 @@ class ConfigTests(unittest.TestCase):
                 {
                     "SLACK_BOT_TOKEN": "xoxb-env",
                     "SLACKGENTIC_CONFIG_FILE": str(config_file),
+                    "SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS": (
+                        "build/.cache,/tmp/example-cache"
+                    ),
                 },
                 clear=True,
             ):
@@ -42,6 +49,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.slack.instance_slug, "riley")
             self.assertEqual(config.slack.slash_command, "/slackgentic-riley")
             self.assertEqual(config.team.default_codex_agents, 2)
+            self.assertEqual(
+                config.sessions.ignored_external_session_cwds,
+                ("build/.cache", "/tmp/example-cache"),
+            )
             self.assertEqual(config.updates.repository, "example-org/example-repo")
             self.assertEqual(config.updates.check_interval_seconds, 120)
             self.assertEqual(config.state_db, Path(tmp) / "file.sqlite")

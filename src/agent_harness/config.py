@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_harness.team import DEFAULT_CLAUDE_TEAM_SIZE, DEFAULT_CODEX_TEAM_SIZE
 from agent_harness.updates import (
@@ -83,6 +83,33 @@ class TeamConfig(BaseModel):
     )
 
 
+class SessionConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ignored_external_session_cwds: tuple[str, ...] = Field(
+        default=(),
+        validation_alias="SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS",
+    )
+
+    @field_validator("ignored_external_session_cwds", mode="before")
+    @classmethod
+    def _parse_ignored_external_session_cwds(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return ()
+            if stripped.startswith("["):
+                decoded = json.loads(stripped)
+                return cls._parse_ignored_external_session_cwds(decoded)
+            separator = os.pathsep if os.pathsep in stripped and "," not in stripped else ","
+            return tuple(part.strip() for part in stripped.split(separator) if part.strip())
+        if isinstance(value, (list, tuple, set)):
+            return tuple(str(part).strip() for part in value if str(part).strip())
+        return (str(value).strip(),) if str(value).strip() else ()
+
+
 class UpdateConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -108,6 +135,7 @@ class AppConfig(BaseModel):
     poll_seconds: float = 1.0
     slack: SlackConfig = Field(default_factory=SlackConfig)
     commands: AgentCommandConfig = Field(default_factory=AgentCommandConfig)
+    sessions: SessionConfig = Field(default_factory=SessionConfig)
     team: TeamConfig = Field(default_factory=TeamConfig)
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
 
@@ -159,6 +187,7 @@ def load_config_from_env(config_file: Path | None = None) -> AppConfig:
     if home:
         config_values["home"] = Path(home)
     config_values["slack"] = SlackConfig.model_validate(merged_values)
+    config_values["sessions"] = SessionConfig.model_validate(merged_values)
     config_values["team"] = TeamConfig.model_validate(merged_values)
     config_values["commands"] = AgentCommandConfig.model_validate(merged_values)
     config_values["updates"] = UpdateConfig.model_validate(merged_values)
