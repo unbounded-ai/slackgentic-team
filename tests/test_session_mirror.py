@@ -12,6 +12,7 @@ from agent_harness.models import (
     Provider,
     SessionStatus,
     SlackThreadRef,
+    TeamAgentKind,
 )
 from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.mirror import SessionMirror, render_session_event
@@ -1177,6 +1178,76 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(len(gateway.posts), 1)
                 self.assertIn("No Codex team seat is available", gateway.posts[0][1])
                 self.assertIn("Hire 1 Codex agent", str(gateway.posts[0][2]))
+            finally:
+                store.close()
+
+    def test_external_session_assignment_does_not_use_pm_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                pm_agent = replace(
+                    build_initial_model_team(codex_count=1, claude_count=0)[0],
+                    kind=TeamAgentKind.PM,
+                )
+                store.upsert_team_agent(pm_agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+            finally:
+                store.close()
+
+    def test_external_session_clears_pm_assignment_without_worker_takeover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                team = build_initial_model_team(codex_count=2, claude_count=0)
+                worker = team[0]
+                pm_agent = replace(team[1], kind=TeamAgentKind.PM)
+                store.upsert_team_agent(worker)
+                store.upsert_team_agent(pm_agent)
+                store.set_setting("external_session_agent.codex.s1", pm_agent.agent_id)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.posts, [])
             finally:
                 store.close()
 

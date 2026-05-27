@@ -52,7 +52,10 @@ _GIT_SAFE_SUBCOMMAND_TOOLS: dict[str, tuple[str, ...]] = {
     "cat-file": ("Bash(git cat-file:*)", "Bash(git cat-file *)"),
     "merge-base": ("Bash(git merge-base:*)", "Bash(git merge-base *)"),
     "for-each-ref": ("Bash(git for-each-ref:*)", "Bash(git for-each-ref *)"),
+    "branch": ("Bash(git branch:*)", "Bash(git branch *)"),
+    "remote": ("Bash(git remote:*)", "Bash(git remote *)"),
 }
+_GIT_EXACT_ONLY_SAFE_SUBCOMMANDS = {"branch", "remote"}
 _GIT_PR_AUTHORING_SUBCOMMAND_TOOLS: dict[str, tuple[str, ...]] = {
     "add": ("Bash(git add:*)", "Bash(git add *)"),
     "commit": ("Bash(git commit:*)", "Bash(git commit *)"),
@@ -77,7 +80,12 @@ _SED_SAFE_TOOLS = ("Bash(sed -n:*)", "Bash(sed -n *)")
 BASH_SAFE_AUTO_ALLOWED_TOOLS: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
-            *[tool for tools in _GIT_SAFE_SUBCOMMAND_TOOLS.values() for tool in tools],
+            *[
+                tool
+                for action, tools in _GIT_SAFE_SUBCOMMAND_TOOLS.items()
+                if action not in _GIT_EXACT_ONLY_SAFE_SUBCOMMANDS
+                for tool in tools
+            ],
             *[tool for tools in _GIT_PR_AUTHORING_SUBCOMMAND_TOOLS.values() for tool in tools],
             *_GIT_PULL_TOOLS,
             *_GIT_CONFIG_READ_TOOLS,
@@ -274,7 +282,7 @@ def _safe_redirection(fd: str, op: str, target: str) -> str | None:
 def _word_has_shell_control(value: str) -> bool:
     return any(
         marker in value
-        for marker in (";", "&&", "||", "|", ">", "<", "&", "$(", "`", "(", ")", "\n", "\r")
+        for marker in (";", "&&", "||", ">", "<", "&", "$(", "`", "(", ")", "\n", "\r")
     )
 
 
@@ -306,6 +314,10 @@ def _unsafe_git_reason(parts: tuple[str, ...]) -> str | None:
         return _unsafe_git_pull_reason(remaining)
     if action == "config":
         return _unsafe_git_config_reason(remaining)
+    if action == "branch":
+        return _unsafe_git_branch_reason(remaining)
+    if action == "remote":
+        return _unsafe_git_remote_reason(remaining)
     if action == "add":
         return _unsafe_git_add_reason(remaining)
     if action == "commit":
@@ -334,6 +346,31 @@ def _unsafe_git_config_reason(parts: tuple[str, ...]) -> str | None:
     if len(parts) == 2 and parts[0] == "--get" and parts[1] in {"user.name", "user.email"}:
         return None
     return "unsupported git config lookup"
+
+
+def _unsafe_git_branch_reason(parts: tuple[str, ...]) -> str | None:
+    allowed_flags = {
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "-v",
+        "-vv",
+        "--verbose",
+        "--list",
+        "--show-current",
+    }
+    if all(part in allowed_flags for part in parts):
+        return None
+    return "unsupported git branch invocation"
+
+
+def _unsafe_git_remote_reason(parts: tuple[str, ...]) -> str | None:
+    if not parts or parts in {("-v",), ("--verbose",)}:
+        return None
+    if len(parts) == 2 and parts[0] == "get-url" and _safe_shell_arg(parts[1]):
+        return None
+    return "unsupported git remote invocation"
 
 
 def _unsafe_git_add_reason(parts: tuple[str, ...]) -> str | None:
@@ -654,6 +691,8 @@ def _allowed_git_bash_tools(parts: tuple[str, ...]) -> tuple[str, ...]:
     if git_command is None:
         return ()
     action, prefix = git_command
+    if action in _GIT_EXACT_ONLY_SAFE_SUBCOMMANDS:
+        return ()
     patterns = list(_GIT_SAFE_SUBCOMMAND_TOOLS.get(action, ()))
     if ")" not in prefix and "," not in prefix:
         patterns.extend((f"Bash({prefix}:*)", f"Bash({prefix} *)"))

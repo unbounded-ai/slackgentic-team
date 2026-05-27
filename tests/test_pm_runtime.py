@@ -1428,7 +1428,7 @@ class PmRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_pm_approval_ignores_external_sessions_for_capacity_slots(self):
+    def test_pm_approval_prompts_to_hire_when_external_session_fills_capacity(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -1439,21 +1439,20 @@ class PmRuntimeTests(unittest.TestCase):
                 pm_agent = hire_team_agents(workers, 1, kind=TeamAgentKind.PM)[0]
                 for agent in [*workers, pm_agent]:
                     store.upsert_team_agent(agent)
-                for index, worker in enumerate(workers):
-                    provider = worker.provider_preference or Provider.CODEX
-                    session_id = f"busy-{index}"
-                    store.upsert_session(
-                        AgentSession(
-                            provider=provider,
-                            session_id=session_id,
-                            transcript_path=Path(tmp) / f"{session_id}.jsonl",
-                            status=SessionStatus.ACTIVE,
-                        )
+                busy_worker = workers[0]
+                provider = busy_worker.provider_preference or Provider.CODEX
+                store.upsert_session(
+                    AgentSession(
+                        provider=provider,
+                        session_id="external-busy",
+                        transcript_path=Path(tmp) / "external-busy.jsonl",
+                        status=SessionStatus.ACTIVE,
                     )
-                    store.set_setting(
-                        f"external_session_agent.{provider.value}.{session_id}",
-                        worker.agent_id,
-                    )
+                )
+                store.set_setting(
+                    f"external_session_agent.{provider.value}.external-busy",
+                    busy_worker.agent_id,
+                )
                 thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
                 initiative = store.create_pm_initiative(
                     thread_ref,
@@ -1525,20 +1524,16 @@ class PmRuntimeTests(unittest.TestCase):
 
                 still_parked = store.get_pm_initiative(initiative.initiative_id)
                 assert still_parked is not None
-                self.assertEqual(still_parked.status, PmInitiativeStatus.ACTIVE)
-                self.assertEqual(len(store.list_pm_subtasks(initiative.initiative_id)), 3)
-                self.assertFalse(
-                    any(
-                        "not enough free worker agents" in reply["text"]
-                        for reply in gateway.thread_replies
-                    )
-                )
-                started_worker_ids = {
-                    task.agent_id
-                    for task, _agent, _thread in runtime.started
-                    if task.task_id != pm_task.task_id
-                }
-                self.assertEqual(started_worker_ids, {agent.agent_id for agent in workers})
+                self.assertEqual(still_parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertIsNotNone(still_parked.pending_plan_json)
+                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
+                self.assertEqual(runtime.started, [])
+                capacity_message = gateway.thread_replies[-1]["text"]
+                self.assertIn("not enough free worker agents", capacity_message)
+                self.assertIn("needs 3 available worker agents", capacity_message)
+                self.assertIn("only 2 worker agents are free", capacity_message)
+                self.assertIn("Hire 1 more agent", capacity_message)
+                self.assertIn("`team hire 1`", capacity_message)
             finally:
                 store.close()
 
@@ -2345,7 +2340,7 @@ class PmReplanRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_pm_replan_does_not_hijack_busy_pm_owner(self):
+    def test_pm_replan_clears_invalid_pm_external_session_assignment(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2402,11 +2397,17 @@ class PmReplanRuntimeTests(unittest.TestCase):
                     }
                 )
 
-                self.assertEqual(runtime.started, [])
+                self.assertEqual(len(runtime.started), 1)
                 refreshed = store.get_pm_initiative(initiative.initiative_id)
                 assert refreshed is not None
-                self.assertEqual(refreshed.status, PmInitiativeStatus.ACTIVE)
-                self.assertIn("is busy right now", gateway.thread_replies[-1]["text"])
+                self.assertEqual(refreshed.status, PmInitiativeStatus.PLANNING)
+                self.assertIsNone(
+                    store.get_setting(f"external_session_agent.{provider.value}.busy-pm")
+                )
+                self.assertIsNotNone(
+                    store.get_setting(f"external_session_ignored.{provider.value}.busy-pm")
+                )
+                self.assertIn("Replanning this initiative", gateway.thread_replies[-1]["text"])
             finally:
                 store.close()
 
