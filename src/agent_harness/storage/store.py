@@ -2228,6 +2228,8 @@ class Store:
         agent_id = self.get_setting(f"external_session_agent.{provider.value}.{session_id}")
         if not agent_id:
             return False
+        if self.get_team_agent(agent_id) is None:
+            return False
         session = self.get_session(provider, session_id)
         return bool(session and session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE})
 

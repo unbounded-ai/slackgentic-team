@@ -471,10 +471,12 @@ class SessionMirror:
         setting_key = _external_session_agent_setting_key(session)
         assigned_agent_id = self.store.get_setting(setting_key)
         if assigned_agent_id:
-            agent = self.store.get_team_agent(assigned_agent_id)
+            agent = self._assigned_external_session_agent(session)
             if agent is not None:
                 self._mark_session_not_pending(session)
                 return agent
+            self.store.delete_setting(setting_key)
+            self._notify_external_session_occupancy_changed(channel_id)
         active_agents = self.store.list_team_agents()
         if not active_agents:
             self._mark_session_pending(session)
@@ -510,10 +512,9 @@ class SessionMirror:
             return False
         live_target_key = _external_session_live_target_key(session)
         stored_pid = _int_setting(self.store.get_setting(live_target_key))
-        assigned_key = _external_session_agent_setting_key(session)
         was_tracked = bool(
             stored_pid is not None
-            or self.store.get_setting(assigned_key)
+            or self._assigned_external_session_agent(session)
             or self._thread_for_session(session, channel_id) is not None
         )
         if session.status == SessionStatus.IDLE and not was_tracked:
@@ -653,18 +654,23 @@ class SessionMirror:
         if session.status != SessionStatus.IDLE:
             return False
         return bool(
-            self.store.get_setting(_external_session_agent_setting_key(session))
+            self._assigned_external_session_agent(session)
             or self.store.get_setting(_external_session_live_target_key(session))
         )
 
     def _tracked_external_session(self, session: AgentSession, channel_id: str) -> bool:
         return bool(
-            self.store.get_setting(_external_session_agent_setting_key(session))
+            self._assigned_external_session_agent(session)
             or self.store.get_setting(_external_session_live_target_key(session))
             or self.store.get_setting(_external_session_missing_target_key(session))
-            or self.store.get_setting(_pending_external_session_key(session))
             or self._thread_for_session(session, channel_id) is not None
         )
+
+    def _assigned_external_session_agent(self, session: AgentSession) -> TeamAgent | None:
+        assigned_agent_id = self.store.get_setting(_external_session_agent_setting_key(session))
+        if not assigned_agent_id:
+            return None
+        return self.store.get_team_agent(assigned_agent_id)
 
     def _skip_ignored_cwd_session(self, session: AgentSession, channel_id: str) -> bool:
         if not _cwd_matches_ignored_patterns(session.cwd, self.ignored_cwd_patterns):

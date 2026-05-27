@@ -952,6 +952,81 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_pending_idle_session_without_thread_is_pruned_from_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                store.set_setting("external_session_pending.codex.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.codex", "170.000001")
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.IDLE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
+                self.assertEqual(gateway.posts, [])
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn(
+                    "Codex capacity for sessions started outside Slack is available now.",
+                    gateway.updates[0][2],
+                )
+            finally:
+                store.close()
+
+    def test_idle_session_assigned_to_fired_agent_is_pruned_from_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.fire_team_agent(agent.agent_id)
+                store.set_setting("external_session_agent.codex.s1", agent.agent_id)
+                store.set_setting("external_session_pending.codex.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.codex", "170.000001")
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.IDLE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
+                self.assertEqual(gateway.posts, [])
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertIn(
+                    "Codex capacity for sessions started outside Slack is available now.",
+                    gateway.updates[0][2],
+                )
+            finally:
+                store.close()
+
     def test_external_sessions_do_not_overfill_available_provider_team(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
