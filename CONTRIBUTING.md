@@ -12,7 +12,7 @@ python -m venv .venv
 Run the same checks used by CI:
 
 ```sh
-PYTHONPATH=src python -m unittest discover -s tests
+PYTHONPATH=src python -m pytest -n auto tests
 PYTHONPATH=src python -m compileall src tests
 python -m ruff check src tests
 python -m ruff format --check src tests
@@ -23,7 +23,9 @@ unit tests is not enough: CI has a separate formatting gate, and
 `python -m ruff format --check src tests` will fail the PR if the formatter
 would rewrite even one file.
 
-The test suite uses `unittest` and should not require network access.
+The test suite is written with `unittest` and run through `pytest` in CI so
+`pytest-xdist` can split tests across workers. It should not require network
+access.
 
 ## Public Change Metadata
 
