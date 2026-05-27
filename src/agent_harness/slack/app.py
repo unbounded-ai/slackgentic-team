@@ -6857,8 +6857,9 @@ class SlackTeamController:
                     self.store.get_pm_initiative(subtask.initiative_id) if subtask else None
                 )
                 blocked_local_id = dep.local_id or upstream.deferred_id
+                surfaced = False
                 if subtask is not None and initiative is not None:
-                    self._surface_pm_blocker(
+                    surfaced = self._surface_pm_blocker(
                         initiative,
                         local_id=subtask.local_id,
                         kind=f"cancelled_dependency:{blocked_local_id}",
@@ -6869,7 +6870,8 @@ class SlackTeamController:
                             "work until that prerequisite is rerun or the PM plan is updated."
                         ),
                     )
-                self._refresh_pm_status_for_deferred(row.deferred_id)
+                if surfaced:
+                    self._refresh_pm_status_for_deferred(row.deferred_id)
                 continue
             satisfied, _missing = self.store.evaluate_deferred_dependencies(row)
             if not satisfied:

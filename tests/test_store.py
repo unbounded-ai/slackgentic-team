@@ -23,6 +23,7 @@ from agent_harness.models import (
     WorkDependencyKind,
     WorkRequest,
     deferred_work_dependency_id,
+    external_session_dependency_id,
     utc_now,
 )
 from agent_harness.storage.store import Store
@@ -299,6 +300,41 @@ class StoreTests(unittest.TestCase):
                 stored = store.get_deferred_work(deferred.deferred_id)
                 assert stored is not None
                 self.assertEqual(stored.status, DeferredWorkStatus.CANCELLED)
+            finally:
+                store.close()
+
+    def test_fired_external_session_agent_does_not_block_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                store.fire_team_agent(agent.agent_id)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_agent.codex.s1", agent.agent_id)
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.deferred", "171.deferred"),
+                    WorkRequest(prompt="continue", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(
+                        WorkDependency(
+                            kind=WorkDependencyKind.AGENT_BUSY,
+                            task_id=external_session_dependency_id(Provider.CODEX, "s1"),
+                        ),
+                    ),
+                )
+
+                satisfied, missing = store.evaluate_deferred_dependencies(deferred)
+
+                self.assertTrue(satisfied)
+                self.assertEqual(missing, [])
             finally:
                 store.close()
 

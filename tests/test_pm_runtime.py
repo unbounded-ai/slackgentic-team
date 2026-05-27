@@ -1351,6 +1351,16 @@ class PmRuntimeTests(unittest.TestCase):
                 blocker_text = "\n".join(reply["text"] for reply in gateway.thread_replies)
                 self.assertIn("dependency `investigate` was cancelled", blocker_text)
                 self.assertIn("will not start downstream work", blocker_text)
+                reply_count = len(gateway.thread_replies)
+                update_count = len(gateway.updates)
+
+                promoted_again = controller.evaluate_pending_deferred_work(
+                    child_deferred.deferred_id
+                )
+
+                self.assertEqual(promoted_again, 0)
+                self.assertEqual(len(gateway.thread_replies), reply_count)
+                self.assertEqual(len(gateway.updates), update_count)
             finally:
                 store.close()
 
