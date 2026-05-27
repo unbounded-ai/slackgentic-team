@@ -97,6 +97,10 @@ SAFE_SIMPLE_COMMANDS = (
     "git -C /path-with-spaces log --oneline -5",
     "git blame src/agent_harness/bash_policy.py",
     "git rev-parse --show-toplevel",
+    "git branch -a",
+    "git branch --show-current",
+    "git remote -v",
+    "git remote get-url origin",
     "gh pr view 35 --json url,state,mergeable",
     "gh pr create --title update --body summary",
     "git pull",
@@ -232,6 +236,8 @@ def _git_command_for(prefix: str, subcommand: str, file: str, word: str, count: 
         "cat-file": "-p HEAD",
         "merge-base": "HEAD main",
         "for-each-ref": "refs/heads",
+        "branch": "-a",
+        "remote": "-v",
     }[subcommand]
     return f"{prefix} {subcommand} {args}".strip()
 

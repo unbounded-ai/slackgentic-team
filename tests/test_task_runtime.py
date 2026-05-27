@@ -190,6 +190,18 @@ class ClaudeSequencedPatchLookupPermissionDeniedProcess(ClaudePermissionDeniedPr
     description = "Check for prior patch file"
 
 
+class ClaudeGitBranchPermissionDeniedProcess(ClaudePermissionDeniedProcess):
+    session_id = "claude-git-branch-session"
+    command = 'git -C /workspace/repos/example-project branch -a | grep -E "design|operator"'
+    description = "Find design branches"
+
+
+class ClaudeGitRemotePermissionDeniedProcess(ClaudePermissionDeniedProcess):
+    session_id = "claude-git-remote-session"
+    command = "cd /workspace/repos/example-project && git remote -v 2>/dev/null"
+    description = "Get git remote info"
+
+
 class ClaudeDangerousPermissionDeniedThenFinalProcess(OneShotProcess):
     session_id = "claude-dangerous-denied-session"
 
@@ -3620,6 +3632,65 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_runtime_retries_safe_auto_git_branch_remote_denials_without_slack_approval(self):
+        def build_process_factory(process_class, requests):
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return process_class(request)
+                return ClaudeOneShotProcess(request)
+
+            return process_factory
+
+        cases = (
+            (
+                ClaudeGitBranchPermissionDeniedProcess,
+                "claude-git-branch-session",
+                'Bash(git -C /workspace/repos/example-project branch -a | grep -E "design|operator")',
+            ),
+            (
+                ClaudeGitRemotePermissionDeniedProcess,
+                "claude-git-remote-session",
+                "Bash(cd /workspace/repos/example-project && git remote -v 2>/dev/null)",
+            ),
+        )
+        for process_class, session_id, allowed_tool in cases:
+            with self.subTest(session_id=session_id), tempfile.TemporaryDirectory() as tmp:
+                store = Store(Path(tmp) / "state.sqlite")
+                requests = []
+                process_factory = build_process_factory(process_class, requests)
+                try:
+                    store.init_schema()
+                    agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                    store.upsert_team_agent(agent)
+                    task = create_agent_task(agent, "inspect git metadata", "C1")
+                    store.upsert_agent_task(task)
+                    gateway = FakeGateway()
+                    runtime = ManagedTaskRuntime(
+                        store,
+                        gateway,
+                        AgentCommandConfig(),
+                        process_factory=process_factory,
+                        poll_seconds=0.01,
+                    )
+
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                    for _ in range(100):
+                        if "Done" in gateway.replies:
+                            break
+                        time.sleep(0.01)
+
+                    self.assertEqual(gateway.replies, ["Done"])
+                    self.assertEqual(len(requests), 2)
+                    self.assertEqual(requests[1].resume_session_id, session_id)
+                    self.assertIn(allowed_tool, requests[1].allowed_tools)
+                    self.assertEqual(
+                        store.list_pending_slack_agent_requests("claude/channel/permission"),
+                        [],
+                    )
+                finally:
+                    store.close()
 
     def test_runtime_retries_managed_claude_after_slack_approval(self):
         with tempfile.TemporaryDirectory() as tmp:

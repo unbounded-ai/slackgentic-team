@@ -21,6 +21,7 @@ from agent_harness.models import (
     SessionStatus,
     SlackThreadRef,
     TeamAgent,
+    TeamAgentKind,
     utc_now,
 )
 from agent_harness.providers.base import AgentProvider
@@ -475,18 +476,29 @@ class SessionMirror:
         assigned_agent_id = self.store.get_setting(setting_key)
         if assigned_agent_id:
             agent = self._assigned_external_session_agent(session)
-            if agent is not None:
+            if agent is not None and agent.kind != TeamAgentKind.PM:
                 self._mark_session_not_pending(session)
                 return agent
             self.store.delete_setting(setting_key)
             self._notify_external_session_occupancy_changed(channel_id)
-        active_agents = self.store.list_team_agents()
+            if agent is not None and agent.kind == TeamAgentKind.PM:
+                self.store.set_setting(
+                    _ignored_external_session_key(session),
+                    utc_now().isoformat(),
+                )
+                self._mark_session_not_pending(session)
+                return None
+        active_agents = [
+            agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.PM
+        ]
         if not active_agents:
             self._mark_session_pending(session)
             self._post_or_update_capacity_notice(channel_id, session.provider)
             return None
         assigned_agent_ids = self._active_external_agent_ids(active_session_keys, setting_key)
-        idle_agents = self.store.idle_team_agents()
+        idle_agents = [
+            agent for agent in self.store.idle_team_agents() if agent.kind != TeamAgentKind.PM
+        ]
         available = [
             agent
             for agent in idle_agents

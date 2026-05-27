@@ -28,6 +28,7 @@ from agent_harness.models import (
     AssignmentMode,
     ControlMode,
     DeferredWorkStatus,
+    PmInitiativeStatus,
     Provider,
     ScheduledWorkKind,
     SessionStatus,
@@ -77,7 +78,7 @@ from agent_harness.slack.app import (
 )
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
-from agent_harness.team import build_initial_model_team, create_agent_task
+from agent_harness.team import build_initial_model_team, create_agent_task, hire_team_agents
 from agent_harness.team.commands import (
     FireCommand,
     FireEveryoneCommand,
@@ -1657,6 +1658,136 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
                 self.assertIn("Free up", blocks)
                 self.assertIn("Available", blocks)
+            finally:
+                store.close()
+
+    def test_roster_shows_pm_owner_as_occupied_after_plan_is_parked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                worker = build_initial_model_team(1, 0)[0]
+                pm_agent = hire_team_agents([worker], 1, Provider.CLAUDE, kind=TeamAgentKind.PM)[0]
+                store.upsert_team_agent(worker)
+                store.upsert_team_agent(pm_agent)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                initiative = store.create_pm_initiative(
+                    thread,
+                    title="Ship project",
+                    summary="Ship project",
+                    pm_agent_id=pm_agent.agent_id,
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id,
+                    PmInitiativeStatus.AWAITING_APPROVAL,
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.post_roster("C1")
+
+                self.assertIn("1 available, 1 occupied", gateway.posts[-1]["text"])
+                blocks = str(gateway.posts[-1]["blocks"])
+                self.assertIn("PM initiative awaiting approval: Ship project", blocks)
+                self.assertIn("'text': {'type': 'plain_text', 'text': 'Open thread'}", blocks)
+                self.assertIn("https://example.slack.com/archives/C1/p171000001", blocks)
+            finally:
+                store.close()
+
+    def test_busy_pm_owner_is_not_assigned_new_pm_initiative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                worker = build_initial_model_team(1, 0)[0]
+                pm_agent = hire_team_agents([worker], 1, Provider.CLAUDE, kind=TeamAgentKind.PM)[0]
+                store.upsert_team_agent(worker)
+                store.upsert_team_agent(pm_agent)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                initiative = store.create_pm_initiative(
+                    thread,
+                    title="Existing project",
+                    summary="Existing project",
+                    pm_agent_id=pm_agent.agent_id,
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id,
+                    PmInitiativeStatus.ACTIVE,
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": f"@{pm_agent.handle} plan another project",
+                            "ts": "171.000002",
+                        }
+                    }
+                )
+
+                self.assertEqual(runtime.started, [])
+                self.assertIn("That specific agent is busy", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_new_pm_initiative_skips_busy_pm_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                worker = build_initial_model_team(1, 0)[0]
+                busy_pm, available_pm = hire_team_agents(
+                    [worker],
+                    2,
+                    Provider.CLAUDE,
+                    kind=TeamAgentKind.PM,
+                )
+                for agent in (worker, busy_pm, available_pm):
+                    store.upsert_team_agent(agent)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                initiative = store.create_pm_initiative(
+                    thread,
+                    title="Existing project",
+                    summary="Existing project",
+                    pm_agent_id=busy_pm.agent_id,
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id,
+                    PmInitiativeStatus.ACTIVE,
+                )
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "pm: plan another project",
+                            "ts": "171.000002",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(runtime.started), 1)
+                self.assertEqual(runtime.started[0][1].agent_id, available_pm.agent_id)
             finally:
                 store.close()
 

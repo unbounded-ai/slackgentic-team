@@ -22,11 +22,16 @@ class BashPolicyTests(unittest.TestCase):
                     tuple(case["safe_allowed_tools"]),
                 )
 
-    def test_safe_auto_rejects_quoted_operator_arguments(self):
+    def test_safe_auto_rejects_quoted_command_separator_arguments(self):
         decision = classify_bash_command('grep "a;b" file')
 
         self.assertFalse(decision.safe)
         self.assertEqual(decision.reason, "quoted or embedded shell operator in argument")
+
+    def test_safe_auto_allows_quoted_grep_alternation(self):
+        decision = classify_bash_command('git branch -a | grep -E "design|operator"')
+
+        self.assertTrue(decision.safe, decision.reason)
 
     def test_startup_allowlist_is_derived_from_policy_tables(self):
         self.assertIn("Bash(git blame:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
@@ -38,6 +43,36 @@ class BashPolicyTests(unittest.TestCase):
         self.assertIn("Bash(git config user.email)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertIn("Bash(gh pr create:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
         self.assertNotIn("Bash(git fetch:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertNotIn("Bash(git branch:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+        self.assertNotIn("Bash(git remote:*)", BASH_SAFE_AUTO_ALLOWED_TOOLS)
+
+    def test_safe_auto_allows_read_only_git_branch_and_remote_commands(self):
+        cases = (
+            "git -C /workspace/repos/example-project branch -a",
+            "git -C /workspace/repos/example-project branch --show-current",
+            'git -C /workspace/repos/example-project branch -a | grep -E "design|operator"',
+            "cd /workspace/repos/example-project && git remote -v 2>/dev/null",
+            "git -C /workspace/repos/example-project remote get-url origin",
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                decision = classify_bash_command(command)
+
+                self.assertTrue(decision.safe, decision.reason)
+                self.assertEqual(decision.safe_allowed_tools, (f"Bash({command})",))
+
+    def test_safe_auto_rejects_mutating_git_branch_and_remote_commands(self):
+        cases = (
+            "git branch feature/new-work",
+            "git branch -D old-work",
+            "git remote add origin https://example.com/repo.git",
+            "git remote set-url origin https://example.com/repo.git",
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                decision = classify_bash_command(command)
+
+                self.assertFalse(decision.safe)
 
     def test_safe_auto_allows_multiline_commit_by_prefix(self):
         command = """git -C /workspace/repos/sample-app commit -m "$(cat <<'EOF'

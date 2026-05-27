@@ -333,6 +333,13 @@ SLACKGENTIC_MCP_PERMISSION_TOOLS = frozenset(
         "mcp__slackgentic__request_user_input",
     }
 )
+_ACTIVE_PM_INITIATIVE_STATUSES = frozenset(
+    {
+        PmInitiativeStatus.PLANNING,
+        PmInitiativeStatus.AWAITING_APPROVAL,
+        PmInitiativeStatus.ACTIVE,
+    }
+)
 AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT = (
     "Allowed internal Claude Slackgentic request; rendering the Slack prompt now."
 )
@@ -1361,6 +1368,7 @@ class SlackTeamController:
             initiative_id=initiative.initiative_id,
             now=utc_now(),
         )
+        busy_agent_ids = self._busy_agent_ids_for_assignment()
         if targeted_pm_handle:
             request = WorkRequest(
                 prompt=resolver_prompt,
@@ -1372,8 +1380,9 @@ class SlackTeamController:
             # to a PM (preferring an idle one) so the PM owns the initiative
             # end-to-end; worker agents never run PM resolvers when PMs exist.
             idle_agent_ids = {agent.agent_id for agent in self.store.idle_team_agents()}
-            idle_pms = [agent for agent in pm_agents if agent.agent_id in idle_agent_ids]
-            chosen_pms = idle_pms or pm_agents
+            available_pms = [agent for agent in pm_agents if agent.agent_id not in busy_agent_ids]
+            idle_pms = [agent for agent in available_pms if agent.agent_id in idle_agent_ids]
+            chosen_pms = idle_pms or available_pms or pm_agents
             pm_handles = sorted(agent.handle for agent in chosen_pms)
             digest_handle = pm_handles[hash(initiative.initiative_id) % len(pm_handles)]
             request = WorkRequest(
@@ -1404,7 +1413,7 @@ class SlackTeamController:
             channel_id,
             requested_by_slack_user=requested_by_slack_user,
             extra_metadata=extra_metadata,
-            exclude_agent_ids=self._busy_agent_ids_for_assignment(),
+            exclude_agent_ids=busy_agent_ids,
         )
         if result is None:
             self.store.update_pm_initiative_status(
@@ -1847,6 +1856,22 @@ class SlackTeamController:
                 thread_url=self._thread_permalink(thread.channel_id, thread.thread_ts),
                 task_id=task.task_id,
             )
+        pm_initiatives_by_agent = self._pm_owner_initiatives_by_agent(agents)
+        for agent in agents:
+            if statuses[agent.agent_id].label != "Available":
+                continue
+            initiatives = pm_initiatives_by_agent.get(agent.agent_id)
+            if not initiatives:
+                continue
+            initiative = initiatives[0]
+            detail = _pm_initiative_roster_detail(initiative)
+            if len(initiatives) > 1:
+                detail = f"{detail}; +{len(initiatives) - 1} more"
+            statuses[agent.agent_id] = AgentRosterStatus(
+                "Occupied",
+                detail,
+                thread_url=self._thread_permalink(initiative.channel_id, initiative.thread_ts),
+            )
         deferred_by_agent = self._pending_deferred_work_by_agent(agents)
         for agent in agents:
             if statuses[agent.agent_id].label != "Available":
@@ -1951,6 +1976,17 @@ class SlackTeamController:
             scheduled_by_agent.setdefault(agent.agent_id, []).append(scheduled)
         return scheduled_by_agent
 
+    def _pm_owner_initiatives_by_agent(self, agents) -> dict[str, list[PmInitiative]]:
+        agent_ids = {agent.agent_id for agent in agents}
+        initiatives_by_agent: dict[str, list[PmInitiative]] = {}
+        for initiative in self.store.list_pm_initiatives():
+            if initiative.status not in _ACTIVE_PM_INITIATIVE_STATUSES:
+                continue
+            if not initiative.pm_agent_id or initiative.pm_agent_id not in agent_ids:
+                continue
+            initiatives_by_agent.setdefault(initiative.pm_agent_id, []).append(initiative)
+        return initiatives_by_agent
+
     def _running_managed_tasks(self):
         if self.runtime is None:
             return []
@@ -2033,8 +2069,10 @@ class SlackTeamController:
         self,
         ignore_schedule_id: str | None = None,
         ignore_deferred_id: str | None = None,
+        ignore_pm_initiative_id: str | None = None,
     ) -> set[str]:
         busy = set(self._external_busy_agent_ids())
+        busy.update(self._pm_owner_busy_agent_ids(ignore_initiative_id=ignore_pm_initiative_id))
         busy.update(self._scheduled_busy_agent_ids(ignore_schedule_id=ignore_schedule_id))
         busy.update(self._deferred_busy_agent_ids(ignore_deferred_id=ignore_deferred_id))
         return busy
@@ -2079,10 +2117,30 @@ class SlackTeamController:
     def _external_busy_agent_ids(self) -> set[str]:
         return set(self._active_external_sessions_by_agent())
 
+    def _pm_owner_busy_agent_ids(self, *, ignore_initiative_id: str | None = None) -> set[str]:
+        return {
+            initiative.pm_agent_id
+            for initiative in self.store.list_pm_initiatives()
+            if initiative.pm_agent_id
+            and initiative.initiative_id != ignore_initiative_id
+            and initiative.status in _ACTIVE_PM_INITIATIVE_STATUSES
+        }
+
     def _active_external_sessions_by_agent(self):
         sessions_by_agent = {}
         for key, agent_id in self.store.list_settings(EXTERNAL_SESSION_AGENT_PREFIX).items():
             session = self._session_for_external_agent_setting(key)
+            agent = self.store.get_team_agent(agent_id)
+            if agent is None:
+                continue
+            if agent.kind == TeamAgentKind.PM:
+                self.store.delete_setting(key)
+                if session is not None:
+                    self.store.set_setting(
+                        _external_session_ignored_setting_key(session),
+                        utc_now().isoformat(),
+                    )
+                continue
             if session is None or session.status not in {
                 SessionStatus.ACTIVE,
                 SessionStatus.IDLE,
@@ -3780,8 +3838,16 @@ class SlackTeamController:
     ) -> bool:
         setting_key = _external_session_agent_setting_key(session)
         assigned_agent_id = self.store.get_setting(setting_key)
-        if assigned_agent_id and self.store.get_team_agent(assigned_agent_id):
-            return True
+        if assigned_agent_id:
+            assigned_agent = self.store.get_team_agent(assigned_agent_id)
+            if assigned_agent is not None and assigned_agent.kind != TeamAgentKind.PM:
+                return True
+            self.store.delete_setting(setting_key)
+            if assigned_agent is not None and assigned_agent.kind == TeamAgentKind.PM:
+                self.store.set_setting(
+                    _external_session_ignored_setting_key(session),
+                    utc_now().isoformat(),
+                )
         if session.status == SessionStatus.ACTIVE:
             return True
         external_busy_agent_ids = self._busy_agent_ids_for_assignment()
@@ -3789,6 +3855,7 @@ class SlackTeamController:
             agent
             for agent in self.store.idle_team_agents()
             if agent.provider_preference == session.provider
+            and agent.kind != TeamAgentKind.PM
             and agent.agent_id not in external_busy_agent_ids
         ]
         if not available:
@@ -5795,6 +5862,8 @@ class SlackTeamController:
 
     def _pm_busy_worker_agent_ids(self) -> set[str]:
         busy = {task.agent_id for task in self.store.list_agent_tasks()}
+        busy.update(self._external_busy_agent_ids())
+        busy.update(self._pm_owner_busy_agent_ids())
         busy.update(self._scheduled_busy_agent_ids())
         busy.update(self._deferred_busy_agent_ids())
         return busy
@@ -6328,7 +6397,11 @@ class SlackTeamController:
         active = self.store.active_task_for_agent(agent.agent_id)
         if active is not None and active.task_id != task.task_id:
             return True
-        return agent.agent_id in self._busy_agent_ids_for_assignment()
+        initiative_id = task.metadata.get(PM_INITIATIVE_ID_METADATA_KEY)
+        ignore_pm_initiative_id = initiative_id if isinstance(initiative_id, str) else None
+        return agent.agent_id in self._busy_agent_ids_for_assignment(
+            ignore_pm_initiative_id=ignore_pm_initiative_id,
+        )
 
     def _maybe_post_pm_status_command(
         self,
@@ -9595,6 +9668,15 @@ def _format_pm_subtask_parent_text(
     return "\n".join(lines)
 
 
+def _pm_initiative_roster_detail(initiative: PmInitiative) -> str:
+    status = {
+        PmInitiativeStatus.PLANNING: "planning",
+        PmInitiativeStatus.AWAITING_APPROVAL: "awaiting approval",
+        PmInitiativeStatus.ACTIVE: "active",
+    }.get(initiative.status, initiative.status.value)
+    return f"PM initiative {status}: {_shorten(initiative.title, 140)}"
+
+
 def _format_pm_capacity_shortfall_message(shortfall: _PmCapacityShortfall) -> str:
     required = shortfall.required_workers
     available = shortfall.available_workers
@@ -10466,6 +10548,10 @@ def _is_external_thread_helper_task(task: AgentTask) -> bool:
 
 def _external_session_agent_setting_key(session) -> str:
     return f"{EXTERNAL_SESSION_AGENT_PREFIX}{session.provider.value}.{session.session_id}"
+
+
+def _external_session_ignored_setting_key(session) -> str:
+    return f"{EXTERNAL_SESSION_IGNORED_PREFIX}{session.provider.value}.{session.session_id}"
 
 
 def _parse_external_session_setting_key(
