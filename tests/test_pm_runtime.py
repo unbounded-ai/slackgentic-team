@@ -2057,10 +2057,15 @@ class PmWatchdogAdversarialTests(unittest.TestCase):
                 )
                 controller = SlackTeamController(store, gateway, default_channel_id="C1")
                 runner = PMInitiativeRunner(store, controller, poll_seconds=0.01)
-                runner.sync_once()
+                with self.assertLogs("agent_harness.slack.app", level="WARNING") as logs:
+                    runner.sync_once()
                 final = store.get_pm_initiative(initiative.initiative_id)
                 assert final is not None
                 self.assertEqual(final.status, PmInitiativeStatus.CANCELLED)
+                self.assertIn(
+                    "thread is unreachable (channel_not_found); cancelling",
+                    "\n".join(logs.output),
+                )
             finally:
                 store.close()
 
