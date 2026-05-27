@@ -104,6 +104,7 @@ class FakeGateway:
         self.history_messages = []
         self.thread_history_messages = {}
         self.channel_message_calls = []
+        self.thread_message_calls = []
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -229,6 +230,7 @@ class FakeGateway:
         return True
 
     def thread_messages(self, channel_id, thread_ts, limit=20, oldest=None):
+        self.thread_message_calls.append((channel_id, thread_ts, oldest, limit))
         messages = [
             {
                 "username": getattr(item.get("persona"), "full_name", None),
@@ -609,6 +611,75 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(store.list_team_agents()[-1].provider_preference, Provider.CLAUDE)
                 self.assertEqual(len(gateway.updates), 1)
                 self.assertEqual(len(gateway.thread_replies), 1)
+            finally:
+                store.close()
+
+    def test_external_capacity_hire_button_reserves_agent_and_refreshes_roster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                store.set_setting("external_session_pending.claude.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.claude", "171.capacity")
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.capacity"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire", count=1, provider=Provider.CLAUDE.value
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 1)
+                self.assertEqual(agents[0].provider_preference, Provider.CLAUDE)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertIsNotNone(
+                    store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "local", "C1")
+                )
+                self.assertIsNone(store.get_setting("external_session_pending.claude.s1"))
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.claude"))
+                session_parents = [
+                    post
+                    for post in gateway.posts
+                    if "Started observing Claude session from outside Slack." in post["text"]
+                ]
+                self.assertEqual(len(session_parents), 1)
+                capacity_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.capacity"
+                ]
+                self.assertEqual(len(capacity_updates), 1)
+                self.assertIn(
+                    "capacity for sessions started outside Slack is available now",
+                    capacity_updates[0]["text"],
+                )
+                roster_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.roster"
+                ]
+                self.assertEqual(len(roster_updates), 1)
+                self.assertIn("0 available, 1 occupied", roster_updates[0]["text"])
+                self.assertIn("Open thread", str(roster_updates[0]["blocks"]))
             finally:
                 store.close()
 
@@ -3523,7 +3594,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_roster_shows_external_session_detach_without_thread_link(self):
+    def test_roster_repairs_external_session_without_thread_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -3556,10 +3627,16 @@ class SlackAppTests(unittest.TestCase):
                     [action["text"]["text"] for action in actions],
                     [
                         "Detach",
+                        "Open thread",
                         "Fire",
                     ],
                 )
                 self.assertEqual(actions[0]["action_id"], "external.session.detach")
+                self.assertIsNotNone(
+                    store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "local", "C1")
+                )
+                self.assertEqual(len(gateway.posts), 2)
+                self.assertIn("Started observing Claude session", gateway.posts[0]["text"])
             finally:
                 store.close()
 
@@ -4948,6 +5025,54 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(store.list_agent_tasks()[0].prompt, "update docs after wake")
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "181.000000")
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_polls_channel_messages_without_sleep_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(1, 0):
+                    store.upsert_team_agent(agent)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                store.set_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE, "171.000000")
+                gateway.history_messages.append(
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "somebody handle the missed socket event",
+                        "ts": "171.500000",
+                    }
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=30.0,
+                    grace_seconds=0.0,
+                    now=lambda: 172.0,
+                )
+
+                recovered = backfill.sync_once()
+
+                self.assertEqual(recovered, 1)
+                self.assertEqual(len(store.list_agent_tasks()), 1)
+                self.assertEqual(
+                    store.list_agent_tasks()[0].prompt,
+                    "handle the missed socket event",
+                )
+                self.assertEqual(gateway.thread_message_calls, [])
+                self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "172.000000")
             finally:
                 store.close()
 
