@@ -107,6 +107,7 @@ class SessionMirror:
         self.ignored_cwd_patterns = tuple(
             pattern.strip() for pattern in ignored_cwd_patterns if pattern.strip()
         )
+        self.started_at = utc_now()
         self._todo_mirror = TodoMirror(store, gateway, home=self.home)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -192,7 +193,12 @@ class SessionMirror:
                     continue
                 chunks, max_line = self._new_chunks(provider, session)
                 if not chunks:
+                    if not self._session_seen_since_mirror_started(session):
+                        self._update_cursor_if_needed(session, max_line)
+                        continue
+                    thread = self._post_session_parent(session, channel_id, agent)
                     self._update_cursor_if_needed(session, max_line)
+                    self._sync_todo_mirror(session, thread)
                     continue
                 thread = self._post_session_parent(session, channel_id, agent)
                 if not self._post_chunks(session, thread, chunks, agent):
@@ -215,6 +221,9 @@ class SessionMirror:
                 session.provider.value,
                 session.session_id,
             )
+
+    def _session_seen_since_mirror_started(self, session: AgentSession) -> bool:
+        return session.last_seen_at is None or session.last_seen_at >= self.started_at
 
     def _run(self) -> None:
         backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)

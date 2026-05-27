@@ -473,6 +473,39 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_unthreaded_assigned_session_posts_parent_without_visible_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=1, claude_count=0)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.parents), 1)
+                self.assertIn("Started observing Codex session", gateway.parents[0][1])
+                self.assertEqual(gateway.replies, [])
+                self.assertIsNotNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
+                )
+                self.assertIsNotNone(store.get_setting("external_session_agent.codex.s1"))
+            finally:
+                store.close()
+
     def test_start_tolerates_initial_sync_post_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
