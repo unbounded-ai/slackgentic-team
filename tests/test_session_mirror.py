@@ -15,7 +15,11 @@ from agent_harness.models import (
     TeamAgentKind,
 )
 from agent_harness.runtime.tasks import build_task_prompt
-from agent_harness.sessions.mirror import SessionMirror, render_session_event
+from agent_harness.sessions.mirror import (
+    SessionMirror,
+    _cwd_matches_ignored_patterns,
+    render_session_event,
+)
 from agent_harness.sessions.terminal import TerminalTarget
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
@@ -373,7 +377,7 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_external_session_matching_ignored_cwd_is_not_mirrored(self):
+    def test_external_session_matching_ignored_cwd_subpath_is_not_mirrored(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
@@ -383,7 +387,7 @@ class SessionMirrorTests(unittest.TestCase):
                     provider=Provider.CODEX,
                     session_id="s1",
                     transcript_path=Path(tmp) / "codex.jsonl",
-                    cwd=Path("/workspace/repos/example-project/.local"),
+                    cwd=Path("/workspace/repos/example-project/.local/run-1"),
                     status=SessionStatus.ACTIVE,
                 )
                 events = [
@@ -410,7 +414,7 @@ class SessionMirrorTests(unittest.TestCase):
                     [FakeProvider(session, events)],
                     team_id="T1",
                     channel_id="C1",
-                    ignored_cwd_patterns=("example-project/.local",),
+                    ignored_cwd_patterns=(".local",),
                 )
 
                 mirror.sync_once()
@@ -424,6 +428,32 @@ class SessionMirrorTests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_ignored_cwd_subpath_matches_complete_segments_only(self):
+        self.assertTrue(
+            _cwd_matches_ignored_patterns(
+                Path("/workspace/repos/example-project/.local"),
+                (".local",),
+            )
+        )
+        self.assertTrue(
+            _cwd_matches_ignored_patterns(
+                Path("/workspace/repos/other-project/.local/run-1"),
+                (".local",),
+            )
+        )
+        self.assertTrue(
+            _cwd_matches_ignored_patterns(
+                Path("/workspace/repos/example-project/.local/run-1"),
+                ("example-project/.local",),
+            )
+        )
+        self.assertFalse(
+            _cwd_matches_ignored_patterns(
+                Path("/workspace/repos/example-project/.local-cache"),
+                (".local",),
+            )
+        )
 
     def test_unthreaded_session_posts_parent_with_first_visible_event(self):
         with tempfile.TemporaryDirectory() as tmp:

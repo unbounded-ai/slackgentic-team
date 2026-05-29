@@ -148,7 +148,10 @@ def main(argv: list[str] | None = None) -> int:
         "--ignore-external-session-cwd",
         action="append",
         dest="ignored_external_session_cwds",
-        help="Ignore observed external agent sessions whose cwd matches this path pattern.",
+        help=(
+            "Ignore observed external agent sessions whose cwd contains this path or path "
+            "segment pattern; e.g. .local matches any .local directory."
+        ),
     )
     service_uninstall = service_sub.add_parser("uninstall", help="Stop and remove the service")
     service_uninstall.add_argument("--name", default="slackgentic-team")
@@ -175,7 +178,10 @@ def main(argv: list[str] | None = None) -> int:
         "--ignore-external-session-cwd",
         action="append",
         dest="ignored_external_session_cwds",
-        help="Ignore observed external agent sessions whose cwd matches this path pattern.",
+        help=(
+            "Ignore observed external agent sessions whose cwd contains this path or path "
+            "segment pattern; e.g. .local matches any .local directory."
+        ),
     )
 
     run_once = sub.add_parser("index-once", help="Index local sessions into SQLite")
@@ -214,7 +220,10 @@ def main(argv: list[str] | None = None) -> int:
         "--ignore-external-session-cwd",
         action="append",
         dest="ignored_external_session_cwds",
-        help="Ignore observed external agent sessions whose cwd matches this path pattern.",
+        help=(
+            "Ignore observed external agent sessions whose cwd contains this path or path "
+            "segment pattern; e.g. .local matches any .local directory."
+        ),
     )
     slack_reset_state = slack_sub.add_parser(
         "reset-state",
