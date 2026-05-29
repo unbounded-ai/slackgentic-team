@@ -421,11 +421,40 @@ class SessionMirrorTests(unittest.TestCase):
 
                 self.assertEqual(gateway.parents, [])
                 self.assertEqual(gateway.replies, [])
-                self.assertIsNotNone(store.get_session(Provider.CODEX, "s1"))
+                ignored = store.get_session(Provider.CODEX, "s1")
+                self.assertIsNotNone(ignored)
+                assert ignored is not None
+                self.assertEqual(ignored.status, SessionStatus.DONE)
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
                 self.assertIsNone(
                     store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
                 )
+            finally:
+                store.close()
+
+    def test_ignored_cwd_session_does_not_keep_mirror_awake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path("/workspace/repos/example-project/.local/run-1"),
+                    status=SessionStatus.ACTIVE,
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    ignored_cwd_patterns=(".local",),
+                )
+
+                self.assertFalse(mirror.has_active_sessions())
             finally:
                 store.close()
 

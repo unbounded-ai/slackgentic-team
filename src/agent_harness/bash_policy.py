@@ -298,6 +298,8 @@ def _unsafe_segment_reason(parts: tuple[str, ...]) -> str | None:
         return _unsafe_gh_reason(parts)
     if executable in _SAFE_SIMPLE_EXECUTABLE_TOOLS:
         return None if all(_safe_shell_arg(part) for part in parts[1:]) else "unsafe argument"
+    if executable == "chmod":
+        return _unsafe_chmod_reason(parts)
     if executable == "sed":
         return _unsafe_sed_reason(parts)
     return f"unsupported executable {executable}"
@@ -521,6 +523,18 @@ def _unsafe_sed_reason(parts: tuple[str, ...]) -> str | None:
     return None
 
 
+def _unsafe_chmod_reason(parts: tuple[str, ...]) -> str | None:
+    if len(parts) < 3:
+        return "chmod without mode and path"
+    mode = parts[1]
+    if mode not in {"+x", "u+x", "a+x", "ug+x"}:
+        return "unsupported chmod mode"
+    for path in parts[2:]:
+        if path.startswith("-") or not _safe_shell_arg(path):
+            return "unsafe chmod path"
+    return None
+
+
 def _safe_shell_arg(value: str) -> bool:
     return not _word_has_shell_control(value)
 
@@ -609,6 +623,8 @@ def _allowed_tools_for_simple_safe_command(
         prefix_tools = _allowed_git_bash_tools(parts)
     elif parts and parts[0] in _SAFE_SIMPLE_EXECUTABLE_TOOLS:
         prefix_tools = _SAFE_SIMPLE_EXECUTABLE_TOOLS[parts[0]]
+    elif parts and parts[0] == "chmod":
+        prefix_tools = ()
     elif parts and parts[0] == "sed":
         prefix_tools = _SED_SAFE_TOOLS
     else:

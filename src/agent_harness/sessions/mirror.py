@@ -143,7 +143,10 @@ class SessionMirror:
                 LOGGER.debug("failed to discover provider sessions for awake check", exc_info=True)
                 continue
             for session in sessions:
-                if session.status == SessionStatus.ACTIVE:
+                if session.status == SessionStatus.ACTIVE and not _cwd_matches_ignored_patterns(
+                    session.cwd,
+                    self.ignored_cwd_patterns,
+                ):
                     return True
         return False
 
@@ -694,7 +697,8 @@ class SessionMirror:
     def _skip_ignored_cwd_session(self, session: AgentSession, channel_id: str) -> bool:
         if not _cwd_matches_ignored_patterns(session.cwd, self.ignored_cwd_patterns):
             return False
-        self.store.upsert_session(session)
+        self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
+        self.store.upsert_session(replace(session, status=SessionStatus.DONE))
         self._clear_external_tracking(session, channel_id)
         return True
 

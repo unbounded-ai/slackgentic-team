@@ -253,7 +253,8 @@ class PmPlanSignalTests(unittest.TestCase):
         )
         self.assertIn("Initiative id: pm_test", prompt)
         self.assertIn("SLACKGENTIC: PM_PLAN", prompt)
-        self.assertIn("validation_error", prompt) if False else None  # placeholder
+        self.assertIn("@riley", prompt)
+        self.assertIn("exactly 2 active handles", prompt)
         self.assertIn("previous PM_PLAN control line was invalid: bad", prompt)
 
     def test_render_pm_plan_dag_shows_roots_and_edges(self):
@@ -287,9 +288,16 @@ class PmPlanSignalTests(unittest.TestCase):
 
         chart = render_pm_plan_dag(plan)
 
-        self.assertIn("roots: investigate", chart)
-        self.assertIn("investigate -> design", chart)
-        self.assertIn("design -> implement", chart)
+        self.assertEqual(
+            chart,
+            "\n".join(
+                (
+                    "investigate - Investigate",
+                    "`-- design - Design",
+                    "    `-- implement - Implement",
+                )
+            ),
+        )
 
 
 class PmStoreTests(unittest.TestCase):
@@ -473,7 +481,25 @@ class PmCoDesignExpansionTests(unittest.TestCase):
         result = parse_agent_pm_plan_signal(
             self._build_signal(payload), known_handles=["alice", "bob"]
         )
-        self.assertIn("2 distinct", result.error or "")
+        self.assertIn("exactly 2 distinct", result.error or "")
+
+    def test_co_designers_rejected_when_more_than_two(self):
+        payload = {
+            "title": "T",
+            "summary": "S",
+            "subtasks": [
+                {
+                    "id": "s1",
+                    "title": "Design",
+                    "task": "Design it.",
+                    "co_designers": ["alice", "bob", "cara"],
+                }
+            ],
+        }
+        result = parse_agent_pm_plan_signal(
+            self._build_signal(payload), known_handles=["alice", "bob", "cara"]
+        )
+        self.assertIn("exactly 2 distinct", result.error or "")
 
     def test_co_designers_validated_unknown_handle(self):
         payload = {
@@ -511,6 +537,26 @@ class PmCoDesignExpansionTests(unittest.TestCase):
         )
         self.assertIn("somebody", result.error or "")
 
+    def test_co_designers_rejected_when_same_model_family(self):
+        payload = {
+            "title": "T",
+            "summary": "S",
+            "subtasks": [
+                {
+                    "id": "s1",
+                    "title": "Design",
+                    "task": "Design it.",
+                    "co_designers": ["alice", "bob"],
+                }
+            ],
+        }
+        result = parse_agent_pm_plan_signal(
+            self._build_signal(payload),
+            known_handles=["alice", "bob"],
+            handle_models={"alice": "claude", "bob": "claude"},
+        )
+        self.assertIn("different model/provider families", result.error or "")
+
     def test_co_designers_parsed_into_subtask(self):
         payload = {
             "title": "T",
@@ -525,7 +571,9 @@ class PmCoDesignExpansionTests(unittest.TestCase):
             ],
         }
         result = parse_agent_pm_plan_signal(
-            self._build_signal(payload), known_handles=["alice", "bob"]
+            self._build_signal(payload),
+            known_handles=["alice", "bob"],
+            handle_models={"alice": "claude", "bob": "codex"},
         )
         self.assertIsNone(result.error)
         plan = result.plan
