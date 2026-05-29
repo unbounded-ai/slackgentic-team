@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -48,7 +49,7 @@ class ParsedPmSubtask:
 
     @property
     def is_co_design(self) -> bool:
-        return len(self.co_designers) >= 2
+        return len(self.co_designers) == 2
 
 
 @dataclass(frozen=True)
@@ -128,9 +129,10 @@ def build_pm_resolution_prompt(
     prior_plan_summary: str | None = None,
     extension_known_ids: tuple[str, ...] = (),
     extension_context: str | None = None,
+    agent_models: Mapping[str, str] | None = None,
 ) -> str:
     reference = now or utc_now()
-    handles = ", ".join(f"@{handle}" for handle in agent_handles) or "(no active agents)"
+    handles = _format_pm_worker_handles(agent_handles, agent_models)
     sample = {
         "title": "Short initiative title",
         "summary": "One to three sentences on what success looks like.",
@@ -194,12 +196,15 @@ def build_pm_resolution_prompt(
             "- `target` is `somebody` (any agent) or one of the active handles "
             "without the leading @. Cross-model reviews are usually best left as "
             "`somebody` so the router can pick the best non-author.\n"
-            "- `co_designers` is an OPTIONAL list of 2+ active handles. When "
+            "- `co_designers` is an OPTIONAL list of exactly 2 active handles "
+            "from different model/provider families. When "
             "present, the subtask fans out into one draft per co-designer "
             "running in parallel followed by an automatic synthesis stage. Use "
             "this for design work where you want independent perspectives "
-            "reconciled — e.g. API design, naming, schema choices. Do not "
-            "combine `co_designers` with a specific `target`.\n"
+            "reconciled — e.g. API design, naming, schema choices. If two "
+            "different model/provider families are not available, ask a concise "
+            "Slack-visible capacity question and do not emit a control line. "
+            "Do not combine `co_designers` with a specific `target`.\n"
             "- `task_kind` is `work` or `review`.\n"
             "- `after_delay_seconds` is an optional delay applied once every "
             "dependency has finished. Default 0.\n"
@@ -263,11 +268,28 @@ def build_pm_resolution_prompt(
     return "\n".join(lines)
 
 
+def _format_pm_worker_handles(
+    agent_handles: list[str] | tuple[str, ...],
+    agent_models: Mapping[str, str] | None,
+) -> str:
+    if not agent_handles:
+        return "(no active agents)"
+    if not agent_models:
+        return ", ".join(f"@{handle}" for handle in agent_handles)
+    model_by_handle = {handle.lower(): model for handle, model in agent_models.items()}
+    labels: list[str] = []
+    for handle in agent_handles:
+        model = model_by_handle.get(handle.lower())
+        labels.append(f"@{handle} ({model})" if model else f"@{handle}")
+    return ", ".join(labels)
+
+
 def parse_agent_pm_plan_signal(
     signal: str,
     *,
     known_handles: list[str] | tuple[str, ...],
     allowed_external_dep_ids: tuple[str, ...] = (),
+    handle_models: Mapping[str, str] | None = None,
 ) -> AgentPmParseResult:
     stripped = signal.strip()
     if not stripped.upper().startswith(AGENT_PM_PLAN_SIGNAL_PREFIX):
@@ -285,6 +307,7 @@ def parse_agent_pm_plan_signal(
         payload,
         known_handles=known_handles,
         allowed_external_dep_ids=allowed_external_dep_ids,
+        handle_models=handle_models,
     )
 
 
@@ -293,6 +316,7 @@ def _parse_plan_payload(
     *,
     known_handles: list[str] | tuple[str, ...],
     allowed_external_dep_ids: tuple[str, ...] = (),
+    handle_models: Mapping[str, str] | None = None,
 ) -> AgentPmParseResult:
     title_raw = payload.get("title")
     if not isinstance(title_raw, str) or not title_raw.strip():
@@ -315,7 +339,12 @@ def _parse_plan_payload(
     parsed_by_id: dict[str, ParsedPmSubtask] = {}
     declaration_order: list[str] = []
     for index, item in enumerate(subtasks_raw):
-        parsed = _parse_subtask(item, known_handles=known_handles, index=index)
+        parsed = _parse_subtask(
+            item,
+            known_handles=known_handles,
+            index=index,
+            handle_models=handle_models,
+        )
         if isinstance(parsed, str):
             return AgentPmParseResult(error=parsed)
         if parsed.local_id in parsed_by_id:
@@ -369,6 +398,7 @@ def _parse_subtask(
     *,
     known_handles: list[str] | tuple[str, ...],
     index: int,
+    handle_models: Mapping[str, str] | None = None,
 ) -> ParsedPmSubtask | str:
     if not isinstance(item, dict):
         return f"subtask #{index + 1} must be a JSON object"
@@ -390,6 +420,11 @@ def _parse_subtask(
         return f"subtask {local_id!r} must include a non-empty 'task' prompt"
     task = task_raw.strip()
     normalized_handles = {handle.lower(): handle for handle in known_handles}
+    model_by_handle = (
+        {handle.lower(): str(model) for handle, model in handle_models.items()}
+        if handle_models
+        else {}
+    )
     co_designers_raw = item.get("co_designers", [])
     if co_designers_raw is None:
         co_designers_raw = []
@@ -418,10 +453,19 @@ def _parse_subtask(
                 continue
             seen_codesigners.add(resolved)
             resolved_codesigners.append(resolved)
-        if len(resolved_codesigners) == 1:
+        if len(resolved_codesigners) != 2:
             return (
-                f"subtask {local_id!r} co_designers must list at least 2 distinct "
+                f"subtask {local_id!r} co_designers must list exactly 2 distinct "
                 "handles; use 'target' for single-agent work"
+            )
+        models = [
+            model_by_handle.get(handle.lower())
+            for handle in resolved_codesigners
+            if model_by_handle.get(handle.lower())
+        ]
+        if len(models) == 2 and models[0] == models[1]:
+            return (
+                f"subtask {local_id!r} co_designers must use two different model/provider families"
             )
         co_designers = tuple(resolved_codesigners)
     target_raw = item.get("target", "somebody")
@@ -585,7 +629,7 @@ def deserialize_parsed_pm_plan(blob: str) -> ParsedPmPlan:
 def expand_codesign_plan(plan: ParsedPmPlan) -> ParsedPmPlan:
     """Fan out co-design subtasks into per-designer drafts plus a synthesis stage.
 
-    A subtask with ``co_designers=(h1, h2, ...)`` is expanded into N parallel
+    A subtask with exactly two ``co_designers`` is expanded into two parallel
     draft subtasks (one pinned to each handle) and a synthesis subtask that
     depends on all of them. The synthesis subtask keeps the original
     ``local_id`` so that downstream ``depends_on`` references continue to
@@ -663,18 +707,41 @@ def render_pm_plan_dag(plan: ParsedPmPlan) -> str:
         for dep in subtask.depends_on:
             if dep in children:
                 children[dep].append(subtask.local_id)
+    by_id = {subtask.local_id: subtask for subtask in plan.subtasks}
+    seen: set[str] = set()
     lines: list[str] = []
-    if roots:
-        lines.append("roots: " + ", ".join(roots))
+
+    def label(local_id: str) -> str:
+        subtask = by_id[local_id]
+        text = f"{subtask.local_id} - {subtask.title}"
+        return text if len(text) <= 82 else f"{text[:79]}..."
+
+    def walk(local_id: str, prefix: str = "", *, branch: str = "") -> None:
+        repeated = local_id in seen
+        lines.append(f"{prefix}{branch}{label(local_id)}{' (see above)' if repeated else ''}")
+        if repeated:
+            return
+        seen.add(local_id)
+        outgoing = children.get(local_id) or []
+        child_prefix = prefix
+        if branch == "|-- ":
+            child_prefix += "|   "
+        elif branch == "`-- ":
+            child_prefix += "    "
+        for index, child in enumerate(outgoing):
+            last = index == len(outgoing) - 1
+            child_branch = "`-- " if last else "|-- "
+            walk(child, child_prefix, branch=child_branch)
+
+    for index, root in enumerate(roots or [plan.subtasks[0].local_id]):
+        if index:
+            lines.append("")
+        walk(root)
     for subtask in plan.subtasks:
-        outgoing = children.get(subtask.local_id) or []
-        if outgoing:
-            for child in outgoing:
-                lines.append(f"{subtask.local_id} -> {child}")
-    if len(plan.subtasks) == 1:
-        only = plan.subtasks[0]
-        return f"{only.local_id}: {only.title}"
-    return "\n".join(dict.fromkeys(lines))
+        if subtask.local_id not in seen:
+            lines.append("")
+            walk(subtask.local_id)
+    return "\n".join(lines)
 
 
 PM_TAG_LEAD_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*(?P<rest>.*)$", re.DOTALL)

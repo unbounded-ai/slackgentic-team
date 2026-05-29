@@ -894,7 +894,8 @@ class PmRuntimeTests(unittest.TestCase):
                 self.assertTrue(handled)
                 plan_message = gateway.thread_replies[-1]
                 self.assertIn("DAG chart:", plan_message["text"])
-                self.assertIn("s00 -> s01", plan_message["text"])
+                self.assertIn("s00 - Step 00", plan_message["text"])
+                self.assertIn("`-- s01 - Step 01", plan_message["text"])
                 blocks = plan_message["blocks"]
                 self.assertIsNotNone(blocks)
                 assert blocks is not None
@@ -1364,6 +1365,75 @@ class PmRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_pm_watchdog_surfaces_cancelled_subtask_even_when_deferred_was_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id,
+                    PmInitiativeStatus.ACTIVE,
+                )
+                refreshed = store.get_pm_initiative(initiative.initiative_id)
+                assert refreshed is not None
+                subtask = store.add_pm_subtask_dispatch(
+                    initiative=refreshed,
+                    local_id="integrate",
+                    title="Integrate pieces",
+                    request=WorkRequest(
+                        prompt="Wire the pieces together.",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    plan_depends_on=(),
+                    existing_subtasks=[],
+                    after_delay_seconds=0,
+                    sort_order=0,
+                )
+                task = replace(
+                    create_agent_task(agent, "Wire the pieces together.", "C1"),
+                    status=AgentTaskStatus.CANCELLED,
+                    thread_ts="171.integrate",
+                    parent_message_ts="171.integrate",
+                    metadata={
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_SUBTASK_LOCAL_ID_METADATA_KEY: "integrate",
+                    },
+                )
+                store.upsert_agent_task(task)
+                store.complete_deferred_work(subtask.deferred_id, last_task_id=task.task_id)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=FakeRuntime(),
+                )
+
+                surfaced = controller.watch_pm_initiatives()
+
+                self.assertEqual(surfaced, 1)
+                updated_deferred = store.get_deferred_work(subtask.deferred_id)
+                assert updated_deferred is not None
+                self.assertEqual(updated_deferred.status, DeferredWorkStatus.CANCELLED)
+                blocker_text = "\n".join(reply["text"] for reply in gateway.thread_replies)
+                self.assertIn("subtask `integrate` was cancelled", blocker_text)
+                self.assertIn("will not treat it as successful", blocker_text)
+                updated_initiative = store.get_pm_initiative(initiative.initiative_id)
+                assert updated_initiative is not None
+                self.assertEqual(updated_initiative.status, PmInitiativeStatus.CANCELLED)
+            finally:
+                store.close()
+
     def test_pm_status_marks_exhausted_stall_recovery_as_stalled(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -1534,6 +1604,110 @@ class PmRuntimeTests(unittest.TestCase):
                 self.assertIn("only 2 worker agents are free", capacity_message)
                 self.assertIn("Hire 1 more agent", capacity_message)
                 self.assertIn("`team hire 1`", capacity_message)
+            finally:
+                store.close()
+
+    def test_pm_approval_prompts_when_codesign_model_agent_is_not_free(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                workers = build_initial_model_team(1, 1)
+                codex_worker = next(
+                    agent for agent in workers if agent.provider_preference == Provider.CODEX
+                )
+                claude_worker = next(
+                    agent for agent in workers if agent.provider_preference == Provider.CLAUDE
+                )
+                pm_agent = hire_team_agents(workers, 1, kind=TeamAgentKind.PM)[0]
+                for agent in [*workers, pm_agent]:
+                    store.upsert_team_agent(agent)
+                busy_task = replace(
+                    create_agent_task(codex_worker, "external project", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.busy",
+                    parent_message_ts="171.busy",
+                )
+                store.upsert_agent_task(busy_task)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Capacity constrained co-design",
+                    summary="Run co-design.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(pm_agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Capacity constrained co-design",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                payload = {
+                    "title": "Capacity constrained co-design",
+                    "summary": "Run co-design.",
+                    "subtasks": [
+                        {
+                            "id": "design",
+                            "title": "Design",
+                            "task": "Design the API.",
+                            "co_designers": [codex_worker.handle, claude_worker.handle],
+                            "depends_on": [],
+                        }
+                    ],
+                }
+                handled = controller.handle_runtime_agent_control(
+                    pm_task,
+                    pm_agent,
+                    thread_ref,
+                    f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+                self.assertTrue(handled)
+                plan_message = gateway.thread_replies[-1]
+
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": json.dumps(
+                                    {
+                                        "v": 1,
+                                        "action": "pm_initiative.start",
+                                        "initiative_id": initiative.initiative_id,
+                                    }
+                                ),
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": plan_message["ts"]},
+                        "user": {"id": "U2"},
+                    }
+                )
+
+                still_parked = store.get_pm_initiative(initiative.initiative_id)
+                assert still_parked is not None
+                self.assertEqual(still_parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
+                self.assertEqual(runtime.started, [])
+                capacity_message = gateway.thread_replies[-1]["text"]
+                self.assertIn("reserves specific worker agents", capacity_message)
+                self.assertIn(f"@{codex_worker.handle}", capacity_message)
+                self.assertIn("not free right now", capacity_message)
             finally:
                 store.close()
 

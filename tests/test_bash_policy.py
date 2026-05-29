@@ -89,3 +89,22 @@ EOF
             "Bash(git -C /workspace/repos/sample-app commit:*)",
             decision.safe_allowed_tools,
         )
+
+    def test_safe_auto_allows_exact_chmod_executable_bit(self):
+        command = "chmod +x /workspace/repos/example-project/scripts/smoke-test.sh"
+
+        decision = classify_bash_command(command)
+
+        self.assertTrue(decision.safe, decision.reason)
+        self.assertEqual(decision.safe_allowed_tools, (f"Bash({command})",))
+
+    def test_safe_auto_rejects_broad_chmod(self):
+        cases = (
+            "chmod -R +x /workspace/repos/example-project",
+            "chmod 777 /workspace/repos/example-project/script.sh",
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                decision = classify_bash_command(command)
+
+                self.assertFalse(decision.safe)

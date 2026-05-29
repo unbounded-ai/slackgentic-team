@@ -300,6 +300,14 @@ def _pm_worker_handles(agents: list[TeamAgent] | tuple[TeamAgent, ...]) -> list[
     return [agent.handle for agent in filter_worker_agents(agents)]
 
 
+def _pm_worker_model_map(agents: list[TeamAgent] | tuple[TeamAgent, ...]) -> dict[str, str]:
+    return {
+        agent.handle: agent.provider_preference.value
+        for agent in filter_worker_agents(agents)
+        if agent.provider_preference is not None
+    }
+
+
 def _slack_error_code(exc: Exception) -> str | None:
     """Return the Slack ``error`` field for a SlackApiError, or None."""
     response = getattr(exc, "response", None)
@@ -399,6 +407,7 @@ class _PmCapacityShortfall:
     required_workers: int
     available_workers: int
     hire_count: int
+    unavailable_handles: tuple[str, ...] = ()
 
 
 class SlackTeamController:
@@ -1370,6 +1379,7 @@ class SlackTeamController:
             _pm_worker_handles(active_agents),
             initiative_id=initiative.initiative_id,
             now=utc_now(),
+            agent_models=_pm_worker_model_map(active_agents),
         )
         busy_agent_ids = self._busy_agent_ids_for_assignment()
         if targeted_pm_handle:
@@ -5637,6 +5647,7 @@ class SlackTeamController:
             signal,
             known_handles=_pm_worker_handles(active_agents),
             allowed_external_dep_ids=extension_known_ids,
+            handle_models=_pm_worker_model_map(active_agents),
         )
         if parsed.plan is None:
             return self._retry_pm_resolution(task, agent, thread, parsed.error or "invalid PM plan")
@@ -5851,6 +5862,29 @@ class SlackTeamController:
             return None
         active_workers = filter_worker_agents(self.store.list_team_agents())
         busy_agent_ids = self._pm_busy_worker_agent_ids()
+        worker_by_handle = {agent.handle: agent for agent in active_workers}
+        specific_handles = tuple(
+            dict.fromkeys(
+                subtask.request.requested_handle
+                for subtask in plan.subtasks
+                if subtask.request.assignment_mode == AssignmentMode.SPECIFIC
+                and subtask.request.requested_handle
+            )
+        )
+        unavailable_handles = tuple(
+            handle
+            for handle in specific_handles
+            if (agent := worker_by_handle.get(handle)) is None or agent.agent_id in busy_agent_ids
+        )
+        if unavailable_handles:
+            return _PmCapacityShortfall(
+                required_workers=required_workers,
+                available_workers=sum(
+                    1 for agent in active_workers if agent.agent_id not in busy_agent_ids
+                ),
+                hire_count=0,
+                unavailable_handles=unavailable_handles,
+            )
         available_workers = sum(
             1 for agent in active_workers if agent.agent_id not in busy_agent_ids
         )
@@ -6093,6 +6127,7 @@ class SlackTeamController:
             extension_known_ids=extension_known_ids,
             extension_context=extension_context,
             prior_plan_summary=prior_summary if (replan_context or extension_known_ids) else None,
+            agent_models=_pm_worker_model_map(active_agents),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
@@ -6212,6 +6247,7 @@ class SlackTeamController:
             now=utc_now(),
             replan_context=replan_body or None,
             prior_plan_summary=prior_summary,
+            agent_models=_pm_worker_model_map(active_agents),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_METADATA_KEY] = True
@@ -6358,6 +6394,7 @@ class SlackTeamController:
             extension_known_ids=existing_ids,
             extension_context=extension_body,
             prior_plan_summary=prior_summary,
+            agent_models=_pm_worker_model_map(active_agents),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_METADATA_KEY] = True
@@ -6729,8 +6766,6 @@ class SlackTeamController:
                     exc_info=True,
                 )
         surfaced = 0
-        all_terminal = True
-        all_done = True
         per_subtask: list[tuple[object, DeferredWork | None, AgentTask | None]] = []
         for subtask in subtasks:
             deferred = self.store.get_deferred_work(subtask.deferred_id)
@@ -6738,7 +6773,40 @@ class SlackTeamController:
             if deferred is not None and deferred.last_task_id:
                 task = self.store.get_agent_task(deferred.last_task_id)
             per_subtask.append((subtask, deferred, task))
+
+        for index, (subtask, deferred, task) in enumerate(per_subtask):
+            if deferred is None or task is None or task.status != AgentTaskStatus.CANCELLED:
+                continue
+            if deferred.status != DeferredWorkStatus.CANCELLED:
+                self.store.update_deferred_work_status(
+                    deferred.deferred_id,
+                    DeferredWorkStatus.CANCELLED,
+                )
+                deferred = self.store.get_deferred_work(deferred.deferred_id) or replace(
+                    deferred,
+                    status=DeferredWorkStatus.CANCELLED,
+                    updated_at=utc_now(),
+                )
+                per_subtask[index] = (subtask, deferred, task)
+            surfaced += int(
+                self._surface_pm_blocker(
+                    initiative,
+                    local_id=subtask.local_id,
+                    kind="cancelled_task",
+                    message=(
+                        f":warning: PM initiative `{initiative.initiative_id}` subtask "
+                        f"`{subtask.local_id}` was cancelled before it completed. "
+                        "I will not treat it as successful or start downstream work "
+                        "until it is rerun or the PM plan is updated."
+                    ),
+                )
+            )
+
+        all_terminal = True
+        all_done = True
+        for _subtask, deferred, task in per_subtask:
             if deferred is None:
+                all_done = False
                 continue
             if deferred.status not in {DeferredWorkStatus.DONE, DeferredWorkStatus.CANCELLED}:
                 all_terminal = False
@@ -6747,7 +6815,7 @@ class SlackTeamController:
             if deferred.status == DeferredWorkStatus.CANCELLED:
                 all_done = False
                 continue
-            if task is not None and task.status == AgentTaskStatus.ACTIVE:
+            if task is not None and task.status != AgentTaskStatus.DONE:
                 all_terminal = False
                 all_done = False
         if all_terminal:
@@ -9772,6 +9840,15 @@ def _pm_initiative_roster_detail(initiative: PmInitiative) -> str:
 
 
 def _format_pm_capacity_shortfall_message(shortfall: _PmCapacityShortfall) -> str:
+    if shortfall.unavailable_handles:
+        handles = ", ".join(f"@{handle}" for handle in shortfall.unavailable_handles)
+        pronoun = "is" if len(shortfall.unavailable_handles) == 1 else "are"
+        return (
+            "I can't start this PM plan yet because it reserves specific worker "
+            f"agents that are not free right now: {handles} {pronoun} unavailable. "
+            "Wait for those agents to finish or ask the PM to replan with available "
+            "agents, then click *Start executing* again."
+        )
     required = shortfall.required_workers
     available = shortfall.available_workers
     hire_count = shortfall.hire_count
