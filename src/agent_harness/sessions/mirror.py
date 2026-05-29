@@ -986,20 +986,39 @@ def _cwd_matches_ignored_patterns(cwd: Path | None, patterns: Iterable[str]) -> 
         if not normalized_pattern:
             continue
         if any(char in normalized_pattern for char in "*?[]"):
-            if fnmatch.fnmatch(normalized, normalized_pattern):
+            if fnmatch.fnmatch(normalized, normalized_pattern) or (
+                "/" not in normalized_pattern
+                and any(
+                    fnmatch.fnmatch(part, normalized_pattern)
+                    for part in _normalized_path_parts(normalized)
+                )
+            ):
                 return True
             continue
-        if (
-            normalized == normalized_pattern
-            or normalized.endswith(f"/{normalized_pattern}")
-            or f"/{normalized_pattern}/" in normalized
-        ):
+        if _normalized_path_contains_subpath(normalized, normalized_pattern):
             return True
     return False
 
 
 def _normalized_path_text(path: Path) -> str:
     return path.as_posix().strip().strip("/")
+
+
+def _normalized_path_contains_subpath(path: str, subpath: str) -> bool:
+    path_parts = _normalized_path_parts(path)
+    subpath_parts = _normalized_path_parts(subpath)
+    if not path_parts or not subpath_parts or len(subpath_parts) > len(path_parts):
+        return False
+    if len(subpath_parts) == 1:
+        return subpath_parts[0] in path_parts
+    return any(
+        path_parts[index : index + len(subpath_parts)] == subpath_parts
+        for index in range(len(path_parts) - len(subpath_parts) + 1)
+    )
+
+
+def _normalized_path_parts(value: str) -> tuple[str, ...]:
+    return tuple(part for part in value.split("/") if part)
 
 
 def _managed_prompt_from_session_transcript(
