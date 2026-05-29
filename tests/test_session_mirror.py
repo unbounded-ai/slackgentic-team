@@ -361,6 +361,7 @@ class SessionMirrorTests(unittest.TestCase):
                     )
                 ]
                 store.set_setting("external_session_ignored.codex.s1", "now")
+                store.set_setting("external_session_agent.codex.s1", "agent-1")
                 gateway = FakeGateway()
                 mirror = SessionMirror(
                     store,
@@ -374,6 +375,39 @@ class SessionMirrorTests(unittest.TestCase):
 
                 self.assertEqual(gateway.parents, [])
                 self.assertEqual(store.get_setting("external_session_agent.codex.s1"), None)
+                ignored = store.get_session(Provider.CODEX, "s1")
+                self.assertIsNotNone(ignored)
+                assert ignored is not None
+                self.assertEqual(ignored.status, SessionStatus.DONE)
+            finally:
+                store.close()
+
+    def test_ignored_idle_external_session_stays_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.IDLE,
+                )
+                store.set_setting("external_session_ignored.codex.s1", "now")
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                ignored = store.get_session(Provider.CODEX, "s1")
+                self.assertIsNotNone(ignored)
+                assert ignored is not None
+                self.assertEqual(ignored.status, SessionStatus.DONE)
             finally:
                 store.close()
 

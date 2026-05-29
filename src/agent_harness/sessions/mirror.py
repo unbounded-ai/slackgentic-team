@@ -159,8 +159,7 @@ class SessionMirror:
         for provider in self.providers:
             for session in provider.discover():
                 if self.store.get_setting(_ignored_external_session_key(session)):
-                    if session.status != SessionStatus.ACTIVE:
-                        self.store.upsert_session(session)
+                    self._record_ignored_session(session, channel_id)
                     continue
                 if self._skip_ignored_cwd_session(session, channel_id):
                     continue
@@ -698,9 +697,14 @@ class SessionMirror:
         if not _cwd_matches_ignored_patterns(session.cwd, self.ignored_cwd_patterns):
             return False
         self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
-        self.store.upsert_session(replace(session, status=SessionStatus.DONE))
-        self._clear_external_tracking(session, channel_id)
+        self._record_ignored_session(session, channel_id)
         return True
+
+    def _record_ignored_session(self, session: AgentSession, channel_id: str) -> None:
+        if session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            session = replace(session, status=SessionStatus.DONE)
+        self.store.upsert_session(session)
+        self._clear_external_tracking(session, channel_id)
 
     def _skip_internal_session(self, session: AgentSession, channel_id: str) -> bool:
         if not _is_codex_subagent_session(session):

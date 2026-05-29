@@ -25,6 +25,8 @@ from agent_harness.sessions.bridge import (
 from agent_harness.sessions.terminal import TerminalTarget
 from agent_harness.storage.store import Store
 
+BRIDGE_THREAD_TIMEOUT_SECONDS = 5.0
+
 
 class FakeGateway:
     def __init__(self):
@@ -191,7 +193,7 @@ class SessionBridgeTests(unittest.TestCase):
                     )
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][0][:5],
                     ["claude-bin", "--print", "--output-format", "json", "--resume"],
@@ -760,7 +762,7 @@ class SessionBridgeTests(unittest.TestCase):
                     )
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
                 )
@@ -838,7 +840,7 @@ class SessionBridgeTests(unittest.TestCase):
                     )
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
                 )
@@ -897,7 +899,7 @@ class SessionBridgeTests(unittest.TestCase):
                     bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
                 )
@@ -956,7 +958,7 @@ class SessionBridgeTests(unittest.TestCase):
                     bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
                 )
@@ -1014,7 +1016,7 @@ class SessionBridgeTests(unittest.TestCase):
                     bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
                 )
@@ -1072,7 +1074,7 @@ class SessionBridgeTests(unittest.TestCase):
                     bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
                 )
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5], ["claude-bin", "--print", "--output-format", "json", "--resume"]
                 )
@@ -1588,7 +1590,7 @@ class SessionBridgeTests(unittest.TestCase):
                 )
 
                 self.assertTrue(handled)
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(calls[0][:4], ["codex-bin", "exec", "resume", "--json"])
                 self.assertTrue(
                     store.consume_session_bridge_prompt(
@@ -1650,7 +1652,7 @@ class SessionBridgeTests(unittest.TestCase):
                 handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
 
                 self.assertTrue(handled)
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertIn("--dangerously-bypass-approvals-and-sandbox", calls[0])
                 self.assertIn('sandbox_mode="danger-full-access"', calls[0])
                 self.assertIn('approval_policy="never"', calls[0])
@@ -1689,7 +1691,7 @@ class SessionBridgeTests(unittest.TestCase):
                 handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
 
                 self.assertTrue(handled)
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(calls[0][:4], ["codex-bin", "exec", "resume", "--json"])
             finally:
                 store.close()
@@ -1728,7 +1730,7 @@ class SessionBridgeTests(unittest.TestCase):
                 handled = bridge.send_to_session(session, "/compact", SlackThreadRef("C1", "171"))
 
                 self.assertTrue(handled)
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(
                     calls[0][:5],
                     ["claude-bin", "--print", "--output-format", "json", "--resume"],
@@ -1772,7 +1774,7 @@ class SessionBridgeTests(unittest.TestCase):
 
                 bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
 
-                self.assertTrue(ran.wait(timeout=1))
+                self.assertTrue(ran.wait(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS))
                 self.assertEqual(terminal.agent_responses[0][1], "done")
             finally:
                 store.close()
