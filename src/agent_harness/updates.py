@@ -462,6 +462,8 @@ class SlackgenticUpdateRunner:
         candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
         tag_name = candidate.release.tag_name
         text = f":white_check_mark: Installed Slackgentic {tag_name} and restarted successfully."
+        self.store.set_setting(SETTING_UPDATE_INSTALLED_VERSION, version)
+        self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
         try:
             self.update_message(
                 channel_id,
@@ -587,7 +589,6 @@ class SlackgenticUpdateRunner:
                     self.status_blocks(candidate, message, False),
                 )
                 return
-            self.store.set_setting(SETTING_UPDATE_INSTALLED_VERSION, candidate.version)
             self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
             message = (
                 f"Installed Slackgentic {candidate.release.tag_name}. "

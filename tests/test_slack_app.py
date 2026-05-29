@@ -67,6 +67,7 @@ from agent_harness.slack.app import (
     IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY,
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
+    SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN,
     ClaudePermissionAutoResolver,
     DeferredWorkRunner,
     ScheduledTimerRunner,
@@ -5204,6 +5205,105 @@ class SlackAppTests(unittest.TestCase):
                 )
                 self.assertEqual(gateway.thread_message_calls, [])
                 self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "172.000000")
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_polls_known_threads_without_sleep_gap_when_due(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="codex-s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "codex-s1", "T1", thread)
+                store.set_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE, "172.000000")
+                store.set_setting(SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN, "171.000000")
+                gateway.thread_history_messages[("C1", thread.thread_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "can this also cover codex?",
+                        "ts": "171.500000",
+                        "thread_ts": thread.thread_ts,
+                    }
+                ]
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="T1",
+                    sleep_gap_seconds=30.0,
+                    grace_seconds=0.0,
+                    thread_poll_seconds=30.0,
+                    now=lambda: 201.0,
+                )
+
+                recovered = backfill.sync_once()
+
+                self.assertEqual(recovered, 1)
+                self.assertEqual(len(bridge.sent), 1)
+                self.assertEqual(bridge.sent[0][0].session_id, "codex-s1")
+                self.assertEqual(bridge.sent[0][1], "can this also cover codex?")
+                self.assertEqual(bridge.sent[0][3], "U1")
+                self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "201.000000")
+                self.assertEqual(
+                    store.get_setting(SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN),
+                    "201.000000",
+                )
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_keeps_checkpoint_when_channel_history_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = DetachedRuntime()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                store.set_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE, "171.000000")
+
+                def fail_channel_messages(channel_id, oldest=None, limit=200):
+                    raise RuntimeError("history timeout")
+
+                gateway.channel_messages = fail_channel_messages
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="local",
+                    sleep_gap_seconds=30.0,
+                    grace_seconds=0.0,
+                    now=lambda: 172.0,
+                )
+
+                recovered = backfill.sync_once()
+
+                self.assertEqual(recovered, 0)
+                self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "171.000000")
             finally:
                 store.close()
 

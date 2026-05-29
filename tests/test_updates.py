@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from agent_harness.storage.store import Store
 from agent_harness.updates import (
+    SETTING_UPDATE_INSTALLED_VERSION,
     GitHubReleaseSource,
     ReleaseInfo,
     SelfUpdater,
@@ -214,6 +215,7 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(restarts, [True])
                 self.assertIn("Installed Slackgentic v0.2.0", updates[-1])
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_INSTALLED_VERSION))
                 # The pre-restart message should hand off the post-restart
                 # ack to the next daemon by recording where to update.
                 pending = store.get_setting("slackgentic.update.restart_pending")
@@ -276,6 +278,10 @@ class UpdateRunnerTests(unittest.TestCase):
                     self.assertIn(f"v{__version__}", text)
                     self.assertIn("restarted successfully", text)
                     self.assertIsNone(store.get_setting("slackgentic.update.restart_pending"))
+                    self.assertEqual(
+                        store.get_setting(SETTING_UPDATE_INSTALLED_VERSION),
+                        __version__,
+                    )
                 finally:
                     runner.stop()
             finally:
