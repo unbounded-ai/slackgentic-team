@@ -236,12 +236,6 @@ class ServiceTests(unittest.TestCase):
         run.assert_has_calls(
             [
                 call(
-                    ["launchctl", "bootout", "gui/501/com.slackgentic-team.daemon"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                ),
-                call(
                     [
                         "launchctl",
                         "bootout",
@@ -258,12 +252,77 @@ class ServiceTests(unittest.TestCase):
                     text=True,
                 ),
                 call(
+                    ["launchctl", "bootout", "gui/501/com.slackgentic-team.daemon"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ),
+                call(
                     ["launchctl", "bootstrap", "gui/501", str(paths[0])],
                     check=False,
                     capture_output=True,
                     text=True,
                 ),
             ]
+        )
+
+    def test_install_services_on_macos_bootstraps_codex_before_daemon_bootout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            codex = build_codex_app_server_service_spec(
+                executable=Path(tmp) / "codex",
+                working_directory=Path(tmp),
+            )
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                if command == [
+                    "launchctl",
+                    "bootout",
+                    "gui/501/com.slackgentic-team.daemon",
+                ]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        5,
+                        "",
+                        "Bootstrap failed: 5: Input/output error",
+                    )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service.os.getuid", return_value=501),
+                patch(
+                    "agent_harness.service._launchd_path",
+                    side_effect=lambda label: Path(tmp) / f"{label}.plist",
+                ),
+                patch("agent_harness.service.subprocess.run", side_effect=fake_run),
+                self.assertRaises(RuntimeError),
+            ):
+                install_services([daemon, codex])
+
+            codex_bootstrap = [
+                "launchctl",
+                "bootstrap",
+                "gui/501",
+                str(Path(tmp) / f"{codex.label}.plist"),
+            ]
+            daemon_bootout = [
+                "launchctl",
+                "bootout",
+                "gui/501/com.slackgentic-team.daemon",
+            ]
+
+        self.assertLess(
+            commands.index(codex_bootstrap),
+            commands.index(daemon_bootout),
         )
 
     def test_install_services_on_macos_retries_transient_bootstrap_failure(self):
@@ -463,7 +522,6 @@ class ServiceTests(unittest.TestCase):
         run.assert_has_calls(
             [
                 call(["systemctl", "--user", "daemon-reload"], check=True),
-                call(["systemctl", "--user", "stop", "slackgentic-team.service"], check=False),
                 call(
                     [
                         "systemctl",
@@ -483,6 +541,7 @@ class ServiceTests(unittest.TestCase):
                     ],
                     check=True,
                 ),
+                call(["systemctl", "--user", "stop", "slackgentic-team.service"], check=False),
                 call(
                     ["systemctl", "--user", "enable", "--now", "slackgentic-team.service"],
                     check=True,

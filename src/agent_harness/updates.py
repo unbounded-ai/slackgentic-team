@@ -4,6 +4,7 @@ import importlib.metadata
 import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -355,6 +356,40 @@ class SelfUpdater:
             )
             results.append(result)
             if completed.returncode != 0:
+                fallback = self._pip_install_fallback(command, result)
+                if fallback is not None:
+                    try:
+                        completed = self.run(
+                            list(fallback.args),
+                            cwd=fallback.cwd,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=self.timeout_seconds,
+                        )
+                    except subprocess.TimeoutExpired:
+                        return UpgradeResult(
+                            False,
+                            plan,
+                            tuple(results),
+                            f"Timed out while trying to {plan.description}.",
+                        )
+                    except OSError as exc:
+                        return UpgradeResult(
+                            False,
+                            plan,
+                            tuple(results),
+                            f"Could not start the update command: {exc}",
+                        )
+                    result = UpgradeCommandResult(
+                        command=fallback.display_args(),
+                        returncode=completed.returncode,
+                        stdout=completed.stdout or "",
+                        stderr=completed.stderr or "",
+                    )
+                    results.append(result)
+                    if completed.returncode == 0:
+                        continue
                 return UpgradeResult(
                     False,
                     plan,
@@ -362,6 +397,36 @@ class SelfUpdater:
                     _command_failure_message(result, plan),
                 )
         return UpgradeResult(True, plan, tuple(results))
+
+    def _pip_install_fallback(
+        self,
+        command: UpgradeCommand,
+        result: UpgradeCommandResult,
+    ) -> UpgradeCommand | None:
+        if not _pip_module_missing(result):
+            return None
+        args = command.args
+        if len(args) < 5 or args[:4] != (self.python_executable, "-m", "pip", "install"):
+            return None
+        uv = shutil.which("uv")
+        if not uv:
+            return None
+        install_args = args[4:]
+        redacted_install_args = (
+            command.redacted_args[4:] if command.redacted_args is not None else install_args
+        )
+        return UpgradeCommand(
+            (uv, "pip", "install", "--python", self.python_executable, *install_args),
+            cwd=command.cwd,
+            redacted_args=(
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                self.python_executable,
+                *redacted_install_args,
+            ),
+        )
 
     def _dirty_source_message(self, source_root: Path) -> str | None:
         try:
@@ -727,6 +792,11 @@ def _command_failure_message(result: UpgradeCommandResult, plan: UpgradePlan) ->
     detail = (result.stderr or result.stdout).strip().splitlines()
     suffix = f": {detail[-1]}" if detail else ""
     return f"Could not {plan.description}; command exited {result.returncode}{suffix}"
+
+
+def _pip_module_missing(result: UpgradeCommandResult) -> bool:
+    output = f"{result.stderr}\n{result.stdout}".lower()
+    return "no module named pip" in output or "no module named 'pip'" in output
 
 
 def _optional_string(value: object) -> str | None:

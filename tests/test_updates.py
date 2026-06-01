@@ -136,6 +136,70 @@ class SelfUpdaterTests(unittest.TestCase):
         self.assertEqual(calls[2][-2:], ["--detach", "v0.2.0"])
         self.assertEqual(calls[3][:4], ["/venv/bin/python", "-m", "pip", "install"])
 
+    def test_install_falls_back_to_uv_when_python_has_no_pip(self):
+        release = ReleaseInfo(
+            version="0.2.0",
+            tag_name="v0.2.0",
+            tarball_url="https://example.com/release.tar.gz",
+        )
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if args[:4] == ["/venv/bin/python", "-m", "pip", "install"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="/venv/bin/python: No module named pip\n",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with (
+            patch("agent_harness.updates.detect_source_root", return_value=None),
+            patch("agent_harness.updates.shutil.which", return_value="/usr/bin/uv"),
+        ):
+            result = SelfUpdater(
+                run=fake_run,
+                python_executable="/venv/bin/python",
+            ).install(release)
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "/venv/bin/python",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--upgrade",
+                    "https://example.com/release.tar.gz",
+                ],
+                [
+                    "/usr/bin/uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    "/venv/bin/python",
+                    "--upgrade",
+                    "https://example.com/release.tar.gz",
+                ],
+            ],
+        )
+        self.assertEqual(
+            result.commands[-1].command,
+            (
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                "/venv/bin/python",
+                "--upgrade",
+                "https://example.com/release.tar.gz",
+            ),
+        )
+
 
 class UpdateRunnerTests(unittest.TestCase):
     def test_sync_once_prompts_once_for_new_version(self):

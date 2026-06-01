@@ -1368,6 +1368,85 @@ class ClaudeChannelTests(unittest.TestCase):
                 "/opt/slackgentic claude-channel --native-input-hook",
             )
 
+    def test_install_registers_native_input_hook_before_user_wildcards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "matcher": "*",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "observer",
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            written = ensure_claude_native_input_hook("/opt/slackgentic", home)
+
+            self.assertEqual(written, home / ".claude" / "settings.local.json")
+            user_config = json.loads(settings.read_text(encoding="utf-8"))
+            user_pre_tool_use = user_config["hooks"]["PreToolUse"]
+            self.assertEqual(user_pre_tool_use[0]["matcher"], "AskUserQuestion")
+            self.assertEqual(user_pre_tool_use[1]["matcher"], "*")
+            self.assertEqual(
+                user_pre_tool_use[0]["hooks"][0]["command"],
+                "/opt/slackgentic claude-channel --native-input-hook",
+            )
+
+            local_config = json.loads(written.read_text(encoding="utf-8"))
+            self.assertEqual(local_config["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion")
+
+    def test_install_moves_existing_native_input_hook_before_wildcards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.local.json"
+            settings.parent.mkdir()
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {"matcher": "*", "hooks": []},
+                                {
+                                    "matcher": "AskUserQuestion",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "old",
+                                            "_slackgentic": "slackgentic.native_input.v1",
+                                        }
+                                    ],
+                                },
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ensure_claude_native_input_hook("/opt/slackgentic", home)
+
+            config = json.loads(settings.read_text(encoding="utf-8"))
+            pre_tool_use = config["hooks"]["PreToolUse"]
+            self.assertEqual([entry["matcher"] for entry in pre_tool_use], ["AskUserQuestion", "*"])
+            self.assertEqual(
+                pre_tool_use[0]["hooks"][0]["command"],
+                "/opt/slackgentic claude-channel --native-input-hook",
+            )
+
     def test_native_input_hook_posts_slack_request_and_returns_updated_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

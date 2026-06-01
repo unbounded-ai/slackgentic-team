@@ -691,7 +691,19 @@ def ensure_claude_native_input_hook(
         command, invocation_args = _current_slackgentic_invocation()
     else:
         invocation_args = list(args or [])
-    path = home / ".claude" / "settings.local.json"
+    local_path = home / ".claude" / "settings.local.json"
+    user_path = home / ".claude" / "settings.json"
+    _ensure_claude_native_input_hook_at_path(local_path, command, invocation_args)
+    if user_path.exists():
+        _ensure_claude_native_input_hook_at_path(user_path, command, invocation_args)
+    return local_path
+
+
+def _ensure_claude_native_input_hook_at_path(
+    path: Path,
+    command: str,
+    invocation_args: list[str],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -718,6 +730,7 @@ def ensure_claude_native_input_hook(
             }
         ],
     }
+    first_wildcard_index = _first_wildcard_hook_index(pre_tool_use)
     for index, candidate in enumerate(pre_tool_use):
         if not isinstance(candidate, dict):
             continue
@@ -728,12 +741,23 @@ def ensure_claude_native_input_hook(
             isinstance(hook, dict) and hook.get("_slackgentic") == NATIVE_INPUT_HOOK_MARKER
             for hook in candidate_hooks
         ):
-            pre_tool_use[index] = entry
+            pre_tool_use.pop(index)
+            insert_index = _first_wildcard_hook_index(pre_tool_use)
+            pre_tool_use.insert(insert_index, entry)
             break
     else:
-        pre_tool_use.append(entry)
+        pre_tool_use.insert(first_wildcard_index, entry)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path
+
+
+def _first_wildcard_hook_index(pre_tool_use: list[object]) -> int:
+    for index, candidate in enumerate(pre_tool_use):
+        if not isinstance(candidate, dict):
+            continue
+        matcher = candidate.get("matcher")
+        if matcher is None or matcher == "*":
+            return index
+    return len(pre_tool_use)
 
 
 def mcp_config(command: str = "slackgentic", args: list[str] | None = None) -> dict[str, Any]:

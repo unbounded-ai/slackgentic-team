@@ -312,10 +312,9 @@ def _install_launchd_services(specs: list[ServiceSpec]) -> list[Path]:
         path.write_bytes(content)
         paths.append(path)
 
-    for spec in specs:
-        _bootout_launchd(spec.label)
     ordered_specs = _codex_first_specs(specs)
     for spec in ordered_specs:
+        _bootout_launchd(spec.label)
         _bootstrap_launchd(spec.label)
     _settle_launchd_services(ordered_specs)
     return paths
@@ -377,9 +376,8 @@ def _install_systemd_services(specs: list[ServiceSpec]) -> list[Path]:
         paths.append(path)
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    for spec in specs:
-        subprocess.run(["systemctl", "--user", "stop", f"{spec.name}.service"], check=False)
     for spec in _codex_first_specs(specs):
+        subprocess.run(["systemctl", "--user", "stop", f"{spec.name}.service"], check=False)
         subprocess.run(
             ["systemctl", "--user", "enable", "--now", f"{spec.name}.service"],
             check=True,
