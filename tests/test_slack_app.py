@@ -5355,6 +5355,61 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_slack_message_backfill_skips_processed_external_session_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    control_mode=ControlMode.OBSERVED,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+                controller._mark_slack_message_processed("C1", "171.000002")
+                gateway.add_reaction("C1", "171.000002", "hourglass_flowing_sand")
+                gateway.thread_history_messages[("C1", thread.thread_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "What's the latest?",
+                        "ts": "171.000002",
+                        "thread_ts": thread.thread_ts,
+                    }
+                ]
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="T1",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000000")
+
+                self.assertEqual(recovered, 0)
+                self.assertEqual(bridge.sent, [])
+                self.assertTrue(controller._slack_message_processed("C1", "171.000002"))
+            finally:
+                store.close()
+
     def test_slack_message_backfill_skips_stored_agent_request_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -6770,6 +6825,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(bridge.sent[0][0].session_id, "s1")
                 self.assertEqual(bridge.sent[0][1], "what are you working on?")
                 self.assertEqual(bridge.sent[0][3], "U1")
+                self.assertEqual(
+                    store.get_setting("external_session_delivery.C1.171.000002"),
+                    "claude:s1",
+                )
             finally:
                 store.close()
 
