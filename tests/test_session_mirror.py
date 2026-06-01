@@ -20,6 +20,7 @@ from agent_harness.sessions.mirror import (
     _cwd_matches_ignored_patterns,
     render_session_event,
 )
+from agent_harness.sessions.native_input import claude_native_input_setting_key
 from agent_harness.sessions.terminal import TerminalTarget
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
@@ -335,6 +336,74 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(seen[0][2], thread)
                 self.assertEqual(seen[0][3], "somebody review this")
                 self.assertEqual(seen[0][4], "173.000001")
+            finally:
+                store.close()
+
+    def test_existing_thread_skips_native_question_when_hook_posted_slack_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                store.set_session_mirror_cursor(Provider.CLAUDE, "s1", 5)
+                store.set_setting(
+                    claude_native_input_setting_key("s1", "toolu_question"),
+                    "{}",
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=6,
+                        metadata={
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_question",
+                                        "name": "AskUserQuestion",
+                                        "input": {
+                                            "questions": [
+                                                {
+                                                    "header": "Scope",
+                                                    "question": "Pick scope.",
+                                                    "options": [{"label": "Cheap"}],
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ]
+                            }
+                        },
+                    )
+                ]
+                provider = CursorAwareProvider(session, events)
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [provider],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CLAUDE, "s1"), 6)
             finally:
                 store.close()
 

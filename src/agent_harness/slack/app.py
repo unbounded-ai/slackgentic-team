@@ -152,7 +152,11 @@ from agent_harness.schedules import (
     parse_agent_schedule_signal,
 )
 from agent_harness.sessions.bridge import ExternalSessionBridge
-from agent_harness.sessions.claude_channel import ensure_codex_mcp_server_registered
+from agent_harness.sessions.claude_channel import (
+    ensure_claude_native_input_hook,
+    ensure_codex_mcp_server_registered,
+    is_slackgentic_mcp_server_configured,
+)
 from agent_harness.sessions.managed_session import (
     clear_managed_session,
     managed_session_agents,
@@ -8672,6 +8676,7 @@ class SocketModeSlackApp:
         self.gateway = SlackGateway(config.slack.bot_token)
         auth = self.gateway.auth_test()
         _ensure_codex_mcp_for_slack_app(config)
+        _ensure_claude_native_input_hook_for_slack_app(config)
         self.codex_app_server = None
         codex_app_server_url = config.commands.codex_app_server_url
         if config.commands.codex_app_server_autostart and codex_app_server_url:
@@ -9005,6 +9010,15 @@ def _ensure_codex_mcp_for_slack_app(config: AppConfig) -> None:
         return
     if registered:
         LOGGER.info("registered Codex MCP server: slackgentic")
+
+
+def _ensure_claude_native_input_hook_for_slack_app(config: AppConfig) -> None:
+    try:
+        if not is_slackgentic_mcp_server_configured(config.home):
+            return
+        ensure_claude_native_input_hook(home=config.home)
+    except Exception:
+        LOGGER.warning("failed to register Claude native input hook", exc_info=True)
 
 
 def run_slack_app(config: AppConfig | None = None) -> int:

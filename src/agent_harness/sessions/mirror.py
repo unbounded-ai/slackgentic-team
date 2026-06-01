@@ -40,6 +40,10 @@ from agent_harness.sessions.claude_channel import (
     claude_session_has_slackgentic_mcp,
     is_slackgentic_mcp_server_configured,
 )
+from agent_harness.sessions.native_input import (
+    claude_ask_user_question_id,
+    claude_native_input_setting_key,
+)
 from agent_harness.sessions.terminal import SessionTerminalNotifier
 from agent_harness.sessions.todo_mirror import TodoMirror
 from agent_harness.slack import build_external_session_capacity_blocks
@@ -384,6 +388,8 @@ class SessionMirror:
             if line_number <= cursor:
                 continue
             max_line = max(max_line, line_number)
+            if self._skip_claude_native_input_request(session, event):
+                continue
             rendered = render_session_event_chunk(event)
             if rendered is None:
                 continue
@@ -398,6 +404,23 @@ class SessionMirror:
                 for chunk in _slack_chunks(rendered.text)
             )
         return chunks, max_line
+
+    def _skip_claude_native_input_request(
+        self,
+        session: AgentSession,
+        event: AgentEvent,
+    ) -> bool:
+        if session.provider != Provider.CLAUDE or event.event_type != "assistant":
+            return False
+        message = event.metadata.get("message")
+        if not isinstance(message, dict):
+            return False
+        tool_use_id = claude_ask_user_question_id(message)
+        if not tool_use_id:
+            return False
+        return bool(
+            self.store.get_setting(claude_native_input_setting_key(session.session_id, tool_use_id))
+        )
 
     def _post_chunks(
         self,

@@ -76,6 +76,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Register the Slackgentic Claude channel in user-level Claude MCP config",
     )
+    claude_channel.add_argument(
+        "--native-input-hook",
+        action="store_true",
+        help="Run the Slackgentic Claude native input hook",
+    )
 
     codex_mcp = sub.add_parser("codex-mcp", help="Run the Slackgentic MCP server for Codex")
     codex_mcp.add_argument("--db", type=Path)
@@ -289,8 +294,11 @@ def main(argv: list[str] | None = None) -> int:
             install_claude_mcp_server,
             mcp_config,
             run_channel_server,
+            run_native_input_hook,
         )
 
+        if args.native_input_hook:
+            return run_native_input_hook(args.db)
         if args.print_mcp_config:
             command, command_args = _current_slackgentic_invocation()
             print(json.dumps(mcp_config(command, command_args), indent=2, sort_keys=True))
