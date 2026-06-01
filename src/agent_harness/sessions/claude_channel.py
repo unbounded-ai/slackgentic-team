@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -13,10 +14,17 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from agent_harness.config import load_config_from_env
-from agent_harness.models import PermissionMode, SlackThreadRef
+from agent_harness.models import PermissionMode, Provider, SlackThreadRef
 from agent_harness.permissions import (
     claude_channel_permission_mode_from_env,
     claude_safe_auto_permission_request_allowed,
+)
+from agent_harness.sessions.native_input import (
+    claude_ask_user_question_answers,
+    claude_ask_user_question_tool_result_text,
+    claude_ask_user_question_updated_input,
+    claude_native_input_setting_key,
+    slack_request_params_for_claude_ask_user_question,
 )
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.storage.store import Store
@@ -61,6 +69,7 @@ SLACKGENTIC_MCP_PERMISSION_ALLOW = tuple(sorted(SLACKGENTIC_MCP_TOOL_NAMES))
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
 CREATE_PULL_REQUEST_TIMEOUT_SECONDS = 120
+NATIVE_INPUT_HOOK_MARKER = "slackgentic.native_input.v1"
 
 
 class PullRequestHeadPreparation(NamedTuple):
@@ -417,6 +426,103 @@ def run_channel_server(db_path: Path | None = None, *, provider_label: str = "Cl
         store.close()
 
 
+def run_native_input_hook(db_path: Path | None = None) -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    config = load_config_from_env()
+    if not config.slack.bot_token:
+        return 0
+    store = Store(db_path or config.state_db)
+    try:
+        store.init_schema()
+        from agent_harness.slack.client import SlackGateway
+
+        result = handle_native_input_hook(
+            payload,
+            store,
+            SlackGateway(config.slack.bot_token),
+            poll_seconds=0.2,
+        )
+    finally:
+        store.close()
+    if result:
+        sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+def handle_native_input_hook(
+    payload: dict[str, Any],
+    store: Store,
+    gateway: Any,
+    *,
+    poll_seconds: float = 0.05,
+) -> dict[str, Any] | None:
+    if payload.get("hook_event_name") != "PreToolUse":
+        return None
+    if payload.get("tool_name") != "AskUserQuestion":
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    params = slack_request_params_for_claude_ask_user_question(tool_input)
+    if params is None:
+        return None
+    session_id = str(payload.get("session_id") or "")
+    tool_use_id = str(payload.get("tool_use_id") or "")
+    thread = _native_input_thread(payload, store)
+    if thread is None:
+        return None
+    if session_id and tool_use_id:
+        store.set_setting(
+            claude_native_input_setting_key(session_id, tool_use_id),
+            json.dumps({"thread": thread.thread_ts}, sort_keys=True),
+        )
+    handler = SlackAgentRequestHandler(
+        gateway,
+        store=store,
+        provider_label="Claude",
+        poll_seconds=poll_seconds,
+    )
+    response = handler.handle_persistent_request(
+        "item/tool/requestUserInput",
+        params,
+        thread,
+        provider_label="Claude",
+    )
+    updated_input = claude_ask_user_question_updated_input(tool_input, response)
+    if updated_input is None:
+        return {
+            "hookSpecificOutput": {"permissionDecision": "deny"},
+            "systemMessage": "Slackgentic did not receive an answer for this question.",
+        }
+    answers = claude_ask_user_question_answers(tool_input, response) or {}
+    return {
+        "hookSpecificOutput": {
+            "permissionDecision": "allow",
+            "updatedInput": updated_input,
+        },
+        "systemMessage": claude_ask_user_question_tool_result_text(tool_input, answers),
+    }
+
+
+def _native_input_thread(payload: dict[str, Any], store: Store) -> SlackThreadRef | None:
+    env_thread = _thread_from_env()
+    if env_thread is not None:
+        return env_thread
+    session_id = str(payload.get("session_id") or "")
+    if not session_id:
+        return None
+    active_task = store.get_active_task_by_session(Provider.CLAUDE, session_id)
+    if active_task is not None and active_task.channel_id and active_task.thread_ts:
+        return SlackThreadRef(active_task.channel_id, active_task.thread_ts)
+    return store.find_slack_thread_for_session(Provider.CLAUDE, session_id)
+
+
 def install_claude_mcp_server(command: str | None = None, home: Path | None = None) -> None:
     if command is None:
         resolved, command_args = _current_slackgentic_invocation()
@@ -459,6 +565,7 @@ def install_claude_mcp_server(command: str | None = None, home: Path | None = No
                 stderr=completed.stderr,
             )
     ensure_claude_mcp_permissions(home)
+    ensure_claude_native_input_hook(resolved, home, args=command_args)
 
 
 def install_codex_mcp_server(
@@ -570,6 +677,62 @@ def ensure_claude_mcp_permissions(home: Path | None = None) -> Path:
             changed = True
     if changed or not path.exists():
         path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def ensure_claude_native_input_hook(
+    command: str | None = None,
+    home: Path | None = None,
+    *,
+    args: list[str] | None = None,
+) -> Path:
+    home = home or Path.home()
+    if command is None:
+        command, invocation_args = _current_slackgentic_invocation()
+    else:
+        invocation_args = list(args or [])
+    path = home / ".claude" / "settings.local.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    hooks = value.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        value["hooks"] = hooks
+    pre_tool_use = hooks.get("PreToolUse")
+    if not isinstance(pre_tool_use, list):
+        pre_tool_use = []
+        hooks["PreToolUse"] = pre_tool_use
+    hook_command = shlex.join([command, *invocation_args, "claude-channel", "--native-input-hook"])
+    entry = {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+            {
+                "type": "command",
+                "command": hook_command,
+                "_slackgentic": NATIVE_INPUT_HOOK_MARKER,
+            }
+        ],
+    }
+    for index, candidate in enumerate(pre_tool_use):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_hooks = candidate.get("hooks")
+        if not isinstance(candidate_hooks, list):
+            continue
+        if any(
+            isinstance(hook, dict) and hook.get("_slackgentic") == NATIVE_INPUT_HOOK_MARKER
+            for hook in candidate_hooks
+        ):
+            pre_tool_use[index] = entry
+            break
+    else:
+        pre_tool_use.append(entry)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 

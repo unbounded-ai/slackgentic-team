@@ -10,7 +10,13 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.models import PermissionMode, SlackThreadRef
+from agent_harness.models import (
+    AgentSession,
+    PermissionMode,
+    Provider,
+    SessionStatus,
+    SlackThreadRef,
+)
 from agent_harness.permissions import CLAUDE_CHANNEL_PERMISSION_MODE_ENV
 from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
@@ -20,7 +26,9 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
     ensure_claude_mcp_permissions,
+    ensure_claude_native_input_hook,
     ensure_codex_mcp_server_registered,
+    handle_native_input_hook,
     install_claude_mcp_server,
     install_codex_mcp_server,
     is_codex_mcp_server_configured,
@@ -1336,6 +1344,120 @@ class ClaudeChannelTests(unittest.TestCase):
             for permission in SLACKGENTIC_MCP_PERMISSION_ALLOW:
                 self.assertIn(permission, config["permissions"]["allow"])
             self.assertIn("Bash(ls:*)", config["permissions"]["allow"])
+
+    def test_install_registers_native_input_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.local.json"
+            settings.parent.mkdir()
+            settings.write_text(
+                json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": []}]}}),
+                encoding="utf-8",
+            )
+
+            written = ensure_claude_native_input_hook("/opt/slackgentic", home)
+
+            self.assertEqual(written, settings)
+            config = json.loads(settings.read_text(encoding="utf-8"))
+            pre_tool_use = config["hooks"]["PreToolUse"]
+            self.assertEqual(pre_tool_use[0]["matcher"], "Bash")
+            native = pre_tool_use[1]
+            self.assertEqual(native["matcher"], "AskUserQuestion")
+            self.assertEqual(
+                native["hooks"][0]["command"],
+                "/opt/slackgentic claude-channel --native-input-hook",
+            )
+
+    def test_native_input_hook_posts_slack_request_and_returns_updated_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                payload = {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_question",
+                    "session_id": "s1",
+                    "tool_input": {
+                        "questions": [
+                            {
+                                "header": "Scope",
+                                "question": "How much should run?",
+                                "options": [
+                                    {"label": "Cheap set"},
+                                    {"label": "Everything runnable"},
+                                ],
+                            },
+                            {
+                                "header": "Validation",
+                                "question": "Add result validation?",
+                                "options": [{"label": "No"}, {"label": "Yes"}],
+                            },
+                        ]
+                    },
+                }
+                result = {}
+
+                def run_hook():
+                    result["value"] = handle_native_input_hook(
+                        payload,
+                        store,
+                        gateway,
+                        poll_seconds=0.01,
+                    )
+
+                worker = threading.Thread(target=run_hook)
+                worker.start()
+                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                rows = store.list_pending_slack_agent_requests("item/tool/requestUserInput")
+                self.assertEqual(len(rows), 1)
+                store.resolve_slack_agent_request(
+                    rows[0]["token"],
+                    {
+                        "answers": {
+                            "q0": {"answers": ["Everything runnable"]},
+                            "q1": {"answers": ["Yes"]},
+                        }
+                    },
+                )
+                worker.join(timeout=1)
+
+                self.assertFalse(worker.is_alive())
+                hook_result = result["value"]
+                self.assertIsNotNone(hook_result)
+                assert hook_result is not None
+                self.assertEqual(
+                    hook_result["hookSpecificOutput"]["permissionDecision"],
+                    "allow",
+                )
+                updated_input = hook_result["hookSpecificOutput"]["updatedInput"]
+                self.assertEqual(
+                    updated_input["answers"],
+                    {
+                        "How much should run?": "Everything runnable",
+                        "Add result validation?": "Yes",
+                    },
+                )
+                self.assertIn("Everything runnable", hook_result["systemMessage"])
+                self.assertIsNotNone(
+                    store.get_setting("claude_native_input_request.claude.s1.toolu_question")
+                )
+            finally:
+                store.close()
 
 
 def _wait_for(predicate, attempts=100):
