@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.config import AgentCommandConfig
+from agent_harness.config import AgentCommandConfig, AppConfig
 from agent_harness.deferred import (
     AGENT_DEFERRED_SIGNAL_PREFIX,
     DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
@@ -76,6 +76,8 @@ from agent_harness.slack.app import (
     SlackReplyTarget,
     SlackTeamController,
     SocketModeSlackApp,
+    _service_reinstall_command,
+    _service_reinstall_environment,
 )
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
@@ -385,6 +387,56 @@ def _roster_work_submission_payload(
 
 
 class SlackAppTests(unittest.TestCase):
+    def test_service_reinstall_command_preserves_runtime_options(self):
+        config = AppConfig.model_validate(
+            {
+                "config_file": Path("/workspace/config.json"),
+                "commands": {
+                    "codex_app_server_url": "ws://127.0.0.1:47684",
+                    "codex_binary": "/usr/local/bin/codex",
+                },
+                "sessions": {
+                    "ignored_external_session_cwds": (".local", "tmp/cache"),
+                },
+            }
+        )
+
+        command = _service_reinstall_command(
+            config,
+            executable=Path("/venv/bin/slackgentic"),
+            working_directory=Path("/workspace/repos/slackgentic"),
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/venv/bin/slackgentic",
+                "service",
+                "install",
+                "--workdir",
+                "/workspace/repos/slackgentic",
+                "--config-file",
+                "/workspace/config.json",
+                "--codex-app-server-url",
+                "ws://127.0.0.1:47684",
+                "--codex-binary",
+                "/usr/local/bin/codex",
+                "--ignore-external-session-cwd",
+                ".local",
+                "--ignore-external-session-cwd",
+                "tmp/cache",
+            ],
+        )
+
+    def test_service_reinstall_environment_points_at_updated_source(self):
+        env = _service_reinstall_environment(
+            Path("/workspace/repos/slackgentic"),
+            {"PATH": "/usr/bin", "PYTHONPATH": "/workspace/repos/old/src"},
+        )
+
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["PYTHONPATH"], "/workspace/repos/slackgentic/src")
+
     def test_socket_mode_connect_retries_before_process_exit(self):
         connect_calls = []
         closed_clients = []
