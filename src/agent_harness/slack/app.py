@@ -6,7 +6,10 @@ import logging
 import os
 import random
 import re
+import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -234,6 +237,7 @@ from agent_harness.updates import (
     SlackgenticUpdateRunner,
     UpdateCandidate,
     UpdateChecker,
+    detect_source_root,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -8906,6 +8910,8 @@ class SocketModeSlackApp:
         from agent_harness.service import restart_service
 
         try:
+            if self._schedule_service_reinstall_after_update():
+                return
             result = restart_service(force=True)
         except Exception as exc:
             self.request_shutdown()
@@ -8917,6 +8923,30 @@ class SocketModeSlackApp:
             raise RuntimeError(
                 f"installed the update, but service restart exited with status {result}"
             )
+
+    def _schedule_service_reinstall_after_update(self) -> bool:
+        executable = Path(sys.argv[0])
+        if not executable.exists():
+            found = shutil.which("slackgentic")
+            if not found:
+                return False
+            executable = Path(found)
+        workdir = _service_reinstall_workdir(Path(__file__).resolve())
+        command = _service_reinstall_command(
+            self.config,
+            executable=executable.resolve(),
+            working_directory=workdir,
+        )
+        env = _service_reinstall_environment(workdir, os.environ)
+        subprocess.Popen(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
 
     def run_forever(self) -> None:
         import signal
@@ -9076,6 +9106,57 @@ def _ensure_claude_native_input_hook_for_slack_app(config: AppConfig) -> None:
         ensure_claude_native_input_hook(home=config.home)
     except Exception:
         LOGGER.warning("failed to register Claude native input hook", exc_info=True)
+
+
+def _service_reinstall_workdir(package_file: Path | None = None) -> Path:
+    source_root = detect_source_root(package_file or Path(__file__).resolve())
+    return (source_root or Path.cwd()).resolve()
+
+
+def _service_reinstall_command(
+    config: AppConfig,
+    *,
+    executable: Path,
+    working_directory: Path,
+) -> list[str]:
+    command = [
+        str(executable),
+        "service",
+        "install",
+        "--workdir",
+        str(working_directory),
+        "--config-file",
+        str(config.config_file),
+    ]
+    codex_app_server_url = config.commands.codex_app_server_url
+    if codex_app_server_url:
+        command.extend(["--codex-app-server-url", codex_app_server_url])
+        codex_binary = _resolved_command_path(config.commands.codex_binary)
+        if codex_binary:
+            command.extend(["--codex-binary", codex_binary])
+    else:
+        command.append("--no-codex-app-server")
+    for cwd_pattern in config.sessions.ignored_external_session_cwds:
+        command.extend(["--ignore-external-session-cwd", cwd_pattern])
+    return command
+
+
+def _service_reinstall_environment(
+    working_directory: Path,
+    environ: os._Environ[str] | dict[str, str],
+) -> dict[str, str]:
+    env = dict(environ)
+    env["PYTHONPATH"] = str(working_directory / "src")
+    return env
+
+
+def _resolved_command_path(command: str) -> str | None:
+    if not command:
+        return None
+    path = Path(command).expanduser()
+    if path.is_absolute() or len(path.parts) > 1:
+        return str(path)
+    return shutil.which(command) or command
 
 
 def run_slack_app(config: AppConfig | None = None) -> int:
