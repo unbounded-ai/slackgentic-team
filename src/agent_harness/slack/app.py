@@ -247,6 +247,7 @@ SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
 SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
+SETTING_EXTERNAL_SESSION_DELIVERY_PREFIX = "external_session_delivery."
 TASK_REACTION_ACKNOWLEDGED = "eyes"
 TASK_REACTION_QUEUED = "inbox_tray"
 TASK_REACTION_IN_PROGRESS = "hourglass_flowing_sand"
@@ -3844,6 +3845,7 @@ class SlackTeamController:
             slack_user=event.get("user"),
         )
         if sent:
+            self._mark_external_session_message_delivered(channel_id, message_ts, session)
             self._mark_message_in_progress(channel_id, message_ts)
         return sent
 
@@ -3921,6 +3923,7 @@ class SlackTeamController:
             target_agent,
             SlackThreadRef(channel_id, thread_ts),
             requested_by_slack_user=event.get("user"),
+            request_message_ts=event.get("ts"),
         ):
             self._mark_message_in_progress(channel_id, event.get("ts"))
             return True
@@ -4283,6 +4286,7 @@ class SlackTeamController:
             thread,
             requested_by_slack_user=task.requested_by_slack_user,
             delivery_text=_agent_authored_external_callback_text(text, request),
+            request_message_ts=message_ts,
         ):
             return True
         if task.metadata.get("delegate_to_agent_id") == target_agent.agent_id:
@@ -4377,6 +4381,7 @@ class SlackTeamController:
                 target_agent,
                 thread,
                 requested_by_slack_user=requested_by_slack_user,
+                request_message_ts=request_message_ts,
             ):
                 handled = True
                 started = True
@@ -4568,6 +4573,7 @@ class SlackTeamController:
         *,
         requested_by_slack_user: str | None,
         delivery_text: str | None = None,
+        request_message_ts: str | None = None,
     ) -> bool:
         session = self._external_session_for_thread_agent(
             agent,
@@ -4582,12 +4588,19 @@ class SlackTeamController:
                 "I found the external session thread, but no session bridge is configured.",
             )
             return True
-        return self.session_bridge.send_to_session(
+        sent = self.session_bridge.send_to_session(
             session,
             delivery_text or request.prompt,
             thread,
             slack_user=requested_by_slack_user,
         )
+        if sent:
+            self._mark_external_session_message_delivered(
+                thread.channel_id,
+                request_message_ts,
+                session,
+            )
+        return sent
 
     def _external_session_for_thread_agent(
         self,
@@ -8032,7 +8045,27 @@ class SlackTeamController:
             return False
         if not _event_has_slackgentic_progress_reaction(event):
             return False
+        if self._has_external_session_delivery_for_message(channel_id, message_ts):
+            return False
+        if self._external_session_for_backfilled_event(event) is not None:
+            return False
         return not self._has_work_for_request_message(channel_id, message_ts)
+
+    def _external_session_for_backfilled_event(self, event: dict):
+        channel_id = event.get("channel")
+        message_ts = event.get("ts")
+        thread_ts = event.get("thread_ts")
+        if (
+            not isinstance(channel_id, str)
+            or not channel_id
+            or not isinstance(message_ts, str)
+            or not message_ts
+            or not isinstance(thread_ts, str)
+            or not thread_ts
+            or thread_ts == message_ts
+        ):
+            return None
+        return self.store.get_session_for_slack_thread(self.team_id, channel_id, thread_ts)
 
     def _has_task_for_request_message(self, channel_id: str, message_ts: str) -> bool:
         for task in self.store.list_agent_tasks(include_done=True):
@@ -8050,6 +8083,8 @@ class SlackTeamController:
 
     def _has_work_for_request_message(self, channel_id: str, message_ts: str) -> bool:
         if self._has_task_for_request_message(channel_id, message_ts):
+            return True
+        if self._has_external_session_delivery_for_message(channel_id, message_ts):
             return True
         for pending in self.store.list_pending_work_requests(limit=500):
             if pending.channel_id != channel_id:
@@ -8073,6 +8108,28 @@ class SlackTeamController:
         self.store.set_setting(
             _slack_message_processed_key(channel_id, message_ts),
             utc_now().isoformat(),
+        )
+
+    def _mark_external_session_message_delivered(
+        self,
+        channel_id: str,
+        message_ts: str | None,
+        session,
+    ) -> None:
+        if not message_ts:
+            return
+        self.store.set_setting(
+            _external_session_delivery_setting_key(channel_id, message_ts),
+            f"{session.provider.value}:{session.session_id}",
+        )
+
+    def _has_external_session_delivery_for_message(
+        self,
+        channel_id: str,
+        message_ts: str,
+    ) -> bool:
+        return bool(
+            self.store.get_setting(_external_session_delivery_setting_key(channel_id, message_ts))
         )
 
 
@@ -9426,6 +9483,10 @@ def _retired_inactive_handle(agent, used_handles: set[str]) -> str:
 
 def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:
     return f"{SETTING_SLACK_MESSAGE_PROCESSED_PREFIX}{channel_id}.{message_ts}"
+
+
+def _external_session_delivery_setting_key(channel_id: str, message_ts: str) -> str:
+    return f"{SETTING_EXTERNAL_SESSION_DELIVERY_PREFIX}{channel_id}.{message_ts}"
 
 
 def _human_user_display_name_key(user_id: str) -> str:
