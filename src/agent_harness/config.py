@@ -90,6 +90,10 @@ class SessionConfig(BaseModel):
         default=(),
         validation_alias="SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS",
     )
+    external_session_mirror_poll_seconds: float = Field(
+        default=15.0,
+        validation_alias="SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS",
+    )
 
     @field_validator("ignored_external_session_cwds", mode="before")
     @classmethod

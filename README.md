@@ -377,6 +377,7 @@ variables override stored values.
 | `SLACKGENTIC_CODEX_APP_SERVER_URL` | Codex app-server URL. |
 | `SLACKGENTIC_CODEX_AGENTS` | Default initial Codex count. |
 | `SLACKGENTIC_CLAUDE_AGENTS` | Default initial Claude count. |
+| `SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS` | Seconds between scans for sessions started outside Slack, default `15`. |
 | `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS avatar directory, or `off`. |
 | `SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS` | Allow managed tasks to start in macOS privacy-protected locations after you have granted OS access. |
 | `SLACKGENTIC_UPDATE_CHECK_ENABLED` | Enable or disable release checks, default `true`. |
