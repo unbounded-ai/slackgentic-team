@@ -9021,7 +9021,10 @@ class SocketModeSlackApp:
             ],
             team_id=config.slack.team_id or "local",
             channel_id=config.slack.channel_id,
-            poll_seconds=max(config.poll_seconds, 2.0),
+            poll_seconds=max(
+                config.poll_seconds,
+                config.sessions.external_session_mirror_poll_seconds,
+            ),
             codex_app_server_url=codex_app_server_url,
             on_external_session_occupancy_change=(
                 self.controller.handle_external_session_occupancy_change
