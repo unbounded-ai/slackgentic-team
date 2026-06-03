@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_UPDATE_REPOSITORY = "unbounded-ai/slackgentic-team"
 DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 10 * 60
+DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 2 * 60
 SETTING_UPDATE_PROMPTED_VERSION = "slackgentic.update.prompted_version"
 SETTING_UPDATE_DISMISSED_VERSION = "slackgentic.update.dismissed_version"
 SETTING_UPDATE_INSTALLING_VERSION = "slackgentic.update.installing_version"
@@ -35,6 +38,7 @@ SETTING_UPDATE_CANDIDATE_PREFIX = "slackgentic.update.candidate."
 # back up on the newly-installed version. Cleared after the post-restart ack
 # is posted (or after one failed attempt, to avoid retry storms).
 SETTING_UPDATE_RESTART_PENDING = "slackgentic.update.restart_pending"
+SETTING_UPDATE_RESTART_HELPER = "slackgentic.update.restart_helper"
 
 
 class UpdateCheckError(RuntimeError):
@@ -49,10 +53,12 @@ class ReleaseInfo:
     tarball_url: str | None = None
     name: str | None = None
     published_at: str | None = None
+    body: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
             {
+                "body": self.body,
                 "version": self.version,
                 "tag_name": self.tag_name,
                 "html_url": self.html_url,
@@ -79,6 +85,7 @@ class ReleaseInfo:
             tarball_url=_optional_string(payload.get("tarball_url")),
             name=_optional_string(payload.get("name")),
             published_at=_optional_string(payload.get("published_at")),
+            body=_optional_string(payload.get("body")),
         )
 
 
@@ -159,6 +166,7 @@ class GitHubReleaseSource:
             tarball_url=_optional_string(payload.get("tarball_url")),
             name=_optional_string(payload.get("name")),
             published_at=_optional_string(payload.get("published_at")),
+            body=_optional_string(payload.get("body")),
         )
 
 
@@ -507,9 +515,8 @@ class SlackgenticUpdateRunner:
         raw = self.store.get_setting(SETTING_UPDATE_RESTART_PENDING)
         if not raw:
             return
-        try:
-            payload = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        payload = _restart_pending_payload(raw)
+        if payload is None:
             self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
             return
         channel_id = payload.get("channel_id")
@@ -522,13 +529,30 @@ class SlackgenticUpdateRunner:
         ):
             self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
             return
+        stale = restart_pending_is_stale(raw)
         if version != __version__:
+            if stale:
+                self._post_restart_pending_failure(channel_id, message_ts, version)
             return
         candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
         tag_name = candidate.release.tag_name
-        text = f":white_check_mark: Installed Slackgentic {tag_name} and restarted successfully."
+        if stale:
+            text = (
+                f":warning: Installed Slackgentic {tag_name}, but automatic service restart "
+                "did not confirm within 2 minutes. This daemon is now running the installed "
+                "version after a later start; run `slackgentic service status` to verify the "
+                "service is healthy."
+            )
+            self.store.set_setting(
+                SETTING_UPDATE_LAST_ERROR,
+                restart_pending_failure_text(version),
+            )
+        else:
+            text = (
+                f":white_check_mark: Installed Slackgentic {tag_name} and restarted successfully."
+            )
+            self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
         self.store.set_setting(SETTING_UPDATE_INSTALLED_VERSION, version)
-        self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
         try:
             self.update_message(
                 channel_id,
@@ -538,6 +562,26 @@ class SlackgenticUpdateRunner:
             )
         except Exception:
             LOGGER.exception("failed to post post-restart upgrade ack")
+        self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
+
+    def _post_restart_pending_failure(
+        self,
+        channel_id: str,
+        message_ts: str,
+        version: str,
+    ) -> None:
+        candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
+        text = restart_pending_failure_text(version, current_version=__version__)
+        self.store.set_setting(SETTING_UPDATE_LAST_ERROR, text)
+        try:
+            self.update_message(
+                channel_id,
+                message_ts,
+                text,
+                self.status_blocks(candidate, text, False),
+            )
+        except Exception:
+            LOGGER.exception("failed to post stale restart-pending failure")
         self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
 
     def stop(self) -> bool:
@@ -673,6 +717,7 @@ class SlackgenticUpdateRunner:
                 json.dumps(
                     {
                         "channel_id": channel_id,
+                        "created_at": utc_now().isoformat(),
                         "message_ts": message_ts,
                         "version": candidate.version,
                     },
@@ -801,6 +846,160 @@ def _pip_module_missing(result: UpgradeCommandResult) -> bool:
 
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def restart_pending_failure_text(version: str, *, current_version: str | None = None) -> str:
+    current = f" Current daemon version: `{current_version}`." if current_version else ""
+    return (
+        f":warning: Slackgentic {version} was installed, but automatic service restart "
+        "did not confirm within 2 minutes."
+        f"{current} Recovery: run `slackgentic service install && "
+        "slackgentic service status`."
+    )
+
+
+def restart_pending_is_stale(
+    raw: str | None,
+    *,
+    now: datetime | None = None,
+    timeout_seconds: float = DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS,
+) -> bool:
+    payload = _restart_pending_payload(raw)
+    if payload is None:
+        return False
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, str):
+        return True
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return True
+    current = now or utc_now()
+    if created.tzinfo is None and current.tzinfo is not None:
+        created = created.replace(tzinfo=current.tzinfo)
+    return (current - created).total_seconds() >= timeout_seconds
+
+
+def stale_restart_pending_status(raw: str | None) -> str | None:
+    if not restart_pending_is_stale(raw):
+        return None
+    payload = _restart_pending_payload(raw)
+    if payload is None:
+        return None
+    version = payload.get("version")
+    if not isinstance(version, str):
+        return None
+    return restart_pending_failure_text(version, current_version=current_package_version())
+
+
+def _restart_pending_payload(raw: str | None) -> dict[str, object] | None:
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def record_update_helper_state(
+    state_db: Path,
+    *,
+    phase: str,
+    version: str,
+    command: Sequence[str],
+    log_file: Path,
+    pid: int | None = None,
+    exit_code: int | None = None,
+    error: str | None = None,
+) -> None:
+    from agent_harness.storage.store import Store
+
+    store = Store(state_db)
+    try:
+        store.init_schema()
+        payload = {
+            "command": list(command),
+            "exit_code": exit_code,
+            "log_file": str(log_file),
+            "phase": phase,
+            "pid": pid,
+            "updated_at": utc_now().isoformat(),
+            "version": version,
+        }
+        if error:
+            payload["error"] = error
+        store.set_setting(SETTING_UPDATE_RESTART_HELPER, json.dumps(payload, sort_keys=True))
+    finally:
+        store.close()
+
+
+def run_update_helper(
+    *,
+    state_db: Path,
+    log_file: Path,
+    version: str,
+    command: Sequence[str],
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int:
+    command_args = list(command)
+    if command_args and command_args[0] == "--":
+        command_args = command_args[1:]
+    if not command_args:
+        record_update_helper_state(
+            state_db,
+            phase="failed",
+            version=version,
+            command=(),
+            log_file=log_file,
+            pid=os.getpid(),
+            exit_code=2,
+            error="missing helper command",
+        )
+        return 2
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    record_update_helper_state(
+        state_db,
+        phase="running",
+        version=version,
+        command=command_args,
+        log_file=log_file,
+        pid=os.getpid(),
+    )
+    try:
+        with log_file.open("a", encoding="utf-8") as log:
+            log.write(f"[{utc_now().isoformat()}] running update helper command\n")
+            completed = run(
+                command_args,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+    except OSError as exc:
+        record_update_helper_state(
+            state_db,
+            phase="failed",
+            version=version,
+            command=command_args,
+            log_file=log_file,
+            pid=os.getpid(),
+            exit_code=127,
+            error=str(exc),
+        )
+        return 127
+    phase = "succeeded" if completed.returncode == 0 else "failed"
+    record_update_helper_state(
+        state_db,
+        phase=phase,
+        version=version,
+        command=command_args,
+        log_file=log_file,
+        pid=os.getpid(),
+        exit_code=completed.returncode,
+    )
+    return int(completed.returncode)
 
 
 def _compare_versions(left: str, right: str) -> int:

@@ -14,11 +14,13 @@ from agent_harness.service import (
     build_codex_app_server_service_spec,
     ensure_service_python_shims,
     install_services,
+    installed_services_match,
     render_launchd_plist,
     render_systemd_unit,
     restart_service,
     service_environment_path,
     start_services,
+    start_update_helper,
 )
 
 
@@ -265,6 +267,130 @@ class ServiceTests(unittest.TestCase):
                 ),
             ]
         )
+
+    def test_installed_services_match_compares_rendered_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            path = Path(tmp) / "daemon.plist"
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service._launchd_path", return_value=path),
+            ):
+                path.write_bytes(render_launchd_plist(spec))
+                self.assertTrue(installed_services_match([spec]))
+                path.write_text("different")
+                self.assertFalse(installed_services_match([spec]))
+
+    def test_install_services_on_macos_does_not_bootout_unchanged_services(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            codex = build_codex_app_server_service_spec(
+                executable=Path(tmp) / "codex",
+                working_directory=Path(tmp),
+            )
+
+            def launchd_path(label):
+                return Path(tmp) / f"{label}.plist"
+
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service.os.getuid", return_value=501),
+                patch("agent_harness.service._launchd_path", side_effect=launchd_path),
+            ):
+                launchd_path(daemon.label).write_bytes(render_launchd_plist(daemon))
+                launchd_path(codex.label).write_bytes(render_launchd_plist(codex))
+                with patch("agent_harness.service.subprocess.run") as run:
+                    run.return_value = subprocess.CompletedProcess([], 0)
+                    install_services([daemon, codex])
+
+            bootouts = [
+                call_args.args[0]
+                for call_args in run.call_args_list
+                if call_args.args[0][:2] == ["launchctl", "bootout"]
+            ]
+        self.assertEqual(bootouts, [])
+
+    def test_install_services_on_macos_rolls_back_plist_when_bootstrap_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            old_payload = {
+                "Label": daemon.label,
+                "ProgramArguments": ["/old/slackgentic", "slack", "serve"],
+            }
+            daemon_path = Path(tmp) / f"{daemon.label}.plist"
+            daemon_path.write_bytes(plistlib.dumps(old_payload))
+
+            def fake_run(command, **kwargs):
+                if command[:2] == ["launchctl", "bootstrap"] and command[-1] == str(daemon_path):
+                    return subprocess.CompletedProcess(
+                        command,
+                        5,
+                        "",
+                        "Bootstrap failed: 5: Input/output error",
+                    )
+                if command[:2] == ["launchctl", "print"]:
+                    return subprocess.CompletedProcess(command, 3, "", "not loaded")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service.os.getuid", return_value=501),
+                patch("agent_harness.service.time.sleep"),
+                patch(
+                    "agent_harness.service._launchd_path",
+                    side_effect=lambda label: daemon_path,
+                ),
+                patch("agent_harness.service.subprocess.run", side_effect=fake_run),
+                self.assertRaises(RuntimeError),
+            ):
+                install_services([daemon])
+
+            self.assertEqual(plistlib.loads(daemon_path.read_bytes()), old_payload)
+
+    def test_start_update_helper_on_macos_uses_one_shot_launch_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper_plist = Path(tmp) / "helper.plist"
+            with (
+                patch("agent_harness.service.platform.system", return_value="Darwin"),
+                patch("agent_harness.service.os.getuid", return_value=501),
+                patch("agent_harness.service._launchd_path", return_value=helper_plist),
+                patch("agent_harness.service.subprocess.run") as run,
+            ):
+                run.return_value = subprocess.CompletedProcess([], 0)
+                log_file = start_update_helper(
+                    executable=Path("/opt/example/bin/slackgentic"),
+                    state_db=Path(tmp) / "state.sqlite",
+                    version="0.2.0",
+                    command=["slackgentic", "service", "install"],
+                    log_dir=Path(tmp) / "logs",
+                    working_directory=Path(tmp),
+                )
+
+            payload = plistlib.loads(helper_plist.read_bytes())
+
+        self.assertEqual(payload["Label"], "com.slackgentic-team.update-helper")
+        self.assertFalse(payload["KeepAlive"])
+        self.assertIn("update-helper", payload["ProgramArguments"])
+        self.assertIn("slackgentic", payload["ProgramArguments"])
+        self.assertEqual(log_file.parent.name, "logs")
 
     def test_install_services_on_macos_bootstraps_codex_before_daemon_bootout(self):
         with tempfile.TemporaryDirectory() as tmp:

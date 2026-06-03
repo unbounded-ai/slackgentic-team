@@ -6,9 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_harness.models import utc_now
 from agent_harness.storage.store import Store
 from agent_harness.updates import (
     SETTING_UPDATE_INSTALLED_VERSION,
+    SETTING_UPDATE_RESTART_HELPER,
+    SETTING_UPDATE_RESTART_PENDING,
     GitHubReleaseSource,
     ReleaseInfo,
     SelfUpdater,
@@ -18,6 +21,7 @@ from agent_harness.updates import (
     UpgradeResult,
     github_tag_tarball_url,
     is_newer_version,
+    run_update_helper,
 )
 
 
@@ -45,6 +49,7 @@ class GitHubReleaseSourceTests(unittest.TestCase):
             "tarball_url": "https://api.github.com/repos/example-org/example-repo/tarball/v0.2.0",
             "name": "v0.2.0",
             "published_at": "2026-05-20T18:00:00Z",
+            "body": "## Changes\n- Improve service restart handling",
         }
 
         class Response:
@@ -64,6 +69,7 @@ class GitHubReleaseSourceTests(unittest.TestCase):
         self.assertEqual(release.version, "0.2.0")
         self.assertEqual(release.tag_name, "v0.2.0")
         self.assertEqual(release.tarball_url, payload["tarball_url"])
+        self.assertEqual(release.body, payload["body"])
 
 
 class SelfUpdaterTests(unittest.TestCase):
@@ -286,6 +292,7 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertIsNotNone(pending)
                 payload = json.loads(pending)
                 self.assertEqual(payload["channel_id"], "C1")
+                self.assertIn("created_at", payload)
                 self.assertEqual(payload["message_ts"], "171")
                 self.assertEqual(payload["version"], "0.2.0")
             finally:
@@ -307,8 +314,15 @@ class UpdateRunnerTests(unittest.TestCase):
                     f"slackgentic.update.candidate.{__version__}", candidate.to_json()
                 )
                 store.set_setting(
-                    "slackgentic.update.restart_pending",
-                    json.dumps({"channel_id": "C1", "message_ts": "999", "version": __version__}),
+                    SETTING_UPDATE_RESTART_PENDING,
+                    json.dumps(
+                        {
+                            "channel_id": "C1",
+                            "created_at": utc_now().isoformat(),
+                            "message_ts": "999",
+                            "version": __version__,
+                        }
+                    ),
                 )
                 updates: list[tuple[str, str, str]] = []
 
@@ -364,10 +378,11 @@ class UpdateRunnerTests(unittest.TestCase):
                 store.init_schema()
                 pending_payload = {
                     "channel_id": "C1",
+                    "created_at": utc_now().isoformat(),
                     "message_ts": "999",
                     "version": f"{__version__}-rollback-target",
                 }
-                store.set_setting("slackgentic.update.restart_pending", json.dumps(pending_payload))
+                store.set_setting(SETTING_UPDATE_RESTART_PENDING, json.dumps(pending_payload))
                 updates: list[tuple[str, str, str]] = []
 
                 class Checker:
@@ -401,6 +416,94 @@ class UpdateRunnerTests(unittest.TestCase):
                     runner.stop()
             finally:
                 store.close()
+
+    def test_start_warns_when_pending_restart_is_stale(self):
+        from agent_harness import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.0.0",
+                    release=ReleaseInfo(version=__version__, tag_name=f"v{__version__}"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(
+                    f"slackgentic.update.candidate.{__version__}", candidate.to_json()
+                )
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_PENDING,
+                    json.dumps(
+                        {
+                            "channel_id": "C1",
+                            "created_at": "2026-01-01T00:00:00+00:00",
+                            "message_ts": "999",
+                            "version": __version__,
+                        }
+                    ),
+                )
+                updates: list[tuple[str, str, str]] = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(
+                        (channel_id, ts, text)
+                    ),
+                    status_blocks=lambda update, status, include_actions: [],
+                )
+                runner.start()
+                try:
+                    self.assertEqual(len(updates), 1)
+                    self.assertIn("automatic service restart did not confirm", updates[0][2])
+                    self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+                    self.assertEqual(
+                        store.get_setting(SETTING_UPDATE_INSTALLED_VERSION),
+                        __version__,
+                    )
+                finally:
+                    runner.stop()
+            finally:
+                store.close()
+
+    def test_update_helper_records_exit_code_and_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "state.sqlite"
+            log_file = Path(tmp) / "update.log"
+
+            def fake_run(args, **kwargs):
+                kwargs["stdout"].write("helper output\n")
+                return subprocess.CompletedProcess(args, 7)
+
+            result = run_update_helper(
+                state_db=state_db,
+                log_file=log_file,
+                version="0.2.0",
+                command=["--", "slackgentic", "service", "install"],
+                run=fake_run,
+            )
+
+            store = Store(state_db)
+            try:
+                payload = json.loads(store.get_setting(SETTING_UPDATE_RESTART_HELPER))
+            finally:
+                store.close()
+
+            self.assertEqual(result, 7)
+            self.assertEqual(payload["phase"], "failed")
+            self.assertEqual(payload["exit_code"], 7)
+            self.assertEqual(payload["command"], ["slackgentic", "service", "install"])
+            self.assertIn("helper output", log_file.read_text())
 
 
 if __name__ == "__main__":
