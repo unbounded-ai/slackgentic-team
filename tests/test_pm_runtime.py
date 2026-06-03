@@ -1607,6 +1607,183 @@ class PmRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_team_hire_in_pm_thread_promotes_plan_before_unrelated_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                workers = build_initial_model_team(1, 0)
+                pm_agent = hire_team_agents(workers, 1, kind=TeamAgentKind.PM)[0]
+                for agent in [*workers, pm_agent]:
+                    store.upsert_team_agent(agent)
+
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Capacity constrained plan",
+                    summary="Run three independent tasks.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(pm_agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Capacity constrained plan",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                payload = {
+                    "title": "Capacity constrained plan",
+                    "summary": "Run three independent tasks.",
+                    "subtasks": [
+                        {
+                            "id": f"root{index}",
+                            "title": f"Root {index}",
+                            "task": f"Run independent task {index}.",
+                            "target": "somebody",
+                            "depends_on": [],
+                        }
+                        for index in range(3)
+                    ],
+                }
+                handled = controller.handle_runtime_agent_control(
+                    pm_task,
+                    pm_agent,
+                    thread_ref,
+                    f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+                self.assertTrue(handled)
+                plan_message = gateway.thread_replies[-1]
+
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": json.dumps(
+                                    {
+                                        "v": 1,
+                                        "action": "pm_initiative.start",
+                                        "initiative_id": initiative.initiative_id,
+                                    }
+                                ),
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": plan_message["ts"]},
+                        "user": {"id": "U2"},
+                    }
+                )
+                still_parked = store.get_pm_initiative(initiative.initiative_id)
+                assert still_parked is not None
+                self.assertEqual(still_parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertIsNotNone(still_parked.pending_plan_json)
+                self.assertEqual(runtime.started, [])
+
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="outside",
+                        transcript_path=Path(tmp) / "outside.jsonl",
+                        status=SessionStatus.IDLE,
+                    )
+                )
+                store.set_setting("external_session_pending.codex.outside", "now")
+                store.create_pending_work_request(
+                    SlackThreadRef("C1", "171.unrelated", "171.unrelated"),
+                    WorkRequest(
+                        prompt="unrelated pending work",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                )
+                unrelated_deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.deferred", "171.deferred"),
+                    WorkRequest(
+                        prompt="unrelated deferred work",
+                        assignment_mode=AssignmentMode.ANYONE,
+                    ),
+                    depends_on=(),
+                )
+                due_at = utc_now() - timedelta(seconds=5)
+                store.mark_deferred_work_ready(
+                    unrelated_deferred.deferred_id,
+                    fire_at=due_at,
+                    deps_satisfied_at=due_at,
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U2",
+                            "text": "team hire 2",
+                            "thread_ts": "171.thread",
+                            "ts": "171.hire",
+                        }
+                    }
+                )
+
+                agents = store.list_team_agents()
+                workers_after_hire = [agent for agent in agents if not agent.is_pm]
+                self.assertEqual(len(agents), 4)
+                self.assertEqual(len(workers_after_hire), 3)
+                promoted = store.get_pm_initiative(initiative.initiative_id)
+                assert promoted is not None
+                self.assertEqual(promoted.status, PmInitiativeStatus.ACTIVE)
+                self.assertIsNone(promoted.pending_plan_json)
+
+                subtasks = store.list_pm_subtasks(initiative.initiative_id)
+                self.assertEqual(len(subtasks), 3)
+                reserved_tasks = []
+                for subtask in subtasks:
+                    deferred = store.get_deferred_work(subtask.deferred_id)
+                    assert deferred is not None
+                    self.assertIsNotNone(deferred.last_task_id)
+                    reserved = store.get_agent_task(str(deferred.last_task_id))
+                    assert reserved is not None
+                    self.assertEqual(
+                        reserved.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY),
+                        subtask.local_id,
+                    )
+                    reserved_tasks.append(reserved)
+                self.assertEqual(len({task.agent_id for task in reserved_tasks}), 3)
+                self.assertEqual(
+                    {
+                        task.metadata.get(PM_SUBTASK_LOCAL_ID_METADATA_KEY)
+                        for task, _, _ in runtime.started
+                    },
+                    {"root0", "root1", "root2"},
+                )
+                self.assertNotIn(
+                    "unrelated pending work",
+                    {task.prompt for task, _, _ in runtime.started},
+                )
+                self.assertEqual(len(store.list_pending_work_requests()), 1)
+                self.assertIsNone(store.get_setting("external_session_agent.codex.outside"))
+                self.assertEqual(
+                    store.get_setting("external_session_pending.codex.outside"),
+                    "now",
+                )
+                latest_unrelated = store.get_deferred_work(unrelated_deferred.deferred_id)
+                assert latest_unrelated is not None
+                self.assertEqual(latest_unrelated.status, DeferredWorkStatus.READY)
+            finally:
+                store.close()
+
     def test_pm_approval_prompts_when_codesign_model_agent_is_not_free(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

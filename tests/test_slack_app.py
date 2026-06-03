@@ -578,6 +578,81 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_hire_pm_button_refreshes_clicked_roster_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting("slack.roster_message.C1.171.000001", "171.000001")
+                store.set_setting("slack.roster_message.C1.171.000002", "171.000002")
+                store.set_setting(SETTING_ROSTER_TS, "171.000002")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.000002"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire",
+                                    count=1,
+                                    provider=Provider.CLAUDE.value,
+                                    kind=TeamAgentKind.PM.value,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual([update["ts"] for update in gateway.updates], ["171.000002"])
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 1)
+                self.assertEqual(agents[0].provider_preference, Provider.CLAUDE)
+                self.assertEqual(agents[0].kind, TeamAgentKind.PM)
+            finally:
+                store.close()
+
+    def test_hire_pm_button_still_refreshes_roster_when_intro_post_fails(self):
+        class IntroFailGateway(FakeGateway):
+            def post_thread_reply(self, *args, **kwargs):
+                raise RuntimeError("intro failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = IntroFailGateway()
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.000001"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire",
+                                    count=1,
+                                    provider=Provider.CLAUDE.value,
+                                    kind=TeamAgentKind.PM.value,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 1)
+                self.assertEqual(agents[0].kind, TeamAgentKind.PM)
+                self.assertEqual([update["ts"] for update in gateway.updates], ["171.000001"])
+            finally:
+                store.close()
+
     def test_pm_routing_handles_backtick_quoted_pm_handle(self):
         """Backtick-quoted `@<pm-handle>` mentions are not recognised by
         message_targets_pm_agent but DO parse via parse_work_request. Without

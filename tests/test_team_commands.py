@@ -16,6 +16,7 @@ from agent_harness.team.commands import (
 class TeamCommandTests(unittest.TestCase):
     def test_parse_hire_auto(self):
         self.assertEqual(parse_team_command("hire 3 new agents"), HireCommand(count=3))
+        self.assertEqual(parse_team_command("team hire 2"), HireCommand(count=2))
 
     def test_parse_hire_provider(self):
         self.assertEqual(

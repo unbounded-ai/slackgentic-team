@@ -64,7 +64,7 @@ def parse_team_command(text: str) -> TeamCommand | None:
 
 def _parse_hire(text: str) -> HireCommand | None:
     match = re.match(
-        r"^(?:please\s+)?hire(?:\s+(?P<count>\d+|one|two|three|four|five|ten))?"
+        r"^(?:please\s+)?(?:team\s+)?hire(?:\s+(?P<count>\d+|one|two|three|four|five|ten))?"
         r"(?:\s+(?:new|more))?(?:\s+(?P<provider>codex|claude))?"
         r"(?:\s+agents?)?\s*$",
         text,
