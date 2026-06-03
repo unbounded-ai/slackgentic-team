@@ -8,7 +8,6 @@ import random
 import re
 import shutil
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -238,6 +237,7 @@ from agent_harness.updates import (
     UpdateCandidate,
     UpdateChecker,
     detect_source_root,
+    record_update_helper_state,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -9046,12 +9046,16 @@ class SocketModeSlackApp:
         self._shutdown.set()
 
     def _restart_after_update(self) -> None:
-        from agent_harness.service import restart_service
+        from agent_harness.service import installed_services_match, restart_service
 
         try:
-            if self._schedule_service_reinstall_after_update():
+            specs = self._service_specs_after_update()
+            if specs is not None and installed_services_match(specs):
+                result = restart_service(force=True)
+            elif self._schedule_service_reinstall_after_update():
                 return
-            result = restart_service(force=True)
+            else:
+                result = restart_service(force=True)
         except Exception as exc:
             self.request_shutdown()
             raise RuntimeError(
@@ -9064,6 +9068,8 @@ class SocketModeSlackApp:
             )
 
     def _schedule_service_reinstall_after_update(self) -> bool:
+        from agent_harness.service import start_update_helper
+
         executable = Path(sys.argv[0])
         if not executable.exists():
             found = shutil.which("slackgentic")
@@ -9076,16 +9082,55 @@ class SocketModeSlackApp:
             executable=executable.resolve(),
             working_directory=workdir,
         )
-        env = _service_reinstall_environment(workdir, os.environ)
-        subprocess.Popen(
-            command,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        version = self.store.get_setting("slackgentic.update.installing_version") or "unknown"
+        log_file = start_update_helper(
+            executable=executable.resolve(),
+            state_db=self.config.state_db,
+            version=version,
+            command=command,
+            log_dir=self.config.state_db.parent / "logs",
+            working_directory=workdir,
+        )
+        record_update_helper_state(
+            self.config.state_db,
+            phase="scheduled",
+            version=version,
+            command=command,
+            log_file=log_file,
         )
         return True
+
+    def _service_specs_after_update(self):
+        from agent_harness.service import (
+            build_codex_app_server_service_spec,
+            build_service_spec,
+        )
+
+        executable = Path(sys.argv[0])
+        if not executable.exists():
+            found = shutil.which("slackgentic")
+            if not found:
+                return None
+            executable = Path(found)
+        workdir = _service_reinstall_workdir(Path(__file__).resolve())
+        daemon_spec = build_service_spec(
+            executable=executable.resolve(),
+            working_directory=workdir,
+            config_file=self.config.config_file,
+            ignored_external_session_cwds=list(self.config.sessions.ignored_external_session_cwds),
+        )
+        specs = [daemon_spec]
+        codex_app_server_url = self.config.commands.codex_app_server_url
+        if codex_app_server_url:
+            codex_binary = _resolved_command_path(self.config.commands.codex_binary)
+            specs.append(
+                build_codex_app_server_service_spec(
+                    executable=Path(codex_binary) if codex_binary else None,
+                    working_directory=workdir,
+                    url=codex_app_server_url,
+                )
+            )
+        return specs
 
     def run_forever(self) -> None:
         import signal

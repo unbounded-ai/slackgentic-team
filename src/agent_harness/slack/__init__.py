@@ -564,6 +564,17 @@ def build_update_prompt_blocks(
             },
         }
     ]
+    release_notes = _release_notes_excerpt(release.body)
+    if release_notes:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Release notes:*\n{release_notes}",
+                },
+            }
+        )
     if include_actions:
         blocks.append(
             {
@@ -585,6 +596,18 @@ def build_update_prompt_blocks(
             }
         )
     return blocks
+
+
+def _release_notes_excerpt(body: str | None, *, limit: int = 1200) -> str | None:
+    if not body:
+        return None
+    normalized = "\n".join(line.rstrip() for line in body.replace("\r\n", "\n").splitlines())
+    normalized = normalized.strip()
+    if not normalized:
+        return None
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
 
 
 def build_external_session_capacity_blocks(

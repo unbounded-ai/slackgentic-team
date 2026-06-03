@@ -10,12 +10,14 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_SERVICE_NAME = "slackgentic-team"
 LOGGER = logging.getLogger(__name__)
 MACOS_LABEL = "com.slackgentic-team.daemon"
 MACOS_CODEX_APP_SERVER_LABEL = "com.slackgentic-team.codex-app-server"
+MACOS_UPDATE_HELPER_LABEL = "com.slackgentic-team.update-helper"
 CODEX_APP_SERVER_SERVICE_SUFFIX = "codex-app-server"
 DEFAULT_CODEX_APP_SERVER_URL = "ws://127.0.0.1:47684"
 DEFAULT_SERVICE_PATHS = (
@@ -230,6 +232,55 @@ def render_service(spec: ServiceSpec) -> tuple[Path, str | bytes]:
     raise RuntimeError(f"Unsupported service platform: {platform.system()}")
 
 
+def installed_services_match(specs: list[ServiceSpec]) -> bool:
+    for path, content in render_services(specs):
+        if isinstance(content, bytes):
+            if not path.exists() or path.read_bytes() != content:
+                return False
+        elif not path.exists() or path.read_text() != content:
+            return False
+    return True
+
+
+def start_update_helper(
+    *,
+    executable: Path,
+    state_db: Path,
+    version: str,
+    command: list[str],
+    log_dir: Path,
+    working_directory: Path,
+) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    log_file = log_dir / f"slackgentic-update-{version}-{stamp}.log"
+    helper_args = [
+        str(executable),
+        "update-helper",
+        "--state-db",
+        str(state_db),
+        "--log-file",
+        str(log_file),
+        "--version",
+        version,
+        "--",
+        *command,
+    ]
+    if platform.system().lower() == "darwin":
+        _start_launchd_update_helper(helper_args, log_file, working_directory)
+    else:
+        with log_file.open("a", encoding="utf-8") as log:
+            subprocess.Popen(
+                helper_args,
+                cwd=working_directory,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    return log_file
+
+
 def render_launchd_plist(spec: ServiceSpec) -> bytes:
     environment = {
         "PATH": service_environment_path(service_bin_dir=_service_python_shim_dir(spec)),
@@ -288,36 +339,44 @@ def render_systemd_unit(spec: ServiceSpec) -> str:
 
 
 def _install_launchd(spec: ServiceSpec) -> Path:
-    ensure_service_python_shims(spec)
-    path, content = render_service(spec)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    spec.log_dir.mkdir(parents=True, exist_ok=True)
-    assert isinstance(content, bytes)
-    path.write_bytes(content)
-    _bootout_launchd(spec.label)
-    _bootstrap_launchd(spec.label)
-    _settle_launchd_services([spec])
-    return path
+    return _install_launchd_services([spec])[0]
 
 
 def _install_launchd_services(specs: list[ServiceSpec]) -> list[Path]:
     for spec in specs:
         ensure_service_python_shims(spec)
-    paths: list[Path] = []
+    rendered: list[tuple[ServiceSpec, Path, bytes]] = []
     for spec in specs:
         path, content = render_service(spec)
         path.parent.mkdir(parents=True, exist_ok=True)
         spec.log_dir.mkdir(parents=True, exist_ok=True)
         assert isinstance(content, bytes)
-        path.write_bytes(content)
-        paths.append(path)
+        plistlib.loads(content)
+        rendered.append((spec, path, content))
+
+    previous: dict[Path, bytes | None] = {
+        path: path.read_bytes() if path.exists() else None for _, path, _ in rendered
+    }
+    changed_paths: set[Path] = set()
+    for _, path, content in rendered:
+        if previous[path] != content:
+            path.write_bytes(content)
+            changed_paths.add(path)
 
     ordered_specs = _codex_first_specs(specs)
-    for spec in ordered_specs:
-        _bootout_launchd(spec.label)
-        _bootstrap_launchd(spec.label)
-    _settle_launchd_services(ordered_specs)
-    return paths
+    try:
+        for spec in ordered_specs:
+            path = _launchd_path(spec.label)
+            if path not in changed_paths:
+                _start_launchd(spec.label)
+                continue
+            _bootout_launchd(spec.label)
+            _bootstrap_launchd(spec.label)
+        _settle_launchd_services(ordered_specs)
+    except Exception:
+        _rollback_launchd_services(rendered, previous)
+        raise
+    return [path for _, path, _ in rendered]
 
 
 def _uninstall_launchd(label: str) -> Path:
@@ -337,6 +396,32 @@ def _start_launchd(label: str) -> int:
         check=False,
     )
     return completed.returncode
+
+
+def _start_launchd_update_helper(
+    helper_args: list[str],
+    log_file: Path,
+    working_directory: Path,
+) -> None:
+    path = _launchd_path(MACOS_UPDATE_HELPER_LABEL)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "Label": MACOS_UPDATE_HELPER_LABEL,
+        "ProgramArguments": helper_args,
+        "WorkingDirectory": str(working_directory),
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "StandardOutPath": str(log_file),
+        "StandardErrorPath": str(log_file),
+        "EnvironmentVariables": {
+            "PATH": service_environment_path(),
+            "PYTHONPATH": str(working_directory / "src"),
+        },
+    }
+    path.write_bytes(plistlib.dumps(payload, sort_keys=True))
+    _bootout_launchd(MACOS_UPDATE_HELPER_LABEL)
+    _bootstrap_launchd(MACOS_UPDATE_HELPER_LABEL)
 
 
 def _restart_launchd(*, force: bool = False) -> int:
@@ -453,6 +538,24 @@ def _retry_bootstrap_launchd(label: str) -> subprocess.CompletedProcess[str] | N
         text=True,
     )
     return completed
+
+
+def _rollback_launchd_services(
+    rendered: list[tuple[ServiceSpec, Path, bytes]],
+    previous: dict[Path, bytes | None],
+) -> None:
+    for spec, path, _ in rendered:
+        old_content = previous.get(path)
+        try:
+            _bootout_launchd(spec.label)
+            if old_content is None:
+                if path.exists():
+                    path.unlink()
+                continue
+            path.write_bytes(old_content)
+            _bootstrap_launchd(spec.label, ignore_already_loaded=True)
+        except Exception:
+            LOGGER.exception("failed to roll back launchd service %s", spec.label)
 
 
 def _launchd_bootstrap_succeeded(

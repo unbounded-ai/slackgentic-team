@@ -172,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     service_status = service_sub.add_parser("status", help="Show service status")
     service_status.add_argument("--name", default="slackgentic-team")
+    service_status.add_argument("--config-file", type=Path)
     service_print = service_sub.add_parser("print", help="Print the service definition")
     service_print.add_argument("--name", default="slackgentic-team")
     service_print.add_argument("--config-file", type=Path)
@@ -263,6 +264,12 @@ def main(argv: list[str] | None = None) -> int:
     slack_doctor.add_argument("--db", type=Path)
     slack_doctor.add_argument("--home", type=Path)
 
+    update_helper = sub.add_parser("update-helper", help=argparse.SUPPRESS)
+    update_helper.add_argument("--state-db", type=Path, required=True)
+    update_helper.add_argument("--log-file", type=Path, required=True)
+    update_helper.add_argument("--version", required=True)
+    update_helper.add_argument("command_args", nargs=argparse.REMAINDER)
+
     args = parser.parse_args(argv)
     runtime_python_issue = _managed_runtime_python_issue(args)
     if runtime_python_issue:
@@ -327,6 +334,15 @@ def main(argv: list[str] | None = None) -> int:
         return _team(args)
     if args.command == "service":
         return _service(args)
+    if args.command == "update-helper":
+        from agent_harness.updates import run_update_helper
+
+        return run_update_helper(
+            state_db=args.state_db,
+            log_file=args.log_file,
+            version=args.version,
+            command=args.command_args,
+        )
     if args.command == "index-once":
         from agent_harness.config import AppConfig
         from agent_harness.sessions.indexer import AgentDaemon
@@ -512,8 +528,31 @@ def _service(args: argparse.Namespace) -> int:
         return result
     if args.service_command == "status":
         statuses = service_statuses(args.name)
+        _print_stale_update_restart_warning(args.config_file)
         return 0 if all(status == 0 for status in statuses) else 1
     raise AssertionError(args.service_command)
+
+
+def _print_stale_update_restart_warning(config_file: Path | None) -> None:
+    from agent_harness.config import load_config_from_env
+    from agent_harness.storage.store import Store
+    from agent_harness.updates import SETTING_UPDATE_RESTART_PENDING, stale_restart_pending_status
+
+    try:
+        config = load_config_from_env(config_file)
+    except Exception:
+        return
+    if not config.state_db.exists():
+        return
+    store = Store(config.state_db)
+    try:
+        warning = stale_restart_pending_status(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+    except Exception:
+        warning = None
+    finally:
+        store.close()
+    if warning:
+        print(warning)
 
 
 def _scan(args: argparse.Namespace) -> int:
