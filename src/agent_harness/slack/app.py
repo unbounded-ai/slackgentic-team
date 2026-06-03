@@ -3484,6 +3484,19 @@ class SlackTeamController:
             if promoted is not None:
                 self._strip_pm_plan_buttons(promoted, message_ts, status_label="approved")
             return
+        if action == "pm_initiative.hire_and_start":
+            if initiative.status != PmInitiativeStatus.AWAITING_APPROVAL:
+                self._strip_pm_plan_buttons(
+                    initiative, message_ts, status_label=initiative.status.value
+                )
+                return
+            self._hire_for_pm_capacity_and_execute(
+                initiative,
+                channel_id,
+                message_ts,
+                approver_slack_user=actor,
+            )
+            return
         if action == "pm_initiative.cancel":
             if initiative.status not in {
                 PmInitiativeStatus.AWAITING_APPROVAL,
@@ -5887,6 +5900,7 @@ class SlackTeamController:
             self.gateway.post_thread_reply(
                 thread,
                 _format_pm_capacity_shortfall_message(shortfall),
+                blocks=_pm_capacity_shortfall_blocks(initiative, shortfall),
             )
             return None
         promoted = self.store.set_pm_initiative_pending_plan(
@@ -5926,6 +5940,67 @@ class SlackTeamController:
             self._fire_due_pm_initiative_deferred_work_now(promoted.initiative_id)
         except Exception:
             LOGGER.debug("failed to eagerly fire PM root subtasks", exc_info=True)
+        return promoted
+
+    def _hire_for_pm_capacity_and_execute(
+        self,
+        initiative: PmInitiative,
+        channel_id: str,
+        message_ts: str | None,
+        *,
+        approver_slack_user: str | None = None,
+    ) -> PmInitiative | None:
+        thread = SlackThreadRef(channel_id=initiative.channel_id, thread_ts=initiative.thread_ts)
+        if not initiative.pending_plan_json:
+            return None
+        try:
+            plan = deserialize_parsed_pm_plan(initiative.pending_plan_json)
+        except Exception:
+            return self._execute_pm_plan(initiative, approver_slack_user=approver_slack_user)
+        shortfall = self._pm_plan_capacity_shortfall(plan)
+        if shortfall is not None and shortfall.unavailable_handles:
+            self.gateway.post_thread_reply(
+                thread,
+                _format_pm_capacity_shortfall_message(shortfall),
+            )
+            return None
+        hire_count = shortfall.hire_count if shortfall is not None else 0
+        if hire_count > 0:
+            if not self._can_hire(hire_count):
+                self.gateway.post_thread_reply(
+                    thread,
+                    f"{AGENT_LIMIT_MESSAGE} Max team size is {MAX_TEAM_AGENTS}.",
+                )
+                return None
+            hired = self.hire_agents(hire_count)
+            summary = ", ".join(
+                f"@{agent.handle} ({agent.provider_preference.value})" for agent in hired
+            )
+            self.gateway.post_thread_reply(
+                thread,
+                (
+                    f"Hired {len(hired)} worker agent(s) for PM initiative "
+                    f"`{initiative.initiative_id}`: {summary}"
+                ),
+            )
+            for agent in hired:
+                try:
+                    self.gateway.post_thread_reply(
+                        thread,
+                        format_agent_introduction(agent),
+                        persona=agent,
+                        icon_url=self._agent_icon_url(agent),
+                    )
+                except Exception:
+                    LOGGER.debug("failed to post hired PM-capacity introduction", exc_info=True)
+        latest = self.store.get_pm_initiative(initiative.initiative_id) or initiative
+        plan_message_ts = latest.pending_plan_message_ts or initiative.pending_plan_message_ts
+        promoted = self._execute_pm_plan(latest, approver_slack_user=approver_slack_user)
+        if promoted is not None:
+            self._strip_pm_plan_buttons(promoted, message_ts, status_label="approved")
+            if plan_message_ts and plan_message_ts != message_ts:
+                self._strip_pm_plan_buttons(promoted, plan_message_ts, status_label="approved")
+        self.refresh_or_post_roster(channel_id)
         return promoted
 
     def _fire_due_pm_initiative_deferred_work_now(self, initiative_id: str) -> int:
@@ -10200,9 +10275,49 @@ def _format_pm_capacity_shortfall_message(shortfall: _PmCapacityShortfall) -> st
         "I can't start this PM plan yet because there are not enough free worker "
         f"agents. The plan needs {required} available worker {required_word} at "
         f"its widest parallel step, but only {available} worker {available_word} "
-        f"{available_verb} free right now. Hire {hire_count} more {hire_word} "
-        f"(`team hire {hire_count}`), then click *Start executing* again."
+        f"{available_verb} free right now. Use *Hire and reserve {hire_count} "
+        f"{hire_word}* below to add capacity directly to this PM initiative."
     )
+
+
+def _pm_capacity_shortfall_blocks(
+    initiative: PmInitiative,
+    shortfall: _PmCapacityShortfall,
+) -> list[dict] | None:
+    if shortfall.unavailable_handles or shortfall.hire_count <= 0:
+        return None
+    hire_word = "agent" if shortfall.hire_count == 1 else "agents"
+    text = _format_pm_capacity_shortfall_message(shortfall)
+    return [
+        {
+            "type": "section",
+            "block_id": f"pm.capacity.{initiative.initiative_id}",
+            "text": {"type": "mrkdwn", "text": text},
+        },
+        {
+            "type": "actions",
+            "block_id": f"pm.capacity.actions.{initiative.initiative_id}",
+            "elements": [
+                _slack_button(
+                    f"Hire and reserve {shortfall.hire_count} {hire_word}",
+                    "pm_initiative.hire_and_start",
+                    encode_action_value(
+                        "pm_initiative.hire_and_start",
+                        initiative_id=initiative.initiative_id,
+                    ),
+                    style="primary",
+                ),
+                _slack_button(
+                    "Cancel",
+                    "pm_initiative.cancel",
+                    encode_action_value(
+                        "pm_initiative.cancel", initiative_id=initiative.initiative_id
+                    ),
+                    style="danger",
+                ),
+            ],
+        },
+    ]
 
 
 def _pm_plan_parallel_worker_demand(plan: ParsedPmPlan) -> int:
