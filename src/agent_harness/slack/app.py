@@ -585,7 +585,11 @@ class SlackTeamController:
             return
         command = parse_team_command(text)
         if command:
-            self.handle_team_command(command, SlackReplyTarget(channel_id=channel_id))
+            self.handle_team_command(
+                command,
+                SlackReplyTarget(channel_id=channel_id),
+                requested_by_slack_user=payload.get("user_id"),
+            )
             return
         self.refresh_or_post_roster(channel_id)
 
@@ -784,7 +788,7 @@ class SlackTeamController:
         )
         command = parse_team_command(text)
         if command:
-            self.handle_team_command(command, target)
+            self.handle_team_command(command, target, requested_by_slack_user=event.get("user"))
             return
         if self._handle_pm_request(event, channel_id, text):
             return
@@ -919,12 +923,20 @@ class SlackTeamController:
             | ScheduledTasksCommand
         ),
         target: SlackReplyTarget,
+        *,
+        requested_by_slack_user: str | None = None,
     ) -> None:
         if isinstance(command, HireCommand):
             if not self._can_hire(command.count):
                 self._post_text(
                     target, f"{AGENT_LIMIT_MESSAGE} Max team size is {MAX_TEAM_AGENTS}."
                 )
+                return
+            if self._handle_pm_capacity_hire_command(
+                command,
+                target,
+                requested_by_slack_user=requested_by_slack_user,
+            ):
                 return
             hired = self.hire_agents(command.count, command.provider)
             summary = ", ".join(
@@ -987,6 +999,72 @@ class SlackTeamController:
             thread_ts=target.thread_ts,
             remember=target.thread_ts is None,
         )
+
+    def _handle_pm_capacity_hire_command(
+        self,
+        command: HireCommand,
+        target: SlackReplyTarget,
+        *,
+        requested_by_slack_user: str | None = None,
+    ) -> bool:
+        initiative = self._awaiting_pm_initiative_for_thread(target.channel_id, target.thread_ts)
+        if initiative is None:
+            return False
+        if not initiative.pending_plan_json:
+            return False
+        try:
+            plan = deserialize_parsed_pm_plan(initiative.pending_plan_json)
+        except Exception:
+            return False
+        shortfall = self._pm_plan_capacity_shortfall(plan)
+        if shortfall is None or shortfall.hire_count <= 0:
+            return False
+
+        hired = self.hire_agents(command.count, command.provider)
+        summary = ", ".join(
+            f"@{agent.handle} ({agent.provider_preference.value})" for agent in hired
+        )
+        self.gateway.post_message(
+            target.channel_id,
+            (
+                f"Hired {len(hired)} agent(s) for PM initiative "
+                f"`{initiative.initiative_id}`: {summary}"
+            ),
+            thread_ts=target.thread_ts,
+        )
+        for agent in hired:
+            try:
+                self._post_agent_reply(target, format_agent_introduction(agent), agent)
+            except Exception:
+                LOGGER.debug("failed to post hired agent introduction", exc_info=True)
+
+        latest = self.store.get_pm_initiative(initiative.initiative_id) or initiative
+        promoted = self._execute_pm_plan(latest, approver_slack_user=requested_by_slack_user)
+        if promoted is not None:
+            self._strip_pm_plan_buttons(
+                promoted,
+                promoted.pending_plan_message_ts or initiative.pending_plan_message_ts,
+                status_label="approved",
+            )
+        self.refresh_or_post_roster(target.channel_id)
+        return True
+
+    def _awaiting_pm_initiative_for_thread(
+        self,
+        channel_id: str,
+        thread_ts: str | None,
+    ) -> PmInitiative | None:
+        if not thread_ts:
+            return None
+        matches = [
+            initiative
+            for initiative in self.store.list_pm_initiatives(
+                statuses=(PmInitiativeStatus.AWAITING_APPROVAL,),
+                limit=200,
+            )
+            if initiative.channel_id == channel_id and initiative.thread_ts == thread_ts
+        ]
+        return matches[-1] if matches else None
 
     def _post_agent_reply(self, target: SlackReplyTarget, text: str, agent) -> None:
         if target.thread_ts:
@@ -2453,10 +2531,7 @@ class SlackTeamController:
             self._discover_recent_roster_messages(channel_id)
         roster_ts_values = self._remembered_roster_ts_values(channel_id)
         if roster_ts_values:
-            agents = self.store.list_team_agents()
-            statuses = self._roster_statuses(agents)
-            text = _roster_text(agents, statuses)
-            blocks = build_team_roster_blocks(agents, statuses)
+            text, blocks = self._current_roster_payload()
             latest_roster_ts = roster_ts_values[-1]
             self.store.set_setting(SETTING_CHANNEL_ID, channel_id)
             self.store.set_setting(SETTING_ROSTER_TS, latest_roster_ts)
@@ -2484,6 +2559,46 @@ class SlackTeamController:
                     )
             return latest_roster_ts
         return self.post_roster(channel_id)
+
+    def refresh_roster_message_or_post(
+        self,
+        channel_id: str,
+        message_ts: str | None,
+        *,
+        pin: bool = False,
+    ) -> str:
+        if not message_ts:
+            return self.refresh_or_post_roster(channel_id, discover=False, pin=pin)
+        self._remember_roster_message(channel_id, message_ts)
+        text, blocks = self._current_roster_payload()
+        if pin:
+            try:
+                self._pin_roster_once(channel_id, message_ts)
+            except Exception:
+                LOGGER.debug("failed to pin Slack roster message", exc_info=True)
+        if self._roster_render_is_current(channel_id, message_ts, text, blocks):
+            return message_ts
+        try:
+            self.gateway.update_message(
+                channel_id,
+                message_ts,
+                text,
+                blocks=blocks,
+            )
+            self._remember_roster_render(channel_id, message_ts, text, blocks)
+            return message_ts
+        except Exception:
+            LOGGER.debug(
+                "failed to update Slack roster message %s; posting replacement",
+                message_ts,
+                exc_info=True,
+            )
+            return self.post_roster(channel_id)
+
+    def _current_roster_payload(self) -> tuple[str, list[dict]]:
+        agents = self.store.list_team_agents()
+        statuses = self._roster_statuses(agents)
+        return _roster_text(agents, statuses), build_team_roster_blocks(agents, statuses)
 
     def _refresh_existing_roster(self, channel_id: str) -> None:
         if self._remembered_roster_ts_values(channel_id):
@@ -2838,16 +2953,24 @@ class SlackTeamController:
             ts = self.post_roster(channel_id)
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=roster_ts or ts)
         for agent in hired:
-            self.gateway.post_thread_reply(
-                thread,
-                format_agent_introduction(agent),
-                persona=agent,
-                icon_url=self._agent_icon_url(agent),
-            )
+            try:
+                self.gateway.post_thread_reply(
+                    thread,
+                    format_agent_introduction(agent),
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                )
+            except Exception:
+                LOGGER.debug("failed to post hired agent introduction", exc_info=True)
         self._resume_pending_work_requests(channel_id)
         if not external_capacity_hire:
             self._assign_hired_agents_to_pending_external_sessions(channel_id, hired, provider)
-        self.refresh_or_post_roster(channel_id)
+        roster_update_ts = (
+            self.store.get_setting(SETTING_ROSTER_TS)
+            if external_capacity_hire
+            else roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
+        )
+        self.refresh_roster_message_or_post(channel_id, roster_update_ts, pin=True)
 
     def _fire_from_action(
         self,
@@ -2868,7 +2991,7 @@ class SlackTeamController:
                 )
         if handle:
             self.store.fire_team_agent(str(handle))
-        ts = self.refresh_or_post_roster(channel_id)
+        ts = self.refresh_roster_message_or_post(channel_id, roster_ts, pin=True)
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=roster_ts or ts)
         if handle:
             if detached_count:
@@ -5800,11 +5923,27 @@ class SlackTeamController:
         # Best-effort: fire any root subtasks immediately rather than waiting
         # for the next DeferredWorkRunner tick.
         try:
-            for deferred in self.store.list_due_deferred_work(limit=MAX_PM_SUBTASKS):
-                self.fire_due_deferred_work(deferred)
+            self._fire_due_pm_initiative_deferred_work_now(promoted.initiative_id)
         except Exception:
             LOGGER.debug("failed to eagerly fire PM root subtasks", exc_info=True)
         return promoted
+
+    def _fire_due_pm_initiative_deferred_work_now(self, initiative_id: str) -> int:
+        fired = 0
+        now = utc_now()
+        for subtask in self.store.list_pm_subtasks(initiative_id):
+            deferred = self.store.get_deferred_work(subtask.deferred_id)
+            if deferred is None or deferred.status != DeferredWorkStatus.READY:
+                continue
+            if deferred.fire_at is None or deferred.fire_at > now:
+                continue
+            if deferred.last_task_id:
+                task = self.store.get_agent_task(deferred.last_task_id)
+                if task is not None and task.status == AgentTaskStatus.ACTIVE:
+                    continue
+            if self.fire_due_deferred_work(deferred):
+                fired += 1
+        return fired
 
     def _reserve_pm_plan_threads(
         self,
