@@ -78,6 +78,7 @@ from agent_harness.slack.app import (
     SocketModeSlackApp,
     _service_reinstall_command,
     _service_reinstall_environment,
+    _socket_mode_connection_stale,
 )
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
@@ -436,6 +437,57 @@ class SlackAppTests(unittest.TestCase):
 
         self.assertEqual(env["PATH"], "/usr/bin")
         self.assertEqual(env["PYTHONPATH"], "/workspace/repos/slackgentic/src")
+
+    def test_socket_mode_connection_stale_when_disconnected(self):
+        client = types.SimpleNamespace(is_connected=lambda: False, current_session=None)
+
+        self.assertTrue(_socket_mode_connection_stale(client, connected_at=10.0))
+
+    def test_socket_mode_connection_stale_when_no_pong_after_grace(self):
+        client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            current_session=types.SimpleNamespace(last_ping_pong_time=None),
+        )
+
+        self.assertFalse(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                monotonic_now=39.0,
+                pong_grace_seconds=30.0,
+            )
+        )
+        self.assertTrue(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                monotonic_now=41.0,
+                pong_grace_seconds=30.0,
+            )
+        )
+
+    def test_socket_mode_connection_stale_when_last_pong_is_old(self):
+        client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            current_session=types.SimpleNamespace(last_ping_pong_time=100.0),
+        )
+
+        self.assertFalse(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                wall_now=129.0,
+                stale_seconds=30.0,
+            )
+        )
+        self.assertTrue(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                wall_now=131.0,
+                stale_seconds=30.0,
+            )
+        )
 
     def test_socket_mode_connect_retries_before_process_exit(self):
         connect_calls = []

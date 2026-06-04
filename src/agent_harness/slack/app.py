@@ -337,6 +337,8 @@ SLACK_BACKFILL_THREAD_POLL_SECONDS = 30.0
 SLACK_BACKFILL_THREAD_INITIAL_LOOKBACK_SECONDS = 5 * 60.0
 SLACK_SOCKET_WORKER_THREADS = 4
 SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
+SLACK_SOCKET_PONG_GRACE_SECONDS = 30.0
+SLACK_SOCKET_STALE_SECONDS = 30.0
 DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
@@ -9241,6 +9243,7 @@ class SocketModeSlackApp:
         shutdown = getattr(self, "_shutdown", threading.Event())
         self._shutdown = shutdown
         shutdown.clear()
+        socket_connected_at: float | None = None
 
         def _request_shutdown(_signum=None, _frame=None) -> None:
             shutdown.set()
@@ -9259,6 +9262,7 @@ class SocketModeSlackApp:
             while not shutdown.is_set():
                 try:
                     client.connect()
+                    socket_connected_at = time.monotonic()
                     connect_backoff.reset()
                     break
                 except Exception:
@@ -9271,9 +9275,23 @@ class SocketModeSlackApp:
                         break
             while not shutdown.is_set():
                 is_connected = getattr(client, "is_connected", None)
-                if callable(is_connected) and not is_connected():
+                disconnected = callable(is_connected) and not is_connected()
+                stale = _socket_mode_connection_stale(
+                    client,
+                    connected_at=socket_connected_at,
+                )
+                if stale and not disconnected:
+                    LOGGER.warning(
+                        "Slack Socket Mode connection is stale; reconnecting (session id: %s)",
+                        client.session_id(),
+                    )
+                if disconnected or stale:
                     try:
-                        client.connect()
+                        if stale:
+                            client.connect_to_new_endpoint(force=True)
+                        else:
+                            client.connect()
+                        socket_connected_at = time.monotonic()
                         connect_backoff.reset()
                     except Exception:
                         log_loop_failure(
@@ -9458,6 +9476,29 @@ def _is_view_submission_request(request) -> bool:
         return False
     payload = getattr(request, "payload", None)
     return isinstance(payload, dict) and payload.get("type") == "view_submission"
+
+
+def _socket_mode_connection_stale(
+    client,
+    *,
+    connected_at: float | None,
+    monotonic_now: float | None = None,
+    wall_now: float | None = None,
+    pong_grace_seconds: float = SLACK_SOCKET_PONG_GRACE_SECONDS,
+    stale_seconds: float = SLACK_SOCKET_STALE_SECONDS,
+) -> bool:
+    is_connected = getattr(client, "is_connected", None)
+    if callable(is_connected) and not is_connected():
+        return True
+    current_session = getattr(client, "current_session", None)
+    last_pong = getattr(current_session, "last_ping_pong_time", None)
+    if isinstance(last_pong, (int, float)):
+        now = time.time() if wall_now is None else wall_now
+        return now - float(last_pong) > stale_seconds
+    if connected_at is None:
+        return False
+    now_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+    return now_monotonic - connected_at > pong_grace_seconds
 
 
 def _is_stop_command(text: str) -> bool:
