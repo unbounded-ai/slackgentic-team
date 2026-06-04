@@ -97,6 +97,7 @@ class SessionMirror:
         | None = None,
         home: Path | None = None,
         ignored_cwd_patterns: Iterable[str] = (),
+        allowed_cwd_prefixes: Iterable[str] = (),
     ):
         self.store = store
         self.gateway = gateway
@@ -111,6 +112,9 @@ class SessionMirror:
         self.home = home or Path.home()
         self.ignored_cwd_patterns = tuple(
             pattern.strip() for pattern in ignored_cwd_patterns if pattern.strip()
+        )
+        self.allowed_cwd_prefixes = tuple(
+            prefix.strip() for prefix in allowed_cwd_prefixes if prefix.strip()
         )
         self.started_at = utc_now()
         self._todo_mirror = TodoMirror(store, gateway, home=self.home)
@@ -147,9 +151,16 @@ class SessionMirror:
                 LOGGER.debug("failed to discover provider sessions for awake check", exc_info=True)
                 continue
             for session in sessions:
-                if session.status == SessionStatus.ACTIVE and not _cwd_matches_ignored_patterns(
-                    session.cwd,
-                    self.ignored_cwd_patterns,
+                if (
+                    session.status == SessionStatus.ACTIVE
+                    and _cwd_matches_allowed_prefixes(
+                        session.cwd,
+                        self.allowed_cwd_prefixes,
+                    )
+                    and not _cwd_matches_ignored_patterns(
+                        session.cwd,
+                        self.ignored_cwd_patterns,
+                    )
                 ):
                     return True
         return False
@@ -164,6 +175,8 @@ class SessionMirror:
             for session in provider.discover():
                 if self.store.get_setting(_ignored_external_session_key(session)):
                     self._record_ignored_session(session, channel_id)
+                    continue
+                if self._skip_disallowed_cwd_session(session, channel_id):
                     continue
                 if self._skip_ignored_cwd_session(session, channel_id):
                     continue
@@ -723,6 +736,13 @@ class SessionMirror:
         self._record_ignored_session(session, channel_id)
         return True
 
+    def _skip_disallowed_cwd_session(self, session: AgentSession, channel_id: str) -> bool:
+        if _cwd_matches_allowed_prefixes(session.cwd, self.allowed_cwd_prefixes):
+            return False
+        self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
+        self._record_ignored_session(session, channel_id)
+        return True
+
     def _record_ignored_session(self, session: AgentSession, channel_id: str) -> None:
         if session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             session = replace(session, status=SessionStatus.DONE)
@@ -1027,6 +1047,23 @@ def _cwd_matches_ignored_patterns(cwd: Path | None, patterns: Iterable[str]) -> 
                 return True
             continue
         if _normalized_path_contains_subpath(normalized, normalized_pattern):
+            return True
+    return False
+
+
+def _cwd_matches_allowed_prefixes(cwd: Path | None, prefixes: Iterable[str]) -> bool:
+    normalized_prefixes = [
+        _normalized_path_text(Path(prefix).expanduser()) for prefix in prefixes if prefix.strip()
+    ]
+    if not normalized_prefixes:
+        return True
+    if cwd is None:
+        return False
+    normalized = _normalized_path_text(cwd.expanduser())
+    path_parts = _normalized_path_parts(normalized)
+    for prefix in normalized_prefixes:
+        prefix_parts = _normalized_path_parts(prefix)
+        if prefix_parts and path_parts[: len(prefix_parts)] == prefix_parts:
             return True
     return False
 

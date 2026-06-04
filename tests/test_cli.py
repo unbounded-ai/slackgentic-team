@@ -231,6 +231,33 @@ class CliTests(unittest.TestCase):
                 ("example-project/.local",),
             )
 
+    def test_slack_serve_passes_allowed_external_session_cwd_prefixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "config.json"
+            config_file.write_text("{}")
+
+            with (
+                patch("sys.version_info", (3, 13, 0)),
+                patch("agent_harness.slack.app.run_slack_app", return_value=0) as run_app,
+            ):
+                code = main(
+                    [
+                        "slack",
+                        "serve",
+                        "--config-file",
+                        str(config_file),
+                        "--allow-external-session-cwd-prefix",
+                        "/workspace/repos",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            config = run_app.call_args.args[0]
+            self.assertEqual(
+                config.sessions.allowed_external_session_cwd_prefixes,
+                ("/workspace/repos",),
+            )
+
     def test_claude_channel_refuses_python_314_runtime(self):
         output = io.StringIO()
         with (
@@ -350,6 +377,43 @@ class CliTests(unittest.TestCase):
                 "serve",
                 "--ignore-external-session-cwd",
                 "example-project/.local",
+            ],
+        )
+
+    def test_service_install_can_set_allowed_external_session_cwd_prefix(self):
+        output = io.StringIO()
+        with (
+            patch("sys.version_info", (3, 13, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
+            patch(
+                "agent_harness.service._current_slackgentic_executable",
+                return_value=Path("/tmp/slackgentic"),
+            ),
+            patch(
+                "agent_harness.service.install_services",
+                return_value=[Path("/tmp/daemon.plist")],
+            ) as install,
+            redirect_stdout(output),
+        ):
+            code = main(
+                [
+                    "service",
+                    "install",
+                    "--no-codex-app-server",
+                    "--allow-external-session-cwd-prefix",
+                    "/workspace/repos",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        specs = install.call_args.args[0]
+        self.assertEqual(
+            specs[0].args,
+            [
+                "slack",
+                "serve",
+                "--allow-external-session-cwd-prefix",
+                "/workspace/repos",
             ],
         )
 

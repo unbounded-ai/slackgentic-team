@@ -90,14 +90,22 @@ class SessionConfig(BaseModel):
         default=(),
         validation_alias="SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS",
     )
+    allowed_external_session_cwd_prefixes: tuple[str, ...] = Field(
+        default=(),
+        validation_alias="SLACKGENTIC_EXTERNAL_SESSION_ALLOWED_CWD_PREFIXES",
+    )
     external_session_mirror_poll_seconds: float = Field(
         default=15.0,
         validation_alias="SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS",
     )
 
-    @field_validator("ignored_external_session_cwds", mode="before")
+    @field_validator(
+        "ignored_external_session_cwds",
+        "allowed_external_session_cwd_prefixes",
+        mode="before",
+    )
     @classmethod
-    def _parse_ignored_external_session_cwds(cls, value: object) -> tuple[str, ...]:
+    def _parse_string_tuple(cls, value: object) -> tuple[str, ...]:
         if value is None:
             return ()
         if isinstance(value, str):
@@ -106,7 +114,7 @@ class SessionConfig(BaseModel):
                 return ()
             if stripped.startswith("["):
                 decoded = json.loads(stripped)
-                return cls._parse_ignored_external_session_cwds(decoded)
+                return cls._parse_string_tuple(decoded)
             separator = os.pathsep if os.pathsep in stripped and "," not in stripped else ","
             return tuple(part.strip() for part in stripped.split(separator) if part.strip())
         if isinstance(value, (list, tuple, set)):

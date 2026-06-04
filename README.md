@@ -377,6 +377,8 @@ variables override stored values.
 | `SLACKGENTIC_CODEX_APP_SERVER_URL` | Codex app-server URL. |
 | `SLACKGENTIC_CODEX_AGENTS` | Default initial Codex count. |
 | `SLACKGENTIC_CLAUDE_AGENTS` | Default initial Claude count. |
+| `SLACKGENTIC_EXTERNAL_SESSION_ALLOWED_CWD_PREFIXES` | Comma- or path-list of cwd prefixes to mirror for sessions started outside Slack, for example `/workspace/repos`. When set, sessions outside these prefixes are ignored. |
+| `SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS` | Comma- or path-list of cwd path segments or patterns to ignore for sessions started outside Slack. |
 | `SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS` | Seconds between scans for sessions started outside Slack, default `15`. |
 | `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS avatar directory, or `off`. |
 | `SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS` | Allow managed tasks to start in macOS privacy-protected locations after you have granted OS access. |

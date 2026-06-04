@@ -398,6 +398,7 @@ class SlackAppTests(unittest.TestCase):
                 },
                 "sessions": {
                     "ignored_external_session_cwds": (".local", "tmp/cache"),
+                    "allowed_external_session_cwd_prefixes": ("/workspace/repos",),
                 },
             }
         )
@@ -426,6 +427,8 @@ class SlackAppTests(unittest.TestCase):
                 ".local",
                 "--ignore-external-session-cwd",
                 "tmp/cache",
+                "--allow-external-session-cwd-prefix",
+                "/workspace/repos",
             ],
         )
 

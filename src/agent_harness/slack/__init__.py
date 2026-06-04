@@ -605,9 +605,74 @@ def _release_notes_excerpt(body: str | None, *, limit: int = 1200) -> str | None
     normalized = normalized.strip()
     if not normalized:
         return None
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3].rstrip() + "..."
+    headlines = _release_note_headlines(normalized)
+    if not headlines:
+        return None
+    lines: list[str] = []
+    for headline in headlines:
+        line = f"- {headline}"
+        candidate = "\n".join([*lines, line])
+        if len(candidate) > limit:
+            break
+        lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    first = f"- {headlines[0]}"
+    return first[: limit - 3].rstrip() + "..."
+
+
+def _release_note_headlines(body: str) -> list[str]:
+    headlines: list[str] = []
+    seen: set[str] = set()
+    saw_changes_header = False
+    in_changes = False
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("##"):
+            header = line.lstrip("#").strip().rstrip(":").lower()
+            in_changes = header in {"what's changed", "whats changed", "changes"}
+            saw_changes_header = saw_changes_header or in_changes
+            continue
+        if line.lower().startswith("**full changelog**"):
+            break
+        if saw_changes_header and not in_changes:
+            continue
+        match = re.match(r"^(?:[-*+]|\d+\.)\s+(?P<headline>.+)$", line)
+        if not match:
+            continue
+        headline = _clean_release_note_headline(match.group("headline"))
+        if not headline or headline in seen:
+            continue
+        seen.add(headline)
+        headlines.append(headline)
+    return headlines
+
+
+def _clean_release_note_headline(value: str) -> str | None:
+    headline = value.strip()
+    if not headline or headline.lower().startswith("**full changelog**"):
+        return None
+    headline = re.sub(
+        r"\s+by\s+@[A-Za-z0-9-]+\s+in\s+\[[^\]]+\]\([^)]+\)\s*$",
+        "",
+        headline,
+    )
+    headline = re.sub(
+        r"\s+by\s+@[A-Za-z0-9-]+\s+in\s+https?://\S+\s*$",
+        "",
+        headline,
+    )
+    headline = re.sub(r"\s+by\s+@[A-Za-z0-9-]+\s*$", "", headline)
+    headline = re.sub(r"\s+in\s+https?://\S+\s*$", "", headline)
+    headline = re.sub(r"<https?://[^>|]+\|([^>]+)>", r"\1", headline)
+    headline = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", headline)
+    headline = re.sub(r"https?://\S+", "", headline)
+    headline = re.sub(r"\s+\(#\d+\)\s*$", "", headline)
+    headline = re.sub(r"\s+\[#\d+\]\s*$", "", headline)
+    headline = re.sub(r"\s+", " ", headline).strip(" -")
+    return headline or None
 
 
 def build_external_session_capacity_blocks(

@@ -17,6 +17,7 @@ from agent_harness.models import (
 from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.mirror import (
     SessionMirror,
+    _cwd_matches_allowed_prefixes,
     _cwd_matches_ignored_patterns,
     render_session_event,
 )
@@ -536,6 +537,131 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_session_outside_allowed_cwd_prefix_is_not_mirrored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path("/workspace/scratch/example-project"),
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                store.set_setting("external_session_agent.codex.s1", "agent-1")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    allowed_cwd_prefixes=("/workspace/repos",),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertEqual(gateway.replies, [])
+                ignored = store.get_session(Provider.CODEX, "s1")
+                self.assertIsNotNone(ignored)
+                assert ignored is not None
+                self.assertEqual(ignored.status, SessionStatus.DONE)
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
+                )
+            finally:
+                store.close()
+
+    def test_external_session_inside_allowed_cwd_prefix_is_mirrored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path("/workspace/repos/example-project"),
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "visible"}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    allowed_cwd_prefixes=("/workspace/repos",),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.parents), 1)
+                self.assertIsNone(store.get_setting("external_session_ignored.codex.s1"))
+            finally:
+                store.close()
+
+    def test_allowed_cwd_prefix_does_not_override_ignored_cwd_pattern(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path("/workspace/repos/example-project/.local/run-1"),
+                    status=SessionStatus.ACTIVE,
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    ignored_cwd_patterns=(".local",),
+                    allowed_cwd_prefixes=("/workspace/repos",),
+                )
+
+                mirror.sync_once()
+
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
+            finally:
+                store.close()
+
     def test_ignored_cwd_session_does_not_keep_mirror_awake(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -560,6 +686,53 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertFalse(mirror.has_active_sessions())
             finally:
                 store.close()
+
+    def test_disallowed_cwd_session_does_not_keep_mirror_awake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path("/workspace/scratch/example-project"),
+                    status=SessionStatus.ACTIVE,
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    allowed_cwd_prefixes=("/workspace/repos",),
+                )
+
+                self.assertFalse(mirror.has_active_sessions())
+            finally:
+                store.close()
+
+    def test_allowed_cwd_prefixes_match_complete_path_prefixes(self):
+        self.assertTrue(
+            _cwd_matches_allowed_prefixes(
+                Path("/workspace/repos/example-project"),
+                ("/workspace/repos",),
+            )
+        )
+        self.assertTrue(
+            _cwd_matches_allowed_prefixes(
+                Path("/workspace/repos"),
+                ("/workspace/repos",),
+            )
+        )
+        self.assertFalse(
+            _cwd_matches_allowed_prefixes(
+                Path("/workspace/repos-old/example-project"),
+                ("/workspace/repos",),
+            )
+        )
+        self.assertFalse(_cwd_matches_allowed_prefixes(None, ("/workspace/repos",)))
+        self.assertTrue(_cwd_matches_allowed_prefixes(None, ()))
 
     def test_ignored_cwd_subpath_matches_complete_segments_only(self):
         self.assertTrue(

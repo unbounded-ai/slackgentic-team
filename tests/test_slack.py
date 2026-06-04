@@ -517,7 +517,15 @@ class SlackTests(unittest.TestCase):
                 version="0.1.1",
                 tag_name="v0.1.1",
                 html_url="https://github.com/example-org/example-repo/releases/tag/v0.1.1",
-                body="## Changes\n- Adds safer update restart handling.",
+                body=(
+                    "## What's Changed\n"
+                    "* Adds safer update restart handling by @contributor in "
+                    "https://github.com/example-org/example-repo/pull/1\n"
+                    "* Shortens release notes in Slack by @contributor in "
+                    "https://github.com/example-org/example-repo/pull/2\n\n"
+                    "**Full Changelog**: "
+                    "https://github.com/example-org/example-repo/compare/v0.1.0...v0.1.1"
+                ),
             ),
             repository="example-org/example-repo",
         )
@@ -527,7 +535,12 @@ class SlackTests(unittest.TestCase):
         self.assertIn("Upgrade now to install the published release", prompt_text)
         self.assertNotIn("*Status:*", prompt_text)
         self.assertIn("*Release notes:*", prompt[1]["text"]["text"])
-        self.assertIn("safer update restart", prompt[1]["text"]["text"])
+        release_notes = prompt[1]["text"]["text"]
+        self.assertIn("- Adds safer update restart handling", release_notes)
+        self.assertIn("- Shortens release notes in Slack", release_notes)
+        self.assertNotIn("@contributor", release_notes)
+        self.assertNotIn("https://", release_notes)
+        self.assertNotIn("Full Changelog", release_notes)
 
         in_progress = build_update_prompt_blocks(
             candidate,

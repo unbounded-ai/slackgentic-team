@@ -23,6 +23,9 @@ class ConfigTests(unittest.TestCase):
                     "SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS": json.dumps(
                         ["/workspace/repos/example-project/.local"]
                     ),
+                    "SLACKGENTIC_EXTERNAL_SESSION_ALLOWED_CWD_PREFIXES": json.dumps(
+                        ["/workspace/repos"]
+                    ),
                     "SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS": "20",
                     "SLACKGENTIC_UPDATE_REPOSITORY": "example-org/example-repo",
                     "SLACKGENTIC_UPDATE_CHECK_INTERVAL_SECONDS": "120",
@@ -39,6 +42,9 @@ class ConfigTests(unittest.TestCase):
                     "SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS": (
                         "build/.cache,/tmp/example-cache"
                     ),
+                    "SLACKGENTIC_EXTERNAL_SESSION_ALLOWED_CWD_PREFIXES": (
+                        "/workspace/repos:/workspace/scratch"
+                    ),
                 },
                 clear=True,
             ):
@@ -53,6 +59,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 config.sessions.ignored_external_session_cwds,
                 ("build/.cache", "/tmp/example-cache"),
+            )
+            self.assertEqual(
+                config.sessions.allowed_external_session_cwd_prefixes,
+                ("/workspace/repos", "/workspace/scratch"),
             )
             self.assertEqual(config.sessions.external_session_mirror_poll_seconds, 20)
             self.assertEqual(config.updates.repository, "example-org/example-repo")

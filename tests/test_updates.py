@@ -365,6 +365,138 @@ class UpdateRunnerTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_post_restart_ack_waits_for_matching_update_helper(self):
+        from agent_harness import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.0.0",
+                    release=ReleaseInfo(version=__version__, tag_name=f"v{__version__}"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(
+                    f"slackgentic.update.candidate.{__version__}", candidate.to_json()
+                )
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_PENDING,
+                    json.dumps(
+                        {
+                            "channel_id": "C1",
+                            "created_at": utc_now().isoformat(),
+                            "message_ts": "999",
+                            "version": __version__,
+                        }
+                    ),
+                )
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_HELPER,
+                    json.dumps({"phase": "running", "version": __version__}),
+                )
+                updates: list[tuple[str, str, str]] = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(
+                        (channel_id, ts, text)
+                    ),
+                    status_blocks=lambda update, status, include_actions: [],
+                )
+
+                runner._confirm_pending_restart_once()
+
+                self.assertEqual(updates, [])
+                self.assertIsNotNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_HELPER,
+                    json.dumps({"phase": "succeeded", "version": __version__}),
+                )
+                runner._confirm_pending_restart_once()
+
+                self.assertEqual(len(updates), 1)
+                self.assertIn(":white_check_mark:", updates[0][2])
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+            finally:
+                store.close()
+
+    def test_post_restart_ack_retains_pending_marker_when_slack_update_fails(self):
+        from agent_harness import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.0.0",
+                    release=ReleaseInfo(version=__version__, tag_name=f"v{__version__}"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(
+                    f"slackgentic.update.candidate.{__version__}", candidate.to_json()
+                )
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_PENDING,
+                    json.dumps(
+                        {
+                            "channel_id": "C1",
+                            "created_at": utc_now().isoformat(),
+                            "message_ts": "999",
+                            "version": __version__,
+                        }
+                    ),
+                )
+                attempts = 0
+                updates: list[tuple[str, str, str]] = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                def update_message(channel_id, ts, text, blocks):
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise RuntimeError("temporary Slack failure")
+                    updates.append((channel_id, ts, text))
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=update_message,
+                    status_blocks=lambda update, status, include_actions: [],
+                )
+
+                runner._confirm_pending_restart_once()
+
+                self.assertEqual(updates, [])
+                self.assertIsNotNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+
+                runner._confirm_pending_restart_once()
+
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(attempts, 2)
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+            finally:
+                store.close()
+
     def test_start_does_not_ack_when_pending_version_does_not_match(self):
         # If the kickstart somehow brought up a daemon at the OLD version
         # (e.g. the install step was rolled back), do not lie to the user by

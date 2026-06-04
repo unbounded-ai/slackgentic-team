@@ -74,6 +74,7 @@ def build_service_spec(
     working_directory: Path | None = None,
     config_file: Path | None = None,
     ignored_external_session_cwds: list[str] | tuple[str, ...] | None = None,
+    allowed_external_session_cwd_prefixes: list[str] | tuple[str, ...] | None = None,
 ) -> ServiceSpec:
     resolved_executable = executable or _current_slackgentic_executable()
     args = ["slack", "serve"]
@@ -82,6 +83,9 @@ def build_service_spec(
     for cwd_pattern in ignored_external_session_cwds or ():
         if cwd_pattern.strip():
             args.extend(["--ignore-external-session-cwd", cwd_pattern.strip()])
+    for cwd_prefix in allowed_external_session_cwd_prefixes or ():
+        if cwd_prefix.strip():
+            args.extend(["--allow-external-session-cwd-prefix", cwd_prefix.strip()])
     return ServiceSpec(
         name=name,
         executable=resolved_executable,
@@ -266,6 +270,15 @@ def start_update_helper(
         "--",
         *command,
     ]
+    from agent_harness.updates import record_update_helper_state
+
+    record_update_helper_state(
+        state_db,
+        phase="scheduled",
+        version=version,
+        command=command,
+        log_file=log_file,
+    )
     if platform.system().lower() == "darwin":
         _start_launchd_update_helper(helper_args, log_file, working_directory)
     else:
