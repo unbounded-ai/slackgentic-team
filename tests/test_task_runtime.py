@@ -2802,6 +2802,172 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def _claude_idle_running_task(self, agent, *, stale_seconds: float = 60.0):
+        stale = time.monotonic() - stale_seconds
+        task = replace(
+            create_agent_task(agent, "ship the change", "C1"),
+            session_provider=Provider.CLAUDE,
+            session_id="claude-session-idle",
+        )
+        running = RunningTask(
+            task=task,
+            agent=agent,
+            process=HoldingProcess(None),
+            thread=SlackThreadRef("C1", "171.000001"),
+            worker=threading.Thread(),
+            started_monotonic=stale,
+            last_output_monotonic=stale,
+            last_activity_monotonic=stale,
+            last_visible_message_monotonic=stale,
+        )
+        return running
+
+    def test_runtime_suppresses_progress_warning_after_completed_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    agent_progress_timeout=timedelta(seconds=5),
+                )
+                running = self._claude_idle_running_task(agent)
+
+                # A genuinely silent run still earns the progress warning.
+                self.assertTrue(runtime._managed_task_progress_warning_due(running))
+
+                # Once the agent has finished its turn and is idle awaiting the
+                # next user turn, the warning is suppressed: it stopped on
+                # purpose, it is not silently stuck.
+                running.turn_complete = True
+                self.assertFalse(runtime._managed_task_progress_warning_due(running))
+            finally:
+                store.close()
+
+    def test_runtime_suppresses_stall_restart_after_completed_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    agent_stall_timeout=timedelta(seconds=5),
+                )
+                running = self._claude_idle_running_task(agent)
+
+                # Silence with no completed turn is a real stall.
+                self.assertTrue(runtime._managed_task_stall_timed_out(running))
+
+                # A completed turn means the agent is waiting for input, not hung,
+                # so it is not restarted as a stalled run.
+                running.turn_complete = True
+                self.assertFalse(runtime._managed_task_stall_timed_out(running))
+            finally:
+                store.close()
+
+    def test_runtime_capture_turn_completion_marks_idle_after_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                )
+                running = self._claude_idle_running_task(agent)
+
+                # A mid-turn assistant event does not end the turn.
+                runtime._capture_turn_completion(
+                    running,
+                    '{"type":"assistant","message":{"content":[{"type":"text","text":"on it"}]}}\n',
+                )
+                self.assertFalse(running.turn_complete)
+
+                # The turn-ending result event marks the agent idle.
+                runtime._capture_turn_completion(
+                    running,
+                    '{"type":"result","subtype":"success","is_error":false,"result":"done"}\n',
+                )
+                self.assertTrue(running.turn_complete)
+
+                # A result split across two reads is still recognized once the
+                # line completes.
+                buffered = self._claude_idle_running_task(agent)
+                runtime._capture_turn_completion(buffered, '{"type":"res')
+                self.assertFalse(buffered.turn_complete)
+                runtime._capture_turn_completion(buffered, 'ult","is_error":false}\n')
+                self.assertTrue(buffered.turn_complete)
+
+                # Codex turns end by exiting the process, so the Claude-only
+                # result scan leaves a Codex run untouched.
+                codex_running = self._claude_idle_running_task(agent)
+                codex_running.task = replace(
+                    codex_running.task,
+                    session_provider=Provider.CODEX,
+                    session_id="codex-session-x",
+                )
+                runtime._capture_turn_completion(
+                    codex_running,
+                    '{"type":"result","is_error":false}\n',
+                )
+                self.assertFalse(codex_running.turn_complete)
+            finally:
+                store.close()
+
+    def test_runtime_send_to_task_rearms_watchdog_after_completed_turn(self):
+        class SendableHoldingProcess(HoldingProcess):
+            def __init__(self, request):
+                super().__init__(request)
+                self.sent = []
+
+            def send(self, message):
+                self.sent.append(message)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    agent_stall_timeout=timedelta(seconds=5),
+                )
+                running = self._claude_idle_running_task(agent)
+                running.process = SendableHoldingProcess(None)
+                running.turn_complete = True
+                running.turn_buffer = "stale-partial"
+                with runtime._lock:
+                    runtime._running[running.task.task_id] = running
+
+                # Idle after a completed turn: the watchdog stays quiet.
+                self.assertFalse(runtime._managed_task_stall_timed_out(running))
+
+                self.assertTrue(runtime.send_to_task(running.task.task_id, "do the next thing"))
+
+                # The follow-up re-arms the watchdog and restarts its clock, so
+                # the previously stale activity timestamp does not instantly read
+                # as a stall.
+                self.assertEqual(running.process.sent, ["do the next thing"])
+                self.assertFalse(running.turn_complete)
+                self.assertEqual(running.turn_buffer, "")
+                self.assertFalse(runtime._managed_task_stall_timed_out(running))
+            finally:
+                store.close()
+
     def test_runtime_marks_managed_run_while_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
