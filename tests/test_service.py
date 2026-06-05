@@ -1,3 +1,4 @@
+import json
 import os
 import plistlib
 import subprocess
@@ -22,6 +23,8 @@ from agent_harness.service import (
     start_services,
     start_update_helper,
 )
+from agent_harness.storage.store import Store
+from agent_harness.updates import SETTING_UPDATE_RESTART_HELPER
 
 
 class ServiceTests(unittest.TestCase):
@@ -368,6 +371,7 @@ class ServiceTests(unittest.TestCase):
     def test_start_update_helper_on_macos_uses_one_shot_launch_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             helper_plist = Path(tmp) / "helper.plist"
+            state_db = Path(tmp) / "state.sqlite"
             with (
                 patch("agent_harness.service.platform.system", return_value="Darwin"),
                 patch("agent_harness.service.os.getuid", return_value=501),
@@ -377,7 +381,7 @@ class ServiceTests(unittest.TestCase):
                 run.return_value = subprocess.CompletedProcess([], 0)
                 log_file = start_update_helper(
                     executable=Path("/opt/example/bin/slackgentic"),
-                    state_db=Path(tmp) / "state.sqlite",
+                    state_db=state_db,
                     version="0.2.0",
                     command=["slackgentic", "service", "install"],
                     log_dir=Path(tmp) / "logs",
@@ -385,12 +389,20 @@ class ServiceTests(unittest.TestCase):
                 )
 
             payload = plistlib.loads(helper_plist.read_bytes())
+            store = Store(state_db)
+            try:
+                helper_state = json.loads(store.get_setting(SETTING_UPDATE_RESTART_HELPER))
+            finally:
+                store.close()
 
         self.assertEqual(payload["Label"], "com.slackgentic-team.update-helper")
         self.assertFalse(payload["KeepAlive"])
         self.assertIn("update-helper", payload["ProgramArguments"])
         self.assertIn("slackgentic", payload["ProgramArguments"])
         self.assertEqual(log_file.parent.name, "logs")
+        self.assertEqual(helper_state["phase"], "scheduled")
+        self.assertEqual(helper_state["version"], "0.2.0")
+        self.assertEqual(helper_state["command"], ["slackgentic", "service", "install"])
 
     def test_install_services_on_macos_bootstraps_codex_before_daemon_bootout(self):
         with tempfile.TemporaryDirectory() as tmp:

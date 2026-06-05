@@ -237,7 +237,6 @@ from agent_harness.updates import (
     UpdateCandidate,
     UpdateChecker,
     detect_source_root,
-    record_update_helper_state,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -9034,6 +9033,7 @@ class SocketModeSlackApp:
             on_agent_message=self.controller.handle_mirrored_session_agent_message,
             home=config.home,
             ignored_cwd_patterns=config.sessions.ignored_external_session_cwds,
+            allowed_cwd_prefixes=config.sessions.allowed_external_session_cwd_prefixes,
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()
@@ -9163,20 +9163,13 @@ class SocketModeSlackApp:
             working_directory=workdir,
         )
         version = self.store.get_setting("slackgentic.update.installing_version") or "unknown"
-        log_file = start_update_helper(
+        start_update_helper(
             executable=executable.resolve(),
             state_db=self.config.state_db,
             version=version,
             command=command,
             log_dir=self.config.state_db.parent / "logs",
             working_directory=workdir,
-        )
-        record_update_helper_state(
-            self.config.state_db,
-            phase="scheduled",
-            version=version,
-            command=command,
-            log_file=log_file,
         )
         return True
 
@@ -9198,6 +9191,9 @@ class SocketModeSlackApp:
             working_directory=workdir,
             config_file=self.config.config_file,
             ignored_external_session_cwds=list(self.config.sessions.ignored_external_session_cwds),
+            allowed_external_session_cwd_prefixes=list(
+                self.config.sessions.allowed_external_session_cwd_prefixes
+            ),
         )
         specs = [daemon_spec]
         codex_app_server_url = self.config.commands.codex_app_server_url
@@ -9418,6 +9414,8 @@ def _service_reinstall_command(
         command.append("--no-codex-app-server")
     for cwd_pattern in config.sessions.ignored_external_session_cwds:
         command.extend(["--ignore-external-session-cwd", cwd_pattern])
+    for cwd_prefix in config.sessions.allowed_external_session_cwd_prefixes:
+        command.extend(["--allow-external-session-cwd-prefix", cwd_prefix])
     return command
 
 

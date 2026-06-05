@@ -158,6 +158,15 @@ def main(argv: list[str] | None = None) -> int:
             "segment pattern; e.g. .local matches any .local directory."
         ),
     )
+    service_install.add_argument(
+        "--allow-external-session-cwd-prefix",
+        action="append",
+        dest="allowed_external_session_cwd_prefixes",
+        help=(
+            "Only mirror observed external agent sessions whose cwd is under this path prefix. "
+            "May be passed more than once."
+        ),
+    )
     service_uninstall = service_sub.add_parser("uninstall", help="Stop and remove the service")
     service_uninstall.add_argument("--name", default="slackgentic-team")
     service_start = service_sub.add_parser("start", help="Start installed services")
@@ -187,6 +196,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Ignore observed external agent sessions whose cwd contains this path or path "
             "segment pattern; e.g. .local matches any .local directory."
+        ),
+    )
+    service_print.add_argument(
+        "--allow-external-session-cwd-prefix",
+        action="append",
+        dest="allowed_external_session_cwd_prefixes",
+        help=(
+            "Only mirror observed external agent sessions whose cwd is under this path prefix. "
+            "May be passed more than once."
         ),
     )
 
@@ -229,6 +247,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Ignore observed external agent sessions whose cwd contains this path or path "
             "segment pattern; e.g. .local matches any .local directory."
+        ),
+    )
+    slack_serve.add_argument(
+        "--allow-external-session-cwd-prefix",
+        action="append",
+        dest="allowed_external_session_cwd_prefixes",
+        help=(
+            "Only mirror observed external agent sessions whose cwd is under this path prefix. "
+            "May be passed more than once."
         ),
     )
     slack_reset_state = slack_sub.add_parser(
@@ -408,19 +435,28 @@ def main(argv: list[str] | None = None) -> int:
         if overrides:
             config = AppConfig.model_validate({**config.model_dump(), **overrides})
         ignored_external_session_cwds = getattr(args, "ignored_external_session_cwds", None)
-        if ignored_external_session_cwds is not None:
+        allowed_external_session_cwd_prefixes = getattr(
+            args,
+            "allowed_external_session_cwd_prefixes",
+            None,
+        )
+        if (
+            ignored_external_session_cwds is not None
+            or allowed_external_session_cwd_prefixes is not None
+        ):
+            session_updates = {}
+            if ignored_external_session_cwds is not None:
+                session_updates["ignored_external_session_cwds"] = tuple(
+                    cwd.strip() for cwd in ignored_external_session_cwds if cwd and cwd.strip()
+                )
+            if allowed_external_session_cwd_prefixes is not None:
+                session_updates["allowed_external_session_cwd_prefixes"] = tuple(
+                    cwd.strip()
+                    for cwd in allowed_external_session_cwd_prefixes
+                    if cwd and cwd.strip()
+                )
             config = config.model_copy(
-                update={
-                    "sessions": config.sessions.model_copy(
-                        update={
-                            "ignored_external_session_cwds": tuple(
-                                cwd.strip()
-                                for cwd in ignored_external_session_cwds
-                                if cwd and cwd.strip()
-                            )
-                        }
-                    )
-                }
+                update={"sessions": config.sessions.model_copy(update=session_updates)}
             )
         if args.slack_command == "reset-state":
             return _reset_slack_state(config, yes=args.yes)
@@ -481,6 +517,7 @@ def _service(args: argparse.Namespace) -> int:
             working_directory=args.workdir,
             config_file=args.config_file,
             ignored_external_session_cwds=args.ignored_external_session_cwds,
+            allowed_external_session_cwd_prefixes=args.allowed_external_session_cwd_prefixes,
         )
         specs = [daemon_spec]
         if not args.no_codex_app_server:
