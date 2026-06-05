@@ -111,6 +111,7 @@ class RunningTask:
     allowed_tools: tuple[str, ...] = ()
     output_buffer: str = ""
     session_buffer: str = ""
+    turn_buffer: str = ""
     permission_buffer: str = ""
     permission_denials: list[dict] = field(default_factory=list)
     permission_denial_keys: set[str] = field(default_factory=set)
@@ -135,6 +136,12 @@ class RunningTask:
     last_transcript_activity_check_monotonic: float = 0.0
     last_transcript_discovery_monotonic: float = 0.0
     progress_warning_monotonic: float | None = None
+    # True once the agent has emitted a turn-ending `result` event and is idle
+    # waiting for the next user turn (a managed Claude process stays alive across
+    # turns). This is an intentional stop — e.g. the agent asked to be released,
+    # parked on a timer, or is waiting on a review — not a silent stall, so the
+    # progress/stall watchdog is suppressed until the next user turn is sent.
+    turn_complete: bool = False
     stop_requested: bool = False
     wake_event: threading.Event = field(default_factory=threading.Event)
 
@@ -382,6 +389,16 @@ class ManagedTaskRuntime:
         except Exception:
             LOGGER.debug("failed to send message to running managed task", exc_info=True)
             return False
+        # A new user turn means the agent is working again, so re-arm the
+        # progress/stall watchdog and start its clock from now. Without resetting
+        # the activity timestamps an agent that idled past the stall window would
+        # be restarted as "stalled" the instant a follow-up arrives.
+        now = time.monotonic()
+        running.turn_complete = False
+        running.turn_buffer = ""
+        running.last_activity_monotonic = now
+        running.last_output_monotonic = now
+        running.progress_warning_monotonic = None
         running.wake_event.set()
         return True
 
@@ -552,6 +569,7 @@ class ManagedTaskRuntime:
                 self._remove_running_task(task_id, running)
                 return
             self._capture_session_id(running, output)
+            self._capture_turn_completion(running, output)
             self._capture_transcript_activity(running)
             permission_denied = self._capture_permission_denials(running, output)
             self._capture_resume_errors(running, output)
@@ -705,6 +723,12 @@ class ManagedTaskRuntime:
     def _managed_task_progress_warning_due(self, running: RunningTask) -> bool:
         if not running.process.is_alive():
             return False
+        if running.turn_complete:
+            # The agent finished its turn and is idle awaiting the next user turn
+            # (e.g. it asked to be released). That is a deliberate stop, not a
+            # silent run, so do not nag about missing progress or threaten a
+            # restart.
+            return False
         if not running.task.session_id and running.visible_message_count <= 0:
             return False
         timeout_seconds = self.agent_progress_timeout.total_seconds()
@@ -743,6 +767,11 @@ class ManagedTaskRuntime:
 
     def _managed_task_stall_timed_out(self, running: RunningTask) -> bool:
         if not running.process.is_alive():
+            return False
+        if running.turn_complete:
+            # A completed turn means the agent stopped on purpose and is waiting
+            # for input, not hung mid-task. Restarting it with a status request
+            # here just loops on an agent that already said it was done.
             return False
         if not running.task.session_id and running.visible_message_count <= 0:
             return False
@@ -1034,6 +1063,21 @@ class ManagedTaskRuntime:
             session_provider=provider,
             session_id=session_id,
         )
+
+    def _capture_turn_completion(self, running: RunningTask, output: str) -> None:
+        # Managed Claude emits a `result` event at the end of every turn and then
+        # idles on stdin waiting for the next user turn. Mark that so the watchdog
+        # treats the wait as a deliberate stop rather than a stall. Other
+        # providers end a turn by exiting the process, so this only applies to
+        # Claude; the flag is cleared when the next user turn is sent.
+        if _provider_for_running(running) != Provider.CLAUDE:
+            return
+        completed, running.turn_buffer = _claude_turn_completed_from_output(
+            output,
+            running.turn_buffer,
+        )
+        if completed:
+            running.turn_complete = True
 
     def _capture_transcript_activity(self, running: RunningTask) -> None:
         session_id = running.task.session_id
@@ -2416,6 +2460,40 @@ def _session_id_from_line(provider: Provider, line: str) -> str | None:
         value = event.get("session_id") or event.get("sessionId")
         return str(value) if value else None
     return None
+
+
+def _claude_turn_completed_from_output(
+    text: str,
+    buffer: str = "",
+    *,
+    final: bool = False,
+) -> tuple[bool, str]:
+    """Report whether `text` contains a managed Claude turn-ending event.
+
+    A `result` event is the last thing Claude emits for a turn; afterwards the
+    `--input-format stream-json` process stays alive waiting for the next user
+    turn. Buffer a trailing partial line like the other stream scanners so a
+    result event split across reads is still recognized once it completes.
+    """
+    combined = buffer + text
+    if not combined:
+        return False, buffer
+    lines = combined.splitlines(keepends=True)
+    next_buffer = ""
+    if lines and not _line_has_ending(lines[-1]) and not final:
+        next_buffer = lines.pop()
+    completed = any(_claude_line_is_turn_result(line.strip()) for line in lines)
+    return completed, next_buffer
+
+
+def _claude_line_is_turn_result(line: str) -> bool:
+    if not line:
+        return False
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(event, dict) and event.get("type") == "result"
 
 
 def _codex_exec_chunks(
