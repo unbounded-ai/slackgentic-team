@@ -9170,6 +9170,7 @@ class SocketModeSlackApp:
             command=command,
             log_dir=self.config.state_db.parent / "logs",
             working_directory=workdir,
+            config_file=self.config.config_file,
         )
         return True
 

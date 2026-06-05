@@ -295,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     update_helper.add_argument("--state-db", type=Path, required=True)
     update_helper.add_argument("--log-file", type=Path, required=True)
     update_helper.add_argument("--version", required=True)
+    update_helper.add_argument("--config-file", type=Path, default=None)
     update_helper.add_argument("command_args", nargs=argparse.REMAINDER)
 
     args = parser.parse_args(argv)
@@ -369,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
             log_file=args.log_file,
             version=args.version,
             command=args.command_args,
+            config_file=args.config_file,
         )
     if args.command == "index-once":
         from agent_harness.config import AppConfig
