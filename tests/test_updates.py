@@ -3,12 +3,14 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_harness.models import utc_now
 from agent_harness.storage.store import Store
 from agent_harness.updates import (
+    SETTING_UPDATE_CANDIDATE_PREFIX,
     SETTING_UPDATE_INSTALLED_VERSION,
     SETTING_UPDATE_RESTART_HELPER,
     SETTING_UPDATE_RESTART_PENDING,
@@ -19,6 +21,7 @@ from agent_harness.updates import (
     UpdateCandidate,
     UpgradePlan,
     UpgradeResult,
+    finalize_restart_pending,
     github_tag_tarball_url,
     is_newer_version,
     run_update_helper,
@@ -636,6 +639,206 @@ class UpdateRunnerTests(unittest.TestCase):
             self.assertEqual(payload["exit_code"], 7)
             self.assertEqual(payload["command"], ["slackgentic", "service", "install"])
             self.assertIn("helper output", log_file.read_text())
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self._now = datetime(2026, 1, 1, tzinfo=UTC)
+        self.slept: list[float] = []
+
+    def now(self) -> datetime:
+        return self._now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self._now += timedelta(seconds=seconds)
+
+
+class UpdateHelperConfirmTests(unittest.TestCase):
+    def _store(self, tmp: str) -> Store:
+        store = Store(Path(tmp) / "state.sqlite")
+        store.init_schema()
+        return store
+
+    def _set_pending(self, store: Store, version: str) -> None:
+        store.set_setting(
+            SETTING_UPDATE_RESTART_PENDING,
+            json.dumps(
+                {
+                    "channel_id": "C1",
+                    "created_at": utc_now().isoformat(),
+                    "message_ts": "171",
+                    "version": version,
+                }
+            ),
+        )
+        candidate = UpdateCandidate(
+            current_version="0.1.0",
+            release=ReleaseInfo(version=version, tag_name=f"v{version}"),
+            repository="example-org/example-repo",
+        )
+        store.set_setting(f"{SETTING_UPDATE_CANDIDATE_PREFIX}{version}", candidate.to_json())
+
+    def test_finalize_posts_terminal_status_when_daemon_never_confirms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            try:
+                self._set_pending(store, "0.2.0")
+                clock = _FakeClock()
+                posts: list[tuple] = []
+
+                outcome = finalize_restart_pending(
+                    store,
+                    version="0.2.0",
+                    helper_phase="succeeded",
+                    update_message=lambda *args: posts.append(args),
+                    status_blocks=lambda candidate, status, actions: [{"type": "section"}],
+                    timeout_seconds=20,
+                    poll_seconds=5,
+                    sleep=clock.sleep,
+                    now=clock.now,
+                )
+
+                self.assertEqual(outcome, "notified")
+                self.assertEqual(len(posts), 1)
+                channel_id, message_ts, text, blocks = posts[0]
+                self.assertEqual((channel_id, message_ts), ("C1", "171"))
+                self.assertIn("did not confirm", text)
+                self.assertEqual(blocks, [{"type": "section"}])
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+                self.assertEqual(store.get_setting(SETTING_UPDATE_INSTALLED_VERSION), "0.2.0")
+            finally:
+                store.close()
+
+    def test_finalize_skips_when_daemon_confirms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            try:
+                self._set_pending(store, "0.2.0")
+                clock = _FakeClock()
+                posts: list[tuple] = []
+
+                def clearing_sleep(seconds: float) -> None:
+                    # Simulate the restarted daemon posting the ack and clearing
+                    # the marker between poll iterations.
+                    store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
+                    clock.sleep(seconds)
+
+                outcome = finalize_restart_pending(
+                    store,
+                    version="0.2.0",
+                    helper_phase="succeeded",
+                    update_message=lambda *args: posts.append(args),
+                    status_blocks=lambda *args: [],
+                    timeout_seconds=20,
+                    poll_seconds=5,
+                    sleep=clearing_sleep,
+                    now=clock.now,
+                )
+
+                self.assertEqual(outcome, "confirmed")
+                self.assertEqual(posts, [])
+            finally:
+                store.close()
+
+    def test_finalize_uses_reinstall_failure_text_when_helper_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            try:
+                self._set_pending(store, "0.2.0")
+                clock = _FakeClock()
+                posts: list[tuple] = []
+
+                finalize_restart_pending(
+                    store,
+                    version="0.2.0",
+                    helper_phase="failed",
+                    update_message=lambda *args: posts.append(args),
+                    timeout_seconds=0,
+                    poll_seconds=5,
+                    sleep=clock.sleep,
+                    now=clock.now,
+                )
+
+                self.assertEqual(len(posts), 1)
+                self.assertIn("reinstall failed", posts[0][2])
+            finally:
+                store.close()
+
+    def test_finalize_retains_marker_when_slack_update_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            try:
+                self._set_pending(store, "0.2.0")
+
+                def boom(*args):
+                    raise RuntimeError("slack down")
+
+                outcome = finalize_restart_pending(
+                    store,
+                    version="0.2.0",
+                    helper_phase="succeeded",
+                    update_message=boom,
+                    timeout_seconds=0,
+                    poll_seconds=5,
+                )
+
+                self.assertIsNone(outcome)
+                self.assertIsNotNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_INSTALLED_VERSION))
+            finally:
+                store.close()
+
+    def test_finalize_noop_without_pending_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            try:
+                posts: list[tuple] = []
+                outcome = finalize_restart_pending(
+                    store,
+                    version="0.2.0",
+                    helper_phase="succeeded",
+                    update_message=lambda *args: posts.append(args),
+                )
+                self.assertIsNone(outcome)
+                self.assertEqual(posts, [])
+            finally:
+                store.close()
+
+    def test_run_update_helper_finalizes_with_install_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "state.sqlite"
+            log_file = Path(tmp) / "update.log"
+            captured: dict = {}
+
+            def fake_finalize(*, state_db, version, helper_phase, config_file):
+                captured.update(
+                    state_db=state_db,
+                    version=version,
+                    helper_phase=helper_phase,
+                    config_file=config_file,
+                )
+                return "notified"
+
+            def fake_run(args, **kwargs):
+                kwargs["stdout"].write("ok\n")
+                return subprocess.CompletedProcess(args, 0)
+
+            result = run_update_helper(
+                state_db=state_db,
+                log_file=log_file,
+                version="0.2.0",
+                command=["--", "slackgentic", "service", "install"],
+                config_file=Path("/tmp/example-config.json"),
+                run=fake_run,
+                finalize_restart=fake_finalize,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["helper_phase"], "succeeded")
+            self.assertEqual(captured["version"], "0.2.0")
+            self.assertEqual(captured["config_file"], Path("/tmp/example-config.json"))
+            self.assertIn("post-restart status: notified", log_file.read_text())
 
 
 if __name__ == "__main__":

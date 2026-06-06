@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -27,6 +28,11 @@ DEFAULT_UPDATE_REPOSITORY = "unbounded-ai/slackgentic-team"
 DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 2 * 60
+# The update-helper waits this long for the restarted daemon to acknowledge the
+# upgrade before posting the terminal status itself. It is intentionally longer
+# than DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS so a slow-but-healthy daemon wins
+# the race and posts the success/stale ack before the helper falls back.
+DEFAULT_UPDATE_HELPER_CONFIRM_TIMEOUT_SECONDS = DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS + 60
 SETTING_UPDATE_PROMPTED_VERSION = "slackgentic.update.prompted_version"
 SETTING_UPDATE_DISMISSED_VERSION = "slackgentic.update.dismissed_version"
 SETTING_UPDATE_INSTALLING_VERSION = "slackgentic.update.installing_version"
@@ -933,6 +939,177 @@ def _restart_pending_payload(raw: str | None) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _candidate_from_store(store: Any, version: str) -> UpdateCandidate | None:
+    raw = store.get_setting(f"{SETTING_UPDATE_CANDIDATE_PREFIX}{version}")
+    if not raw:
+        return None
+    try:
+        return UpdateCandidate.from_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _build_slack_update_from_config(
+    config_file: Path | None,
+) -> tuple[Callable[..., None] | None, Callable[..., list[dict[str, Any]]] | None]:
+    """Build a Slack ``update_message`` callable (and status-block builder) from
+    the on-disk config, or ``(None, None)`` when Slack cannot be reached."""
+
+    if config_file is None:
+        return None, None
+    try:
+        from agent_harness.config import load_config_from_env
+        from agent_harness.slack import build_update_prompt_blocks
+        from agent_harness.slack.client import SlackGateway
+
+        config = load_config_from_env(config_file)
+        token = config.slack.bot_token
+        if not token:
+            return None, None
+        gateway = SlackGateway(token)
+
+        def status_blocks(
+            candidate: UpdateCandidate, status: str, include_actions: bool
+        ) -> list[dict[str, Any]]:
+            return build_update_prompt_blocks(
+                candidate, status_text=status, include_actions=include_actions
+            )
+
+        return gateway.update_message, status_blocks
+    except Exception:
+        LOGGER.exception("update helper could not build a Slack client for the restart status")
+        return None, None
+
+
+def _wait_for_restart_confirmation(
+    store: Any,
+    *,
+    version: str,
+    timeout_seconds: float,
+    poll_seconds: float,
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+) -> bool:
+    """Return ``True`` once a daemon clears (or supersedes) the pending marker.
+
+    The marker is only deleted after Slack accepts the post-restart status, so a
+    cleared marker means a live daemon already posted the acknowledgement and the
+    helper must not post a duplicate.
+    """
+
+    start = now()
+    while True:
+        payload = _restart_pending_payload(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+        if payload is None or payload.get("version") != version:
+            return True
+        if (now() - start).total_seconds() >= timeout_seconds:
+            return False
+        sleep(poll_seconds)
+
+
+def finalize_restart_pending(
+    store: Any,
+    *,
+    version: str,
+    helper_phase: str,
+    update_message: Callable[..., None] | None,
+    status_blocks: Callable[..., list[dict[str, Any]]] | None = None,
+    timeout_seconds: float = DEFAULT_UPDATE_HELPER_CONFIRM_TIMEOUT_SECONDS,
+    poll_seconds: float = 5.0,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+) -> str | None:
+    """Guarantee the upgrade prompt reaches a terminal state.
+
+    The post-restart acknowledgement is normally posted by the daemon that comes
+    up after the kickstart. If that daemon never starts, the prompt would sit at
+    "Restarting the service to load it." forever. The update-helper outlives the
+    restart, so it gives the daemon a bounded window to confirm and, failing that,
+    posts the terminal status itself and clears the marker.
+
+    Returns ``"confirmed"`` when a daemon handled it, ``"notified"`` when the
+    helper posted the fallback status, or ``None`` when there is nothing to do or
+    Slack could not be reached.
+    """
+
+    payload = _restart_pending_payload(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+    if payload is None or payload.get("version") != version:
+        return None
+    channel_id = payload.get("channel_id")
+    message_ts = payload.get("message_ts")
+    if not isinstance(channel_id, str) or not isinstance(message_ts, str):
+        return None
+    if update_message is None:
+        # Leave the marker so a future daemon can still post the ack.
+        return None
+    if _wait_for_restart_confirmation(
+        store,
+        version=version,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+        sleep=sleep,
+        now=now,
+    ):
+        return "confirmed"
+    if helper_phase == "failed":
+        text = restart_helper_failure_text(version)
+    else:
+        text = restart_pending_failure_text(version)
+    blocks: list[dict[str, Any]] | None = None
+    if status_blocks is not None:
+        candidate = _candidate_from_store(store, version)
+        if candidate is not None:
+            try:
+                blocks = status_blocks(candidate, text, False)
+            except Exception:
+                LOGGER.debug("failed to build update status blocks", exc_info=True)
+                blocks = None
+    try:
+        update_message(channel_id, message_ts, text, blocks)
+    except Exception:
+        LOGGER.exception("update helper failed to post the post-restart status")
+        # Keep the marker so the next daemon retries on its normal cadence.
+        return None
+    store.set_setting(SETTING_UPDATE_INSTALLED_VERSION, version)
+    store.set_setting(SETTING_UPDATE_LAST_ERROR, text)
+    store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
+    return "notified"
+
+
+def finalize_restart_pending_via_helper(
+    *,
+    state_db: Path,
+    version: str,
+    helper_phase: str,
+    config_file: Path | None,
+    timeout_seconds: float = DEFAULT_UPDATE_HELPER_CONFIRM_TIMEOUT_SECONDS,
+    poll_seconds: float = 5.0,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+) -> str | None:
+    update_message, status_blocks = _build_slack_update_from_config(config_file)
+    if update_message is None:
+        return None
+    from agent_harness.storage.store import Store
+
+    store = Store(state_db)
+    try:
+        store.init_schema()
+        return finalize_restart_pending(
+            store,
+            version=version,
+            helper_phase=helper_phase,
+            update_message=update_message,
+            status_blocks=status_blocks,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+            sleep=sleep,
+            now=now,
+        )
+    finally:
+        store.close()
+
+
 def record_update_helper_state(
     state_db: Path,
     *,
@@ -971,8 +1148,29 @@ def run_update_helper(
     log_file: Path,
     version: str,
     command: Sequence[str],
+    config_file: Path | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    finalize_restart: Callable[..., str | None] = finalize_restart_pending_via_helper,
 ) -> int:
+    def _finalize(phase: str) -> None:
+        # Best-effort: never let confirmation problems mask the install result.
+        try:
+            outcome = finalize_restart(
+                state_db=state_db,
+                version=version,
+                helper_phase=phase,
+                config_file=config_file,
+            )
+        except Exception:
+            LOGGER.exception("update helper failed to finalize the post-restart status")
+            return
+        if outcome:
+            try:
+                with log_file.open("a", encoding="utf-8") as log:
+                    log.write(f"[{utc_now().isoformat()}] post-restart status: {outcome}\n")
+            except OSError:
+                LOGGER.debug("could not append restart outcome to helper log", exc_info=True)
+
     command_args = list(command)
     if command_args and command_args[0] == "--":
         command_args = command_args[1:]
@@ -987,6 +1185,7 @@ def run_update_helper(
             exit_code=2,
             error="missing helper command",
         )
+        _finalize("failed")
         return 2
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1019,6 +1218,7 @@ def run_update_helper(
             exit_code=127,
             error=str(exc),
         )
+        _finalize("failed")
         return 127
     phase = "succeeded" if completed.returncode == 0 else "failed"
     record_update_helper_state(
@@ -1030,6 +1230,7 @@ def run_update_helper(
         pid=os.getpid(),
         exit_code=completed.returncode,
     )
+    _finalize(phase)
     return int(completed.returncode)
 
 

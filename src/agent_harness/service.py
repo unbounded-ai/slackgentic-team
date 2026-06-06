@@ -254,6 +254,7 @@ def start_update_helper(
     command: list[str],
     log_dir: Path,
     working_directory: Path,
+    config_file: Path | None = None,
 ) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -267,9 +268,10 @@ def start_update_helper(
         str(log_file),
         "--version",
         version,
-        "--",
-        *command,
     ]
+    if config_file is not None:
+        helper_args += ["--config-file", str(config_file)]
+    helper_args += ["--", *command]
     from agent_harness.updates import record_update_helper_state
 
     record_update_helper_state(
