@@ -677,9 +677,7 @@ class UpdateHelperConfirmTests(unittest.TestCase):
             release=ReleaseInfo(version=version, tag_name=f"v{version}"),
             repository="example-org/example-repo",
         )
-        store.set_setting(
-            f"{SETTING_UPDATE_CANDIDATE_PREFIX}{version}", candidate.to_json()
-        )
+        store.set_setting(f"{SETTING_UPDATE_CANDIDATE_PREFIX}{version}", candidate.to_json())
 
     def test_finalize_posts_terminal_status_when_daemon_never_confirms(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -708,9 +706,7 @@ class UpdateHelperConfirmTests(unittest.TestCase):
                 self.assertIn("did not confirm", text)
                 self.assertEqual(blocks, [{"type": "section"}])
                 self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
-                self.assertEqual(
-                    store.get_setting(SETTING_UPDATE_INSTALLED_VERSION), "0.2.0"
-                )
+                self.assertEqual(store.get_setting(SETTING_UPDATE_INSTALLED_VERSION), "0.2.0")
             finally:
                 store.close()
 

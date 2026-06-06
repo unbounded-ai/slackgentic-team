@@ -1167,9 +1167,7 @@ def run_update_helper(
         if outcome:
             try:
                 with log_file.open("a", encoding="utf-8") as log:
-                    log.write(
-                        f"[{utc_now().isoformat()}] post-restart status: {outcome}\n"
-                    )
+                    log.write(f"[{utc_now().isoformat()}] post-restart status: {outcome}\n")
             except OSError:
                 LOGGER.debug("could not append restart outcome to helper log", exc_info=True)
 
