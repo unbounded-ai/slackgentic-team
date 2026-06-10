@@ -715,6 +715,7 @@ IDLE_RELEASE_PROMPT_TEXT = (
 )
 
 IDLE_RELEASE_DISMISSED_TEXT = "_Continuing — picked up the next turn in this thread._"
+IDLE_RELEASE_CLOSED_TEXT = "_Finished and freed up this agent._"
 
 
 def build_idle_release_prompt_blocks(task: AgentTask) -> list[dict[str, Any]]:
@@ -750,6 +751,19 @@ def build_idle_release_dismissed_blocks(task: AgentTask) -> list[dict[str, Any]]
             "text": {
                 "type": "mrkdwn",
                 "text": IDLE_RELEASE_DISMISSED_TEXT,
+            },
+        },
+    ]
+
+
+def build_idle_release_closed_blocks(task: AgentTask) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "block_id": f"task.idle.{task.task_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": IDLE_RELEASE_CLOSED_TEXT,
             },
         },
     ]

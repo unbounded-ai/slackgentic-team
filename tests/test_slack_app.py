@@ -3311,7 +3311,10 @@ class SlackAppTests(unittest.TestCase):
                     None,
                 )
                 self.assertIsNotNone(dismissed)
-                self.assertNotIn("Free up this agent", str(dismissed["blocks"]))
+                dismissed_blocks = str(dismissed["blocks"])
+                self.assertNotIn("Free up this agent", dismissed_blocks)
+                self.assertIn("Finished and freed up this agent", dismissed_blocks)
+                self.assertNotIn("Continuing", dismissed_blocks)
                 self.assertTrue(
                     any(
                         reply.get("text") == "Finished and freed up this agent."
@@ -3373,7 +3376,10 @@ class SlackAppTests(unittest.TestCase):
                     None,
                 )
                 self.assertIsNotNone(dismissed)
-                self.assertNotIn("Free up this agent", str(dismissed["blocks"]))
+                dismissed_blocks = str(dismissed["blocks"])
+                self.assertNotIn("Free up this agent", dismissed_blocks)
+                self.assertIn("Continuing", dismissed_blocks)
+                self.assertNotIn("Finished and freed up this agent", dismissed_blocks)
             finally:
                 store.close()
 
