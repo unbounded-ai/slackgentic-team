@@ -12,6 +12,8 @@ from agent_harness.storage.store import Store
 from agent_harness.updates import (
     SETTING_UPDATE_CANDIDATE_PREFIX,
     SETTING_UPDATE_INSTALLED_VERSION,
+    SETTING_UPDATE_LAST_ERROR,
+    SETTING_UPDATE_PROMPTED_VERSION,
     SETTING_UPDATE_RESTART_HELPER,
     SETTING_UPDATE_RESTART_PENDING,
     GitHubReleaseSource,
@@ -76,7 +78,7 @@ class GitHubReleaseSourceTests(unittest.TestCase):
 
 
 class SelfUpdaterTests(unittest.TestCase):
-    def test_pip_plan_uses_release_tarball_when_not_running_from_source(self):
+    def test_pip_plan_uses_installable_archive_when_not_running_from_source(self):
         release = ReleaseInfo(version="0.2.0", tag_name="v0.2.0")
         with patch("agent_harness.updates.detect_source_root", return_value=None):
             plan = SelfUpdater(
@@ -96,6 +98,37 @@ class SelfUpdaterTests(unittest.TestCase):
                 github_tag_tarball_url("example-org/example-repo", "v0.2.0"),
             ),
         )
+
+    def test_pip_plan_rewrites_github_api_tarball_url(self):
+        release = ReleaseInfo(
+            version="0.2.0",
+            tag_name="v0.2.0",
+            tarball_url="https://api.github.com/repos/example-org/example-repo/tarball/v0.2.0",
+        )
+        with patch("agent_harness.updates.detect_source_root", return_value=None):
+            plan = SelfUpdater(
+                repository="example-org/example-repo",
+                python_executable="/venv/bin/python",
+            ).plan(release)
+
+        self.assertEqual(
+            plan.commands[0].args[-1],
+            github_tag_tarball_url("example-org/example-repo", "v0.2.0"),
+        )
+
+    def test_pip_plan_preserves_supported_release_archive_url(self):
+        release = ReleaseInfo(
+            version="0.2.0",
+            tag_name="v0.2.0",
+            tarball_url="https://example.com/release.tar.gz",
+        )
+        with patch("agent_harness.updates.detect_source_root", return_value=None):
+            plan = SelfUpdater(
+                repository="example-org/example-repo",
+                python_executable="/venv/bin/python",
+            ).plan(release)
+
+        self.assertEqual(plan.commands[0].args[-1], "https://example.com/release.tar.gz")
 
     def test_source_plan_fetches_tag_and_reinstalls_editable_checkout(self):
         release = ReleaseInfo(version="0.2.0", tag_name="v0.2.0")
@@ -209,6 +242,40 @@ class SelfUpdaterTests(unittest.TestCase):
             ),
         )
 
+    def test_install_falls_back_to_uv_with_supported_archive_url(self):
+        release = ReleaseInfo(
+            version="0.2.0",
+            tag_name="v0.2.0",
+            tarball_url="https://api.github.com/repos/example-org/example-repo/tarball/v0.2.0",
+        )
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if args[:4] == ["/venv/bin/python", "-m", "pip", "install"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="/venv/bin/python: No module named pip\n",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with (
+            patch("agent_harness.updates.detect_source_root", return_value=None),
+            patch("agent_harness.updates.shutil.which", return_value="/usr/bin/uv"),
+        ):
+            result = SelfUpdater(
+                repository="example-org/example-repo",
+                run=fake_run,
+                python_executable="/venv/bin/python",
+            ).install(release)
+
+        archive_url = github_tag_tarball_url("example-org/example-repo", "v0.2.0")
+        self.assertTrue(result.succeeded)
+        self.assertEqual(calls[0][-1], archive_url)
+        self.assertEqual(calls[1][-1], archive_url)
+
 
 class UpdateRunnerTests(unittest.TestCase):
     def test_sync_once_prompts_once_for_new_version(self):
@@ -243,6 +310,44 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertEqual(runner.sync_once(), candidate)
 
                 self.assertEqual(prompts, [("C1", candidate)])
+            finally:
+                store.close()
+
+    def test_sync_once_reprompts_same_version_after_failed_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.1.0",
+                    release=ReleaseInfo(version="0.2.0", tag_name="v0.2.0"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, "0.2.0")
+                store.set_setting(SETTING_UPDATE_LAST_ERROR, "previous install failed")
+                prompts = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return candidate
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: prompts.append((channel_id, update)) or "171",
+                    update_message=lambda channel_id, ts, text, blocks: None,
+                    status_blocks=lambda update, status, include_actions: [],
+                )
+
+                self.assertEqual(runner.sync_once(), candidate)
+
+                self.assertEqual(prompts, [("C1", candidate)])
+                self.assertEqual(store.get_setting(SETTING_UPDATE_PROMPTED_VERSION), "0.2.0")
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_LAST_ERROR))
             finally:
                 store.close()
 
@@ -298,6 +403,59 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertIn("created_at", payload)
                 self.assertEqual(payload["message_ts"], "171")
                 self.assertEqual(payload["version"], "0.2.0")
+            finally:
+                store.close()
+
+    def test_start_upgrade_failure_keeps_retry_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.1.0",
+                    release=ReleaseInfo(version="0.2.0", tag_name="v0.2.0"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting("slackgentic.update.candidate.0.2.0", candidate.to_json())
+                store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, "0.2.0")
+                updates = []
+                action_flags = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                class Updater:
+                    def install(self, release):
+                        return UpgradeResult(
+                            False,
+                            UpgradePlan("test upgrade", ()),
+                            failure_message="install failed",
+                        )
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=Updater(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: "171",
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(text),
+                    status_blocks=lambda update, status, include_actions: (
+                        action_flags.append(include_actions) or []
+                    ),
+                )
+
+                thread = runner.start_upgrade("0.2.0", "C1", "171")
+                assert thread is not None
+                thread.join(timeout=2)
+
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(updates[-1], "install failed")
+                self.assertTrue(action_flags[-1])
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_PROMPTED_VERSION))
+                self.assertEqual(store.get_setting(SETTING_UPDATE_LAST_ERROR), "install failed")
             finally:
                 store.close()
 
