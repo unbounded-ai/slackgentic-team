@@ -30,6 +30,7 @@ from agent_harness.deferred import (
     looks_like_deferred_request,
     parse_agent_deferred_signal,
 )
+from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
@@ -7847,6 +7848,8 @@ class SlackTeamController:
         for message in messages[-12:]:
             text = self._thread_context_text(message.get("text") or "").strip()
             if not text:
+                continue
+            if is_internal_task_notification_text(text):
                 continue
             author = self._thread_context_author(message)
             lines.append(f"{author}: {text}")

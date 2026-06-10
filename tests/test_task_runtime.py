@@ -65,6 +65,28 @@ from agent_harness.team import build_initial_model_team, create_agent_task
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX, parse_agent_timer_signal
 
 
+def _task_notification_text(*, escaped: bool = False) -> str:
+    if escaped:
+        return (
+            "&lt;task-notification&gt;\n"
+            "&lt;task-id&gt;abc123&lt;/task-id&gt;\n"
+            "&lt;tool-use-id&gt;toolu_123&lt;/tool-use-id&gt;\n"
+            "&lt;output-file&gt;/tmp/example-output&lt;/output-file&gt;\n"
+            "&lt;status&gt;completed&lt;/status&gt;\n"
+            "&lt;summary&gt;Background command completed&lt;/summary&gt;\n"
+            "&lt;/task-notification&gt;"
+        )
+    return (
+        "<task-notification>\n"
+        "<task-id>abc123</task-id>\n"
+        "<tool-use-id>toolu_123</tool-use-id>\n"
+        "<output-file>/tmp/example-output</output-file>\n"
+        "<status>completed</status>\n"
+        "<summary>Background command completed</summary>\n"
+        "</task-notification>"
+    )
+
+
 class FakeGateway:
     def __init__(self):
         self.replies = []
@@ -693,6 +715,27 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("Private Slack thread context", prompt)
         self.assertIn("Do not quote this heading", prompt)
         self.assertIn("original answer", prompt)
+
+    def test_build_task_prompt_filters_internal_task_notifications_from_thread_context(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = replace(
+            create_agent_task(agent, "review this", "C1"),
+            metadata={
+                "thread_context": (
+                    "Reviewer: first pass\n"
+                    f"Slack user: {_task_notification_text(escaped=True)}\n"
+                    "Reviewer: fixed"
+                )
+            },
+        )
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("Reviewer: first pass", prompt)
+        self.assertIn("Reviewer: fixed", prompt)
+        self.assertNotIn("task-notification", prompt)
+        self.assertNotIn("Background command completed", prompt)
+        self.assertNotIn("/tmp/example-output", prompt)
 
     def test_build_task_prompt_instructs_agent_requested_reviews(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

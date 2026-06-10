@@ -19,6 +19,7 @@ from agent_harness.bash_policy import (
 )
 from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
+from agent_harness.internal_notifications import filter_internal_task_notifications
 from agent_harness.models import (
     AgentTask,
     AgentTaskStatus,
@@ -1799,16 +1800,18 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
         lines.append("Review the PR(s) and report findings with concrete file or diff references.")
     thread_context = task.metadata.get("thread_context")
     if isinstance(thread_context, str) and thread_context.strip():
-        sanitized_thread_context = replace_slack_user_ids(thread_context.strip())
-        lines.extend(
-            [
-                "",
-                "Private Slack thread context. Use this to understand prior messages, "
-                "handoffs, reviews, and user intent. Do not quote this heading or describe "
-                "it as hidden context in Slack-visible replies:",
-                sanitized_thread_context,
-            ]
-        )
+        sanitized_thread_context = filter_internal_task_notifications(thread_context.strip())
+        if sanitized_thread_context:
+            sanitized_thread_context = replace_slack_user_ids(sanitized_thread_context)
+            lines.extend(
+                [
+                    "",
+                    "Private Slack thread context. Use this to understand prior messages, "
+                    "handoffs, reviews, and user intent. Do not quote this heading or describe "
+                    "it as hidden context in Slack-visible replies:",
+                    sanitized_thread_context,
+                ]
+            )
     return "\n".join(lines)
 
 

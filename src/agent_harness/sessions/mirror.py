@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.models import (
     AgentEvent,
     AgentSession,
@@ -1170,10 +1171,14 @@ def _render_codex_event(event: AgentEvent) -> RenderedSessionEvent | None:
     if event_type == "agent_message":
         message = payload.get("message") or payload.get("text")
         text = _clean_text(str(message)) if message else ""
+        if text and is_internal_task_notification_text(text):
+            return None
         return RenderedSessionEvent(text, "assistant") if text else None
     if event_type == "user_message":
         message = payload.get("message") or payload.get("text")
         text = _clean_text(str(message)) if message else ""
+        if text and is_internal_task_notification_text(text):
+            return None
         return RenderedSessionEvent(text, "user") if text else None
     if event_type == "function_call" and _is_codex_native_request_user_input(payload):
         text = _format_codex_request_user_input(payload)
@@ -1196,6 +1201,8 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
         return RenderedSessionEvent(ask_user_question_text, "assistant")
     text = _claude_message_text(message)
     if not text:
+        return None
+    if is_internal_task_notification_text(text):
         return None
     if _has_claude_local_command_block(text):
         return None
