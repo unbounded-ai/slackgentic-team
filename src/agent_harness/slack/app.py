@@ -179,6 +179,7 @@ from agent_harness.slack import (
     AgentRosterStatus,
     build_channel_overview_blocks,
     build_external_session_capacity_blocks,
+    build_idle_release_closed_blocks,
     build_idle_release_dismissed_blocks,
     build_idle_release_prompt_blocks,
     build_setup_modal,
@@ -7945,7 +7946,7 @@ class SlackTeamController:
                     channel_id,
                     message_ts,
                     " ",
-                    blocks=build_idle_release_dismissed_blocks(current),
+                    blocks=build_idle_release_closed_blocks(current),
                 )
             except Exception:
                 LOGGER.debug(
