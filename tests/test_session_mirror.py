@@ -27,6 +27,18 @@ from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 
 
+def _task_notification_text() -> str:
+    return (
+        "<task-notification>\n"
+        "<task-id>abc123</task-id>\n"
+        "<tool-use-id>toolu_123</tool-use-id>\n"
+        "<output-file>/tmp/example-output</output-file>\n"
+        "<status>completed</status>\n"
+        "<summary>Background command completed</summary>\n"
+        "</task-notification>"
+    )
+
+
 class FakeGateway:
     def __init__(self):
         self.parents = []
@@ -927,6 +939,59 @@ class SessionMirrorTests(unittest.TestCase):
                     mirror.sync_once()
 
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 0)
+            finally:
+                store.close()
+
+    def test_mirror_skips_claude_task_notification_user_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=0, claude_count=1)
+                agent = store.list_team_agents()[0]
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.thread", "171.parent")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="user",
+                        line_number=1,
+                        metadata={"message": {"content": _task_notification_text()}},
+                    ),
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=2,
+                        metadata={"message": {"content": "visible reply"}},
+                    ),
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CLAUDE, "s1"), 2)
+                self.assertEqual(len(gateway.replies), 1)
+                self.assertEqual(gateway.replies[0][1], "visible reply")
+                self.assertNotIn("task-notification", gateway.replies[0][1])
             finally:
                 store.close()
 
