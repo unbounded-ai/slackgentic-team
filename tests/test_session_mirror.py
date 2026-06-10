@@ -2610,6 +2610,58 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_claude_task_notifications_are_not_mirrored_as_user_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="user",
+                        line_number=1,
+                        metadata={
+                            "message": {
+                                "content": (
+                                    "<task-notification>\n"
+                                    "<task-id>task123</task-id>\n"
+                                    "<tool-use-id>toolu_example</tool-use-id>\n"
+                                    "<output-file>/tmp/example-output</output-file>\n"
+                                    "<status>completed</status>\n"
+                                    "<summary>Background command completed</summary>\n"
+                                    "</task-notification>"
+                                )
+                            }
+                        },
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CLAUDE, "s1"), 1)
+            finally:
+                store.close()
+
     def test_local_user_messages_use_configured_human_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -2955,6 +3007,35 @@ class SessionMirrorTests(unittest.TestCase):
             )
 
             self.assertIsNone(render_session_event(event))
+
+    def test_render_claude_event_hides_task_notification_records(self):
+        for text in (
+            (
+                "<task-notification>\n"
+                "<task-id>task123</task-id>\n"
+                "<tool-use-id>toolu_example</tool-use-id>\n"
+                "<output-file>/tmp/example-output</output-file>\n"
+                "<status>completed</status>\n"
+                "<summary>Background command completed</summary>\n"
+                "</task-notification>"
+            ),
+            (
+                "&lt;task-notification&gt;\n"
+                "&lt;task-id&gt;task123&lt;/task-id&gt;\n"
+                "&lt;status&gt;completed&lt;/status&gt;\n"
+                "&lt;/task-notification&gt;"
+            ),
+        ):
+            with self.subTest(text=text):
+                event = AgentEvent(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    timestamp=None,
+                    event_type="user",
+                    metadata={"message": {"content": text}},
+                )
+
+                self.assertIsNone(render_session_event(event))
 
     def test_render_claude_event_strips_echoed_slackgentic_channel_block(self):
         event = AgentEvent(

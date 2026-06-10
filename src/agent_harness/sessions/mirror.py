@@ -55,6 +55,10 @@ SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
     r"<channel\b(?=[^>]*\bsource=[\"']slackgentic[\"'])[^>]*>.*?</channel>",
     flags=re.IGNORECASE | re.DOTALL,
 )
+CLAUDE_TASK_NOTIFICATION_BLOCK_RE = re.compile(
+    r"<task-notification\b[^>]*>.*?</task-notification>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 HUMAN_DISPLAY_NAME_SETTING = "slack.human_display_name"
 HUMAN_IMAGE_URL_SETTING = "slack.human_image_url"
 EXTERNAL_SESSION_AGENT_PREFIX = "external_session_agent."
@@ -1199,6 +1203,8 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
         return None
     if _has_claude_local_command_block(text):
         return None
+    if event.event_type == "user" and _has_claude_task_notification_block(text):
+        return None
     if event.event_type == "user" and _has_slackgentic_channel_block(text):
         return None
     if event.event_type == "assistant":
@@ -1388,6 +1394,10 @@ def _clean_text(text: str) -> str:
 
 def _has_slackgentic_channel_block(text: str) -> bool:
     return bool(SLACKGENTIC_CHANNEL_BLOCK_RE.search(html.unescape(text)))
+
+
+def _has_claude_task_notification_block(text: str) -> bool:
+    return bool(CLAUDE_TASK_NOTIFICATION_BLOCK_RE.search(html.unescape(text)))
 
 
 def _remove_slackgentic_channel_blocks(text: str) -> str:
