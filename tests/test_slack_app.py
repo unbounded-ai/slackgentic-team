@@ -93,6 +93,28 @@ from agent_harness.team.commands import (
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 
 
+def _task_notification_text(*, escaped: bool = False) -> str:
+    if escaped:
+        return (
+            "&lt;task-notification&gt;\n"
+            "&lt;task-id&gt;abc123&lt;/task-id&gt;\n"
+            "&lt;tool-use-id&gt;toolu_123&lt;/tool-use-id&gt;\n"
+            "&lt;output-file&gt;/tmp/example-output&lt;/output-file&gt;\n"
+            "&lt;status&gt;completed&lt;/status&gt;\n"
+            "&lt;summary&gt;Background command completed&lt;/summary&gt;\n"
+            "&lt;/task-notification&gt;"
+        )
+    return (
+        "<task-notification>\n"
+        "<task-id>abc123</task-id>\n"
+        "<tool-use-id>toolu_123</tool-use-id>\n"
+        "<output-file>/tmp/example-output</output-file>\n"
+        "<status>completed</status>\n"
+        "<summary>Background command completed</summary>\n"
+        "</task-notification>"
+    )
+
+
 class FakeGateway:
     bot_user_id_value = "UBOT"
 
@@ -8827,7 +8849,7 @@ class SlackAppTests(unittest.TestCase):
                 controller._remember_human_user(
                     "U12345678",
                     {
-                        "display_name": "Ilshat",
+                        "display_name": "Example User",
                         "image_72": "https://example.com/avatar.png",
                     },
                 )
@@ -8841,7 +8863,10 @@ class SlackAppTests(unittest.TestCase):
 
                 context = controller._thread_context("C1", "171.thread")
 
-                self.assertEqual(context, "Ilshat: please check Ilshat and Ilshat")
+                self.assertEqual(
+                    context,
+                    "Example User: please check Example User and Example User",
+                )
                 self.assertNotIn("U12345678", context)
             finally:
                 store.close()
@@ -8868,6 +8893,42 @@ class SlackAppTests(unittest.TestCase):
                     "Slack user: Slack user once the PR is updated, this is good to merge",
                 )
                 self.assertNotIn("UUNKNOWN1", context)
+            finally:
+                store.close()
+
+    def test_thread_context_skips_internal_task_notifications(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller._remember_human_user(
+                    "U12345678",
+                    {
+                        "display_name": "Example User",
+                        "image_72": "https://example.com/avatar.png",
+                    },
+                )
+                gateway.thread_history_messages[("C1", "171.thread")] = [
+                    {
+                        "user": "U12345678",
+                        "text": _task_notification_text(escaped=True),
+                        "ts": "171.000001",
+                    },
+                    {
+                        "username": "agent",
+                        "text": "real progress update",
+                        "ts": "171.000002",
+                    },
+                ]
+
+                context = controller._thread_context("C1", "171.thread")
+
+                self.assertEqual(context, "agent: real progress update")
+                self.assertNotIn("task-notification", context or "")
+                self.assertNotIn("Background command completed", context or "")
+                self.assertNotIn("/tmp/example-output", context or "")
             finally:
                 store.close()
 
