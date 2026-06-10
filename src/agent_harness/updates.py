@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -310,10 +311,7 @@ class SelfUpdater:
                     ),
                 ),
             )
-        install_target = release.tarball_url or github_tag_tarball_url(
-            self.repository,
-            release.tag_name,
-        )
+        install_target = installable_release_archive_url(self.repository, release)
         return UpgradePlan(
             description="install the published Slackgentic release",
             commands=(
@@ -624,7 +622,8 @@ class SlackgenticUpdateRunner:
             return None
         self._remember_candidate(candidate)
         prompted = self.store.get_setting(SETTING_UPDATE_PROMPTED_VERSION)
-        if prompted == candidate.version:
+        last_error = self.store.get_setting(SETTING_UPDATE_LAST_ERROR)
+        if prompted == candidate.version and not last_error:
             return candidate
         channel_id = self.channel_id()
         if not channel_id:
@@ -711,11 +710,12 @@ class SlackgenticUpdateRunner:
             if not result.succeeded:
                 message = result.failure_message or "Slackgentic upgrade failed."
                 self.store.set_setting(SETTING_UPDATE_LAST_ERROR, message)
+                self._clear_prompted_version(candidate.version)
                 self.update_message(
                     channel_id,
                     message_ts,
                     message,
-                    self.status_blocks(candidate, message, False),
+                    self.status_blocks(candidate, message, True),
                 )
                 return
             self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
@@ -750,11 +750,12 @@ class SlackgenticUpdateRunner:
             LOGGER.exception("failed to install Slackgentic update")
             message = f"Slackgentic upgrade failed: {exc}"
             self.store.set_setting(SETTING_UPDATE_LAST_ERROR, message)
+            self._clear_prompted_version(candidate.version)
             self.update_message(
                 channel_id,
                 message_ts,
                 message,
-                self.status_blocks(candidate, message, False),
+                self.status_blocks(candidate, message, True),
             )
         finally:
             self.store.delete_setting(SETTING_UPDATE_INSTALLING_VERSION)
@@ -782,6 +783,10 @@ class SlackgenticUpdateRunner:
             if candidate.version == version:
                 return candidate
         return None
+
+    def _clear_prompted_version(self, version: str) -> None:
+        if self.store.get_setting(SETTING_UPDATE_PROMPTED_VERSION) == version:
+            self.store.delete_setting(SETTING_UPDATE_PROMPTED_VERSION)
 
     def _fallback_candidate(self, version: str) -> UpdateCandidate:
         tag_name = version if version.startswith("v") else f"v{version}"
@@ -815,6 +820,13 @@ def github_tag_tarball_url(repository: str, tag_name: str) -> str:
     return (
         f"https://github.com/{normalize_repository(repository)}/archive/refs/tags/{tag_name}.tar.gz"
     )
+
+
+def installable_release_archive_url(repository: str, release: ReleaseInfo) -> str:
+    tarball_url = release.tarball_url or ""
+    if _url_has_supported_archive_extension(tarball_url):
+        return tarball_url
+    return github_tag_tarball_url(repository, release.tag_name)
 
 
 def version_from_tag(tag_name: str) -> str:
@@ -866,6 +878,29 @@ def _pip_module_missing(result: UpgradeCommandResult) -> bool:
 
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _url_has_supported_archive_extension(value: str) -> bool:
+    if not value:
+        return False
+    path = urllib.parse.urlsplit(value).path.lower()
+    return path.endswith(
+        (
+            ".whl",
+            ".tar.gz",
+            ".zip",
+            ".tar.bz2",
+            ".tar.lz",
+            ".tar.lzma",
+            ".tar.xz",
+            ".tar.zst",
+            ".tar",
+            ".tbz",
+            ".tgz",
+            ".tlz",
+            ".txz",
+        )
+    )
 
 
 def restart_pending_failure_text(version: str, *, current_version: str | None = None) -> str:
