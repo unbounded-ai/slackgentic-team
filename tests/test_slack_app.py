@@ -3343,6 +3343,31 @@ class SlackAppTests(unittest.TestCase):
                         for reply in gateway.thread_replies
                     )
                 )
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": idle_reply["ts"]},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "task.done",
+                                    task_id=task.task_id,
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(
+                    [
+                        reply.get("text")
+                        for reply in gateway.thread_replies
+                        if reply.get("text") == "Finished and freed up this agent."
+                    ],
+                    ["Finished and freed up this agent."],
+                )
             finally:
                 store.close()
 

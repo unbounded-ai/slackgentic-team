@@ -3421,7 +3421,7 @@ class SlackTeamController:
         thread_ts = task.thread_ts if task and task.thread_ts else message_ts
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=thread_ts or "")
         if action in {"task.done", "task.finish", "task.cancel", "task.pause"}:
-            completed_tasks: list[AgentTask] = []
+            closed_tasks: list[AgentTask] = []
             if task is not None and task.thread_ts:
                 for thread_task in self.store.list_agent_tasks(include_done=True):
                     if (
@@ -3437,16 +3437,26 @@ class SlackTeamController:
                                 thread_task.task_id,
                                 AgentTaskStatus.DONE,
                             )
-                        completed_tasks.append(thread_task)
+                        closed_tasks.append(thread_task)
             elif self.runtime:
-                self.runtime.stop_task(str(task_id), AgentTaskStatus.DONE)
+                if task is not None and task.status in {
+                    AgentTaskStatus.QUEUED,
+                    AgentTaskStatus.ACTIVE,
+                }:
+                    self.runtime.stop_task(str(task_id), AgentTaskStatus.DONE)
+                    closed_tasks.append(task)
             else:
-                self.store.update_agent_task_status(str(task_id), AgentTaskStatus.DONE)
-            if not completed_tasks and task is not None:
-                completed_tasks.append(task)
-            for completed_task in completed_tasks:
+                if task is not None and task.status in {
+                    AgentTaskStatus.QUEUED,
+                    AgentTaskStatus.ACTIVE,
+                }:
+                    self.store.update_agent_task_status(str(task_id), AgentTaskStatus.DONE)
+                    closed_tasks.append(task)
+            if not closed_tasks and task is not None:
+                self._mark_task_complete(task, thread, include_thread=True)
+            for completed_task in closed_tasks:
                 self._mark_task_complete(completed_task, thread, include_thread=True)
-            if thread.thread_ts:
+            if closed_tasks and thread.thread_ts:
                 self.gateway.post_thread_reply(thread, "Finished and freed up this agent.")
             try:
                 self.evaluate_pending_deferred_work()
