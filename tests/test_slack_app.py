@@ -8863,7 +8863,10 @@ class SlackAppTests(unittest.TestCase):
 
                 context = controller._thread_context("C1", "171.thread")
 
-                self.assertEqual(context, "Ilshat: please check Ilshat and Ilshat")
+                self.assertEqual(
+                    context,
+                    "Example User: please check Example User and Example User",
+                )
                 self.assertNotIn("U12345678", context)
             finally:
                 store.close()
@@ -8903,7 +8906,7 @@ class SlackAppTests(unittest.TestCase):
                 controller._remember_human_user(
                     "U12345678",
                     {
-                        "display_name": "Ilshat",
+                        "display_name": "Example User",
                         "image_72": "https://example.com/avatar.png",
                     },
                 )
