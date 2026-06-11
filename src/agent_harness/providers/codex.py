@@ -55,7 +55,9 @@ class CodexProvider:
             return []
         sessions: list[AgentSession] = []
         now = datetime.now(UTC)
-        scan_roots = () if self._path_index.full_scan_due() else self._recent_session_date_roots(now)
+        scan_roots = (
+            () if self._path_index.full_scan_due() else self._recent_session_date_roots(now)
+        )
         discovery = self._path_index.discover(
             hot_paths=self._hot_session_paths(now),
             scan_roots=scan_roots,
@@ -86,12 +88,7 @@ class CodexProvider:
         roots: list[Path] = []
         for offset in range(days):
             day = now - timedelta(days=offset)
-            root = (
-                self.sessions_root
-                / f"{day.year:04d}"
-                / f"{day.month:02d}"
-                / f"{day.day:02d}"
-            )
+            root = self.sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
             if root.exists():
                 roots.append(root)
         return roots
