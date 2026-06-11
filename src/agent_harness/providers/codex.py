@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +18,33 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
+from agent_harness.providers.path_index import TranscriptPathIndex
 from agent_harness.storage.jsonl import first_jsonl_record, iter_jsonl, last_jsonl_line_number
 
 
 class CodexProvider:
     provider = Provider.CODEX
 
-    def __init__(self, home: Path | None = None, active_within_seconds: int = 900):
+    def __init__(
+        self,
+        home: Path | None = None,
+        active_within_seconds: int = 900,
+        *,
+        full_discovery_interval_seconds: float = 300.0,
+        hot_path_retention_seconds: float | None = None,
+    ):
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
         self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
+        self._hot_path_retention_seconds = (
+            hot_path_retention_seconds
+            if hot_path_retention_seconds is not None
+            else active_within_seconds + full_discovery_interval_seconds + 60.0
+        )
+        self._path_index = TranscriptPathIndex(
+            lambda: self.sessions_root,
+            full_scan_interval_seconds=full_discovery_interval_seconds,
+        )
 
     @property
     def sessions_root(self) -> Path:
@@ -37,19 +54,44 @@ class CodexProvider:
         if not self.sessions_root.exists():
             return []
         sessions: list[AgentSession] = []
-        seen_paths: set[Path] = set()
         now = datetime.now(UTC)
-        for path in sorted(self.sessions_root.rglob("*.jsonl")):
-            seen_paths.add(path)
+        scan_roots = (
+            () if self._path_index.full_scan_due() else self._recent_session_date_roots(now)
+        )
+        discovery = self._path_index.discover(
+            hot_paths=self._hot_session_paths(now),
+            scan_roots=scan_roots,
+        )
+        for path in discovery.paths:
             session = self._cached_session_from_path(path, now)
             if session:
                 sessions.append(session)
-        self._drop_deleted_cache_entries(seen_paths)
+        if discovery.full_scan:
+            self._drop_deleted_cache_entries(set(discovery.paths))
         return sorted(
             sessions,
             key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
+
+    def _hot_session_paths(self, now: datetime) -> list[Path]:
+        paths: list[Path] = []
+        for path, (_, session) in self._session_cache.items():
+            if session is None or session.last_seen_at is None:
+                continue
+            age = (now - session.last_seen_at).total_seconds()
+            if age <= self._hot_path_retention_seconds:
+                paths.append(path)
+        return paths
+
+    def _recent_session_date_roots(self, now: datetime, *, days: int = 3) -> list[Path]:
+        roots: list[Path] = []
+        for offset in range(days):
+            day = now - timedelta(days=offset)
+            root = self.sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+            if root.exists():
+                roots.append(root)
+        return roots
 
     def _cached_session_from_path(self, path: Path, now: datetime) -> AgentSession | None:
         stat = path.stat()

@@ -183,6 +183,51 @@ class ClaudeProviderTests(unittest.TestCase):
 
             self.assertEqual(provider.discover()[0].metadata["entrypoint"], "sdk-cli")
 
+    def test_discover_finds_new_session_in_changed_project_before_full_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / ".claude" / "projects" / "-tmp-repo"
+            project.mkdir(parents=True)
+            first = project / "session-1.jsonl"
+            first.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "cwd": str(project),
+                        "sessionId": "session-1",
+                    }
+                )
+                + "\n"
+            )
+            provider = ClaudeProvider(
+                home=home,
+                active_within_seconds=3600,
+                full_discovery_interval_seconds=3600,
+            )
+
+            self.assertEqual([session.session_id for session in provider.discover()], ["session-1"])
+
+            second = project / "session-2.jsonl"
+            second.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-04-27T12:00:01.000Z",
+                        "cwd": str(project),
+                        "sessionId": "session-2",
+                    }
+                )
+                + "\n"
+            )
+            now = datetime.now(UTC).timestamp()
+            os.utime(project, (now, now))
+
+            self.assertEqual(
+                {session.session_id for session in provider.discover()},
+                {"session-1", "session-2"},
+            )
+
     def test_exit_command_marks_recent_session_done(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

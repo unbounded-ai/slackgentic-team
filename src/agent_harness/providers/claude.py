@@ -17,6 +17,7 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
+from agent_harness.providers.path_index import TranscriptPathIndex
 from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_line_number, tail_jsonl_records
 
 CLAUDE_LOCAL_EXIT_MARKERS = (
@@ -28,10 +29,27 @@ CLAUDE_LOCAL_EXIT_MARKERS = (
 class ClaudeProvider:
     provider = Provider.CLAUDE
 
-    def __init__(self, home: Path | None = None, active_within_seconds: int = 900):
+    def __init__(
+        self,
+        home: Path | None = None,
+        active_within_seconds: int = 900,
+        *,
+        full_discovery_interval_seconds: float = 300.0,
+        hot_path_retention_seconds: float | None = None,
+    ):
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
         self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
+        self._project_dir_signatures: dict[Path, tuple[int, int]] = {}
+        self._hot_path_retention_seconds = (
+            hot_path_retention_seconds
+            if hot_path_retention_seconds is not None
+            else active_within_seconds + full_discovery_interval_seconds + 60.0
+        )
+        self._path_index = TranscriptPathIndex(
+            lambda: self.projects_root,
+            full_scan_interval_seconds=full_discovery_interval_seconds,
+        )
 
     @property
     def projects_root(self) -> Path:
@@ -41,22 +59,75 @@ class ClaudeProvider:
         if not self.projects_root.exists():
             return []
         sessions_by_id: dict[str, AgentSession] = {}
-        seen_paths: set[Path] = set()
         now = datetime.now(UTC)
-        for path in sorted(self.projects_root.rglob("*.jsonl")):
-            seen_paths.add(path)
+        scan_roots = () if self._path_index.full_scan_due() else self._changed_project_roots()
+        discovery = self._path_index.discover(
+            hot_paths=self._hot_session_paths(now),
+            scan_roots=scan_roots,
+        )
+        if discovery.full_scan:
+            self._remember_project_roots()
+        for path in discovery.paths:
             session = self._cached_session_from_path(path, now)
             if not session:
                 continue
             existing = sessions_by_id.get(session.session_id)
             if existing is None or _prefer_session_discovery(session, existing):
                 sessions_by_id[session.session_id] = session
-        self._drop_deleted_cache_entries(seen_paths)
+        if discovery.full_scan:
+            self._drop_deleted_cache_entries(set(discovery.paths))
         return sorted(
             sessions_by_id.values(),
             key=lambda item: item.last_seen_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
+
+    def _hot_session_paths(self, now: datetime) -> list[Path]:
+        paths: list[Path] = []
+        for path, (_, session) in self._session_cache.items():
+            if session is None or session.last_seen_at is None:
+                continue
+            age = (now - session.last_seen_at).total_seconds()
+            if age <= self._hot_path_retention_seconds:
+                paths.append(path)
+        return paths
+
+    def _changed_project_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for path in self._iter_project_roots():
+            seen.add(path)
+            try:
+                signature = _stat_signature(path.stat())
+            except OSError:
+                continue
+            if self._project_dir_signatures.get(path) != signature:
+                roots.append(path)
+            self._project_dir_signatures[path] = signature
+        for path in list(self._project_dir_signatures):
+            if path not in seen:
+                self._project_dir_signatures.pop(path, None)
+        return roots
+
+    def _remember_project_roots(self) -> None:
+        self._project_dir_signatures = {}
+        for path in self._iter_project_roots():
+            try:
+                self._project_dir_signatures[path] = _stat_signature(path.stat())
+            except OSError:
+                continue
+
+    def _iter_project_roots(self) -> Iterator[Path]:
+        try:
+            children = self.projects_root.iterdir()
+        except OSError:
+            return
+        for child in children:
+            try:
+                if child.is_dir():
+                    yield child
+            except OSError:
+                continue
 
     def _cached_session_from_path(self, path: Path, now: datetime) -> AgentSession | None:
         stat = path.stat()
