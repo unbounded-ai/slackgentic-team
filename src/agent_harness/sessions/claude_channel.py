@@ -497,12 +497,16 @@ def handle_native_input_hook(
     updated_input = claude_ask_user_question_updated_input(tool_input, response)
     if updated_input is None:
         return {
-            "hookSpecificOutput": {"permissionDecision": "deny"},
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+            },
             "systemMessage": "Slackgentic did not receive an answer for this question.",
         }
     answers = claude_ask_user_question_answers(tool_input, response) or {}
     return {
         "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "updatedInput": updated_input,
         },

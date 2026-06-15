@@ -1520,6 +1520,10 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertIsNotNone(hook_result)
                 assert hook_result is not None
                 self.assertEqual(
+                    hook_result["hookSpecificOutput"]["hookEventName"],
+                    "PreToolUse",
+                )
+                self.assertEqual(
                     hook_result["hookSpecificOutput"]["permissionDecision"],
                     "allow",
                 )
@@ -1538,6 +1542,175 @@ class ClaudeChannelTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_native_input_hook_resolves_from_slack_actions_with_valid_hook_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                payload = {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_question",
+                    "session_id": "s1",
+                    "tool_input": {
+                        "questions": [
+                            {
+                                "header": "Scope",
+                                "question": "How much should run?",
+                                "options": [
+                                    {"label": "Cheap set"},
+                                    {"label": "Everything runnable"},
+                                ],
+                            },
+                            {
+                                "header": "Validation",
+                                "question": "Add result validation?",
+                                "options": [{"label": "No"}, {"label": "Yes"}],
+                            },
+                        ]
+                    },
+                }
+                result = {}
+
+                def run_hook():
+                    result["value"] = handle_native_input_hook(
+                        payload,
+                        store,
+                        gateway,
+                        poll_seconds=0.01,
+                    )
+
+                worker = threading.Thread(target=run_hook)
+                worker.start()
+                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+
+                responder = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=2,
+                    store=store,
+                    provider_label="Claude",
+                )
+                self.assertTrue(
+                    _click_request_button(
+                        responder,
+                        gateway,
+                        block_index=2,
+                        element_index=1,
+                    )
+                )
+                self.assertTrue(_wait_for(lambda: bool(gateway.updates)))
+                self.assertTrue(
+                    _click_request_button(
+                        responder,
+                        gateway,
+                        block_index=4,
+                        element_index=1,
+                    )
+                )
+                worker.join(timeout=1)
+
+                self.assertFalse(worker.is_alive())
+                hook_result = result["value"]
+                self.assertIsNotNone(hook_result)
+                assert hook_result is not None
+                self.assertEqual(
+                    hook_result["hookSpecificOutput"],
+                    {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "updatedInput": {
+                            "questions": payload["tool_input"]["questions"],
+                            "answers": {
+                                "How much should run?": "Everything runnable",
+                                "Add result validation?": "Yes",
+                            },
+                        },
+                    },
+                )
+                self.assertEqual(gateway.updates[-1]["text"], "Answered Claude input request.")
+            finally:
+                store.close()
+
+    def test_native_input_hook_denial_uses_valid_hook_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                payload = {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_question",
+                    "session_id": "s1",
+                    "tool_input": {
+                        "questions": [
+                            {
+                                "header": "Scope",
+                                "question": "How much should run?",
+                                "options": [{"label": "Cheap set"}],
+                            },
+                        ]
+                    },
+                }
+                result = {}
+
+                def run_hook():
+                    result["value"] = handle_native_input_hook(
+                        payload,
+                        store,
+                        gateway,
+                        poll_seconds=0.01,
+                    )
+
+                worker = threading.Thread(target=run_hook)
+                worker.start()
+                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                rows = store.list_pending_slack_agent_requests("item/tool/requestUserInput")
+                self.assertEqual(len(rows), 1)
+                store.resolve_slack_agent_request(rows[0]["token"], {"answers": {}})
+                worker.join(timeout=1)
+
+                self.assertFalse(worker.is_alive())
+                hook_result = result["value"]
+                self.assertIsNotNone(hook_result)
+                assert hook_result is not None
+                self.assertEqual(
+                    hook_result["hookSpecificOutput"],
+                    {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                    },
+                )
+            finally:
+                store.close()
+
 
 def _wait_for(predicate, attempts=100):
     event = threading.Event()
@@ -1546,6 +1719,18 @@ def _wait_for(predicate, attempts=100):
             return True
         event.wait(0.01)
     return False
+
+
+def _click_request_button(
+    handler: SlackAgentRequestHandler,
+    gateway: FakeGateway,
+    *,
+    block_index: int,
+    element_index: int,
+) -> bool:
+    blocks = gateway.updates[-1]["blocks"] if gateway.updates else gateway.replies[0]["blocks"]
+    value = blocks[block_index]["elements"][element_index]["value"]
+    return handler.handle_block_action(decode_action_value(value), "C1", gateway.replies[0]["ts"])
 
 
 if __name__ == "__main__":
