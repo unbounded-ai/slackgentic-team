@@ -202,7 +202,14 @@ class SessionMirror:
                         self._update_capacity_notice_if_clear(channel_id, session.provider)
                     continue
                 sync_sessions.append((provider, session))
-        self._cleanup_inactive_external_sessions(active_session_keys, channel_id)
+        retained_session_keys = self._cleanup_inactive_external_sessions(
+            active_session_keys,
+            channel_id,
+        )
+        # Discovery can briefly omit a still-running external session. If its
+        # stored terminal target is still live, keep it occupying its agent for
+        # the rest of this sync instead of freeing and reassigning the seat.
+        active_session_keys.update(retained_session_keys)
         sync_sessions.sort(
             key=lambda item: self._thread_for_session(item[1], channel_id) is not None
         )
@@ -660,8 +667,9 @@ class SessionMirror:
         self,
         active_session_keys: set[str],
         channel_id: str,
-    ) -> None:
+    ) -> set[str]:
         providers_to_refresh: set[Provider] = set()
+        retained_session_keys: set[str] = set()
         for prefix in (
             EXTERNAL_SESSION_AGENT_PREFIX,
             PENDING_EXTERNAL_SESSION_PREFIX,
@@ -671,6 +679,9 @@ class SessionMirror:
             for key in list(self.store.list_settings(prefix)):
                 session_key = key.removeprefix(prefix)
                 if session_key in active_session_keys:
+                    continue
+                if self._inactive_external_session_still_live(session_key):
+                    retained_session_keys.add(session_key)
                     continue
                 parsed = _provider_session_from_external_key(session_key)
                 self.store.delete_setting(key)
@@ -694,6 +705,27 @@ class SessionMirror:
                     )
         for provider in providers_to_refresh:
             self._update_capacity_notice_if_clear(channel_id, provider)
+        return retained_session_keys
+
+    def _inactive_external_session_still_live(self, session_key: str) -> bool:
+        parsed = _provider_session_from_external_key(session_key)
+        if parsed is None:
+            return False
+        provider, session_id = parsed
+        session = self.store.get_session(provider, session_id)
+        if session is None or session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            return False
+        if self.store.get_setting(_ignored_external_session_key(session)):
+            return False
+        stored_pid = _int_setting(
+            self.store.get_setting(_external_session_live_target_key(session))
+        )
+        if stored_pid is None:
+            return False
+        target = self._stored_live_terminal_target(session, stored_pid)
+        if target is None:
+            return False
+        return self._live_target_matches_session(session, target)
 
     def _should_keep_external_session(self, session: AgentSession, channel_id: str) -> bool:
         if self.store.get_setting(_ignored_external_session_key(session)):

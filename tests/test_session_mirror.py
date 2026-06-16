@@ -3464,6 +3464,138 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_missing_discovery_keeps_assigned_session_with_live_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp),
+                                command="codex --remote http://localhost:1455",
+                                started_at=started,
+                            )
+                        ]
+                    ),
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s1"), "123")
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "s1").status,
+                    SessionStatus.ACTIVE,
+                )
+                self.assertEqual(gateway.replies, [])
+            finally:
+                store.close()
+
+    def test_missing_live_session_still_occupies_agent_for_new_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                retained = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex-1.jsonl",
+                    cwd=Path(tmp) / "one",
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                incoming = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s2",
+                    transcript_path=Path(tmp) / "codex-2.jsonl",
+                    cwd=Path(tmp) / "two",
+                    status=SessionStatus.ACTIVE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                store.upsert_session(retained)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([incoming], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp) / "one",
+                                command="codex --remote http://localhost:1455",
+                                started_at=started,
+                            )
+                        ]
+                    ),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s2"))
+                self.assertIsNotNone(store.get_setting("external_session_pending.codex.s2"))
+                self.assertEqual(gateway.parents, [])
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+            finally:
+                store.close()
+
     def test_closed_live_claude_terminal_frees_assigned_agent_without_exit_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
