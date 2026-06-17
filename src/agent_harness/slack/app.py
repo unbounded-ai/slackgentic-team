@@ -1464,12 +1464,13 @@ class SlackTeamController:
             summary=project_body,
             requested_by_slack_user=requested_by_slack_user,
         )
+        available_workers = self._pm_available_worker_agents()
         resolver_prompt = build_pm_resolution_prompt(
             project_body,
-            _pm_worker_handles(active_agents),
+            _pm_worker_handles(available_workers),
             initiative_id=initiative.initiative_id,
             now=utc_now(),
-            agent_models=_pm_worker_model_map(active_agents),
+            agent_models=_pm_worker_model_map(available_workers),
         )
         busy_agent_ids = self._busy_agent_ids_for_assignment()
         if targeted_pm_handle:
@@ -1548,6 +1549,22 @@ class SlackTeamController:
         if self.runtime:
             self.runtime.start_task(task, result.agent, thread)
         return True
+
+    def _pm_available_worker_agents(
+        self,
+        *,
+        ignore_task_id: str | None = None,
+        ignore_pm_initiative_id: str | None = None,
+    ) -> list[TeamAgent]:
+        busy_agent_ids = self._pm_busy_worker_agent_ids(
+            ignore_task_id=ignore_task_id,
+            ignore_pm_initiative_id=ignore_pm_initiative_id,
+        )
+        return [
+            agent
+            for agent in filter_worker_agents(self.store.list_team_agents())
+            if agent.agent_id not in busy_agent_ids
+        ]
 
     def _pm_agent_for_request_target(self, request: WorkRequest):
         """Return the PM-kind TeamAgent the request targets, or None.
@@ -5815,17 +5832,25 @@ class SlackTeamController:
                 icon_url=self._agent_icon_url(agent),
             )
             return True
-        active_agents = self.store.list_team_agents()
+        available_workers = self._pm_available_worker_agents(
+            ignore_task_id=task.task_id,
+            ignore_pm_initiative_id=initiative.initiative_id,
+        )
         extension_known_ids = self._task_extension_known_ids(task)
         parsed = parse_agent_pm_plan_signal(
             signal,
-            known_handles=_pm_worker_handles(active_agents),
+            known_handles=_pm_worker_handles(available_workers),
             allowed_external_dep_ids=extension_known_ids,
-            handle_models=_pm_worker_model_map(active_agents),
+            handle_models=_pm_worker_model_map(available_workers),
         )
         if parsed.plan is None:
             return self._retry_pm_resolution(task, agent, thread, parsed.error or "invalid PM plan")
         plan = expand_codesign_plan(parsed.plan)
+        shortfall = self._pm_plan_capacity_shortfall(
+            plan,
+            ignore_task_id=task.task_id,
+            ignore_pm_initiative_id=initiative.initiative_id,
+        )
         # Park the plan until the requester approves it. Subtasks are NOT
         # inserted yet; nothing dispatches until the "Start executing" button
         # fires _execute_pm_plan.
@@ -5837,9 +5862,16 @@ class SlackTeamController:
         if parked is None:
             return True
         plan_text = _format_pm_plan_ack(
-            parked, plan, requested_by=initiative.requested_by_slack_user
+            parked,
+            plan,
+            requested_by=initiative.requested_by_slack_user,
+            capacity_blocked=shortfall is not None,
         )
-        plan_blocks = _pm_plan_approval_blocks(parked, plan_text)
+        if shortfall is None:
+            plan_blocks = _pm_plan_approval_blocks(parked, plan_text)
+        else:
+            plan_blocks = _pm_plan_capacity_blocks(parked, plan_text, shortfall)
+            plan_text = f"{plan_text}\n\n{_format_pm_capacity_shortfall_message(shortfall)}"
         posted = self.gateway.post_thread_reply(
             thread,
             plan_text,
@@ -6108,12 +6140,21 @@ class SlackTeamController:
             last_reserved_by_agent[agent.agent_id] = saved
             assigned_counts[agent.agent_id] = assigned_counts.get(agent.agent_id, 0) + 1
 
-    def _pm_plan_capacity_shortfall(self, plan: ParsedPmPlan) -> _PmCapacityShortfall | None:
+    def _pm_plan_capacity_shortfall(
+        self,
+        plan: ParsedPmPlan,
+        *,
+        ignore_task_id: str | None = None,
+        ignore_pm_initiative_id: str | None = None,
+    ) -> _PmCapacityShortfall | None:
         required_workers = _pm_plan_parallel_worker_demand(plan)
         if required_workers <= 0:
             return None
         active_workers = filter_worker_agents(self.store.list_team_agents())
-        busy_agent_ids = self._pm_busy_worker_agent_ids()
+        busy_agent_ids = self._pm_busy_worker_agent_ids(
+            ignore_task_id=ignore_task_id,
+            ignore_pm_initiative_id=ignore_pm_initiative_id,
+        )
         worker_by_handle = {agent.handle: agent for agent in active_workers}
         specific_handles = tuple(
             dict.fromkeys(
@@ -6149,10 +6190,19 @@ class SlackTeamController:
             hire_count=hire_count,
         )
 
-    def _pm_busy_worker_agent_ids(self) -> set[str]:
-        busy = {task.agent_id for task in self.store.list_agent_tasks()}
+    def _pm_busy_worker_agent_ids(
+        self,
+        *,
+        ignore_task_id: str | None = None,
+        ignore_pm_initiative_id: str | None = None,
+    ) -> set[str]:
+        busy = {
+            task.agent_id
+            for task in self.store.list_agent_tasks()
+            if not ignore_task_id or task.task_id != ignore_task_id
+        }
         busy.update(self._external_busy_agent_ids())
-        busy.update(self._pm_owner_busy_agent_ids())
+        busy.update(self._pm_owner_busy_agent_ids(ignore_initiative_id=ignore_pm_initiative_id))
         busy.update(self._scheduled_busy_agent_ids())
         busy.update(self._deferred_busy_agent_ids())
         return busy
@@ -6358,7 +6408,10 @@ class SlackTeamController:
         original_text = task.metadata.get(PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
         if not isinstance(original_text, str) or not original_text.strip():
             original_text = task.prompt
-        active_agents = self.store.list_team_agents()
+        available_workers = self._pm_available_worker_agents(
+            ignore_task_id=task.task_id,
+            ignore_pm_initiative_id=str(initiative_id) if initiative_id else None,
+        )
         extension_known_ids = self._task_extension_known_ids(task)
         extension_context_raw = task.metadata.get(PM_EXTENSION_CONTEXT_METADATA_KEY)
         extension_context = (
@@ -6371,7 +6424,7 @@ class SlackTeamController:
             prior_summary = self._build_pm_initiative_plan_view(initiative_id)
         retry_prompt = build_pm_resolution_prompt(
             original_text,
-            _pm_worker_handles(active_agents),
+            _pm_worker_handles(available_workers),
             initiative_id=str(initiative_id) if initiative_id else "",
             now=utc_now(),
             validation_error=error,
@@ -6379,7 +6432,7 @@ class SlackTeamController:
             extension_known_ids=extension_known_ids,
             extension_context=extension_context,
             prior_plan_summary=prior_summary if (replan_context or extension_known_ids) else None,
-            agent_models=_pm_worker_model_map(active_agents),
+            agent_models=_pm_worker_model_map(available_workers),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
@@ -6491,15 +6544,18 @@ class SlackTeamController:
         original_text = task.metadata.get(PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
         if not isinstance(original_text, str) or not original_text.strip():
             original_text = initiative.summary or initiative.title
-        active_agents = self.store.list_team_agents()
+        available_workers = self._pm_available_worker_agents(
+            ignore_task_id=task.task_id,
+            ignore_pm_initiative_id=initiative_id,
+        )
         retry_prompt = build_pm_resolution_prompt(
             original_text,
-            _pm_worker_handles(active_agents),
+            _pm_worker_handles(available_workers),
             initiative_id=initiative_id,
             now=utc_now(),
             replan_context=replan_body or None,
             prior_plan_summary=prior_summary,
-            agent_models=_pm_worker_model_map(active_agents),
+            agent_models=_pm_worker_model_map(available_workers),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_METADATA_KEY] = True
@@ -6637,16 +6693,19 @@ class SlackTeamController:
         original_text = task.metadata.get(PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
         if not isinstance(original_text, str) or not original_text.strip():
             original_text = initiative.summary or initiative.title
-        active_agents = self.store.list_team_agents()
+        available_workers = self._pm_available_worker_agents(
+            ignore_task_id=task.task_id,
+            ignore_pm_initiative_id=initiative_id,
+        )
         retry_prompt = build_pm_resolution_prompt(
             original_text,
-            _pm_worker_handles(active_agents),
+            _pm_worker_handles(available_workers),
             initiative_id=initiative_id,
             now=utc_now(),
             extension_known_ids=existing_ids,
             extension_context=extension_body,
             prior_plan_summary=prior_summary,
-            agent_models=_pm_worker_model_map(active_agents),
+            agent_models=_pm_worker_model_map(available_workers),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_METADATA_KEY] = True
@@ -10178,15 +10237,25 @@ def _format_pm_plan_ack(
     plan: ParsedPmPlan,
     *,
     requested_by: str | None = None,
+    capacity_blocked: bool = False,
 ) -> str:
     mention = f"<@{requested_by}>" if requested_by else "you"
     estimate = estimate_pm_plan(plan)
+    if capacity_blocked:
+        start_note = (
+            f"{mention} — review the plan below. I will *not* start any subtasks "
+            "until the capacity issue below is resolved."
+        )
+    else:
+        start_note = (
+            f"{mention} — review the plan below. I will *not* start any subtasks "
+            "until you click *Start executing*."
+        )
     lines = [
         f":clipboard: PM plan ready for *{plan.title}* (`{initiative.initiative_id}`).",
         plan.summary,
         "",
-        f"{mention} — review the plan below. I will *not* start any subtasks "
-        "until you click *Start executing*.",
+        start_note,
         "",
         f"Estimate: {_format_pm_plan_estimate(estimate)}.",
         "",
@@ -10278,6 +10347,25 @@ def _pm_plan_approval_blocks(
             ],
         }
     )
+    return blocks
+
+
+def _pm_plan_capacity_blocks(
+    initiative: PmInitiative,
+    plan_text: str,
+    shortfall: _PmCapacityShortfall,
+) -> list[dict]:
+    blocks = [
+        {
+            "type": "section",
+            "block_id": f"pm.plan.{initiative.initiative_id}.{index}",
+            "text": {"type": "mrkdwn", "text": chunk},
+        }
+        for index, chunk in enumerate(_slack_mrkdwn_chunks(plan_text), start=1)
+    ]
+    capacity_blocks = _pm_capacity_shortfall_blocks(initiative, shortfall)
+    if capacity_blocks:
+        blocks.extend(capacity_blocks)
     return blocks
 
 
@@ -10434,6 +10522,14 @@ def _pm_capacity_shortfall_blocks(
                         initiative_id=initiative.initiative_id,
                     ),
                     style="primary",
+                ),
+                _slack_button(
+                    "Try start again",
+                    "pm_initiative.start",
+                    encode_action_value(
+                        "pm_initiative.start",
+                        initiative_id=initiative.initiative_id,
+                    ),
                 ),
                 _slack_button(
                     "Cancel",

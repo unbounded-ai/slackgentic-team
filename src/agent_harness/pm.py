@@ -177,7 +177,7 @@ def build_pm_resolution_prompt(
         "",
         f"Initiative id: {initiative_id}",
         f"Current UTC time: {reference.isoformat()}",
-        f"Active Slackgentic worker handles: {handles}",
+        f"Available Slackgentic worker handles: {handles}",
         "",
         f"User project: {text.strip()}",
         "",
@@ -193,10 +193,11 @@ def build_pm_resolution_prompt(
             "you were assigning the subtask to a teammate who has not seen this "
             "conversation. Include the relevant project context and what 'done' "
             "looks like.\n"
-            "- `target` is `somebody` (any agent) or one of the active handles "
-            "without the leading @. Cross-model reviews are usually best left as "
-            "`somebody` so the router can pick the best non-author.\n"
-            "- `co_designers` is an OPTIONAL list of exactly 2 active handles "
+            "- `target` is `somebody` (any available agent) or one of the "
+            "available handles without the leading @. Cross-model reviews are "
+            "usually best left as `somebody` so the router can pick the best "
+            "non-author.\n"
+            "- `co_designers` is an OPTIONAL list of exactly 2 available handles "
             "from different model/provider families. When "
             "present, the subtask fans out into one draft per co-designer "
             "running in parallel followed by an automatic synthesis stage. Use "
@@ -205,6 +206,11 @@ def build_pm_resolution_prompt(
             "different model/provider families are not available, ask a concise "
             "Slack-visible capacity question and do not emit a control line. "
             "Do not combine `co_designers` with a specific `target`.\n"
+            "- Do not target or co-design with handles that are not listed as "
+            "available. Shape dependencies so the widest same-depth parallel "
+            "step fits the listed available workers. If the project needs more "
+            "free workers than are available, ask a concise Slack-visible "
+            "capacity question and do not emit a control line.\n"
             "- `task_kind` is `work` or `review`.\n"
             "- `after_delay_seconds` is an optional delay applied once every "
             "dependency has finished. Default 0.\n"
@@ -273,7 +279,7 @@ def _format_pm_worker_handles(
     agent_models: Mapping[str, str] | None,
 ) -> str:
     if not agent_handles:
-        return "(no active agents)"
+        return "(none)"
     if not agent_models:
         return ", ".join(f"@{handle}" for handle in agent_handles)
     model_by_handle = {handle.lower(): model for handle, model in agent_models.items()}
@@ -447,7 +453,7 @@ def _parse_subtask(
                 handles_text = ", ".join(known_handles) or "(none)"
                 return (
                     f"subtask {local_id!r} co_designer {entry!r} must be one of the "
-                    f"active handles: {handles_text}"
+                    f"available handles: {handles_text}"
                 )
             if resolved in seen_codesigners:
                 continue
@@ -488,7 +494,7 @@ def _parse_subtask(
             handles_text = ", ".join(known_handles) or "(none)"
             return (
                 f"subtask {local_id!r} target {target_raw!r} must be 'somebody' or "
-                f"one of the active handles: {handles_text}"
+                f"one of the available handles: {handles_text}"
             )
         assignment_mode = AssignmentMode.SPECIFIC
         requested_handle = resolved

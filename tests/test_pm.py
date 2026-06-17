@@ -254,7 +254,7 @@ class PmPlanSignalTests(unittest.TestCase):
         self.assertIn("Initiative id: pm_test", prompt)
         self.assertIn("SLACKGENTIC: PM_PLAN", prompt)
         self.assertIn("@riley", prompt)
-        self.assertIn("exactly 2 active handles", prompt)
+        self.assertIn("exactly 2 available handles", prompt)
         self.assertIn("previous PM_PLAN control line was invalid: bad", prompt)
 
     def test_render_pm_plan_dag_shows_roots_and_edges(self):
@@ -517,7 +517,7 @@ class PmCoDesignExpansionTests(unittest.TestCase):
         result = parse_agent_pm_plan_signal(
             self._build_signal(payload), known_handles=["alice", "bob"]
         )
-        self.assertIn("active handles", result.error or "")
+        self.assertIn("available handles", result.error or "")
 
     def test_co_designers_rejected_with_anyone_target(self):
         payload = {
