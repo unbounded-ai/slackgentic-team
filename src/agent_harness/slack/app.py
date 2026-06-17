@@ -168,6 +168,8 @@ from agent_harness.sessions.mirror import (
     CAPACITY_NOTICE_TS_PREFIX,
     EXTERNAL_SESSION_AGENT_PREFIX,
     EXTERNAL_SESSION_IGNORED_PREFIX,
+    EXTERNAL_SESSION_LIVE_TARGET_PREFIX,
+    EXTERNAL_SESSION_MISSING_TARGET_PREFIX,
     EXTERNAL_SESSION_SUMMARY_PREFIX,
     HUMAN_DISPLAY_NAME_SETTING,
     HUMAN_IMAGE_URL_SETTING,
@@ -273,6 +275,7 @@ TASK_STATUS_REACTIONS = (
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
 SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN = "slack.backfill.last_thread_scan_unix"
+SETTING_SLACK_BACKFILL_THREAD_SCAN_PREFIX = "slack.backfill.thread_scan_unix."
 SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
 SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
@@ -8378,7 +8381,7 @@ class SlackTeamController:
         if self._has_external_session_delivery_for_message(channel_id, message_ts):
             return False
         if self._external_session_for_backfilled_event(event) is not None:
-            return False
+            return True
         return not self._has_work_for_request_message(channel_id, message_ts)
 
     def _external_session_for_backfilled_event(self, event: dict):
@@ -8556,6 +8559,7 @@ class _SlackBackfillEventScan:
     events: list[dict]
     channel_history_ok: bool
     thread_history_ok: bool
+    scanned_thread_ts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -8623,6 +8627,7 @@ class SlackMessageBackfill:
         if previous is not None:
             include_threads = now - previous >= self.sleep_gap_seconds
             oldest_unix = max(0.0, previous - self.grace_seconds)
+            thread_oldest_unix: float | None = None
             if not include_threads:
                 last_thread_scan = self._last_thread_scan_unix
                 if last_thread_scan is None:
@@ -8638,10 +8643,22 @@ class SlackMessageBackfill:
                         )
                     else:
                         thread_oldest_unix = max(0.0, last_thread_scan - self.grace_seconds)
-                    oldest_unix = min(oldest_unix, thread_oldest_unix)
+            elif include_threads:
+                last_thread_scan = self._last_thread_scan_unix
+                if last_thread_scan is None:
+                    last_thread_scan = _float_setting(
+                        self.store.get_setting(SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN)
+                    )
+                if last_thread_scan is not None:
+                    thread_oldest_unix = max(0.0, last_thread_scan - self.grace_seconds)
             result = self._recover_since_result(
                 _slack_ts_from_unix(oldest_unix),
                 include_threads=include_threads,
+                thread_oldest=(
+                    _slack_ts_from_unix(thread_oldest_unix)
+                    if thread_oldest_unix is not None
+                    else None
+                ),
             )
             recovered = result.recovered
             if result.channel_history_ok:
@@ -8660,6 +8677,7 @@ class SlackMessageBackfill:
         oldest: str,
         *,
         include_threads: bool = True,
+        thread_oldest: str | None = None,
     ) -> _SlackBackfillResult:
         channel_id = self.controller._configured_agent_channel_id()
         if not channel_id:
@@ -8668,7 +8686,12 @@ class SlackMessageBackfill:
                 channel_history_ok=True,
                 thread_history_ok=True,
             )
-        scan = self._events_since(channel_id, oldest, include_threads=include_threads)
+        scan = self._events_since(
+            channel_id,
+            oldest,
+            include_threads=include_threads,
+            thread_oldest=thread_oldest,
+        )
         if not scan.channel_history_ok:
             return _SlackBackfillResult(
                 recovered=0,
@@ -8693,6 +8716,9 @@ class SlackMessageBackfill:
                     event_channel_id,
                     message_ts,
                 )
+        scan_finished_at = float(self.now())
+        for thread_ts in scan.scanned_thread_ts:
+            self._record_thread_scan(channel_id, thread_ts, scan_finished_at)
         return _SlackBackfillResult(
             recovered=recovered,
             channel_history_ok=scan.channel_history_ok,
@@ -8712,12 +8738,19 @@ class SlackMessageBackfill:
         self._last_thread_scan_unix = now
         self.store.set_setting(SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN, f"{now:.6f}")
 
+    def _record_thread_scan(self, channel_id: str, thread_ts: str, now: float) -> None:
+        self.store.set_setting(
+            _slack_backfill_thread_scan_key(channel_id, thread_ts),
+            f"{now:.6f}",
+        )
+
     def _events_since(
         self,
         channel_id: str,
         oldest: str,
         *,
         include_threads: bool = True,
+        thread_oldest: str | None = None,
     ) -> _SlackBackfillEventScan:
         events_by_ts: dict[str, dict] = {}
         thread_ts_values = self._known_thread_ts(channel_id) if include_threads else set()
@@ -8753,12 +8786,19 @@ class SlackMessageBackfill:
             )
 
         thread_history_ok = True
-        for thread_ts in sorted(thread_ts_values, key=_slack_ts_sort_key):
+        scanned_thread_ts: list[str] = []
+        base_thread_oldest = thread_oldest or oldest
+        for thread_ts in self._ordered_thread_ts(channel_id, thread_ts_values):
+            scan_oldest = self._oldest_for_thread_scan(
+                channel_id,
+                thread_ts,
+                base_thread_oldest,
+            )
             try:
                 thread_messages = self.gateway.thread_messages(
                     channel_id,
                     thread_ts,
-                    oldest=oldest,
+                    oldest=scan_oldest,
                     limit=SLACK_BACKFILL_FETCH_LIMIT,
                 )
             except Exception as exc:
@@ -8770,7 +8810,10 @@ class SlackMessageBackfill:
                     thread_ts,
                     exc_info=True,
                 )
+                if _slack_error_code(exc) == "ratelimited":
+                    break
                 continue
+            scanned_thread_ts.append(thread_ts)
             for message in thread_messages:
                 event = _history_message_event(channel_id, message, default_thread_ts=thread_ts)
                 message_ts = event.get("ts")
@@ -8780,7 +8823,50 @@ class SlackMessageBackfill:
             events=list(events_by_ts.values()),
             channel_history_ok=True,
             thread_history_ok=thread_history_ok,
+            scanned_thread_ts=tuple(scanned_thread_ts),
         )
+
+    def _oldest_for_thread_scan(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        fallback_oldest: str,
+    ) -> str:
+        last_thread_scan = _float_setting(
+            self.store.get_setting(_slack_backfill_thread_scan_key(channel_id, thread_ts))
+        )
+        if last_thread_scan is None:
+            return fallback_oldest
+        oldest_unix = max(0.0, last_thread_scan - self.grace_seconds)
+        return _slack_ts_from_unix(oldest_unix)
+
+    def _ordered_thread_ts(self, channel_id: str, thread_ts_values: set[str]) -> list[str]:
+        return sorted(
+            thread_ts_values,
+            key=lambda thread_ts: self._thread_backfill_sort_key(channel_id, thread_ts),
+        )
+
+    def _thread_backfill_sort_key(self, channel_id: str, thread_ts: str) -> tuple[int, float]:
+        try:
+            session = self.store.get_session_for_slack_thread(self.team_id, channel_id, thread_ts)
+        except sqlite3.Error:
+            session = None
+        if session is not None and self._tracked_external_session(session):
+            last_seen = session.last_seen_at or session.started_at or utc_now()
+            return (0, -last_seen.timestamp())
+        return (1, -_slack_ts_sort_key(thread_ts))
+
+    def _tracked_external_session(self, session: AgentSession) -> bool:
+        suffix = f"{session.provider.value}.{session.session_id}"
+        for prefix in (
+            EXTERNAL_SESSION_AGENT_PREFIX,
+            PENDING_EXTERNAL_SESSION_PREFIX,
+            EXTERNAL_SESSION_LIVE_TARGET_PREFIX,
+            EXTERNAL_SESSION_MISSING_TARGET_PREFIX,
+        ):
+            if self.store.get_setting(f"{prefix}{suffix}"):
+                return True
+        return False
 
     def _known_thread_ts(self, channel_id: str) -> set[str]:
         thread_ts_values: set[str] = set()
@@ -9977,6 +10063,10 @@ def _retired_inactive_handle(agent, used_handles: set[str]) -> str:
 
 def _slack_message_processed_key(channel_id: str, message_ts: str) -> str:
     return f"{SETTING_SLACK_MESSAGE_PROCESSED_PREFIX}{channel_id}.{message_ts}"
+
+
+def _slack_backfill_thread_scan_key(channel_id: str, thread_ts: str) -> str:
+    return f"{SETTING_SLACK_BACKFILL_THREAD_SCAN_PREFIX}{channel_id}.{thread_ts}"
 
 
 def _external_session_delivery_setting_key(channel_id: str, message_ts: str) -> str:
