@@ -3493,9 +3493,12 @@ class SlackTeamController:
                     initiative, message_ts, status_label=initiative.status.value
                 )
                 return
+            plan_message_ts = initiative.pending_plan_message_ts
             promoted = self._execute_pm_plan(initiative, approver_slack_user=actor)
             if promoted is not None:
                 self._strip_pm_plan_buttons(promoted, message_ts, status_label="approved")
+                if plan_message_ts and plan_message_ts != message_ts:
+                    self._strip_pm_plan_buttons(promoted, plan_message_ts, status_label="approved")
             return
         if action == "pm_initiative.hire_and_start":
             if initiative.status != PmInitiativeStatus.AWAITING_APPROVAL:
@@ -3530,6 +3533,7 @@ class SlackTeamController:
                 f"{mention}cancelled this PM initiative. No subtasks were started.",
             )
             self._strip_pm_plan_buttons(initiative, message_ts, status_label="cancelled")
+            self._clear_pm_initiative_request_status(initiative)
             return
 
     def _strip_pm_plan_buttons(
@@ -5860,8 +5864,7 @@ class SlackTeamController:
         self._finish_pm_resolver_task_after_plan(task)
         resolved_task = self.store.get_agent_task(task.task_id) or task
         self._remove_task_action_buttons_if_resolved(resolved_task)
-        for message_ts in _task_request_message_ts_values(resolved_task):
-            self._mark_message_complete(thread.channel_id, message_ts)
+        self._mark_pm_initiative_request_in_progress(parked, resolved_task)
         self.refresh_or_post_roster(thread.channel_id)
         return True
 
@@ -5910,6 +5913,7 @@ class SlackTeamController:
             return None
         shortfall = self._pm_plan_capacity_shortfall(plan)
         if shortfall is not None:
+            self._mark_pm_initiative_request_in_progress(initiative)
             self.gateway.post_thread_reply(
                 thread,
                 _format_pm_capacity_shortfall_message(shortfall),
@@ -7070,6 +7074,10 @@ class SlackTeamController:
             self._post_pm_initiative_recap(initiative, per_subtask, all_done=all_done)
             new_status = PmInitiativeStatus.DONE if all_done else PmInitiativeStatus.CANCELLED
             self.store.update_pm_initiative_status(initiative.initiative_id, new_status)
+            if all_done:
+                self._mark_pm_initiative_request_complete(initiative)
+            else:
+                self._clear_pm_initiative_request_status(initiative)
             self._post_or_update_pm_status_message(initiative.initiative_id)
             self._clear_pm_surfaced_keys(initiative.initiative_id)
             return 1
@@ -7942,6 +7950,36 @@ class SlackTeamController:
                 continue
             self._clear_message_status_reactions(thread.channel_id, message_ts)
         self._reconcile_pending_thread_reactions(task, thread)
+
+    def _mark_pm_initiative_request_in_progress(
+        self,
+        initiative: PmInitiative,
+        task: AgentTask | None = None,
+    ) -> None:
+        for message_ts in self._pm_initiative_request_message_ts_values(initiative, task):
+            self._mark_message_in_progress(initiative.channel_id, message_ts)
+
+    def _mark_pm_initiative_request_complete(self, initiative: PmInitiative) -> None:
+        for message_ts in self._pm_initiative_request_message_ts_values(initiative):
+            self._mark_message_complete(initiative.channel_id, message_ts)
+
+    def _clear_pm_initiative_request_status(self, initiative: PmInitiative) -> None:
+        for message_ts in self._pm_initiative_request_message_ts_values(initiative):
+            self._clear_message_status_reactions(initiative.channel_id, message_ts)
+
+    def _pm_initiative_request_message_ts_values(
+        self,
+        initiative: PmInitiative,
+        task: AgentTask | None = None,
+    ) -> tuple[str, ...]:
+        if task is None and initiative.pm_task_id:
+            task = self.store.get_agent_task(initiative.pm_task_id)
+        values: list[str] = []
+        if task is not None:
+            values.extend(_task_request_message_ts_values(task))
+        if initiative.message_ts:
+            values.append(initiative.message_ts)
+        return tuple(dict.fromkeys(value for value in values if value))
 
     def _clear_idle_release_prompt_on_close(
         self,
@@ -10318,8 +10356,9 @@ def _format_pm_capacity_shortfall_message(shortfall: _PmCapacityShortfall) -> st
         return (
             "I can't start this PM plan yet because it reserves specific worker "
             f"agents that are not free right now: {handles} {pronoun} unavailable. "
-            "Wait for those agents to finish or ask the PM to replan with available "
-            "agents, then click *Start executing* again."
+            "The plan is still parked. Wait for those agents to finish or ask the PM "
+            "to replan with available agents; then use *Try start again* here or "
+            "*Start executing* on the original approval card."
         )
     required = shortfall.required_workers
     available = shortfall.available_workers
@@ -10341,7 +10380,39 @@ def _pm_capacity_shortfall_blocks(
     initiative: PmInitiative,
     shortfall: _PmCapacityShortfall,
 ) -> list[dict] | None:
-    if shortfall.unavailable_handles or shortfall.hire_count <= 0:
+    if shortfall.unavailable_handles:
+        text = _format_pm_capacity_shortfall_message(shortfall)
+        return [
+            {
+                "type": "section",
+                "block_id": f"pm.capacity.{initiative.initiative_id}",
+                "text": {"type": "mrkdwn", "text": text},
+            },
+            {
+                "type": "actions",
+                "block_id": f"pm.capacity.actions.{initiative.initiative_id}",
+                "elements": [
+                    _slack_button(
+                        "Try start again",
+                        "pm_initiative.start",
+                        encode_action_value(
+                            "pm_initiative.start",
+                            initiative_id=initiative.initiative_id,
+                        ),
+                        style="primary",
+                    ),
+                    _slack_button(
+                        "Cancel",
+                        "pm_initiative.cancel",
+                        encode_action_value(
+                            "pm_initiative.cancel", initiative_id=initiative.initiative_id
+                        ),
+                        style="danger",
+                    ),
+                ],
+            },
+        ]
+    if shortfall.hire_count <= 0:
         return None
     hire_word = "agent" if shortfall.hire_count == 1 else "agents"
     text = _format_pm_capacity_shortfall_message(shortfall)

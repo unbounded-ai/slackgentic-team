@@ -36,7 +36,10 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_STARTED_METADATA_KEY,
     build_task_prompt,
 )
+from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
+    TASK_REACTION_DONE,
+    TASK_REACTION_IN_PROGRESS,
     PMInitiativeRunner,
     SlackTeamController,
 )
@@ -394,14 +397,16 @@ class PmFullLifecycleTests(unittest.TestCase):
                     "SLACKGENTIC: PM_PLAN",
                     " ".join(item.get("text") or "" for item in gateway.thread_replies),
                 )
+                request_reactions = {
+                    item["name"] for item in gateway._current_reactions("C1", "171.000001")
+                }
+                self.assertIn(TASK_REACTION_IN_PROGRESS, request_reactions)
+                self.assertNotIn(TASK_REACTION_DONE, request_reactions)
 
                 # ---- STEP 3: user clicks ``Start executing``.
-                approve_action = json.dumps(
-                    {
-                        "v": 1,
-                        "action": "pm_initiative.start",
-                        "initiative_id": initiative.initiative_id,
-                    }
+                approve_action = encode_action_value(
+                    "pm_initiative.start",
+                    initiative_id=initiative.initiative_id,
                 )
                 controller.handle_block_action(
                     {
@@ -1613,6 +1618,152 @@ class PmRuntimeTests(unittest.TestCase):
                     for element in block.get("elements", [])
                 ]
                 self.assertIn("pm_initiative.hire_and_start", action_ids)
+            finally:
+                store.close()
+
+    def test_pm_specific_worker_shortfall_keeps_actionable_retry_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = FakeRuntime()
+            try:
+                store.init_schema()
+                workers = build_initial_model_team(2, 0)
+                pm_agent = hire_team_agents(workers, 1, kind=TeamAgentKind.PM)[0]
+                for agent in [*workers, pm_agent]:
+                    store.upsert_team_agent(agent)
+                busy_worker = workers[0]
+                busy_task = replace(
+                    create_agent_task(busy_worker, "busy elsewhere", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.busy",
+                    parent_message_ts="171.busy",
+                )
+                store.upsert_agent_task(busy_task)
+                thread_ref = SlackThreadRef("C1", "171.thread", "171.parent")
+                initiative = store.create_pm_initiative(
+                    thread_ref,
+                    title="Specific worker plan",
+                    summary="Run one pinned task.",
+                    requested_by_slack_user="U1",
+                )
+                pm_task = replace(
+                    create_agent_task(pm_agent, "resolve PM plan", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.thread",
+                    parent_message_ts="171.parent",
+                    metadata={
+                        PM_RESOLUTION_METADATA_KEY: True,
+                        PM_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: "Specific worker plan",
+                        "request_message_ts": "171.thread",
+                    },
+                )
+                store.upsert_agent_task(pm_task)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    runtime=runtime,
+                )
+                payload = {
+                    "title": "Specific worker plan",
+                    "summary": "Run one pinned task.",
+                    "subtasks": [
+                        {
+                            "id": "pinned",
+                            "title": "Pinned work",
+                            "task": "Run the pinned work.",
+                            "target": busy_worker.handle,
+                            "depends_on": [],
+                        }
+                    ],
+                }
+                handled = controller.handle_runtime_agent_control(
+                    pm_task,
+                    pm_agent,
+                    thread_ref,
+                    f"{AGENT_PM_PLAN_SIGNAL_PREFIX}{json.dumps(payload)}",
+                )
+                self.assertTrue(handled)
+                plan_message = gateway.thread_replies[-1]
+                request_reactions = {
+                    item["name"] for item in gateway._current_reactions("C1", "171.thread")
+                }
+                self.assertIn(TASK_REACTION_IN_PROGRESS, request_reactions)
+                self.assertNotIn(TASK_REACTION_DONE, request_reactions)
+
+                start_value = next(
+                    element["value"]
+                    for block in plan_message.get("blocks") or []
+                    if block.get("type") == "actions"
+                    for element in block.get("elements", [])
+                    if element["action_id"] == "pm_initiative.start"
+                )
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": start_value,
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": plan_message["ts"]},
+                        "user": {"id": "U2"},
+                    }
+                )
+
+                still_parked = store.get_pm_initiative(initiative.initiative_id)
+                assert still_parked is not None
+                self.assertEqual(still_parked.status, PmInitiativeStatus.AWAITING_APPROVAL)
+                self.assertEqual(store.list_pm_subtasks(initiative.initiative_id), [])
+                capacity_message = gateway.thread_replies[-1]
+                self.assertIn("reserves specific worker agents", capacity_message["text"])
+                self.assertIn("The plan is still parked", capacity_message["text"])
+                self.assertIn("Try start again", capacity_message["text"])
+                retry_blocks = capacity_message.get("blocks")
+                self.assertIsNotNone(retry_blocks)
+                retry_actions = [
+                    element
+                    for block in retry_blocks or []
+                    if block.get("type") == "actions"
+                    for element in block.get("elements", [])
+                ]
+                self.assertEqual(
+                    [element["action_id"] for element in retry_actions],
+                    ["pm_initiative.start", "pm_initiative.cancel"],
+                )
+
+                store.update_agent_task_status(busy_task.task_id, AgentTaskStatus.DONE)
+                controller.handle_block_action(
+                    {
+                        "actions": [
+                            {
+                                "action_id": "pm_initiative.start",
+                                "value": retry_actions[0]["value"],
+                            }
+                        ],
+                        "channel": {"id": "C1"},
+                        "message": {"ts": capacity_message["ts"]},
+                        "user": {"id": "U2"},
+                    }
+                )
+
+                promoted = store.get_pm_initiative(initiative.initiative_id)
+                assert promoted is not None
+                self.assertEqual(promoted.status, PmInitiativeStatus.ACTIVE)
+                self.assertEqual(len(store.list_pm_subtasks(initiative.initiative_id)), 1)
+                stripped_by_ts = {update["ts"]: update for update in gateway.updates}
+                self.assertIn(plan_message["ts"], stripped_by_ts)
+                self.assertIn(capacity_message["ts"], stripped_by_ts)
+                for update in stripped_by_ts.values():
+                    if update["ts"] not in {plan_message["ts"], capacity_message["ts"]}:
+                        continue
+                    self.assertFalse(
+                        any(block.get("type") == "actions" for block in update["blocks"])
+                    )
             finally:
                 store.close()
 
