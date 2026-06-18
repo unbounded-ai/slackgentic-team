@@ -126,6 +126,7 @@ class RunningTask:
     control_signals: list[str] = field(default_factory=list)
     terminal_control_signal_handled: bool = False
     visible_message_count: int = 0
+    last_visible_message: str | None = None
     started_monotonic: float = field(default_factory=time.monotonic)
     last_output_monotonic: float = field(default_factory=time.monotonic)
     last_activity_monotonic: float = field(default_factory=time.monotonic)
@@ -662,6 +663,17 @@ class ManagedTaskRuntime:
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
                 completed_task = self._clear_managed_run_started(task_id) or completed_task
+                if _running_task_exited_with_provider_failure(running):
+                    self._clear_managed_session_for_task(task_id)
+                    self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+                    completed_task = self.store.get_agent_task(task_id) or replace(
+                        completed_task,
+                        status=AgentTaskStatus.CANCELLED,
+                        updated_at=utc_now(),
+                    )
+                    if self.on_task_done:
+                        self.on_task_done(completed_task, running.agent, running.thread)
+                    return
                 if running.terminal_control_signal_handled:
                     return
                 handled_signals = self._handle_agent_control_signals(running, completed_task)
@@ -943,6 +955,7 @@ class ManagedTaskRuntime:
             raise
         now = time.monotonic()
         running.visible_message_count += 1
+        running.last_visible_message = normalized
         running.last_visible_message_monotonic = now
         running.last_activity_monotonic = now
         running.progress_warning_monotonic = None
@@ -2925,6 +2938,19 @@ def _claude_assistant_message_text(record: dict) -> str | None:
 
 def _format_claude_error(message: object) -> str:
     return f"Claude error: {_clean_terminal_output(str(message))}" if message else "Claude error."
+
+
+def _running_task_exited_with_provider_failure(running: RunningTask) -> bool:
+    return _looks_like_managed_provider_failure(running.last_visible_message)
+
+
+def _looks_like_managed_provider_failure(message: str | None) -> bool:
+    if not message:
+        return False
+    normalized = message.strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith(("codex error:", "claude error:"))
 
 
 def _line_has_ending(line: str) -> bool:
