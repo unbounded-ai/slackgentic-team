@@ -5107,8 +5107,10 @@ class SlackTeamController:
     ) -> None:
         task_is_child = _is_subtask(task) or _is_external_thread_helper_task(task)
         if task_is_child:
-            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
             task = self.store.get_agent_task(task.task_id) or task
+            if task.status != AgentTaskStatus.CANCELLED:
+                self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+                task = self.store.get_agent_task(task.task_id) or task
             self._clear_task_request_status_reactions(task, thread)
             self._remove_task_action_buttons_if_resolved(task)
         if task.session_provider is not None and task.session_id:
