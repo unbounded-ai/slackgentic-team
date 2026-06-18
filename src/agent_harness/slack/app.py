@@ -8664,7 +8664,7 @@ class SlackMessageBackfill:
             recovered = result.recovered
             if result.channel_history_ok:
                 self._record_last_awake(now)
-            if include_threads and result.thread_history_ok:
+            if include_threads and result.channel_history_ok and result.thread_history_ok:
                 self._record_last_thread_scan(now)
             return recovered
         self._record_last_awake(now)
@@ -8693,12 +8693,6 @@ class SlackMessageBackfill:
             include_threads=include_threads,
             thread_oldest=thread_oldest,
         )
-        if not scan.channel_history_ok:
-            return _SlackBackfillResult(
-                recovered=0,
-                channel_history_ok=False,
-                thread_history_ok=False,
-            )
         recovered = 0
         for event in sorted(scan.events, key=lambda item: _slack_ts_sort_key(item.get("ts"))):
             event_channel_id, message_ts = self.controller._recoverable_user_message_ref(event)
@@ -8755,6 +8749,7 @@ class SlackMessageBackfill:
     ) -> _SlackBackfillEventScan:
         events_by_ts: dict[str, dict] = {}
         thread_ts_values = self._known_thread_ts(channel_id) if include_threads else set()
+        channel_history_ok = True
         try:
             channel_messages = self.gateway.channel_messages(
                 channel_id,
@@ -8762,27 +8757,24 @@ class SlackMessageBackfill:
                 limit=SLACK_BACKFILL_FETCH_LIMIT,
             )
         except Exception:
+            channel_history_ok = False
             LOGGER.exception("failed to fetch Slack channel history for backfill")
-            return _SlackBackfillEventScan(
-                events=[],
-                channel_history_ok=False,
-                thread_history_ok=False,
-            )
-        for message in channel_messages:
-            event = _history_message_event(channel_id, message)
-            message_ts = event.get("ts")
-            if isinstance(message_ts, str):
-                events_by_ts[message_ts] = event
-            thread_ts = event.get("thread_ts")
-            if isinstance(thread_ts, str) and thread_ts:
-                thread_ts_values.add(thread_ts)
-            elif isinstance(message_ts, str) and message.get("reply_count"):
-                thread_ts_values.add(message_ts)
+        else:
+            for message in channel_messages:
+                event = _history_message_event(channel_id, message)
+                message_ts = event.get("ts")
+                if isinstance(message_ts, str):
+                    events_by_ts[message_ts] = event
+                thread_ts = event.get("thread_ts")
+                if isinstance(thread_ts, str) and thread_ts:
+                    thread_ts_values.add(thread_ts)
+                elif isinstance(message_ts, str) and message.get("reply_count"):
+                    thread_ts_values.add(message_ts)
 
         if not include_threads:
             return _SlackBackfillEventScan(
                 events=list(events_by_ts.values()),
-                channel_history_ok=True,
+                channel_history_ok=channel_history_ok,
                 thread_history_ok=True,
             )
 
@@ -8822,7 +8814,7 @@ class SlackMessageBackfill:
                     events_by_ts[message_ts] = event
         return _SlackBackfillEventScan(
             events=list(events_by_ts.values()),
-            channel_history_ok=True,
+            channel_history_ok=channel_history_ok,
             thread_history_ok=thread_history_ok,
             scanned_thread_ts=tuple(scanned_thread_ts),
         )

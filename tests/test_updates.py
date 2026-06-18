@@ -178,6 +178,64 @@ class SelfUpdaterTests(unittest.TestCase):
         self.assertEqual(calls[2][-2:], ["--detach", "v0.2.0"])
         self.assertEqual(calls[3][:4], ["/venv/bin/python", "-m", "pip", "install"])
 
+    def test_install_retries_transient_published_release_failure(self):
+        release = ReleaseInfo(
+            version="0.2.0",
+            tag_name="v0.2.0",
+            tarball_url="https://example.com/release.tar.gz",
+        )
+        calls = []
+        sleeps = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    args,
+                    2,
+                    stdout="",
+                    stderr="error: request failed\n  Caused by: operation timed out\n",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch("agent_harness.updates.detect_source_root", return_value=None):
+            result = SelfUpdater(
+                run=fake_run,
+                python_executable="/venv/bin/python",
+                sleep=sleeps.append,
+            ).install(release)
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(sleeps, [2.0])
+        self.assertEqual([command.returncode for command in result.commands], [2, 0])
+
+    def test_install_does_not_retry_non_transient_failure(self):
+        release = ReleaseInfo(
+            version="0.2.0",
+            tag_name="v0.2.0",
+            tarball_url="https://example.com/release.tar.gz",
+        )
+        calls = []
+        sleeps = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="permission denied")
+
+        with patch("agent_harness.updates.detect_source_root", return_value=None):
+            result = SelfUpdater(
+                run=fake_run,
+                python_executable="/venv/bin/python",
+                sleep=sleeps.append,
+            ).install(release)
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+        self.assertIn("permission denied", result.failure_message)
+
     def test_install_falls_back_to_uv_when_python_has_no_pip(self):
         release = ReleaseInfo(
             version="0.2.0",
