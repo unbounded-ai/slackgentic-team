@@ -28,6 +28,8 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_UPDATE_REPOSITORY = "unbounded-ai/slackgentic-team"
 DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 10 * 60
+DEFAULT_UPGRADE_COMMAND_ATTEMPTS = 2
+DEFAULT_UPGRADE_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 2 * 60
 # The update-helper waits this long for the restarted daemon to acknowledge the
 # upgrade before posting the terminal status itself. It is intentionally longer
@@ -249,12 +251,18 @@ class SelfUpdater:
         package_file: Path | None = None,
         python_executable: str | None = None,
         timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+        command_attempts: int = DEFAULT_UPGRADE_COMMAND_ATTEMPTS,
+        retry_delay_seconds: float = DEFAULT_UPGRADE_RETRY_DELAY_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ):
         self.repository = normalize_repository(repository)
         self.package_file = Path(package_file).resolve() if package_file is not None else None
         self.python_executable = python_executable or sys.executable
         self.timeout_seconds = timeout_seconds
+        self.command_attempts = max(1, command_attempts)
+        self.retry_delay_seconds = max(0.0, retry_delay_seconds)
+        self.sleep = sleep
         self.run = run
 
     def plan(self, release: ReleaseInfo) -> UpgradePlan:
@@ -337,6 +345,33 @@ class SelfUpdater:
 
         results: list[UpgradeCommandResult] = []
         for command in plan.commands:
+            failure = self._run_command(command, plan, results)
+            if failure is not None:
+                return failure
+            result = results[-1]
+            if result.returncode != 0:
+                fallback = self._pip_install_fallback(command, result)
+                if fallback is not None:
+                    failure = self._run_command(fallback, plan, results)
+                    if failure is not None:
+                        return failure
+                    if results[-1].returncode == 0:
+                        continue
+                return UpgradeResult(
+                    False,
+                    plan,
+                    tuple(results),
+                    _command_failure_message(results[-1], plan),
+                )
+        return UpgradeResult(True, plan, tuple(results))
+
+    def _run_command(
+        self,
+        command: UpgradeCommand,
+        plan: UpgradePlan,
+        results: list[UpgradeCommandResult],
+    ) -> UpgradeResult | None:
+        for attempt in range(self.command_attempts):
             try:
                 completed = self.run(
                     list(command.args),
@@ -347,6 +382,9 @@ class SelfUpdater:
                     timeout=self.timeout_seconds,
                 )
             except subprocess.TimeoutExpired:
+                if attempt + 1 < self.command_attempts:
+                    self.sleep(self.retry_delay_seconds)
+                    continue
                 return UpgradeResult(
                     False,
                     plan,
@@ -367,48 +405,11 @@ class SelfUpdater:
                 stderr=completed.stderr or "",
             )
             results.append(result)
-            if completed.returncode != 0:
-                fallback = self._pip_install_fallback(command, result)
-                if fallback is not None:
-                    try:
-                        completed = self.run(
-                            list(fallback.args),
-                            cwd=fallback.cwd,
-                            capture_output=True,
-                            text=True,
-                            check=False,
-                            timeout=self.timeout_seconds,
-                        )
-                    except subprocess.TimeoutExpired:
-                        return UpgradeResult(
-                            False,
-                            plan,
-                            tuple(results),
-                            f"Timed out while trying to {plan.description}.",
-                        )
-                    except OSError as exc:
-                        return UpgradeResult(
-                            False,
-                            plan,
-                            tuple(results),
-                            f"Could not start the update command: {exc}",
-                        )
-                    result = UpgradeCommandResult(
-                        command=fallback.display_args(),
-                        returncode=completed.returncode,
-                        stdout=completed.stdout or "",
-                        stderr=completed.stderr or "",
-                    )
-                    results.append(result)
-                    if completed.returncode == 0:
-                        continue
-                return UpgradeResult(
-                    False,
-                    plan,
-                    tuple(results),
-                    _command_failure_message(result, plan),
-                )
-        return UpgradeResult(True, plan, tuple(results))
+            if completed.returncode == 0 or not _transient_command_failure(result):
+                return None
+            if attempt + 1 < self.command_attempts:
+                self.sleep(self.retry_delay_seconds)
+        return None
 
     def _pip_install_fallback(
         self,
@@ -874,6 +875,23 @@ def _command_failure_message(result: UpgradeCommandResult, plan: UpgradePlan) ->
 def _pip_module_missing(result: UpgradeCommandResult) -> bool:
     output = f"{result.stderr}\n{result.stdout}".lower()
     return "no module named pip" in output or "no module named 'pip'" in output
+
+
+def _transient_command_failure(result: UpgradeCommandResult) -> bool:
+    output = f"{result.stderr}\n{result.stdout}".lower()
+    return any(
+        marker in output
+        for marker in (
+            "operation timed out",
+            "read operation timed out",
+            "connection timed out",
+            "timed out while",
+            "temporary failure in name resolution",
+            "connection reset by peer",
+            "connection aborted",
+            "network is unreachable",
+        )
+    )
 
 
 def _optional_string(value: object) -> str | None:
