@@ -3441,6 +3441,14 @@ class SlackAppTests(unittest.TestCase):
             time.sleep(0.01)
         return self._find_idle_release_prompt(gateway) is not None
 
+    def _drive_runtime_to_stop(self, runtime, *, timeout: float = 2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not runtime.has_running_tasks():
+                return True
+            time.sleep(0.01)
+        return not runtime.has_running_tasks()
+
     def test_runtime_to_controller_e2e_posts_idle_prompt_for_codex(self):
         class CodexFinalProcess:
             def __init__(self, request):
@@ -3575,6 +3583,133 @@ class SlackAppTests(unittest.TestCase):
                 )
             finally:
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                store.close()
+
+    def test_runtime_provider_error_cancels_pm_subtask_and_blocks_dependents(self):
+        from agent_harness.pm import (
+            PM_INITIATIVE_ID_METADATA_KEY,
+            PM_SUBTASK_LOCAL_ID_METADATA_KEY,
+        )
+
+        class CodexTransportErrorProcess:
+            def __init__(self, request):
+                self.request = request
+                self._read_once = False
+
+            def start(self):
+                pass
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self._read_once:
+                    return ""
+                self._read_once = True
+                return (
+                    '{"type":"error","message":"unexpected status 404 Not Found: '
+                    'Unknown error, url: https://example.invalid/api/responses"}\n'
+                )
+
+            def is_alive(self):
+                return False
+
+            def terminate(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            runtime = None
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                initiative = store.create_pm_initiative(
+                    SlackThreadRef("C1", "171.parent", "171.parent"),
+                    title="Ship feature X",
+                    summary="Roll out feature X.",
+                    requested_by_slack_user="U1",
+                )
+                store.update_pm_initiative_status(
+                    initiative.initiative_id,
+                    PmInitiativeStatus.ACTIVE,
+                )
+                active_initiative = store.get_pm_initiative(initiative.initiative_id)
+                assert active_initiative is not None
+                root = store.add_pm_subtask_dispatch(
+                    initiative=active_initiative,
+                    local_id="operator",
+                    title="Implement operator",
+                    request=WorkRequest(
+                        prompt="Implement the operator.",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    plan_depends_on=(),
+                    existing_subtasks=[],
+                    after_delay_seconds=0,
+                    sort_order=0,
+                    thread=SlackThreadRef("C1", "171.operator", "171.operator"),
+                )
+                child = store.add_pm_subtask_dispatch(
+                    initiative=active_initiative,
+                    local_id="review",
+                    title="Review operator",
+                    request=WorkRequest(
+                        prompt="Review the operator.",
+                        assignment_mode=AssignmentMode.SPECIFIC,
+                        requested_handle=agent.handle,
+                    ),
+                    plan_depends_on=("operator",),
+                    existing_subtasks=[root],
+                    after_delay_seconds=0,
+                    sort_order=1,
+                    thread=SlackThreadRef("C1", "171.review", "171.review"),
+                )
+                root_task = replace(
+                    create_agent_task(agent, "Implement the operator.", "C1"),
+                    status=AgentTaskStatus.ACTIVE,
+                    thread_ts="171.operator",
+                    parent_message_ts="171.operator",
+                    metadata={
+                        "deferred_work_id": root.deferred_id,
+                        PM_INITIATIVE_ID_METADATA_KEY: initiative.initiative_id,
+                        PM_SUBTASK_LOCAL_ID_METADATA_KEY: "operator",
+                    },
+                )
+                store.upsert_agent_task(root_task)
+                store.complete_deferred_work(root.deferred_id, last_task_id=root_task.task_id)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=CodexTransportErrorProcess,
+                    poll_seconds=0.01,
+                    on_task_done=controller.handle_runtime_task_done,
+                    on_agent_message=controller.handle_runtime_agent_message,
+                    on_agent_control=controller.handle_runtime_agent_control,
+                )
+                controller.runtime = runtime
+
+                runtime.start_task(
+                    root_task,
+                    agent,
+                    SlackThreadRef("C1", "171.operator", "171.operator"),
+                )
+                self.assertTrue(self._drive_runtime_to_stop(runtime))
+
+                failed_task = store.get_agent_task(root_task.task_id)
+                assert failed_task is not None
+                self.assertEqual(failed_task.status, AgentTaskStatus.CANCELLED)
+                still_waiting = store.get_deferred_work(child.deferred_id)
+                assert still_waiting is not None
+                self.assertEqual(still_waiting.status, DeferredWorkStatus.WAITING_DEPS)
+                blocker_text = "\n".join(reply["text"] for reply in gateway.thread_replies)
+                self.assertIn("Codex error: unexpected status 404 Not Found", blocker_text)
+                self.assertIn("dependency `operator` was cancelled", blocker_text)
+                self.assertIn("will not start downstream work", blocker_text)
+            finally:
+                if runtime is not None:
+                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
                 store.close()
 
     def test_agent_final_handle_line_routes_callback_without_action_button(self):
