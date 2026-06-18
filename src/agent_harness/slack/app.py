@@ -355,6 +355,7 @@ CLAUDE_EXTERNAL_COMMAND = "claude --dangerously-load-development-channels server
 CLAUDE_CHANNEL_PERMISSION_METHOD = "claude/channel/permission"
 SLACKGENTIC_MCP_PERMISSION_TOOLS = frozenset(
     {
+        "mcp__slackgentic__read_thread",
         "mcp__slackgentic__request_approval",
         "mcp__slackgentic__request_user_input",
     }
@@ -366,9 +367,7 @@ _ACTIVE_PM_INITIATIVE_STATUSES = frozenset(
         PmInitiativeStatus.ACTIVE,
     }
 )
-AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT = (
-    "Allowed internal Claude Slackgentic request; rendering the Slack prompt now."
-)
+AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT = "Allowed internal Claude Slackgentic MCP request."
 REVIEW_DELEGATE_PROMPT = (
     "Continue the original task using @{sender_handle}'s review above. "
     "Address any required changes, then give the user the final result "

@@ -1767,6 +1767,11 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "creation workflow through Slackgentic so PR creation still works when "
             "ordinary shell networking or sandbox policy gets in the way."
         ),
+        (
+            "When you need to inspect another Slackgentic thread from a Slack link, "
+            "use Slackgentic's `read_thread` MCP tool if it is available; it only "
+            "reads links from the configured Slackgentic channel."
+        ),
     ]
     if _task_dangerous_mode(task):
         lines.append(
