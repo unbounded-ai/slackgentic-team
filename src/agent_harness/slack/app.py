@@ -9475,10 +9475,7 @@ class SocketModeSlackApp:
                     )
                 if disconnected or stale:
                     try:
-                        if stale:
-                            client.connect_to_new_endpoint(force=True)
-                        else:
-                            client.connect()
+                        self._reconnect_socket_mode(client, new_endpoint=stale)
                         socket_connected_at = time.monotonic()
                         connect_backoff.reset()
                     except Exception:
@@ -9505,6 +9502,40 @@ class SocketModeSlackApp:
             except Exception:
                 LOGGER.debug("failed to close Slack socket client cleanly", exc_info=True)
             self.close()
+
+    def _reconnect_socket_mode(self, client, *, new_endpoint: bool) -> None:
+        """Re-establish a stale or dropped Slack Socket Mode connection.
+
+        slack_sdk closes the previous session inline inside ``connect()``. That
+        teardown races the dying session's own monitor thread: the connection
+        nulls ``self.sock`` between slack_sdk's ``sock is not None`` guard and
+        the ``sock.close()`` call, raising ``AttributeError``. When it fires,
+        slack_sdk never swaps in the freshly connected session, so the client
+        stays pinned to a dead socket (``is_connected()`` keeps returning
+        ``False``) while the new session is leaked. Realtime Slack delivery then
+        stalls until the backfill loop recovers the missed replies minutes
+        later. Tear the stale session down ourselves first so the reconnect has
+        nothing live to close, and retry once if the close still races.
+        """
+
+        def _connect() -> None:
+            if new_endpoint:
+                client.connect_to_new_endpoint(force=True)
+            else:
+                client.connect()
+
+        try:
+            client.disconnect()
+        except Exception:
+            LOGGER.debug("ignoring error tearing down stale Slack socket", exc_info=True)
+        try:
+            _connect()
+        except AttributeError:
+            LOGGER.debug(
+                "retrying Slack Socket Mode reconnect after a racy session close",
+                exc_info=True,
+            )
+            _connect()
 
     def handle_request(self, request) -> dict | None:
         if request.type == "interactive":
