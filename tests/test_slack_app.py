@@ -575,6 +575,65 @@ class SlackAppTests(unittest.TestCase):
         self.assertEqual(closed_clients, [True])
         self.assertEqual(closed_apps, [True])
 
+    def test_reconnect_socket_mode_recovers_from_racy_session_close(self):
+        events = []
+
+        class FakeStaleClient:
+            def __init__(self):
+                self.endpoint_calls = 0
+
+            def disconnect(self):
+                events.append("disconnect")
+
+            def connect_to_new_endpoint(self, force=False):
+                self.endpoint_calls += 1
+                events.append(f"connect_to_new_endpoint(force={force})")
+                if self.endpoint_calls == 1:
+                    # slack_sdk closes the racing old session inline and blows up
+                    # with this exact error before swapping in the new session.
+                    raise AttributeError("'NoneType' object has no attribute 'close'")
+
+            def connect(self):  # pragma: no cover - not used in the stale path
+                events.append("connect")
+
+        app = object.__new__(SocketModeSlackApp)
+        client = FakeStaleClient()
+
+        app._reconnect_socket_mode(client, new_endpoint=True)
+
+        # We tear the stale session down ourselves first, then retry the
+        # endpoint reconnect once past the racy close so realtime delivery
+        # actually recovers instead of staying pinned to a dead socket.
+        self.assertEqual(
+            events,
+            [
+                "disconnect",
+                "connect_to_new_endpoint(force=True)",
+                "connect_to_new_endpoint(force=True)",
+            ],
+        )
+
+    def test_reconnect_socket_mode_tolerates_disconnect_failure(self):
+        events = []
+
+        class FakeClient:
+            def disconnect(self):
+                events.append("disconnect")
+                raise AttributeError("'NoneType' object has no attribute 'close'")
+
+            def connect(self):
+                events.append("connect")
+
+            def connect_to_new_endpoint(self, force=False):  # pragma: no cover
+                events.append("connect_to_new_endpoint")
+
+        app = object.__new__(SocketModeSlackApp)
+
+        # A racy teardown during our own disconnect must not abort the reconnect.
+        app._reconnect_socket_mode(FakeClient(), new_endpoint=False)
+
+        self.assertEqual(events, ["disconnect", "connect"])
+
     def test_socket_mode_acknowledged_requests_run_on_worker(self):
         submitted = []
         handled = []
