@@ -279,10 +279,11 @@ claude --dangerously-load-development-channels server:slackgentic
 channel automatically when those CLIs are on `PATH`. Run
 `slackgentic codex-mcp --install` or `slackgentic claude-channel --install`
 manually if setup could not reach a CLI, and restart any already-open sessions
-after installing. The Claude installer adds Slackgentic's Slack request tools to
-Claude's allowlist so they do not require their own approval. No extra MCP flag
-is needed after registration unless you start Claude with `--strict-mcp-config`
-or another custom MCP config that excludes user-level servers.
+after installing. The Claude installer adds Slackgentic's Slack request and
+thread-link tools to Claude's allowlist so they do not require their own
+approval. No extra MCP flag is needed after registration unless you start Claude
+with `--strict-mcp-config` or another custom MCP config that excludes user-level
+servers.
 
 Those commands create tracked Slack threads for sessions you started outside
 Slack. If all matching team seats are occupied, Slackgentic posts a

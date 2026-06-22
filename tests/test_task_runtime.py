@@ -798,6 +798,15 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIn("create_pull_request", prompt)
         self.assertIn("MCP tool", prompt)
 
+    def test_build_task_prompt_mentions_slack_thread_reader_mcp(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        task = create_agent_task(agent, "inspect this Slack link", "C1")
+
+        prompt = build_task_prompt(agent, task)
+
+        self.assertIn("read_thread", prompt)
+        self.assertIn("configured Slackgentic channel", prompt)
+
     def test_build_task_prompt_instructs_dangerous_mode_no_approval_requests(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         task = create_agent_task(agent, "merge and deploy", "C1")
