@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -12,6 +13,7 @@ from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
+    AgentSession,
     AgentTask,
     Provider,
     SlackThreadRef,
@@ -48,6 +50,14 @@ class AgentRosterStatus:
     task_id: str | None = None
     session_provider: Provider | None = None
     session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class UnassignedExternalSessionListItem:
+    session: AgentSession
+    summary: str | None = None
+    assignable_agents: tuple[TeamAgent, ...] = ()
+    thread_url: str | None = None
 
 
 PROVIDER_SORT_ORDER = {
@@ -506,10 +516,12 @@ def build_channel_overview_blocks(
                     f"or run them as `{slash_command} <command>`\n"
                     f"`{slash_command} status`  usage and active sessions\n"
                     f"`{slash_command} show roster`  current team\n"
+                    f"`{slash_command} external sessions`  unassigned outside-Slack sessions\n"
                     f"`{slash_command} scheduled tasks`  active schedules\n"
                     f"`{slash_command} hire 3 agents`  add capacity\n"
                     f"`{slash_command} fire everyone`  clear the team\n"
-                    "`status`, `show roster`, `scheduled tasks`, `hire 3 agents` also work here"
+                    "`status`, `show roster`, `external sessions`, `scheduled tasks`, "
+                    "`hire 3 agents` also work here"
                 ),
             },
         },
@@ -707,6 +719,100 @@ def build_external_session_capacity_blocks(
             ],
         },
     ]
+
+
+def build_unassigned_external_session_blocks(
+    items: list[UnassignedExternalSessionListItem],
+    *,
+    total_count: int | None = None,
+) -> list[dict[str, Any]]:
+    count = len(items) if total_count is None else total_count
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Unassigned external sessions*  {count} waiting",
+            },
+        }
+    ]
+    if not items:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "No active outside-Slack sessions are waiting for an agent.",
+                },
+            }
+        )
+        return blocks
+    for item in items:
+        section: dict[str, Any] = {
+            "type": "section",
+            "block_id": _external_session_block_id(item.session),
+            "text": {"type": "mrkdwn", "text": _unassigned_external_session_text(item)},
+        }
+        if item.assignable_agents:
+            section["accessory"] = _button(
+                "Assign",
+                "external.session.assign.open",
+                encode_action_value(
+                    "external.session.assign.open",
+                    provider=item.session.provider.value,
+                    session_id=item.session.session_id,
+                ),
+                "primary",
+            )
+        blocks.append(section)
+        if not item.assignable_agents:
+            label = item.session.provider.value.title()
+            blocks.append(
+                {
+                    "type": "context",
+                    "block_id": f"{_external_session_block_id(item.session)}.capacity",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"No available {label} engineer can take this session.",
+                        }
+                    ],
+                }
+            )
+    return blocks
+
+
+def _unassigned_external_session_text(item: UnassignedExternalSessionListItem) -> str:
+    session = item.session
+    label = session.provider.value.title()
+    parts = [f"*{label}* {session.status.value} session `{_short_session_id(session.session_id)}`"]
+    if item.summary and item.summary.strip():
+        parts.append(f"*Task:* {_short_plain_text(item.summary, 140)}")
+    elif session.cwd:
+        parts.append(f"*Workspace:* `{session.cwd.name or session.cwd}`")
+    if session.git_branch:
+        parts.append(f"*Branch:* `{session.git_branch}`")
+    if session.model:
+        parts.append(f"*Model:* `{session.model}`")
+    if item.thread_url:
+        parts.append(f"*Thread:* <{item.thread_url}|open>")
+    return "\n".join(parts)
+
+
+def _external_session_block_id(session: AgentSession) -> str:
+    digest = hashlib.sha256(f"{session.provider.value}.{session.session_id}".encode()).hexdigest()
+    return f"external.unassigned.{digest[:16]}"
+
+
+def _short_session_id(session_id: str) -> str:
+    return _short_plain_text(session_id, 12)
+
+
+def _short_plain_text(value: str, limit: int) -> str:
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
 
 
 IDLE_RELEASE_PROMPT_TEXT = (

@@ -175,11 +175,13 @@ from agent_harness.sessions.mirror import (
     HUMAN_IMAGE_URL_SETTING,
     PENDING_EXTERNAL_SESSION_PREFIX,
     SessionMirror,
+    _is_codex_subagent_session,
     format_session_parent,
 )
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
     AgentRosterStatus,
+    UnassignedExternalSessionListItem,
     build_channel_overview_blocks,
     build_external_session_capacity_blocks,
     build_idle_release_closed_blocks,
@@ -188,6 +190,7 @@ from agent_harness.slack import (
     build_setup_modal,
     build_task_thread_blocks,
     build_team_roster_blocks,
+    build_unassigned_external_session_blocks,
     build_update_prompt_blocks,
     decode_action_value,
     encode_action_value,
@@ -225,6 +228,7 @@ from agent_harness.team.commands import (
     RepoRootCommand,
     RosterCommand,
     ScheduledTasksCommand,
+    UnassignedExternalSessionsCommand,
     parse_team_command,
 )
 from agent_harness.team.routing import (
@@ -280,6 +284,7 @@ SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
 SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
 SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
+UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE = 20
 _PM_BLOCKER_PREFIX = "pm.blocker."
 _PM_STATUS_MESSAGE_PREFIX = "pm.status_message."
 _PM_APPROVAL_BLOCKER_SECONDS = 5 * 60
@@ -494,6 +499,13 @@ class SlackTeamController:
             self._schedule_from_action(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name in {"external.session.detach", "external.session.finish"}:
             self._external_session_detach_from_action(decoded, channel_id)
+        elif action_name == "external.session.assign.open":
+            self._open_external_session_assign_modal(
+                decoded,
+                channel_id,
+                message_ts,
+                payload.get("trigger_id"),
+            )
         elif action_name.startswith("update."):
             self._update_from_action(decoded, channel_id, message_ts)
         elif action_name.startswith("pm_initiative."):
@@ -513,6 +525,8 @@ class SlackTeamController:
             return self._handle_schedule_change_submission(payload, async_success=async_success)
         if callback_id == "roster.work":
             return self._handle_roster_work_submission(payload, async_success=async_success)
+        if callback_id == "external.session.assign":
+            return self._handle_external_session_assign_submission(payload)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -927,6 +941,7 @@ class SlackTeamController:
             | RepoRootCommand
             | RosterCommand
             | ScheduledTasksCommand
+            | UnassignedExternalSessionsCommand
         ),
         target: SlackReplyTarget,
         *,
@@ -999,6 +1014,9 @@ class SlackTeamController:
             return
         if isinstance(command, ScheduledTasksCommand):
             self._post_scheduled_tasks(target)
+            return
+        if isinstance(command, UnassignedExternalSessionsCommand):
+            self._post_unassigned_external_sessions(target)
             return
         self.post_roster(
             target.channel_id,
@@ -2409,6 +2427,247 @@ class SlackTeamController:
             self._update_external_capacity_notice(channel_id, touched_provider)
         return assigned
 
+    def _post_unassigned_external_sessions(self, target: SlackReplyTarget) -> None:
+        items = self._unassigned_external_session_items(target.channel_id)
+        if not items:
+            text, blocks = self._unassigned_external_sessions_payload([])
+            self.gateway.post_message(
+                target.channel_id,
+                text,
+                blocks=blocks,
+                thread_ts=target.thread_ts,
+            )
+            return
+        for start in range(0, len(items), UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE):
+            page_items = items[start : start + UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE]
+            text, blocks = self._unassigned_external_sessions_payload(
+                page_items,
+                total_count=len(items),
+                page_start=start,
+            )
+            self.gateway.post_message(
+                target.channel_id,
+                text,
+                blocks=blocks,
+                thread_ts=target.thread_ts,
+            )
+
+    def _unassigned_external_sessions_payload(
+        self,
+        items: list[UnassignedExternalSessionListItem] | None = None,
+        *,
+        total_count: int | None = None,
+        page_start: int = 0,
+    ) -> tuple[str, list[dict]]:
+        if items is None:
+            items = self._unassigned_external_session_items(self._configured_agent_channel_id())
+        total = len(items) if total_count is None else total_count
+        text = f"Unassigned external sessions: {total}"
+        if total and (page_start or page_start + len(items) < total):
+            page_end = page_start + len(items)
+            text = f"{text} (showing {page_start + 1}-{page_end})"
+        blocks = build_unassigned_external_session_blocks(items, total_count=total)
+        if total and (page_start or page_start + len(items) < total):
+            blocks[0]["text"]["text"] = (
+                f"*Unassigned external sessions*  {total} waiting "
+                f"(showing {page_start + 1}-{page_start + len(items)})"
+            )
+        return text, blocks
+
+    def _unassigned_external_session_items(
+        self,
+        channel_id: str | None,
+    ) -> list[UnassignedExternalSessionListItem]:
+        items: list[UnassignedExternalSessionListItem] = []
+        for session in self.store.list_sessions():
+            if not self._external_session_can_be_assigned(session):
+                continue
+            thread_url = None
+            if channel_id:
+                thread = self._external_session_thread_for_channel(
+                    session.provider,
+                    session.session_id,
+                    channel_id,
+                )
+                if thread is not None:
+                    thread_url = self._thread_permalink(thread.channel_id, thread.thread_ts)
+            items.append(
+                UnassignedExternalSessionListItem(
+                    session=session,
+                    summary=self._external_session_summary(session),
+                    assignable_agents=tuple(self._external_session_assignable_agents(session)),
+                    thread_url=thread_url,
+                )
+            )
+        return items
+
+    def _external_session_can_be_assigned(self, session: AgentSession) -> bool:
+        if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            return False
+        if self.store.get_setting(_external_session_ignored_setting_key(session)):
+            return False
+        if self.store.has_agent_task_session(session.provider, session.session_id):
+            return False
+        if _is_codex_subagent_session(session):
+            return False
+        setting_key = _external_session_agent_setting_key(session)
+        assigned_agent_id = self.store.get_setting(setting_key)
+        if not assigned_agent_id:
+            return True
+        assigned_agent = self.store.get_team_agent(assigned_agent_id)
+        if assigned_agent is not None and assigned_agent.kind != TeamAgentKind.PM:
+            return False
+        self.store.delete_setting(setting_key)
+        return True
+
+    def _external_session_assignable_agents(self, session: AgentSession) -> list[TeamAgent]:
+        busy_agent_ids = self._busy_agent_ids_for_assignment()
+        return [
+            agent
+            for agent in self.store.idle_team_agents()
+            if agent.kind != TeamAgentKind.PM
+            and agent.provider_preference == session.provider
+            and agent.agent_id not in busy_agent_ids
+        ]
+
+    def _open_external_session_assign_modal(
+        self,
+        payload: dict,
+        channel_id: str,
+        message_ts: str | None,
+        trigger_id: str | None,
+    ) -> None:
+        if not trigger_id:
+            self._post_text(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=message_ts),
+                "Use `external sessions` again to assign a session from Slack.",
+            )
+            return
+        session, error = self._assignable_external_session_from_payload(payload)
+        if error is not None:
+            self._post_text(SlackReplyTarget(channel_id=channel_id, thread_ts=message_ts), error)
+            self._update_unassigned_external_sessions_message(channel_id, message_ts)
+            return
+        assert session is not None
+        agents = self._external_session_assignable_agents(session)
+        if not agents:
+            self._post_text(
+                SlackReplyTarget(channel_id=channel_id, thread_ts=message_ts),
+                f"No available {session.provider.value} engineer can take that session.",
+            )
+            self._update_unassigned_external_sessions_message(channel_id, message_ts)
+            return
+        self.gateway.open_view(
+            trigger_id,
+            _external_session_assign_modal(
+                session,
+                agents,
+                channel_id=channel_id,
+                message_ts=message_ts,
+                summary=self._external_session_summary(session),
+            ),
+        )
+
+    def _handle_external_session_assign_submission(self, payload: dict) -> dict | None:
+        view = payload.get("view") or {}
+        metadata = _decode_external_session_assign_metadata(view.get("private_metadata"))
+        values = view.get("state", {}).get("values", {})
+        agent_id = _view_selected_value(values, "external_session_agent", "value")
+        if not agent_id:
+            return _view_errors("external_session_agent", "Choose an agent.")
+        provider, session_id = _external_session_metadata_provider_session(metadata)
+        if provider is None or not session_id:
+            return _view_errors("external_session_agent", "That session is no longer available.")
+        channel_id = metadata.get("channel_id") or self._configured_agent_channel_id()
+        if not channel_id:
+            return _view_errors("external_session_agent", "No agent channel is configured.")
+        error = self._assign_external_session_to_agent(
+            provider,
+            session_id,
+            agent_id,
+            channel_id,
+            list_message_ts=metadata.get("message_ts"),
+        )
+        if error is not None:
+            return _view_errors("external_session_agent", error)
+        return None
+
+    def _assignable_external_session_from_payload(
+        self,
+        payload: dict,
+    ) -> tuple[AgentSession | None, str | None]:
+        provider_text = payload.get("provider")
+        session_id = payload.get("session_id")
+        try:
+            provider = Provider(str(provider_text))
+        except ValueError:
+            return None, "That session is no longer available."
+        if not isinstance(session_id, str) or not session_id:
+            return None, "That session is no longer available."
+        session = self.store.get_session(provider, session_id)
+        if session is None:
+            return None, "That session is no longer available."
+        if not self._external_session_can_be_assigned(session):
+            return None, "That session is already assigned or no longer active."
+        return session, None
+
+    def _assign_external_session_to_agent(
+        self,
+        provider: Provider,
+        session_id: str,
+        agent_id: str,
+        channel_id: str,
+        *,
+        list_message_ts: str | None = None,
+    ) -> str | None:
+        session = self.store.get_session(provider, session_id)
+        if session is None:
+            return "That session is no longer available."
+        if not self._external_session_can_be_assigned(session):
+            return "That session is already assigned or no longer active."
+        agent = self.store.get_team_agent(agent_id)
+        if agent is None:
+            return "That agent is no longer active."
+        if agent.kind == TeamAgentKind.PM:
+            return "PM agents cannot own outside-Slack sessions."
+        if agent.provider_preference != provider:
+            return f"@{agent.handle} does not match the {provider.value} session provider."
+        assignable_agent_ids = {
+            candidate.agent_id for candidate in self._external_session_assignable_agents(session)
+        }
+        if agent.agent_id not in assignable_agent_ids:
+            return f"@{agent.handle} is not available for that session."
+        self.store.set_setting(_external_session_agent_setting_key(session), agent.agent_id)
+        self.store.delete_setting(f"{PENDING_EXTERNAL_SESSION_PREFIX}{provider.value}.{session_id}")
+        thread = self._ensure_external_session_thread(channel_id, session, agent)
+        self.gateway.post_thread_reply(
+            thread,
+            f"Assigned this external session to @{agent.handle}.",
+        )
+        self._update_external_capacity_notice(channel_id, provider)
+        self._update_unassigned_external_sessions_message(channel_id, list_message_ts)
+        self.refresh_or_post_roster(channel_id)
+        return None
+
+    def _update_unassigned_external_sessions_message(
+        self,
+        channel_id: str,
+        message_ts: str | None,
+    ) -> None:
+        if not message_ts:
+            return
+        items = self._unassigned_external_session_items(channel_id)
+        text, blocks = self._unassigned_external_sessions_payload(
+            items[:UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE],
+            total_count=len(items),
+        )
+        self._try_update_message(channel_id, message_ts, text, blocks=blocks)
+
+    def _external_session_summary(self, session: AgentSession) -> str | None:
+        return self.store.get_setting(
+            f"{EXTERNAL_SESSION_SUMMARY_PREFIX}{session.provider.value}.{session.session_id}"
+        )
+
     def _ensure_external_session_thread(
         self,
         channel_id: str,
@@ -2494,8 +2753,9 @@ class SlackTeamController:
                     "Run commands by typing them directly in this channel, "
                     f"or as `{command} <command>`: "
                     f"`{command} status`, `{command} show roster`, "
-                    f"`{command} scheduled tasks`, `{command} hire 3 agents`, "
-                    "or just `status`, `show roster`, `scheduled tasks`, "
+                    f"`{command} external sessions`, `{command} scheduled tasks`, "
+                    f"`{command} hire 3 agents`, "
+                    "or just `status`, `show roster`, `external sessions`, `scheduled tasks`, "
                     "`hire 3 agents`."
                 ),
                 f"Codex outside Slack: `{codex_command}` creates a tracking thread here.",
@@ -10791,6 +11051,88 @@ def _slack_button(
     return button
 
 
+def _external_session_assign_modal(
+    session: AgentSession,
+    agents: list[TeamAgent],
+    *,
+    channel_id: str,
+    message_ts: str | None,
+    summary: str | None = None,
+) -> dict:
+    options = [
+        _modal_option(
+            f"@{agent.handle}",
+            agent.agent_id,
+            agent.full_name,
+        )
+        for agent in agents[:100]
+    ]
+    metadata = {
+        "provider": session.provider.value,
+        "session_id": session.session_id,
+        "channel_id": channel_id,
+        "message_ts": message_ts,
+    }
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _external_session_assign_modal_detail(session, summary),
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "external_session_agent",
+            "label": {"type": "plain_text", "text": "Agent"},
+            "element": {
+                "type": "static_select",
+                "action_id": "value",
+                "placeholder": {"type": "plain_text", "text": "Choose an agent"},
+                "options": options,
+            },
+        },
+    ]
+    if len(agents) > len(options):
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Showing the first {len(options)} available matching agents.",
+                    }
+                ],
+            }
+        )
+    return {
+        "type": "modal",
+        "callback_id": "external.session.assign",
+        "private_metadata": json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+        "title": {"type": "plain_text", "text": "Assign session"},
+        "submit": {"type": "plain_text", "text": "Assign"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": blocks,
+    }
+
+
+def _external_session_assign_modal_detail(
+    session: AgentSession,
+    summary: str | None,
+) -> str:
+    label = session.provider.value.title()
+    parts = [f"*{label} session* `{_shorten(session.session_id, 12)}`"]
+    if summary and summary.strip():
+        parts.append(f"*Task:* {_shorten(summary, 180)}")
+    elif session.cwd:
+        parts.append(f"*Workspace:* `{session.cwd.name or session.cwd}`")
+    if session.git_branch:
+        parts.append(f"*Branch:* `{session.git_branch}`")
+    if session.model:
+        parts.append(f"*Model:* `{session.model}`")
+    return "\n".join(parts)
+
+
 def _roster_work_modal(
     agent,
     *,
@@ -11179,6 +11521,32 @@ def _decode_schedule_change_metadata(value) -> dict[str, str]:
     if not isinstance(decoded, dict):
         return {}
     return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _decode_external_session_assign_metadata(value) -> dict[str, str]:
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _external_session_metadata_provider_session(
+    metadata: dict[str, str],
+) -> tuple[Provider | None, str | None]:
+    provider_text = metadata.get("provider")
+    session_id = metadata.get("session_id")
+    try:
+        provider = Provider(str(provider_text))
+    except ValueError:
+        provider = None
+    if not session_id:
+        return provider, None
+    return provider, session_id
 
 
 def _view_errors(block_id: str, message: str) -> dict:
