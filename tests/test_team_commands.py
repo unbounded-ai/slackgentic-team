@@ -9,6 +9,7 @@ from agent_harness.team.commands import (
     RepoRootCommand,
     RosterCommand,
     ScheduledTasksCommand,
+    UnassignedExternalSessionsCommand,
     parse_team_command,
 )
 
@@ -38,6 +39,16 @@ class TeamCommandTests(unittest.TestCase):
     def test_parse_scheduled_tasks(self):
         self.assertEqual(parse_team_command("scheduled tasks"), ScheduledTasksCommand())
         self.assertEqual(parse_team_command("show schedules"), ScheduledTasksCommand())
+
+    def test_parse_unassigned_external_sessions(self):
+        self.assertEqual(
+            parse_team_command("external sessions"),
+            UnassignedExternalSessionsCommand(),
+        )
+        self.assertEqual(
+            parse_team_command("list unassigned sessions"),
+            UnassignedExternalSessionsCommand(),
+        )
 
     def test_parse_repo_root(self):
         self.assertEqual(parse_team_command("show repo root"), RepoRootCommand())

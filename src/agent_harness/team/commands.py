@@ -35,6 +35,11 @@ class ScheduledTasksCommand:
 
 
 @dataclass(frozen=True)
+class UnassignedExternalSessionsCommand:
+    pass
+
+
+@dataclass(frozen=True)
 class RepoRootCommand:
     path: Path | None = None
 
@@ -45,6 +50,7 @@ TeamCommand = (
     | FireEveryoneCommand
     | RosterCommand
     | ScheduledTasksCommand
+    | UnassignedExternalSessionsCommand
     | RepoRootCommand
 )
 
@@ -56,6 +62,7 @@ def parse_team_command(text: str) -> TeamCommand | None:
     return (
         _parse_hire(cleaned)
         or _parse_fire(cleaned)
+        or _parse_unassigned_external_sessions(cleaned)
         or _parse_scheduled_tasks(cleaned)
         or _parse_roster(cleaned)
         or _parse_repo_root(cleaned)
@@ -108,6 +115,22 @@ def _parse_scheduled_tasks(text: str) -> ScheduledTasksCommand | None:
         flags=re.IGNORECASE,
     ):
         return ScheduledTasksCommand()
+    return None
+
+
+def _parse_unassigned_external_sessions(text: str) -> UnassignedExternalSessionsCommand | None:
+    if re.match(
+        r"^(?:(?:show|list)\s+)?(?:(?:unassigned|unclaimed)\s+)?external\s+sessions?\s*$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return UnassignedExternalSessionsCommand()
+    if re.match(
+        r"^(?:(?:show|list)\s+)?(?:unassigned|unclaimed)\s+sessions?\s*$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return UnassignedExternalSessionsCommand()
     return None
 
 

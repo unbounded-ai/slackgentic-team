@@ -89,6 +89,7 @@ from agent_harness.team.commands import (
     HireCommand,
     RosterCommand,
     ScheduledTasksCommand,
+    UnassignedExternalSessionsCommand,
 )
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 
@@ -4434,6 +4435,160 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(row["status"], "assigned")
                 self.assertEqual(len(runtime.started), 1)
                 self.assertEqual(runtime.started[0][1].agent_id, agent.agent_id)
+            finally:
+                store.close()
+
+    def test_unassigned_external_sessions_command_lists_only_unassigned_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(2, 0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="unassigned-session",
+                        transcript_path=Path(tmp) / "codex-unassigned.jsonl",
+                        cwd=Path("/workspace/repos/example-project"),
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="assigned-session",
+                        transcript_path=Path(tmp) / "codex-assigned.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting(
+                    "external_session_agent.codex.assigned-session", agents[0].agent_id
+                )
+                store.set_setting(
+                    "external_session_summary.codex.unassigned-session",
+                    "repair the release notes",
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    UnassignedExternalSessionsCommand(),
+                    SlackReplyTarget(channel_id="C1"),
+                )
+
+                post = gateway.posts[-1]
+                self.assertEqual(post["text"], "Unassigned external sessions: 1")
+                rendered = str(post["blocks"])
+                self.assertIn("repair the release notes", rendered)
+                self.assertIn("Assign", rendered)
+                self.assertNotIn('"session_id":"assigned-session"', rendered)
+            finally:
+                store.close()
+
+    def test_unassigned_external_session_can_be_assigned_from_slack_modal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(2, 0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="assignable-session",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path("/workspace/repos/example-project"),
+                    status=SessionStatus.ACTIVE,
+                    git_branch="main",
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_pending.codex.assignable-session", "now")
+                store.set_setting(
+                    "external_session_summary.codex.assignable-session",
+                    "stabilize the installer",
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_slash_command(
+                    {
+                        "text": "external sessions",
+                        "channel_id": "C1",
+                        "user_id": "U1",
+                        "user_name": "slack-user",
+                    }
+                )
+                list_post = gateway.posts[-1]
+                assign_section = next(
+                    block for block in list_post["blocks"] if block.get("accessory")
+                )
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "trigger_id": "TRIGGER1",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": list_post["ts"]},
+                        "actions": [
+                            {
+                                "value": assign_section["accessory"]["value"],
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(len(gateway.views), 1)
+                _trigger_id, modal = gateway.views[0]
+                self.assertEqual(modal["callback_id"], "external.session.assign")
+                selected_agent = agents[0]
+
+                result = controller.handle_view_submission(
+                    {
+                        "user": {"id": "U1"},
+                        "view": {
+                            "callback_id": "external.session.assign",
+                            "private_metadata": modal["private_metadata"],
+                            "state": {
+                                "values": {
+                                    "external_session_agent": {
+                                        "value": {
+                                            "selected_option": {"value": selected_agent.agent_id}
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                    }
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.assignable-session"),
+                    selected_agent.agent_id,
+                )
+                self.assertIsNone(
+                    store.get_setting("external_session_pending.codex.assignable-session")
+                )
+                self.assertIsNotNone(
+                    store.get_slack_thread_for_session(
+                        Provider.CODEX,
+                        "assignable-session",
+                        "local",
+                        "C1",
+                    )
+                )
+                self.assertIn("Started observing Codex session", gateway.posts[-2]["text"])
+                self.assertIn(
+                    f"Assigned this external session to @{selected_agent.handle}.",
+                    gateway.thread_replies[-1]["text"],
+                )
+                self.assertTrue(gateway.updates)
+                self.assertEqual(gateway.updates[-1]["text"], "Unassigned external sessions: 0")
+                self.assertIn(
+                    "No active outside-Slack sessions", str(gateway.updates[-1]["blocks"])
+                )
             finally:
                 store.close()
 
