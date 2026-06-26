@@ -949,6 +949,101 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_capacity_notice_prompts_assign_when_agent_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting("external_session_pending.claude.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.claude", "171.capacity")
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_external_session_occupancy_change("C1")
+
+                capacity_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.capacity"
+                ]
+                self.assertEqual(len(capacity_updates), 1)
+                self.assertEqual(capacity_updates[0]["text"], "Unassigned external sessions: 1")
+                rendered = str(capacity_updates[0]["blocks"])
+                self.assertIn("Assign", rendered)
+                self.assertNotIn("Hire 1 Claude agent", rendered)
+                self.assertEqual(
+                    store.get_setting("external_session_capacity_notice_ts.claude"),
+                    "171.capacity",
+                )
+            finally:
+                store.close()
+
+    def test_external_capacity_hire_button_assigns_available_agent_before_hiring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(0, 1)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                store.set_setting("external_session_pending.claude.s1", "now")
+                store.set_setting("external_session_capacity_notice_ts.claude", "171.capacity")
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.capacity"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire", count=1, provider=Provider.CLAUDE.value
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 1)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agent.agent_id,
+                )
+                self.assertIsNone(store.get_setting("external_session_pending.claude.s1"))
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.claude"))
+                self.assertIsNotNone(
+                    store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "local", "C1")
+                )
+                capacity_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.capacity"
+                ]
+                self.assertEqual(len(capacity_updates), 1)
+                self.assertIn(
+                    "capacity for sessions started outside Slack is available now",
+                    capacity_updates[0]["text"],
+                )
+            finally:
+                store.close()
+
     def test_update_button_starts_upgrade(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

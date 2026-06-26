@@ -2377,20 +2377,34 @@ class SlackTeamController:
             return False
         return self.store.get_setting(self._capacity_notice_ts_key(provider)) == message_ts
 
-    def _assign_hired_agents_to_pending_external_sessions(
+    def _pending_external_session_count(self, provider: Provider) -> int:
+        return len(self.store.list_settings(f"{PENDING_EXTERNAL_SESSION_PREFIX}{provider.value}."))
+
+    def _assign_available_agents_to_pending_external_sessions(
         self,
         channel_id: str,
-        hired: list,
+        provider: Provider | None = None,
+    ) -> int:
+        return self._assign_agents_to_pending_external_sessions(
+            channel_id,
+            self.store.idle_team_agents(),
+            provider,
+        )
+
+    def _assign_agents_to_pending_external_sessions(
+        self,
+        channel_id: str,
+        agents: list,
         provider: Provider | None = None,
     ) -> int:
         available_by_provider: dict[Provider, list] = {}
-        external_busy_ids = self._external_busy_agent_ids()
-        for agent in hired:
-            if agent.is_pm or agent.provider_preference is None:
+        busy_agent_ids = self._busy_agent_ids_for_assignment()
+        for agent in agents:
+            if agent.kind == TeamAgentKind.PM or agent.provider_preference is None:
                 continue
             if provider is not None and agent.provider_preference != provider:
                 continue
-            if agent.agent_id in external_busy_ids:
+            if agent.agent_id in busy_agent_ids:
                 continue
             if self.store.active_task_for_agent(agent.agent_id) is not None:
                 continue
@@ -2398,7 +2412,7 @@ class SlackTeamController:
         if not available_by_provider:
             return 0
 
-        touched_providers: set[Provider] = set()
+        changed_providers: set[Provider] = set()
         assigned = 0
         for key in sorted(self.store.list_settings(PENDING_EXTERNAL_SESSION_PREFIX)):
             parsed = _parse_external_session_setting_key(key, PENDING_EXTERNAL_SESSION_PREFIX)
@@ -2408,23 +2422,20 @@ class SlackTeamController:
             candidates = available_by_provider.get(session_provider)
             if not candidates:
                 continue
-            touched_providers.add(session_provider)
             session = self.store.get_session(session_provider, session_id)
-            if session is None or session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            if session is None or not self._external_session_can_be_assigned(session):
                 self.store.delete_setting(key)
-                continue
-            assigned_key = f"{EXTERNAL_SESSION_AGENT_PREFIX}{session_provider.value}.{session_id}"
-            if self.store.get_setting(assigned_key):
-                self.store.delete_setting(key)
+                changed_providers.add(session_provider)
                 continue
             agent = candidates.pop(0)
-            self.store.set_setting(assigned_key, agent.agent_id)
+            self.store.set_setting(_external_session_agent_setting_key(session), agent.agent_id)
             self.store.delete_setting(key)
             self._ensure_external_session_thread(channel_id, session, agent)
+            changed_providers.add(session_provider)
             assigned += 1
 
-        for touched_provider in touched_providers:
-            self._update_external_capacity_notice(channel_id, touched_provider)
+        for changed_provider in changed_providers:
+            self._update_external_capacity_notice(channel_id, changed_provider)
         return assigned
 
     def _post_unassigned_external_sessions(self, target: SlackReplyTarget) -> None:
@@ -2713,10 +2724,20 @@ class SlackTeamController:
         existing_ts = self.store.get_setting(setting_key)
         if not existing_ts:
             return
-        pending_count = len(
-            self.store.list_settings(f"{PENDING_EXTERNAL_SESSION_PREFIX}{provider.value}.")
-        )
+        items = [
+            item
+            for item in self._unassigned_external_session_items(channel_id)
+            if item.session.provider == provider
+        ]
+        pending_count = len(items)
         if pending_count > 0:
+            if any(item.assignable_agents for item in items):
+                text, blocks = self._unassigned_external_sessions_payload(
+                    items[:UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE],
+                    total_count=pending_count,
+                )
+                self.gateway.update_message(channel_id, existing_ts, text, blocks=blocks)
+                return
             label = provider.value.title()
             plural = "session is" if pending_count == 1 else "sessions are"
             text = (
@@ -2738,6 +2759,10 @@ class SlackTeamController:
             f"{label} capacity for sessions started outside Slack is available now.",
         )
         self.store.delete_setting(setting_key)
+
+    def _refresh_external_capacity_notices(self, channel_id: str) -> None:
+        for provider in Provider:
+            self._update_external_capacity_notice(channel_id, provider)
 
     def post_channel_overview(self, channel_id: str) -> str:
         codex_command = f"codex --remote {self.codex_app_server_url}"
@@ -2973,6 +2998,7 @@ class SlackTeamController:
                 exc_info=True,
             )
         self._resume_pending_work_requests(channel_id)
+        self._refresh_external_capacity_notices(channel_id)
         self.refresh_or_post_roster(channel_id)
 
     def resume_pending_work_requests(self, channel_id: str) -> int:
@@ -3225,6 +3251,15 @@ class SlackTeamController:
         provider = Provider(provider_text) if provider_text else None
         kind_text = payload.get("kind")
         kind = TeamAgentKind(kind_text) if kind_text else TeamAgentKind.ENGINEER
+        external_capacity_hire = self._external_capacity_hire_clicked(provider, roster_ts)
+        if external_capacity_hire and kind == TeamAgentKind.ENGINEER:
+            self._assign_available_agents_to_pending_external_sessions(channel_id, provider)
+            if provider is not None and self._pending_external_session_count(provider) == 0:
+                self._update_external_capacity_notice(channel_id, provider)
+                self._resume_pending_work_requests(channel_id)
+                roster_update_ts = self.store.get_setting(SETTING_ROSTER_TS) or roster_ts
+                self.refresh_roster_message_or_post(channel_id, roster_update_ts, pin=True)
+                return
         if not self._can_hire(count):
             thread_ts = roster_ts or self.store.get_setting(SETTING_ROSTER_TS)
             self._post_text(
@@ -3233,9 +3268,8 @@ class SlackTeamController:
             )
             return
         hired = self.hire_agents(count, provider, kind=kind)
-        external_capacity_hire = self._external_capacity_hire_clicked(provider, roster_ts)
         if external_capacity_hire:
-            self._assign_hired_agents_to_pending_external_sessions(
+            self._assign_agents_to_pending_external_sessions(
                 channel_id,
                 hired,
                 provider,
@@ -3256,7 +3290,7 @@ class SlackTeamController:
                 LOGGER.debug("failed to post hired agent introduction", exc_info=True)
         self._resume_pending_work_requests(channel_id)
         if not external_capacity_hire:
-            self._assign_hired_agents_to_pending_external_sessions(channel_id, hired, provider)
+            self._assign_agents_to_pending_external_sessions(channel_id, hired, provider)
         roster_update_ts = (
             self.store.get_setting(SETTING_ROSTER_TS)
             if external_capacity_hire
@@ -5399,6 +5433,7 @@ class SlackTeamController:
         else:
             task = self._hold_completed_runtime_task_open(task, thread)
         self._refresh_pm_status_for_task(task)
+        self._refresh_external_capacity_notices(thread.channel_id)
         self.refresh_or_post_roster(thread.channel_id)
         delegate_to_agent_id = task.metadata.get("delegate_to_agent_id")
         delegate_prompt = task.metadata.get("delegate_prompt")
