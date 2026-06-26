@@ -5970,7 +5970,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertEqual(store.get_setting(SETTING_SLACK_BACKFILL_LAST_AWAKE), "172.000000")
                 self.assertEqual(
                     store.get_setting(SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN),
-                    "171.000000",
+                    "201.000000",
                 )
                 self.assertEqual(
                     store.get_setting(
