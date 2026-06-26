@@ -1044,6 +1044,77 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_capacity_hire_keeps_live_tracked_session_on_current_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="tracked-session",
+                        transcript_path=Path(tmp) / "tracked.jsonl",
+                        status=SessionStatus.DONE,
+                    )
+                )
+                store.set_setting(
+                    "external_session_agent.codex.tracked-session",
+                    agent.agent_id,
+                )
+                store.set_setting("external_session_live_target.codex.tracked-session", "123")
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="pending-session",
+                        transcript_path=Path(tmp) / "pending.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                store.set_setting("external_session_pending.codex.pending-session", "now")
+                store.set_setting("external_session_capacity_notice_ts.codex", "171.capacity")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.capacity"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire", count=1, provider=Provider.CODEX.value
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 2)
+                hired_agent = next(item for item in agents if item.agent_id != agent.agent_id)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.tracked-session"),
+                    agent.agent_id,
+                )
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.pending-session"),
+                    hired_agent.agent_id,
+                )
+                self.assertIsNone(
+                    store.get_setting("external_session_pending.codex.pending-session")
+                )
+                roster_updates = [
+                    update for update in gateway.updates if update["ts"] == "171.roster"
+                ]
+                self.assertEqual(len(roster_updates), 1)
+                self.assertIn("0 available, 2 occupied", roster_updates[0]["text"])
+            finally:
+                store.close()
+
     def test_update_button_starts_upgrade(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

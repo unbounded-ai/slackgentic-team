@@ -2282,10 +2282,12 @@ class SlackTeamController:
                         utc_now().isoformat(),
                     )
                 continue
-            if session is None or session.status not in {
+            if session is None:
+                continue
+            if session.status not in {
                 SessionStatus.ACTIVE,
                 SessionStatus.IDLE,
-            }:
+            } and not self._external_session_has_live_target(session):
                 continue
             existing = sessions_by_agent.get(agent_id)
             if existing is None or (
@@ -2293,6 +2295,16 @@ class SlackTeamController:
             ):
                 sessions_by_agent[agent_id] = session
         return sessions_by_agent
+
+    def _external_session_has_live_target(self, session: AgentSession) -> bool:
+        if self.store.get_setting(_external_session_ignored_setting_key(session)):
+            return False
+        return bool(
+            self.store.get_setting(
+                f"{EXTERNAL_SESSION_LIVE_TARGET_PREFIX}"
+                f"{session.provider.value}.{session.session_id}"
+            )
+        )
 
     def _session_for_external_agent_setting(self, key: str):
         parsed = _parse_external_session_setting_key(key, EXTERNAL_SESSION_AGENT_PREFIX)

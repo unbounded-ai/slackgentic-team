@@ -605,8 +605,6 @@ class SessionMirror:
         if not was_tracked:
             return False
         missing_target_key = _external_session_missing_target_key(session)
-        if self.store.get_setting(missing_target_key):
-            return True
         self.store.set_setting(missing_target_key, utc_now().isoformat())
         return False
 

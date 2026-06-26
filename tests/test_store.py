@@ -338,6 +338,46 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_live_target_external_session_blocks_dependency_even_if_status_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "codex.jsonl",
+                        status=SessionStatus.DONE,
+                    )
+                )
+                store.set_setting("external_session_agent.codex.s1", agent.agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                dependency = WorkDependency(
+                    kind=WorkDependencyKind.AGENT_BUSY,
+                    task_id=external_session_dependency_id(Provider.CODEX, "s1"),
+                )
+                deferred = store.create_deferred_work_request(
+                    SlackThreadRef("C1", "171.deferred", "171.deferred"),
+                    WorkRequest(prompt="continue", assignment_mode=AssignmentMode.ANYONE),
+                    depends_on=(dependency,),
+                )
+
+                satisfied, missing = store.evaluate_deferred_dependencies(deferred)
+
+                self.assertFalse(satisfied)
+                self.assertEqual(missing, [dependency])
+
+                store.delete_setting("external_session_live_target.codex.s1")
+                satisfied, missing = store.evaluate_deferred_dependencies(deferred)
+
+                self.assertTrue(satisfied)
+                self.assertEqual(missing, [])
+            finally:
+                store.close()
+
     def test_managed_thread_task_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.sqlite"
