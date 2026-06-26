@@ -2479,8 +2479,17 @@ class SlackTeamController:
         channel_id: str | None,
     ) -> list[UnassignedExternalSessionListItem]:
         items: list[UnassignedExternalSessionListItem] = []
-        for session in self.store.list_sessions():
+        for key in sorted(self.store.list_settings(PENDING_EXTERNAL_SESSION_PREFIX)):
+            parsed = _parse_external_session_setting_key(key, PENDING_EXTERNAL_SESSION_PREFIX)
+            if parsed is None:
+                continue
+            provider, session_id = parsed
+            session = self.store.get_session(provider, session_id)
+            if session is None:
+                self.store.delete_setting(key)
+                continue
             if not self._external_session_can_be_assigned(session):
+                self.store.delete_setting(key)
                 continue
             thread_url = None
             if channel_id:
