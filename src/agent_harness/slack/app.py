@@ -8934,7 +8934,7 @@ class SlackMessageBackfill:
             recovered = result.recovered
             if result.channel_history_ok:
                 self._record_last_awake(now)
-            if include_threads and result.channel_history_ok and result.thread_history_ok:
+            if include_threads and result.thread_history_ok:
                 self._record_last_thread_scan(now)
             return recovered
         self._record_last_awake(now)
