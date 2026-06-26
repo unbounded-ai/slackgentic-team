@@ -4456,6 +4456,7 @@ class SlackAppTests(unittest.TestCase):
                         status=SessionStatus.ACTIVE,
                     )
                 )
+                store.set_setting("external_session_pending.codex.unassigned-session", "now")
                 store.upsert_session(
                     AgentSession(
                         provider=Provider.CODEX,
@@ -4466,6 +4467,15 @@ class SlackAppTests(unittest.TestCase):
                 )
                 store.set_setting(
                     "external_session_agent.codex.assigned-session", agents[0].agent_id
+                )
+                store.set_setting("external_session_pending.codex.assigned-session", "now")
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CODEX,
+                        session_id="stored-idle-session",
+                        transcript_path=Path(tmp) / "codex-stored-idle.jsonl",
+                        status=SessionStatus.IDLE,
+                    )
                 )
                 store.set_setting(
                     "external_session_summary.codex.unassigned-session",
@@ -4484,6 +4494,10 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("repair the release notes", rendered)
                 self.assertIn("Assign", rendered)
                 self.assertNotIn('"session_id":"assigned-session"', rendered)
+                self.assertNotIn('"session_id":"stored-idle-session"', rendered)
+                self.assertIsNone(
+                    store.get_setting("external_session_pending.codex.assigned-session")
+                )
             finally:
                 store.close()
 
