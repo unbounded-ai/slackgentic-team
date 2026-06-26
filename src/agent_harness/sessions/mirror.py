@@ -23,6 +23,7 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgent,
     TeamAgentKind,
+    parse_timestamp,
     utc_now,
 )
 from agent_harness.providers.base import AgentProvider
@@ -174,7 +175,11 @@ class SessionMirror:
         active_session_keys: set[str] = set()
         for provider in self.providers:
             for session in provider.discover():
-                if self.store.get_setting(_ignored_external_session_key(session)):
+                revived_ignored_session = self._revive_ignored_session_if_new_activity(
+                    session,
+                    channel_id,
+                )
+                if revived_ignored_session is False:
                     self._record_ignored_session(session, channel_id)
                     continue
                 if self._skip_disallowed_cwd_session(session, channel_id):
@@ -194,6 +199,10 @@ class SessionMirror:
                 if self._skip_managed_task_session(session, channel_id):
                     continue
                 if not self._should_keep_external_session(session, channel_id):
+                    if revived_ignored_session:
+                        active_session_keys.add(
+                            _external_session_key(session.provider, session.session_id)
+                        )
                     continue
                 active_session_keys.add(_external_session_key(session.provider, session.session_id))
                 if not self._should_sync_session(session, channel_id):
@@ -756,6 +765,22 @@ class SessionMirror:
             or self._thread_for_session(session, channel_id) is not None
         )
 
+    def _revive_ignored_session_if_new_activity(
+        self,
+        session: AgentSession,
+        channel_id: str,
+    ) -> bool | None:
+        setting_key = _ignored_external_session_key(session)
+        ignored_at_text = self.store.get_setting(setting_key)
+        if not ignored_at_text:
+            return None
+        if not _ignored_external_session_has_new_activity(session, ignored_at_text):
+            return False
+        self.store.delete_setting(setting_key)
+        self._mark_session_pending(session)
+        self._notify_external_session_occupancy_changed(channel_id)
+        return True
+
     def _assigned_external_session_agent(self, session: AgentSession) -> TeamAgent | None:
         assigned_agent_id = self.store.get_setting(_external_session_agent_setting_key(session))
         if not assigned_agent_id:
@@ -1038,6 +1063,20 @@ def _provider_session_from_external_key(value: str) -> tuple[Provider, str] | No
     except ValueError:
         return None
     return provider, session_id
+
+
+def _ignored_external_session_has_new_activity(
+    session: AgentSession,
+    ignored_at_text: str,
+) -> bool:
+    if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+        return False
+    if session.last_seen_at is None:
+        return False
+    ignored_at = parse_timestamp(ignored_at_text)
+    if ignored_at is None:
+        return False
+    return session.last_seen_at > ignored_at
 
 
 def _pending_external_session_key(session: AgentSession) -> str:
