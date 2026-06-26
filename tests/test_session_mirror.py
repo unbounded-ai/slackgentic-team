@@ -493,6 +493,82 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_ignored_external_session_with_new_activity_is_pending_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                ignored_at = datetime(2026, 6, 24, 19, 47, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path("/workspace/repos/example-project"),
+                    status=SessionStatus.IDLE,
+                    started_at=ignored_at - timedelta(minutes=30),
+                    last_seen_at=ignored_at + timedelta(hours=5),
+                )
+                store.set_setting(
+                    "external_session_ignored.claude.s1",
+                    ignored_at.isoformat(),
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                revived = store.get_session(Provider.CLAUDE, "s1")
+                self.assertIsNotNone(revived)
+                assert revived is not None
+                self.assertEqual(revived.status, SessionStatus.IDLE)
+                self.assertIsNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_pending.claude.s1"))
+            finally:
+                store.close()
+
+    def test_ignored_external_session_without_new_activity_stays_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                ignored_at = datetime(2026, 6, 24, 19, 47, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path("/workspace/repos/example-project"),
+                    status=SessionStatus.IDLE,
+                    started_at=ignored_at - timedelta(minutes=30),
+                    last_seen_at=ignored_at,
+                )
+                store.set_setting(
+                    "external_session_ignored.claude.s1",
+                    ignored_at.isoformat(),
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                ignored = store.get_session(Provider.CLAUDE, "s1")
+                self.assertIsNotNone(ignored)
+                assert ignored is not None
+                self.assertEqual(ignored.status, SessionStatus.DONE)
+                self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertIsNone(store.get_setting("external_session_pending.claude.s1"))
+            finally:
+                store.close()
+
     def test_external_session_matching_ignored_cwd_subpath_is_not_mirrored(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
