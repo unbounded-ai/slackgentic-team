@@ -56,6 +56,23 @@ class FakeGateway:
         self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
 
 
+class FakeRequestHandler:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def handle_persistent_request(self, method, params, thread, *, provider_label=None):
+        self.calls.append(
+            {
+                "method": method,
+                "params": params,
+                "thread": thread,
+                "provider_label": provider_label,
+            }
+        )
+        return self.response
+
+
 class ClaudeChannelTests(unittest.TestCase):
     def test_initialize_advertises_claude_channel_capability(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,6 +156,45 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertIn("GitHub pull request", tools["create_pull_request"]["description"])
                 self.assertIn("multiple options", tools["request_user_input"]["description"])
                 self.assertIn("one concrete action", tools["request_approval"]["description"])
+            finally:
+                store.close()
+
+    def test_request_user_input_tool_result_includes_option_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                handler = FakeRequestHandler(
+                    {"answers": {"answer": {"answers": ["Everything runnable"]}}}
+                )
+                server = ClaudeChannelServer(
+                    store,
+                    target_pid=123,
+                    request_handler=handler,
+                )
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                result = server._handle_request_user_input_tool(
+                    {
+                        "question": "How much should run?",
+                        "options": [
+                            {
+                                "label": "Cheap set",
+                                "description": "quick check",
+                            },
+                            {"label": "Everything runnable"},
+                        ],
+                    }
+                )
+
+                self.assertNotIn("isError", result)
+                self.assertEqual(result["content"][0]["text"], "Everything runnable")
+                self.assertIn("Question: How much should run?", result["content"][1]["text"])
+                self.assertIn(
+                    "Options: Cheap set (quick check); Everything runnable",
+                    result["content"][1]["text"],
+                )
+                self.assertEqual(handler.calls[0]["method"], "item/tool/requestUserInput")
             finally:
                 store.close()
 
@@ -1536,6 +1592,15 @@ class ClaudeChannelTests(unittest.TestCase):
                     },
                 )
                 self.assertIn("Everything runnable", hook_result["systemMessage"])
+                self.assertIn("How much should run?", hook_result["systemMessage"])
+                self.assertIn(
+                    "Options: Cheap set; Everything runnable",
+                    hook_result["systemMessage"],
+                )
+                self.assertIn(
+                    "Options: No; Yes",
+                    hook_result["systemMessage"],
+                )
                 self.assertIsNotNone(
                     store.get_setting("claude_native_input_request.claude.s1.toolu_question")
                 )
