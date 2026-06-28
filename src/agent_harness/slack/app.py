@@ -9164,7 +9164,12 @@ class SlackMessageBackfill:
         if session is not None and self._tracked_external_session(session):
             last_seen = session.last_seen_at or session.started_at or utc_now()
             return (0, -last_seen.timestamp())
-        return (1, -_slack_ts_sort_key(thread_ts))
+        if session is not None:
+            last_seen = session.last_seen_at or session.started_at
+            if last_seen is not None:
+                return (1, -last_seen.timestamp())
+            return (1, -_slack_ts_sort_key(thread_ts))
+        return (2, -_slack_ts_sort_key(thread_ts))
 
     def _tracked_external_session(self, session: AgentSession) -> bool:
         suffix = f"{session.provider.value}.{session.session_id}"
@@ -9181,6 +9186,26 @@ class SlackMessageBackfill:
     def _known_thread_ts(self, channel_id: str) -> set[str]:
         thread_ts_values: set[str] = set()
         try:
+            session_threads = self.store.list_slack_session_threads(self.team_id, channel_id)
+        except sqlite3.Error:
+            session_threads = []
+        session_threads.sort(
+            key=lambda item: (
+                not self._tracked_external_session(item[0]),
+                item[0].status != SessionStatus.ACTIVE,
+                -((item[0].last_seen_at or item[0].started_at or utc_now()).timestamp()),
+                -_slack_ts_sort_key(item[1].thread_ts),
+            )
+        )
+        for _session, thread in session_threads[:SLACK_BACKFILL_KNOWN_THREAD_LIMIT]:
+            if thread.thread_ts:
+                thread_ts_values.add(thread.thread_ts)
+
+        remaining = max(0, SLACK_BACKFILL_KNOWN_THREAD_LIMIT - len(thread_ts_values))
+        if remaining == 0:
+            return thread_ts_values
+
+        try:
             tasks = [
                 task
                 for task in self.store.list_agent_tasks(include_done=True)
@@ -9194,10 +9219,12 @@ class SlackMessageBackfill:
                 -(task.updated_at.timestamp()),
             )
         )
-        for task in tasks[:SLACK_BACKFILL_KNOWN_THREAD_LIMIT]:
+        for task in tasks[:remaining]:
             if task.thread_ts:
                 thread_ts_values.add(task.thread_ts)
         remaining = max(0, SLACK_BACKFILL_KNOWN_THREAD_LIMIT - len(thread_ts_values))
+        if remaining == 0:
+            return thread_ts_values
         try:
             sessions = sorted(
                 self.store.list_sessions(),

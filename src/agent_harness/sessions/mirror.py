@@ -687,7 +687,7 @@ class SessionMirror:
                 session_key = key.removeprefix(prefix)
                 if session_key in active_session_keys:
                     continue
-                if self._inactive_external_session_still_live(session_key):
+                if self._inactive_external_session_still_tracked(session_key, channel_id):
                     retained_session_keys.add(session_key)
                     continue
                 parsed = _provider_session_from_external_key(session_key)
@@ -713,6 +713,26 @@ class SessionMirror:
         for provider in providers_to_refresh:
             self._update_capacity_notice_if_clear(channel_id, provider)
         return retained_session_keys
+
+    def _inactive_external_session_still_tracked(
+        self,
+        session_key: str,
+        channel_id: str,
+    ) -> bool:
+        if self._inactive_external_session_still_live(session_key):
+            return True
+        parsed = _provider_session_from_external_key(session_key)
+        if parsed is None:
+            return False
+        provider, session_id = parsed
+        session = self.store.get_session(provider, session_id)
+        if session is None or session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            return False
+        if self.store.get_setting(_ignored_external_session_key(session)):
+            return False
+        if not session.transcript_path.exists():
+            return False
+        return self._thread_for_session(session, channel_id) is not None
 
     def _inactive_external_session_still_live(self, session_key: str) -> bool:
         parsed = _provider_session_from_external_key(session_key)

@@ -3776,6 +3776,54 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_missing_discovery_keeps_resumable_thread_session_assigned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=0, claude_count=1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                transcript = Path(tmp) / "claude.jsonl"
+                transcript.write_text("{}\n")
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=transcript,
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    metadata={"entrypoint": "sdk-cli"},
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.claude.s1", agents[0].agent_id)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, [])
+            finally:
+                store.close()
+
     def test_older_claude_session_does_not_reclaim_newer_live_target_same_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

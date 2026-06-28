@@ -68,6 +68,7 @@ from agent_harness.slack.app import (
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
     SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN,
+    SLACK_BACKFILL_KNOWN_THREAD_LIMIT,
     ClaudePermissionAutoResolver,
     DeferredWorkRunner,
     ScheduledTimerRunner,
@@ -6399,6 +6400,77 @@ class SlackAppTests(unittest.TestCase):
                     store.get_setting(
                         "slack.backfill.thread_scan_unix.C1.171.000050",
                     )
+                )
+            finally:
+                store.close()
+
+    def test_slack_message_backfill_includes_untracked_external_session_threads(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                for index in range(SLACK_BACKFILL_KNOWN_THREAD_LIMIT):
+                    task = replace(
+                        create_agent_task(agent, f"done task {index}", "C1"),
+                        status=AgentTaskStatus.DONE,
+                        thread_ts=f"171.{index + 100000:06d}",
+                        parent_message_ts=f"171.{index + 100000:06d}",
+                    )
+                    store.upsert_agent_task(task)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    control_mode=ControlMode.OBSERVED,
+                    last_seen_at=utc_now(),
+                )
+                thread = SlackThreadRef("C1", "171.000050", "171.000050")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                gateway.thread_history_messages[("C1", thread.thread_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U1",
+                        "text": "please catch this",
+                        "ts": "171.000060",
+                        "thread_ts": thread.thread_ts,
+                    }
+                ]
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+                backfill = SlackMessageBackfill(
+                    store,
+                    gateway,
+                    controller,
+                    team_id="T1",
+                    sleep_gap_seconds=5.0,
+                    grace_seconds=0.0,
+                    now=lambda: 181.0,
+                )
+
+                recovered = backfill.recover_since("171.000000")
+
+                self.assertEqual(recovered, 1)
+                self.assertEqual(len(bridge.sent), 1)
+                self.assertEqual(bridge.sent[0][0].session_id, "s1")
+                self.assertEqual(bridge.sent[0][1], "please catch this")
+                self.assertIn(
+                    ("C1", thread.thread_ts, "171.000000", 500),
+                    gateway.thread_message_calls,
                 )
             finally:
                 store.close()
