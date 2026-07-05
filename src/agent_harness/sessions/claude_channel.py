@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from agent_harness.config import load_config_from_env
+from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.models import PermissionMode, Provider, SlackThreadRef
 from agent_harness.permissions import (
     claude_channel_permission_mode_from_env,
@@ -26,6 +27,7 @@ from agent_harness.sessions.native_input import (
     claude_native_input_setting_key,
     slack_request_params_for_claude_ask_user_question,
 )
+from agent_harness.slack import parse_thread_ref, replace_slack_user_ids
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.storage.store import Store
 
@@ -34,6 +36,7 @@ CHANNEL_VERSION = "0.1.0"
 SLACK_THREAD_CHANNEL_ENV = "SLACKGENTIC_CLAUDE_CHANNEL_ID"
 SLACK_THREAD_TS_ENV = "SLACKGENTIC_CLAUDE_THREAD_TS"
 DANGEROUS_MODE_ENV = "SLACKGENTIC_CLAUDE_DANGEROUS_MODE"
+SLACK_CHANNEL_SETTING = "slack.channel_id"
 CHANNEL_INSTRUCTIONS = (
     "Slackgentic forwards Slack thread replies into this Claude Code session as "
     '<channel source="slackgentic" ...> events. Treat only the body of each event '
@@ -52,16 +55,22 @@ CHANNEL_INSTRUCTIONS = (
     "first because Claude may expose only a truncated native tool input preview. "
     "When opening a GitHub pull request, prefer the Slackgentic `create_pull_request` "
     "MCP tool; it runs the narrow `gh pr create` workflow through the channel so "
-    "PR creation still works when Claude Bash is sandboxed."
+    "PR creation still works when Claude Bash is sandboxed. When you need the "
+    "contents of another Slackgentic thread from a Slack link, use the "
+    "`read_thread` MCP tool; it only reads links from the configured Slackgentic "
+    "channel."
 )
 CODEX_MCP_INSTRUCTIONS = (
     "Slackgentic provides MCP tools for Slack-mediated workflows. When opening a "
     "GitHub pull request, prefer the `create_pull_request` tool; it runs the narrow "
     "`gh pr create` workflow through Slackgentic so PR creation still works when "
-    "ordinary shell networking or sandbox policy gets in the way."
+    "ordinary shell networking or sandbox policy gets in the way. When you need the "
+    "contents of another Slackgentic thread from a Slack link, use `read_thread`; it "
+    "only reads links from the configured Slackgentic channel."
 )
 SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__create_pull_request",
+    f"mcp__{CHANNEL_NAME}__read_thread",
     f"mcp__{CHANNEL_NAME}__request_approval",
     f"mcp__{CHANNEL_NAME}__request_user_input",
 }
@@ -84,6 +93,8 @@ class ClaudeChannelServer:
         target_pid: int | None = None,
         poll_seconds: float = 0.2,
         request_handler: SlackAgentRequestHandler | None = None,
+        gateway: Any | None = None,
+        slack_channel_id: str | None = None,
         command_runner: CommandRunner | None = None,
         instructions: str = CHANNEL_INSTRUCTIONS,
     ):
@@ -91,6 +102,8 @@ class ClaudeChannelServer:
         self.target_pid = target_pid or os.getppid()
         self.poll_seconds = poll_seconds
         self.request_handler = request_handler
+        self.gateway = gateway or getattr(request_handler, "gateway", None)
+        self.slack_channel_id = _configured_slack_channel_id(store, slack_channel_id)
         self.command_runner = command_runner or subprocess.run
         self.instructions = instructions
         self._current_thread = _thread_from_env()
@@ -218,7 +231,62 @@ class ClaudeChannelServer:
             return self._handle_request_approval_tool(arguments)
         if name == "create_pull_request":
             return self._handle_create_pull_request_tool(arguments)
+        if name == "read_thread":
+            return self._handle_read_thread_tool(arguments)
         return _tool_result(f"Unknown Slackgentic tool: {name}", is_error=True)
+
+    def _handle_read_thread_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.gateway is None:
+            return _tool_result("Slack thread access is not configured.", is_error=True)
+        link = _string_arg(arguments, "url") or _string_arg(arguments, "link")
+        if not link:
+            return _tool_result("read_thread requires a Slack thread URL.", is_error=True)
+        ref = parse_thread_ref(link)
+        if ref is None:
+            return _tool_result(
+                "read_thread requires a valid Slack thread permalink.", is_error=True
+            )
+        allowed_channel = self._allowed_slack_channel_id()
+        if not allowed_channel:
+            return _tool_result(
+                "read_thread requires a configured Slackgentic channel.",
+                is_error=True,
+            )
+        if ref.channel_id != allowed_channel:
+            return _tool_result(
+                "read_thread can only read links from the configured Slackgentic channel.",
+                is_error=True,
+            )
+        limit = _int_arg(arguments, "limit", default=40, minimum=1, maximum=200)
+        try:
+            messages = self.gateway.thread_messages(ref.channel_id, ref.thread_ts, limit=limit)
+        except Exception as exc:
+            return _tool_result(
+                f"Failed to read Slack thread: {_exception_summary(exc)}",
+                is_error=True,
+            )
+        if not messages:
+            return _tool_result("No messages were found for that Slack thread.")
+        transcript = _slack_thread_transcript(messages)
+        if not transcript:
+            return _tool_result(
+                "The Slack thread was fetched, but it did not contain readable text messages."
+            )
+        count = len(messages)
+        limit_note = (
+            " The result may be truncated by the requested limit." if count >= limit else ""
+        )
+        return _tool_result(
+            f"Slack thread transcript ({count} message{'s' if count != 1 else ''})."
+            f"{limit_note}\n\n{transcript}"
+        )
+
+    def _allowed_slack_channel_id(self) -> str:
+        if self.slack_channel_id:
+            return self.slack_channel_id
+        if self._current_thread is not None:
+            return self._current_thread.channel_id
+        return ""
 
     def _handle_create_pull_request_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         title = _string_arg(arguments, "title")
@@ -409,11 +477,13 @@ def run_channel_server(db_path: Path | None = None, *, provider_label: str = "Cl
     try:
         store.init_schema()
         request_handler = None
+        gateway = None
         if config.slack.bot_token:
             from agent_harness.slack.client import SlackGateway
 
+            gateway = SlackGateway(config.slack.bot_token)
             request_handler = SlackAgentRequestHandler(
-                SlackGateway(config.slack.bot_token),
+                gateway,
                 store=store,
                 provider_label=provider_label,
             )
@@ -421,6 +491,8 @@ def run_channel_server(db_path: Path | None = None, *, provider_label: str = "Cl
         return ClaudeChannelServer(
             store,
             request_handler=request_handler,
+            gateway=gateway,
+            slack_channel_id=config.slack.channel_id,
             instructions=instructions,
         ).run()
     finally:
@@ -864,6 +936,16 @@ def _thread_from_env() -> SlackThreadRef | None:
     return None
 
 
+def _configured_slack_channel_id(store: Store, configured: str | None) -> str:
+    if configured and configured.strip():
+        return configured.strip()
+    try:
+        stored = store.get_setting(SLACK_CHANNEL_SETTING)
+    except Exception:
+        return ""
+    return stored.strip() if stored and stored.strip() else ""
+
+
 def _dangerous_mode_from_env() -> bool:
     raw = os.environ.get(DANGEROUS_MODE_ENV, "")
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -950,6 +1032,30 @@ def _tools() -> list[dict[str, Any]]:
                     "draft": {"type": "boolean"},
                 },
                 "required": ["title"],
+            },
+        },
+        {
+            "name": "read_thread",
+            "description": (
+                "Read messages from a Slack thread permalink in the configured "
+                "Slackgentic channel. Use this when an agent needs context from a "
+                "linked Slackgentic thread."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Slack thread permalink to read.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Maximum messages to fetch. Defaults to 40.",
+                    },
+                },
+                "required": ["url"],
             },
         },
         {
@@ -1333,6 +1439,29 @@ def _bool_arg(arguments: dict[str, Any], key: str) -> bool:
     return arguments.get(key) is True
 
 
+def _int_arg(
+    arguments: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = arguments.get(key)
+    if isinstance(raw, bool):
+        value = default
+    elif isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            value = default
+    else:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 def _string_param(params: dict[str, Any], key: str) -> str:
     value = params.get(key)
     if isinstance(value, str) and value.strip():
@@ -1343,3 +1472,50 @@ def _string_param(params: dict[str, Any], key: str) -> str:
         return json.dumps(value, sort_keys=True)
     except TypeError:
         return str(value)
+
+
+def _slack_thread_transcript(messages: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        text = replace_slack_user_ids(str(message.get("text") or "")).strip()
+        if not text or is_internal_task_notification_text(text):
+            continue
+        author = _slack_message_author(message)
+        timestamp = str(message.get("ts") or "").strip()
+        prefix = f"[{timestamp}] {author}" if timestamp else author
+        lines.append(f"{prefix}: {text.replace(chr(10), chr(10) + '    ')}")
+    return "\n".join(lines)[-20000:]
+
+
+def _slack_message_author(message: dict[str, Any]) -> str:
+    username = _stringish(message.get("username"))
+    if username:
+        return username
+    for key in ("user_profile", "bot_profile"):
+        profile_name = _profile_display_name(message.get(key))
+        if profile_name:
+            return profile_name
+    if _stringish(message.get("user")):
+        return "Slack user"
+    return "Slack"
+
+
+def _profile_display_name(profile: object) -> str | None:
+    if not isinstance(profile, dict):
+        return None
+    for key in ("display_name", "real_name", "name", "username"):
+        value = _stringish(profile.get(key))
+        if value:
+            return value
+    return None
+
+
+def _stringish(value: object) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def _exception_summary(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return message[:500]
+    return exc.__class__.__name__

@@ -46,6 +46,8 @@ class FakeGateway:
     def __init__(self):
         self.replies = []
         self.updates = []
+        self.thread_history_messages = {}
+        self.thread_history_calls = []
 
     def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
         ts = f"1712345678.{len(self.replies):06d}"
@@ -54,6 +56,12 @@ class FakeGateway:
 
     def update_message(self, channel_id, ts, text, blocks=None):
         self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
+
+    def thread_messages(self, channel_id, thread_ts, limit=20, oldest=None):
+        self.thread_history_calls.append(
+            {"channel_id": channel_id, "thread_ts": thread_ts, "limit": limit, "oldest": oldest}
+        )
+        return list(self.thread_history_messages.get((channel_id, thread_ts), []))[:limit]
 
 
 class FakeRequestHandler:
@@ -151,9 +159,11 @@ class ClaudeChannelTests(unittest.TestCase):
                 response = json.loads(output.getvalue())
                 tools = {tool["name"]: tool for tool in response["result"]["tools"]}
                 self.assertIn("create_pull_request", tools)
+                self.assertIn("read_thread", tools)
                 self.assertIn("request_user_input", tools)
                 self.assertIn("request_approval", tools)
                 self.assertIn("GitHub pull request", tools["create_pull_request"]["description"])
+                self.assertIn("Slack thread permalink", tools["read_thread"]["description"])
                 self.assertIn("multiple options", tools["request_user_input"]["description"])
                 self.assertIn("one concrete action", tools["request_approval"]["description"])
             finally:
@@ -222,7 +232,148 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 response = json.loads(output.getvalue())
                 self.assertIn("create_pull_request", response["result"]["instructions"])
+                self.assertIn("read_thread", response["result"]["instructions"])
                 self.assertNotIn("Claude Code session", response["result"]["instructions"])
+            finally:
+                store.close()
+
+    def test_read_thread_tool_fetches_linked_thread_in_configured_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                root_ts = "1712345680.000001"
+                reply_ts = "1712345680.000002"
+                link = (
+                    "https://example.slack.com/archives/C1/"
+                    f"p{reply_ts.replace('.', '')}?thread_ts={root_ts}&cid=C1"
+                )
+                gateway.thread_history_messages[("C1", root_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U123456789",
+                        "user_profile": {"display_name": "Dana"},
+                        "text": "Original issue references <@U987654321>.",
+                        "ts": root_ts,
+                    },
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "username": "agent",
+                        "text": "Earlier agent reply.",
+                        "ts": reply_ts,
+                        "thread_ts": root_ts,
+                    },
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "username": "agent",
+                        "text": (
+                            "<task-notification>\n"
+                            "<task-id>t1</task-id>\n"
+                            "<tool-use-id>toolu_1</tool-use-id>\n"
+                            "<output-file>/tmp/example-output</output-file>\n"
+                            "<status>ok</status>\n"
+                            "<summary>done</summary>\n"
+                            "</task-notification>"
+                        ),
+                        "ts": "1712345680.000003",
+                        "thread_ts": root_ts,
+                    },
+                ]
+                server = ClaudeChannelServer(
+                    store,
+                    target_pid=123,
+                    gateway=gateway,
+                    slack_channel_id="C1",
+                )
+
+                result = server._handle_tool_call(
+                    {"name": "read_thread", "arguments": {"url": link, "limit": 10}}
+                )
+
+                self.assertNotIn("isError", result)
+                text = result["content"][0]["text"]
+                self.assertIn("Slack thread transcript (3 messages)", text)
+                self.assertIn(
+                    "[1712345680.000001] Dana: Original issue references Slack user.", text
+                )
+                self.assertIn("[1712345680.000002] agent: Earlier agent reply.", text)
+                self.assertNotIn("task-notification", text)
+                self.assertEqual(
+                    gateway.thread_history_calls,
+                    [
+                        {
+                            "channel_id": "C1",
+                            "thread_ts": root_ts,
+                            "limit": 10,
+                            "oldest": None,
+                        }
+                    ],
+                )
+            finally:
+                store.close()
+
+    def test_read_thread_tool_rejects_links_outside_configured_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                server = ClaudeChannelServer(
+                    store,
+                    target_pid=123,
+                    gateway=gateway,
+                    slack_channel_id="C1",
+                )
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "read_thread",
+                        "arguments": {
+                            "url": "https://example.slack.com/archives/C2/p1712345680000001"
+                        },
+                    }
+                )
+
+                self.assertTrue(result["isError"])
+                self.assertIn("configured Slackgentic channel", result["content"][0]["text"])
+                self.assertEqual(gateway.thread_history_calls, [])
+            finally:
+                store.close()
+
+    def test_read_thread_tool_can_use_current_thread_channel_when_unconfigured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                root_ts = "1712345680.000001"
+                gateway.thread_history_messages[("C1", root_ts)] = [
+                    {
+                        "type": "message",
+                        "channel": "C1",
+                        "user": "U123456789",
+                        "text": "Current-channel context.",
+                        "ts": root_ts,
+                    }
+                ]
+                server = ClaudeChannelServer(store, target_pid=123, gateway=gateway)
+                server._current_thread = SlackThreadRef("C1", "171.000001")
+
+                result = server._handle_tool_call(
+                    {
+                        "name": "read_thread",
+                        "arguments": {
+                            "url": "https://example.slack.com/archives/C1/p1712345680000001"
+                        },
+                    }
+                )
+
+                self.assertNotIn("isError", result)
+                self.assertIn("Current-channel context.", result["content"][0]["text"])
             finally:
                 store.close()
 
