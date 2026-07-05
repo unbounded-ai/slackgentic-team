@@ -493,6 +493,82 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_ignored_external_session_with_new_activity_is_pending_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                ignored_at = datetime(2026, 6, 24, 19, 47, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path("/workspace/repos/example-project"),
+                    status=SessionStatus.IDLE,
+                    started_at=ignored_at - timedelta(minutes=30),
+                    last_seen_at=ignored_at + timedelta(hours=5),
+                )
+                store.set_setting(
+                    "external_session_ignored.claude.s1",
+                    ignored_at.isoformat(),
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                revived = store.get_session(Provider.CLAUDE, "s1")
+                self.assertIsNotNone(revived)
+                assert revived is not None
+                self.assertEqual(revived.status, SessionStatus.IDLE)
+                self.assertIsNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_pending.claude.s1"))
+            finally:
+                store.close()
+
+    def test_ignored_external_session_without_new_activity_stays_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                ignored_at = datetime(2026, 6, 24, 19, 47, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path("/workspace/repos/example-project"),
+                    status=SessionStatus.IDLE,
+                    started_at=ignored_at - timedelta(minutes=30),
+                    last_seen_at=ignored_at,
+                )
+                store.set_setting(
+                    "external_session_ignored.claude.s1",
+                    ignored_at.isoformat(),
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                ignored = store.get_session(Provider.CLAUDE, "s1")
+                self.assertIsNotNone(ignored)
+                assert ignored is not None
+                self.assertEqual(ignored.status, SessionStatus.DONE)
+                self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertIsNone(store.get_setting("external_session_pending.claude.s1"))
+            finally:
+                store.close()
+
     def test_external_session_matching_ignored_cwd_subpath_is_not_mirrored(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -2021,7 +2097,7 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_tracked_codex_session_is_freed_when_stored_pid_disappears(self):
+    def test_tracked_codex_session_stays_assigned_when_stored_pid_disappears(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
@@ -2059,19 +2135,22 @@ class SessionMirrorTests(unittest.TestCase):
                 mirror.sync_once()
                 mirror.sync_once()
 
-                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
-                self.assertIsNone(store.get_setting("external_session_live_target.codex.s1"))
-                self.assertIsNone(store.get_setting("external_session_missing_target.codex.s1"))
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s1"), "123")
+                self.assertIsNotNone(store.get_setting("external_session_missing_target.codex.s1"))
                 self.assertEqual(
                     store.get_session(Provider.CODEX, "s1").status,
-                    SessionStatus.DONE,
+                    SessionStatus.ACTIVE,
                 )
-                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
-                self.assertEqual(refreshed_channels, ["C1"])
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, [])
             finally:
                 store.close()
 
-    def test_idle_tracked_codex_session_is_freed_when_terminal_disappears(self):
+    def test_idle_tracked_codex_session_waits_for_discovery_to_drop_before_freeing(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
@@ -2096,10 +2175,11 @@ class SessionMirrorTests(unittest.TestCase):
                 store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
                 gateway = FakeGateway()
                 refreshed_channels = []
+                provider = FakeProvider(idle, [])
                 mirror = SessionMirror(
                     store,
                     gateway,
-                    [FakeProvider(idle, [])],
+                    [provider],
                     team_id="T1",
                     channel_id="C1",
                     terminal_notifier=FakeTerminalNotifier([]),
@@ -2114,13 +2194,25 @@ class SessionMirrorTests(unittest.TestCase):
 
                 mirror.sync_once()
 
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agents[0].agent_id,
+                )
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s1"), "123")
+                self.assertIsNotNone(store.get_setting("external_session_missing_target.codex.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CODEX, "s1").status,
+                    SessionStatus.IDLE,
+                )
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, [])
+
+                provider.session = []
+                mirror.sync_once()
+
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_live_target.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_missing_target.codex.s1"))
-                self.assertEqual(
-                    store.get_session(Provider.CODEX, "s1").status,
-                    SessionStatus.DONE,
-                )
                 self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
                 self.assertEqual(refreshed_channels, ["C1"])
             finally:
@@ -3596,7 +3688,7 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_closed_live_claude_terminal_frees_assigned_agent_without_exit_marker(self):
+    def test_discovered_claude_session_stays_assigned_when_live_target_disappears(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
@@ -3624,10 +3716,11 @@ class SessionMirrorTests(unittest.TestCase):
                     ]
                 )
                 gateway = FakeGateway()
+                provider = FakeProvider([session], [])
                 mirror = SessionMirror(
                     store,
                     gateway,
-                    [FakeProvider([session], [])],
+                    [provider],
                     team_id="T1",
                     channel_id="C1",
                     terminal_notifier=notifier,
@@ -3655,30 +3748,79 @@ class SessionMirrorTests(unittest.TestCase):
 
                 mirror.sync_once()
 
-                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
-                self.assertIsNone(store.get_setting("external_session_live_target.claude.s1"))
-                self.assertIsNone(store.get_setting("external_session_missing_target.claude.s1"))
-                self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
                 self.assertEqual(
-                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agents[0].agent_id,
                 )
-                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(
+                    store.get_setting("external_session_live_target.claude.s1"),
+                    "123",
+                )
+                self.assertIsNotNone(store.get_setting("external_session_missing_target.claude.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.ACTIVE
+                )
+                self.assertEqual(gateway.replies, [])
+
+                provider.session = []
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.ACTIVE
+                )
                 self.assertEqual(
                     [reply[1] for reply in gateway.replies],
                     ["Session ended; freed up this agent."],
                 )
+            finally:
+                store.close()
+
+    def test_missing_discovery_keeps_resumable_thread_session_assigned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=0, claude_count=1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                transcript = Path(tmp) / "claude.jsonl"
+                transcript.write_text("{}\n")
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=transcript,
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    metadata={"entrypoint": "sdk-cli"},
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.claude.s1", agents[0].agent_id)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                gateway = FakeGateway()
+                refreshed_channels = []
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    on_external_session_occupancy_change=refreshed_channels.append,
+                )
 
                 mirror.sync_once()
-                mirror.sync_once()
 
-                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
                 self.assertEqual(
-                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
+                    store.get_setting("external_session_agent.claude.s1"),
+                    agents[0].agent_id,
                 )
-                self.assertEqual(
-                    [reply[1] for reply in gateway.replies],
-                    ["Session ended; freed up this agent."],
-                )
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(refreshed_channels, [])
             finally:
                 store.close()
 

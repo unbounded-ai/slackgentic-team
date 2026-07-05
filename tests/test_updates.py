@@ -16,6 +16,7 @@ from agent_harness.updates import (
     SETTING_UPDATE_PROMPTED_VERSION,
     SETTING_UPDATE_RESTART_HELPER,
     SETTING_UPDATE_RESTART_PENDING,
+    UPDATE_HELPER_FOLLOWUP_SECONDS,
     GitHubReleaseSource,
     ReleaseInfo,
     SelfUpdater,
@@ -645,6 +646,80 @@ class UpdateRunnerTests(unittest.TestCase):
                 )
                 runner._confirm_pending_restart_once()
 
+                self.assertEqual(len(updates), 1)
+                self.assertIn(":white_check_mark:", updates[0][2])
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
+            finally:
+                store.close()
+
+    def test_update_loop_rechecks_running_helper_before_release_poll(self):
+        from agent_harness import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.0.0",
+                    release=ReleaseInfo(version=__version__, tag_name=f"v{__version__}"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(
+                    f"{SETTING_UPDATE_CANDIDATE_PREFIX}{__version__}",
+                    candidate.to_json(),
+                )
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_PENDING,
+                    json.dumps(
+                        {
+                            "channel_id": "C1",
+                            "created_at": utc_now().isoformat(),
+                            "message_ts": "999",
+                            "version": __version__,
+                        }
+                    ),
+                )
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_HELPER,
+                    json.dumps({"phase": "running", "version": __version__}),
+                )
+                updates: list[tuple[str, str, str]] = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def __init__(self):
+                        self.calls = 0
+
+                    def check(self):
+                        self.calls += 1
+                        return None
+
+                checker = Checker()
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=checker,
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(
+                        (channel_id, ts, text)
+                    ),
+                    status_blocks=lambda update, status, include_actions: [],
+                    poll_seconds=300,
+                )
+
+                self.assertEqual(runner._run_once(), UPDATE_HELPER_FOLLOWUP_SECONDS)
+                self.assertEqual(checker.calls, 0)
+                self.assertEqual(updates, [])
+
+                store.set_setting(
+                    SETTING_UPDATE_RESTART_HELPER,
+                    json.dumps({"phase": "succeeded", "version": __version__}),
+                )
+                self.assertEqual(runner._run_once(), 300)
+
+                self.assertEqual(checker.calls, 1)
                 self.assertEqual(len(updates), 1)
                 self.assertIn(":white_check_mark:", updates[0][2])
                 self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))

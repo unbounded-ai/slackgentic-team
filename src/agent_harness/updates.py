@@ -36,6 +36,7 @@ DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 2 * 60
 # than DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS so a slow-but-healthy daemon wins
 # the race and posts the success/stale ack before the helper falls back.
 DEFAULT_UPDATE_HELPER_CONFIRM_TIMEOUT_SECONDS = DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS + 60
+UPDATE_HELPER_FOLLOWUP_SECONDS = 5.0
 SETTING_UPDATE_PROMPTED_VERSION = "slackgentic.update.prompted_version"
 SETTING_UPDATE_DISMISSED_VERSION = "slackgentic.update.dismissed_version"
 SETTING_UPDATE_INSTALLING_VERSION = "slackgentic.update.installing_version"
@@ -508,7 +509,7 @@ class SlackgenticUpdateRunner:
         )
         self._thread.start()
 
-    def _confirm_pending_restart_once(self) -> None:
+    def _confirm_pending_restart_once(self) -> bool:
         # When the previous daemon process kickstarted itself after a
         # successful pip install, it recorded the prompt message it wanted
         # the newly-loaded daemon to update with a success ack. Keep the
@@ -516,13 +517,17 @@ class SlackgenticUpdateRunner:
         # failures can retry on the normal update-check cadence. Leave the
         # marker untouched on a version mismatch — that means the kickstart
         # did not actually adopt the new build and an operator should look at it.
+        #
+        # Returns True when a matching helper is still scheduled/running so the
+        # update loop can recheck the marker promptly instead of waiting for the
+        # normal release-poll interval.
         raw = self.store.get_setting(SETTING_UPDATE_RESTART_PENDING)
         if not raw:
-            return
+            return False
         payload = _restart_pending_payload(raw)
         if payload is None:
             self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
-            return
+            return False
         channel_id = payload.get("channel_id")
         message_ts = payload.get("message_ts")
         version = payload.get("version")
@@ -532,20 +537,20 @@ class SlackgenticUpdateRunner:
             or not isinstance(version, str)
         ):
             self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
-            return
+            return False
         stale = restart_pending_is_stale(raw)
         if version != __version__:
             if stale:
                 self._post_restart_pending_failure(channel_id, message_ts, version)
-            return
-        candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
-        tag_name = candidate.release.tag_name
+            return False
         helper_status = restart_helper_status(
             self.store.get_setting(SETTING_UPDATE_RESTART_HELPER),
             version,
         )
         if helper_status in {"scheduled", "running"} and not stale:
-            return
+            return True
+        candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
+        tag_name = candidate.release.tag_name
         if helper_status == "failed":
             text = restart_helper_failure_text(version)
             self.store.set_setting(SETTING_UPDATE_LAST_ERROR, text)
@@ -567,8 +572,9 @@ class SlackgenticUpdateRunner:
             self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
         self.store.set_setting(SETTING_UPDATE_INSTALLED_VERSION, version)
         if not self._update_restart_pending_message(channel_id, message_ts, candidate, text):
-            return
+            return False
         self.store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
+        return False
 
     def _post_restart_pending_failure(
         self,
@@ -692,13 +698,20 @@ class SlackgenticUpdateRunner:
     def _run(self) -> None:
         while not self._stop.wait(0.1):
             try:
-                self._confirm_pending_restart_once()
-                self.sync_once()
+                wait_seconds = self._run_once()
             except Exception:
                 LOGGER.exception("failed to check for Slackgentic updates")
                 self.store.set_setting(SETTING_UPDATE_LAST_ERROR, "update check failed")
-            if self._stop.wait(self.poll_seconds):
+                wait_seconds = self.poll_seconds
+            if self._stop.wait(wait_seconds):
                 break
+
+    def _run_once(self) -> float:
+        waiting_for_helper = self._confirm_pending_restart_once()
+        if waiting_for_helper:
+            return UPDATE_HELPER_FOLLOWUP_SECONDS
+        self.sync_once()
+        return self.poll_seconds
 
     def _upgrade_in_background(
         self,

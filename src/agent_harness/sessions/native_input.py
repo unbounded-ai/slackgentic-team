@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from agent_harness.models import Provider
@@ -93,19 +92,22 @@ def claude_ask_user_question_tool_result_text(
     answers: dict[str, str | list[str]],
 ) -> str:
     questions = _questions(tool_input)
-    pairs: list[str] = []
+    lines: list[str] = []
     for index, question in enumerate(questions):
         question_key = _question_answer_key(question, index)
         answer = answers.get(question_key)
         value = ", ".join(answer) if isinstance(answer, list) else str(answer or "")
         if value:
-            pairs.append(f"{json.dumps(question_key)}={json.dumps(value)}")
-    if not pairs:
+            lines.append(f"- {question_key}: {value}")
+            options = _option_labels(question.get("options"))
+            if options:
+                lines.append(f"  Options: {'; '.join(options)}")
+    if not lines:
         return "No answer was selected."
     return (
-        "Your questions have been answered: "
-        + ", ".join(pairs)
-        + ". You can now continue with these answers in mind."
+        "Your questions have been answered in Slack:\n"
+        + "\n".join(lines)
+        + "\nYou can now continue with these answers in mind."
     )
 
 
@@ -159,6 +161,10 @@ def _options(value: object) -> list[dict[str, str]]:
             option["description"] = description
         options.append(option)
     return options
+
+
+def _option_labels(value: object) -> list[str]:
+    return [option["label"] for option in _options(value) if option.get("label")]
 
 
 def _string_field(value: dict[str, Any], key: str) -> str:

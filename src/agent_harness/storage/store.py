@@ -1021,6 +1021,44 @@ class Store:
             message_ts=row["parent_ts"],
         )
 
+    def list_slack_session_threads(
+        self,
+        team_id: str,
+        channel_id: str,
+    ) -> list[tuple[AgentSession, SlackThreadRef]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              session.*,
+              thread.channel_id AS slack_channel_id,
+              thread.thread_ts AS slack_thread_ts,
+              thread.parent_ts AS slack_parent_ts
+            FROM slack_threads thread
+            JOIN sessions session
+              ON session.provider = thread.provider
+             AND session.session_id = thread.session_id
+            WHERE thread.team_id = ?
+              AND thread.channel_id = ?
+            """,
+            (team_id, channel_id),
+        ).fetchall()
+        results: list[tuple[AgentSession, SlackThreadRef]] = []
+        for row in rows:
+            session = _session_from_row(row)
+            if session is None:
+                continue
+            results.append(
+                (
+                    session,
+                    SlackThreadRef(
+                        channel_id=row["slack_channel_id"],
+                        thread_ts=row["slack_thread_ts"],
+                        message_ts=row["slack_parent_ts"],
+                    ),
+                )
+            )
+        return results
+
     def get_session_for_slack_thread(
         self,
         team_id: str,
@@ -2253,6 +2291,10 @@ class Store:
             return False
         if self.get_team_agent(agent_id) is None:
             return False
+        if self.get_setting(f"external_session_ignored.{provider.value}.{session_id}"):
+            return False
+        if self.get_setting(f"external_session_live_target.{provider.value}.{session_id}"):
+            return True
         session = self.get_session(provider, session_id)
         return bool(session and session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE})
 

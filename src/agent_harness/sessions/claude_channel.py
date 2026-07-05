@@ -370,7 +370,8 @@ class ClaudeChannelServer:
         answer = _selected_answer(response, "answer")
         if not answer:
             return _tool_result("No answer was selected.", is_error=True)
-        return _tool_result(answer)
+        context = _request_user_input_result_context(question, options)
+        return _tool_result(answer, extra_texts=[context] if context else None)
 
     def _handle_request_approval_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.request_handler is None:
@@ -1322,8 +1323,17 @@ def _timeout_message(exc: subprocess.TimeoutExpired) -> str:
     return f"Command timed out after {CREATE_PULL_REQUEST_TIMEOUT_SECONDS} seconds."
 
 
-def _tool_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
-    result: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+def _tool_result(
+    text: str,
+    *,
+    is_error: bool = False,
+    extra_texts: list[str] | None = None,
+) -> dict[str, Any]:
+    content = [{"type": "text", "text": text}]
+    for extra in extra_texts or []:
+        if extra:
+            content.append({"type": "text", "text": extra})
+    result: dict[str, Any] = {"content": content}
     if is_error:
         result["isError"] = True
     return result
@@ -1346,6 +1356,28 @@ def _tool_options(value: object) -> list[dict[str, str]]:
                 option["description"] = description
             options.append(option)
     return options
+
+
+def _request_user_input_result_context(question: str, options: list[dict[str, str]]) -> str:
+    lines = [f"Question: {question}"]
+    option_text = _request_user_input_options_text(options)
+    if option_text:
+        lines.append(f"Options: {option_text}")
+    return "\n".join(lines)
+
+
+def _request_user_input_options_text(options: list[dict[str, str]]) -> str:
+    labels: list[str] = []
+    for option in options:
+        label = option.get("label", "").strip()
+        if not label:
+            continue
+        description = option.get("description", "").strip()
+        if description:
+            labels.append(f"{label} ({description})")
+        else:
+            labels.append(label)
+    return "; ".join(labels)
 
 
 def _approval_request(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
