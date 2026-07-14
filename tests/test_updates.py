@@ -46,6 +46,12 @@ class UpdateVersionTests(unittest.TestCase):
 
         self.assertEqual(__version__, metadata["project"]["version"])
 
+    def test_current_version_matches_running_module(self):
+        from agent_harness import __version__
+        from agent_harness.updates import current_package_version
+
+        self.assertEqual(current_package_version(), __version__)
+
 
 class GitHubReleaseSourceTests(unittest.TestCase):
     def test_latest_release_parses_github_payload(self):

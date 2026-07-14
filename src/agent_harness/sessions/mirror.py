@@ -48,7 +48,10 @@ from agent_harness.sessions.native_input import (
 )
 from agent_harness.sessions.terminal import SessionTerminalNotifier
 from agent_harness.sessions.todo_mirror import TodoMirror
-from agent_harness.slack import build_external_session_capacity_blocks
+from agent_harness.slack import (
+    build_external_session_capacity_blocks,
+    format_external_session_capacity_text,
+)
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 
@@ -905,7 +908,7 @@ class SessionMirror:
 
     def _post_or_update_capacity_notice(self, channel_id: str, provider: Provider) -> None:
         count = self._pending_count(provider)
-        text = _capacity_message(provider, count)
+        text = format_external_session_capacity_text(provider, count)
         blocks = build_external_session_capacity_blocks(provider, count)
         setting_key = _capacity_notice_ts_key(provider)
         existing_ts = self.store.get_setting(setting_key)
@@ -1106,16 +1109,6 @@ def _pending_external_session_key(session: AgentSession) -> str:
 
 def _capacity_notice_ts_key(provider: Provider) -> str:
     return f"{CAPACITY_NOTICE_TS_PREFIX}{provider.value}"
-
-
-def _capacity_message(provider: Provider, waiting_count: int) -> str:
-    label = provider.value.title()
-    plural = "session is" if waiting_count == 1 else "sessions are"
-    return (
-        f"No {label} team seat is available for sessions started outside Slack. "
-        f"{waiting_count} {label} {plural} waiting. "
-        "Hire one matching agent and Slackgentic will backfill the transcript."
-    )
 
 
 def _cwd_matches_ignored_patterns(cwd: Path | None, patterns: Iterable[str]) -> bool:

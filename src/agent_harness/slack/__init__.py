@@ -727,6 +727,21 @@ def build_external_session_capacity_blocks(
     ]
 
 
+def format_external_session_capacity_text(
+    provider: Provider,
+    waiting_count: int = 1,
+) -> str:
+    label = provider.value.title()
+    session_plural = "session is" if waiting_count == 1 else "sessions are"
+    agent_plural = "agent" if waiting_count == 1 else "agents"
+    return (
+        f"No {label} team seat is available for sessions started outside Slack. "
+        f"{waiting_count} {label} {session_plural} waiting. "
+        f"Hire {waiting_count} matching {agent_plural} and Slackgentic will backfill "
+        "the transcript."
+    )
+
+
 def build_unassigned_external_session_blocks(
     items: list[UnassignedExternalSessionListItem],
     *,

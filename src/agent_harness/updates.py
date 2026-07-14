@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.metadata
 import json
 import logging
 import os
@@ -181,10 +180,7 @@ class GitHubReleaseSource:
 
 
 def current_package_version() -> str:
-    try:
-        return importlib.metadata.version("slackgentic-team")
-    except importlib.metadata.PackageNotFoundError:
-        return __version__
+    return __version__
 
 
 class UpdateChecker:

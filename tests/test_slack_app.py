@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -537,6 +538,7 @@ class SlackAppTests(unittest.TestCase):
         connect_calls = []
         closed_clients = []
         closed_apps = []
+        update_starts = []
 
         class FakeSocketModeClient:
             def __init__(self, app_token, web_client):
@@ -576,6 +578,7 @@ class SlackAppTests(unittest.TestCase):
         app.gateway = types.SimpleNamespace(client=object())
         app.close = lambda: closed_apps.append(True)
         app.handle_request = lambda request: None
+        app.update_runner = types.SimpleNamespace(start=lambda: update_starts.append(True))
 
         with (
             patch.dict(
@@ -591,8 +594,55 @@ class SlackAppTests(unittest.TestCase):
             app.run_forever()
 
         self.assertEqual(connect_calls, ["connect", "connect"])
+        self.assertEqual(update_starts, [])
         self.assertEqual(closed_clients, [True])
         self.assertEqual(closed_apps, [True])
+
+    def test_update_checks_start_only_after_socket_mode_connects(self):
+        events = []
+
+        class FakeSocketModeClient:
+            def __init__(self, app_token, web_client):
+                self.socket_mode_request_listeners = []
+
+            def connect(self):
+                events.append("connect")
+
+            def close(self):
+                events.append("close")
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id, payload=None):
+                self.envelope_id = envelope_id
+                self.payload = payload
+
+        socket_mode_module = types.ModuleType("slack_sdk.socket_mode")
+        socket_mode_module.SocketModeClient = FakeSocketModeClient
+        response_module = types.ModuleType("slack_sdk.socket_mode.response")
+        response_module.SocketModeResponse = FakeSocketModeResponse
+        app = object.__new__(SocketModeSlackApp)
+        app.config = types.SimpleNamespace(slack=types.SimpleNamespace(app_token="xapp-test"))
+        app.gateway = types.SimpleNamespace(client=object())
+        app.close = lambda: events.append("app-close")
+        app.handle_request = lambda request: None
+        app._shutdown = threading.Event()
+
+        def start_updates():
+            events.append("update-start")
+            app._shutdown.set()
+
+        app.update_runner = types.SimpleNamespace(start=start_updates)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "slack_sdk.socket_mode": socket_mode_module,
+                "slack_sdk.socket_mode.response": response_module,
+            },
+        ):
+            app.run_forever()
+
+        self.assertEqual(events, ["connect", "update-start", "close", "app-close"])
 
     def test_reconnect_socket_mode_recovers_from_racy_session_close(self):
         events = []
