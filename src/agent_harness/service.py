@@ -98,14 +98,22 @@ def build_service_spec(
 def build_codex_app_server_service_spec(
     name: str = DEFAULT_SERVICE_NAME,
     executable: Path | None = None,
+    supervisor_executable: Path | None = None,
     working_directory: Path | None = None,
     url: str = DEFAULT_CODEX_APP_SERVER_URL,
 ) -> ServiceSpec:
-    resolved_executable = executable or _current_codex_executable()
+    codex_executable = str(executable) if executable is not None else "codex"
+    resolved_supervisor = supervisor_executable or _current_slackgentic_executable()
     return ServiceSpec(
         name=_codex_app_server_service_name(name),
-        executable=resolved_executable,
-        args=["app-server", "--listen", url],
+        executable=resolved_supervisor,
+        args=[
+            "codex-app-server",
+            "--listen",
+            url,
+            "--codex-binary",
+            codex_executable,
+        ],
         working_directory=(working_directory or Path.cwd()).resolve(),
         log_dir=Path.home() / ".slackgentic-team" / "logs",
         label=MACOS_CODEX_APP_SERVER_LABEL,
@@ -664,13 +672,6 @@ def _current_slackgentic_executable() -> Path:
     if found:
         return Path(found).resolve()
     raise RuntimeError("Could not locate slackgentic executable")
-
-
-def _current_codex_executable() -> Path:
-    found = shutil.which("codex")
-    if found:
-        return Path(found).resolve()
-    return Path("codex")
 
 
 def _launchd_status(label: str) -> int:

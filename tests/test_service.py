@@ -58,6 +58,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spec = build_codex_app_server_service_spec(
                 executable=Path(tmp) / "codex",
+                supervisor_executable=Path(tmp) / "slackgentic",
                 working_directory=Path(tmp),
                 url="ws://127.0.0.1:9999",
             )
@@ -66,8 +67,15 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(payload["Label"], MACOS_CODEX_APP_SERVER_LABEL)
             self.assertEqual(
-                payload["ProgramArguments"][-3:],
-                ["app-server", "--listen", "ws://127.0.0.1:9999"],
+                payload["ProgramArguments"],
+                [
+                    str(Path(tmp) / "slackgentic"),
+                    "codex-app-server",
+                    "--listen",
+                    "ws://127.0.0.1:9999",
+                    "--codex-binary",
+                    str(Path(tmp) / "codex"),
+                ],
             )
             self.assertNotIn(
                 "SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART",
@@ -98,6 +106,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spec = build_codex_app_server_service_spec(
                 executable=Path(tmp) / "codex",
+                supervisor_executable=Path(tmp) / "slackgentic",
                 working_directory=Path(tmp),
                 url="ws://127.0.0.1:9999",
             )
@@ -105,7 +114,8 @@ class ServiceTests(unittest.TestCase):
             unit = render_systemd_unit(spec)
 
             self.assertIn("Description=Slackgentic Team Codex app-server", unit)
-            self.assertIn("app-server --listen ws://127.0.0.1:9999", unit)
+            self.assertIn("codex-app-server --listen ws://127.0.0.1:9999", unit)
+            self.assertIn(f"--codex-binary {Path(tmp) / 'codex'}", unit)
             self.assertNotIn("SLACKGENTIC_CODEX_APP_SERVER_AUTOSTART", unit)
 
     def test_service_environment_path_filters_transient_entries(self):

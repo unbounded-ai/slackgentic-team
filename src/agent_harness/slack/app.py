@@ -9732,10 +9732,10 @@ class SocketModeSlackApp:
         specs = [daemon_spec]
         codex_app_server_url = self.config.commands.codex_app_server_url
         if codex_app_server_url:
-            codex_binary = _resolved_command_path(self.config.commands.codex_binary)
             specs.append(
                 build_codex_app_server_service_spec(
-                    executable=Path(codex_binary) if codex_binary else None,
+                    executable=Path(self.config.commands.codex_binary),
+                    supervisor_executable=executable.resolve(),
                     working_directory=workdir,
                     url=codex_app_server_url,
                 )
@@ -9972,7 +9972,7 @@ def _service_reinstall_command(
     codex_app_server_url = config.commands.codex_app_server_url
     if codex_app_server_url:
         command.extend(["--codex-app-server-url", codex_app_server_url])
-        codex_binary = _resolved_command_path(config.commands.codex_binary)
+        codex_binary = config.commands.codex_binary
         if codex_binary:
             command.extend(["--codex-binary", codex_binary])
     else:
@@ -9991,15 +9991,6 @@ def _service_reinstall_environment(
     env = dict(environ)
     env["PYTHONPATH"] = str(working_directory / "src")
     return env
-
-
-def _resolved_command_path(command: str) -> str | None:
-    if not command:
-        return None
-    path = Path(command).expanduser()
-    if path.is_absolute() or len(path.parts) > 1:
-        return str(path)
-    return shutil.which(command) or command
 
 
 def run_slack_app(config: AppConfig | None = None) -> int:
