@@ -3265,7 +3265,9 @@ class SlackTeamController:
         external_capacity_hire = self._external_capacity_hire_clicked(provider, roster_ts)
         if external_capacity_hire and kind == TeamAgentKind.ENGINEER:
             self._assign_available_agents_to_pending_external_sessions(channel_id, provider)
-            if provider is not None and self._pending_external_session_count(provider) == 0:
+            if provider is not None:
+                count = self._pending_external_session_count(provider)
+            if count == 0:
                 self._update_external_capacity_notice(channel_id, provider)
                 self._resume_pending_work_requests(channel_id)
                 roster_update_ts = self.store.get_setting(SETTING_ROSTER_TS) or roster_ts

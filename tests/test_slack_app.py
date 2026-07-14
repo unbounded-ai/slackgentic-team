@@ -967,6 +967,57 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_capacity_hire_uses_current_pending_count_for_old_button(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                store.set_setting("external_session_capacity_notice_ts.codex", "171.capacity")
+                for index in range(3):
+                    session_id = f"s{index}"
+                    store.set_setting(f"external_session_pending.codex.{session_id}", "now")
+                    store.upsert_session(
+                        AgentSession(
+                            provider=Provider.CODEX,
+                            session_id=session_id,
+                            transcript_path=Path(tmp) / f"{session_id}.jsonl",
+                            status=SessionStatus.ACTIVE,
+                        )
+                    )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.capacity"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire", count=1, provider=Provider.CODEX.value
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                agents = store.list_team_agents()
+                self.assertEqual(len(agents), 3)
+                assigned_agent_ids = {
+                    store.get_setting(f"external_session_agent.codex.s{index}")
+                    for index in range(3)
+                }
+                self.assertEqual(assigned_agent_ids, {agent.agent_id for agent in agents})
+                self.assertEqual(
+                    store.list_settings("external_session_pending.codex."),
+                    {},
+                )
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
+            finally:
+                store.close()
+
     def test_external_capacity_notice_prompts_assign_when_agent_available(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
