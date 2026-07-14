@@ -20,6 +20,7 @@ from agent_harness.slack import (
     dangerous_flag,
     decode_action_value,
     encode_action_value,
+    format_external_session_capacity_text,
     is_dependency_intent,
     normalize_slack_mrkdwn,
     pack_slack_ts,
@@ -426,6 +427,12 @@ class SlackTests(unittest.TestCase):
         self.assertEqual(
             decode_action_value(button["value"]),
             {"v": 1, "action": "team.hire", "count": 2, "provider": "claude"},
+        )
+        self.assertEqual(
+            format_external_session_capacity_text(Provider.CLAUDE, waiting_count=2),
+            "No Claude team seat is available for sessions started outside Slack. "
+            "2 Claude sessions are waiting. Hire 2 matching agents and Slackgentic "
+            "will backfill the transcript.",
         )
 
     def test_normalize_slack_mrkdwn_converts_double_asterisk_outside_code_blocks(self):

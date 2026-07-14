@@ -194,6 +194,7 @@ from agent_harness.slack import (
     build_update_prompt_blocks,
     decode_action_value,
     encode_action_value,
+    format_external_session_capacity_text,
     is_dependency_intent,
     parse_thread_ref,
     replace_slack_user_ids,
@@ -2749,13 +2750,7 @@ class SlackTeamController:
                 )
                 self.gateway.update_message(channel_id, existing_ts, text, blocks=blocks)
                 return
-            label = provider.value.title()
-            plural = "session is" if pending_count == 1 else "sessions are"
-            text = (
-                f"No {label} team seat is available for sessions started outside Slack. "
-                f"{pending_count} {label} {plural} waiting. "
-                "Hire one matching agent and Slackgentic will backfill the transcript."
-            )
+            text = format_external_session_capacity_text(provider, pending_count)
             self.gateway.update_message(
                 channel_id,
                 existing_ts,
@@ -9542,7 +9537,6 @@ class SocketModeSlackApp:
             poll_seconds=config.updates.check_interval_seconds,
         )
         self.controller.set_update_runner(self.update_runner)
-        self.update_runner.start()
         self.runtime.on_task_done = self.controller.handle_runtime_task_done
         self.runtime.on_agent_message = self.controller.handle_runtime_agent_message
         self.runtime.on_agent_control = self.controller.handle_runtime_agent_control
@@ -9805,6 +9799,8 @@ class SocketModeSlackApp:
                     )
                     if connect_backoff.wait(shutdown):
                         break
+            if not shutdown.is_set():
+                self.update_runner.start()
             while not shutdown.is_set():
                 is_connected = getattr(client, "is_connected", None)
                 disconnected = callable(is_connected) and not is_connected()
