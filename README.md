@@ -312,6 +312,13 @@ slackgentic service status
 slackgentic service uninstall
 ```
 
+The Codex app-server service is supervised so `codex --remote` stays compatible
+across Codex upgrades. With the default `codex` command, Slackgentic checks all
+Codex executables visible on the service `PATH`, starts the newest version, and
+restarts the app-server when that executable or its upgrade symlink changes. An
+explicit `SLACKGENTIC_CODEX_BINARY` pins selection to that path, while still
+detecting upgrades installed at the same path.
+
 On macOS, active managed sessions and sessions started outside Slack keep the
 machine awake with the built-in `caffeinate` command until the work is done.
 

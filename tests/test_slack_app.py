@@ -465,6 +465,23 @@ class SlackAppTests(unittest.TestCase):
         self.assertEqual(env["PATH"], "/usr/bin")
         self.assertEqual(env["PYTHONPATH"], "/workspace/repos/slackgentic/src")
 
+    def test_service_reinstall_keeps_default_codex_command_dynamic(self):
+        config = AppConfig.model_validate(
+            {
+                "config_file": Path("/workspace/config.json"),
+                "commands": {"codex_binary": "codex"},
+            }
+        )
+
+        command = _service_reinstall_command(
+            config,
+            executable=Path("/venv/bin/slackgentic"),
+            working_directory=Path("/workspace/repos/slackgentic"),
+        )
+
+        codex_argument = command.index("--codex-binary")
+        self.assertEqual(command[codex_argument + 1], "codex")
+
     def test_socket_mode_connection_stale_when_disconnected(self):
         client = types.SimpleNamespace(is_connected=lambda: False, current_session=None)
 

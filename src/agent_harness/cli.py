@@ -298,6 +298,11 @@ def main(argv: list[str] | None = None) -> int:
     update_helper.add_argument("--config-file", type=Path, default=None)
     update_helper.add_argument("command_args", nargs=argparse.REMAINDER)
 
+    codex_app_server = sub.add_parser("codex-app-server", help=argparse.SUPPRESS)
+    codex_app_server.add_argument("--listen", default="ws://127.0.0.1:47684")
+    codex_app_server.add_argument("--codex-binary", default="codex")
+    codex_app_server.add_argument("--version-check-interval", type=float, default=2.0)
+
     args = parser.parse_args(argv)
     runtime_python_issue = _managed_runtime_python_issue(args)
     if runtime_python_issue:
@@ -362,6 +367,14 @@ def main(argv: list[str] | None = None) -> int:
         return _team(args)
     if args.command == "service":
         return _service(args)
+    if args.command == "codex-app-server":
+        from agent_harness.runtime.codex_app_server import run_codex_app_server_supervisor
+
+        return run_codex_app_server_supervisor(
+            args.codex_binary,
+            args.listen,
+            check_interval_seconds=args.version_check_interval,
+        )
     if args.command == "update-helper":
         from agent_harness.updates import run_update_helper
 
@@ -489,7 +502,7 @@ def _managed_runtime_python_issue(args: argparse.Namespace) -> str | None:
 
 
 def _command_starts_managed_runtime(args: argparse.Namespace) -> bool:
-    if args.command == "claude-channel":
+    if args.command in {"claude-channel", "codex-app-server"}:
         return True
     if args.command == "service":
         return args.service_command in {"install", "print"}
@@ -527,6 +540,7 @@ def _service(args: argparse.Namespace) -> int:
                 build_codex_app_server_service_spec(
                     name=args.name,
                     executable=args.codex_binary,
+                    supervisor_executable=daemon_spec.executable,
                     working_directory=args.workdir,
                     url=args.codex_app_server_url,
                 ),

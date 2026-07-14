@@ -317,7 +317,17 @@ class CliTests(unittest.TestCase):
         specs = install.call_args.args[0]
         self.assertEqual(len(specs), 2)
         self.assertEqual(specs[0].args, ["slack", "serve"])
-        self.assertEqual(specs[1].args[:3], ["app-server", "--listen", "ws://127.0.0.1:47684"])
+        self.assertEqual(
+            specs[1].args,
+            [
+                "codex-app-server",
+                "--listen",
+                "ws://127.0.0.1:47684",
+                "--codex-binary",
+                "/tmp/codex",
+            ],
+        )
+        self.assertEqual(specs[1].executable, Path("/tmp/slackgentic"))
         self.assertIn("codex.plist", output.getvalue())
         self.assertIn("daemon.plist", output.getvalue())
 
@@ -342,6 +352,30 @@ class CliTests(unittest.TestCase):
         specs = install.call_args.args[0]
         self.assertEqual(len(specs), 1)
         self.assertEqual(specs[0].args, ["slack", "serve"])
+
+    def test_internal_codex_app_server_command_runs_supervisor(self):
+        with patch(
+            "agent_harness.runtime.codex_app_server.run_codex_app_server_supervisor",
+            return_value=0,
+        ) as run:
+            code = main(
+                [
+                    "codex-app-server",
+                    "--listen",
+                    "ws://127.0.0.1:9999",
+                    "--codex-binary",
+                    "/opt/tools/codex",
+                    "--version-check-interval",
+                    "3",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        run.assert_called_once_with(
+            "/opt/tools/codex",
+            "ws://127.0.0.1:9999",
+            check_interval_seconds=3.0,
+        )
 
     def test_service_install_can_set_ignored_external_session_cwd_argument(self):
         output = io.StringIO()

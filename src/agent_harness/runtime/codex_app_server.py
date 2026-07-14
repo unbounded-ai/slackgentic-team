@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import signal
 import socket
 import struct
 import subprocess
@@ -18,9 +20,15 @@ from pathlib import Path
 from typing import Any
 
 from agent_harness.config import AgentCommandConfig
+from agent_harness.updates import is_newer_version
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CODEX_APP_SERVER_URL = "ws://127.0.0.1:47684"
+DEFAULT_CODEX_VERSION_CHECK_SECONDS = 2.0
+CODEX_VERSION_TIMEOUT_SECONDS = 5.0
+CODEX_VERSION_PATTERN = re.compile(
+    r"(?<![0-9A-Za-z])(?P<version>\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.-]+)?)"
+)
 
 
 class CodexAppServerError(RuntimeError):
@@ -164,10 +172,14 @@ class CodexAppServerManager:
             return None
         if _health_ready(self.url):
             return self.url
+        installation = resolve_codex_installation(self.commands.codex_binary)
+        codex_binary = (
+            str(installation.executable) if installation is not None else self.commands.codex_binary
+        )
         try:
             self._process = subprocess.Popen(
                 [
-                    self.commands.codex_binary,
+                    codex_binary,
                     "app-server",
                     "--listen",
                     self.url,
@@ -176,6 +188,7 @@ class CodexAppServerManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
         except OSError:
             LOGGER.exception("failed to start Codex app-server")
@@ -200,12 +213,269 @@ class CodexAppServerManager:
         process = self._process
         if process is None or process.poll() is not None:
             return
-        process.terminate()
+        _stop_codex_process(process)
+
+
+@dataclass(frozen=True)
+class CodexInstallation:
+    executable: Path
+    version: str
+    signature: tuple[Any, ...]
+
+
+def resolve_codex_installation(
+    command: str,
+    *,
+    environ_path: str | None = None,
+) -> CodexInstallation | None:
+    """Resolve the newest usable Codex binary visible to the service.
+
+    A service can outlive changes to the user's shell PATH, and Codex can be
+    installed by more than one package manager. For a bare command name, check
+    every matching executable on PATH and prefer the newest reported version.
+    Explicit paths remain pinned to the requested installation.
+    """
+
+    best: CodexInstallation | None = None
+    for candidate in _codex_candidate_paths(command, environ_path=environ_path):
+        version = _codex_version(candidate)
+        if version is None:
+            continue
+        installation = CodexInstallation(
+            executable=candidate,
+            version=version,
+            signature=(*_codex_file_signature(candidate), version),
+        )
+        if best is None or is_newer_version(installation.version, best.version):
+            best = installation
+    return best
+
+
+class CodexAppServerSupervisor:
+    """Keep the app-server aligned with upgrades to the Codex executable."""
+
+    def __init__(
+        self,
+        codex_binary: str = "codex",
+        url: str = DEFAULT_CODEX_APP_SERVER_URL,
+        *,
+        check_interval_seconds: float = DEFAULT_CODEX_VERSION_CHECK_SECONDS,
+        startup_timeout_seconds: float = 8.0,
+    ):
+        self.codex_binary = codex_binary
+        self.url = url
+        self.check_interval_seconds = max(0.1, check_interval_seconds)
+        self.startup_timeout_seconds = startup_timeout_seconds
+        self._process: subprocess.Popen[str] | None = None
+        self._installation: CodexInstallation | None = None
+        self._candidate_snapshot: tuple[Any, ...] | None = None
+
+    def run(self, stop: threading.Event) -> int:
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+            self.reconcile(force=True)
+            while not stop.wait(self.check_interval_seconds):
+                process_missing = self._process is None
+                process_exited = self._process is not None and self._process.poll() is not None
+                snapshot = _codex_candidate_snapshot(self.codex_binary)
+                if process_missing or process_exited or snapshot != self._candidate_snapshot:
+                    self.reconcile(force=process_exited, snapshot=snapshot)
+        finally:
+            self.close()
+        return 0
+
+    def reconcile(
+        self,
+        *,
+        force: bool = False,
+        snapshot: tuple[Any, ...] | None = None,
+    ) -> bool:
+        if snapshot is None:
+            snapshot = _codex_candidate_snapshot(self.codex_binary)
+        self._candidate_snapshot = snapshot
+        installation = resolve_codex_installation(self.codex_binary)
+        if installation is None:
+            self._candidate_snapshot = None
+            LOGGER.error("could not find a usable Codex executable: %s", self.codex_binary)
+            return False
+        process_running = self._process is not None and self._process.poll() is None
+        if (
+            process_running
+            and not force
+            and self._installation is not None
+            and installation.signature == self._installation.signature
+        ):
+            return True
+        if process_running:
+            LOGGER.info(
+                "restarting Codex app-server after Codex changed from %s to %s",
+                self._installation.version if self._installation else "unknown",
+                installation.version,
+            )
+            self._stop_process()
+        return self._start_process(installation)
+
+    def close(self) -> None:
+        self._stop_process()
+
+    def _start_process(self, installation: CodexInstallation) -> bool:
+        try:
+            self._process = subprocess.Popen(
+                [str(installation.executable), "app-server", "--listen", self.url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError:
+            LOGGER.exception("failed to start Codex app-server with %s", installation.executable)
+            self._process = None
+            return False
+        self._installation = installation
+        _drain_stream(self._process.stdout, logging.INFO)
+        _drain_stream(self._process.stderr, logging.WARNING)
+        deadline = time.monotonic() + self.startup_timeout_seconds
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                LOGGER.warning(
+                    "Codex app-server %s exited early with code %s",
+                    installation.version,
+                    self._process.returncode,
+                )
+                return False
+            if _health_ready(self.url):
+                LOGGER.info(
+                    "Codex app-server %s is ready at %s",
+                    installation.version,
+                    self.url,
+                )
+                return True
+            time.sleep(0.1)
+        LOGGER.warning("Codex app-server did not become ready at %s", self.url)
+        self._stop_process()
+        return False
+
+    def _stop_process(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None or process.poll() is not None:
+            return
+        _stop_codex_process(process)
+
+
+def _stop_codex_process(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (AttributeError, OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
             process.kill()
-            process.wait(timeout=5)
+        process.wait(timeout=5)
+
+
+def run_codex_app_server_supervisor(
+    codex_binary: str = "codex",
+    url: str = DEFAULT_CODEX_APP_SERVER_URL,
+    *,
+    check_interval_seconds: float = DEFAULT_CODEX_VERSION_CHECK_SECONDS,
+) -> int:
+    stop = threading.Event()
+    supervisor = CodexAppServerSupervisor(
+        codex_binary,
+        url,
+        check_interval_seconds=check_interval_seconds,
+    )
+
+    def request_stop(_signum=None, _frame=None) -> None:
+        stop.set()
+
+    previous_handlers: dict[int, Any] = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[sig] = signal.signal(sig, request_stop)
+        except (ValueError, OSError):
+            continue
+    try:
+        return supervisor.run(stop)
+    finally:
+        for sig, previous in previous_handlers.items():
+            try:
+                signal.signal(sig, previous)
+            except (ValueError, OSError, TypeError):
+                continue
+
+
+def _codex_candidate_paths(
+    command: str,
+    *,
+    environ_path: str | None = None,
+) -> list[Path]:
+    requested = Path(command).expanduser()
+    if requested.is_absolute() or len(requested.parts) > 1:
+        candidates = [requested]
+    else:
+        path_value = environ_path if environ_path is not None else os.environ.get("PATH", "")
+        candidates = [
+            Path(directory).expanduser() / command for directory in path_value.split(os.pathsep)
+        ]
+    usable: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        absolute = candidate.absolute()
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        usable.append(absolute)
+    return usable
+
+
+def _codex_version(executable: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            [str(executable), "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=CODEX_VERSION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = CODEX_VERSION_PATTERN.search(f"{completed.stdout}\n{completed.stderr}")
+    return match.group("version") if match else None
+
+
+def _codex_file_signature(executable: Path) -> tuple[Any, ...]:
+    try:
+        link_stat = executable.lstat()
+        target = executable.resolve(strict=True)
+        target_stat = target.stat()
+    except OSError:
+        return (str(executable),)
+    return (
+        str(executable),
+        link_stat.st_dev,
+        link_stat.st_ino,
+        link_stat.st_mtime_ns,
+        link_stat.st_size,
+        str(target),
+        target_stat.st_dev,
+        target_stat.st_ino,
+        target_stat.st_mtime_ns,
+        target_stat.st_size,
+    )
+
+
+def _codex_candidate_snapshot(command: str) -> tuple[Any, ...]:
+    return tuple(_codex_file_signature(candidate) for candidate in _codex_candidate_paths(command))
 
 
 class _JsonRpcWebSocket:
