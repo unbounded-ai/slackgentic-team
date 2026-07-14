@@ -422,10 +422,10 @@ class SlackTests(unittest.TestCase):
         action_block = next(block for block in blocks if block.get("type") == "actions")
         button = action_block["elements"][0]
 
-        self.assertEqual(button["text"]["text"], "Hire 1 Claude agent")
+        self.assertEqual(button["text"]["text"], "Hire 2 Claude agents")
         self.assertEqual(
             decode_action_value(button["value"]),
-            {"v": 1, "action": "team.hire", "count": 1, "provider": "claude"},
+            {"v": 1, "action": "team.hire", "count": 2, "provider": "claude"},
         )
 
     def test_normalize_slack_mrkdwn_converts_double_asterisk_outside_code_blocks(self):

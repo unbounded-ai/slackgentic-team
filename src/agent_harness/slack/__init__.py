@@ -693,6 +693,7 @@ def build_external_session_capacity_blocks(
 ) -> list[dict[str, Any]]:
     label = provider.value.title()
     plural = "session" if waiting_count == 1 else "sessions"
+    agent_plural = "agent" if waiting_count == 1 else "agents"
     return [
         {
             "type": "section",
@@ -700,8 +701,9 @@ def build_external_session_capacity_blocks(
                 "type": "mrkdwn",
                 "text": (
                     f"*No {label} team seat is available.*\n"
-                    f"{waiting_count} {label} {plural} started outside Slack waiting. Hire one "
-                    "matching agent and Slackgentic will backfill visible transcript "
+                    f"{waiting_count} {label} {plural} started outside Slack waiting. Hire "
+                    f"{waiting_count} matching {agent_plural} and Slackgentic will backfill "
+                    "visible transcript "
                     "output into the tracked thread."
                 ),
             },
@@ -711,9 +713,13 @@ def build_external_session_capacity_blocks(
             "block_id": f"external.capacity.{provider.value}",
             "elements": [
                 _button(
-                    f"Hire 1 {label} agent",
+                    f"Hire {waiting_count} {label} {agent_plural}",
                     f"external.capacity.hire.{provider.value}",
-                    encode_action_value("team.hire", count=1, provider=provider.value),
+                    encode_action_value(
+                        "team.hire",
+                        count=waiting_count,
+                        provider=provider.value,
+                    ),
                     "primary",
                 )
             ],
