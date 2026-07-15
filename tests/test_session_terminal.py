@@ -192,6 +192,28 @@ class SessionTerminalNotifierTests(unittest.TestCase):
             self.assertNotIn("> done", tty_writes[0][1])
             self.assertNotIn("log:", tty_writes[0][1])
 
+    def test_codex_agent_response_can_force_notice_for_background_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tty_writes = []
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: ["101 ttys002 codex"],
+                cwd_resolver=lambda pid: Path(tmp),
+                log_writer=lambda path, text: None,
+                tty_writer=lambda tty, text: tty_writes.append((tty, text)),
+                write_tui_notice=False,
+            )
+            session = AgentSession(
+                provider=Provider.CODEX,
+                session_id="abcdef123456",
+                transcript_path=Path(tmp) / "session.jsonl",
+                cwd=Path(tmp),
+            )
+
+            notifier.notify_agent_response(session, "background output", force_tui=True)
+
+            self.assertEqual(tty_writes[0][0], "ttys002")
+            self.assertIn("background output", tty_writes[0][1])
+
     def test_user_message_does_not_write_to_tty_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             tty_writes = []

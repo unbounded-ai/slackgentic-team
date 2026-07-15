@@ -137,6 +137,16 @@ class FakeTerminalNotifier:
     def __init__(self, targets=None, provider_targets=None):
         self.targets = targets or []
         self.provider_targets = provider_targets
+        self.user_messages = []
+        self.agent_responses = []
+
+    def notify_user_message(self, session, text, *, force_tui=False):
+        self.user_messages.append((session, text, force_tui))
+        return 1
+
+    def notify_agent_response(self, session, text, *, force_tui=False):
+        self.agent_responses.append((session, text, force_tui))
+        return 1
 
     def targets_for_session(self, session):
         return self.targets
@@ -2726,10 +2736,12 @@ class SessionMirrorTests(unittest.TestCase):
                     provider=Provider.CODEX,
                     session_id="s1",
                     transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
                     status=SessionStatus.ACTIVE,
                 )
                 thread = SlackThreadRef("C1", "171.000001", "171.000001")
                 store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                store.set_setting("session_channel_notice.codex.s1", "already-posted")
                 store.add_session_bridge_prompt(Provider.CODEX, "s1", "from slack")
                 events = [
                     AgentEvent(
@@ -2749,13 +2761,25 @@ class SessionMirrorTests(unittest.TestCase):
                         metadata={"payload": {"type": "agent_message", "message": "done"}},
                     ),
                 ]
+                provider = FakeProvider(session, events)
                 gateway = FakeGateway()
+                terminal = FakeTerminalNotifier(
+                    [
+                        TerminalTarget(
+                            pid=101,
+                            tty="ttys002",
+                            cwd=Path(tmp),
+                            command="codex --dangerously-bypass-approvals-and-sandbox",
+                        )
+                    ]
+                )
                 mirror = SessionMirror(
                     store,
                     gateway,
-                    [FakeProvider(session, events)],
+                    [provider],
                     team_id="T1",
                     channel_id="C1",
+                    terminal_notifier=terminal,
                 )
 
                 mirror.sync_once()
@@ -2764,6 +2788,108 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertFalse(
                     store.consume_session_bridge_prompt(Provider.CODEX, "s1", "from slack")
                 )
+                self.assertEqual(
+                    [(text, forced) for _, text, forced in terminal.user_messages],
+                    [("from slack", True)],
+                )
+                self.assertEqual(
+                    [(text, forced) for _, text, forced in terminal.agent_responses],
+                    [("done", True)],
+                )
+                self.assertIsNotNone(store.get_setting("external_session_terminal_mirror.codex.s1"))
+
+                provider.events.extend(
+                    [
+                        AgentEvent(
+                            provider=Provider.CODEX,
+                            session_id="s1",
+                            timestamp=None,
+                            event_type="event_msg",
+                            line_number=3,
+                            metadata={"payload": {"type": "agent_message", "message": "later"}},
+                        ),
+                        AgentEvent(
+                            provider=Provider.CODEX,
+                            session_id="s1",
+                            timestamp=None,
+                            event_type="event_msg",
+                            line_number=4,
+                            metadata={"payload": {"type": "task_complete"}},
+                        ),
+                    ]
+                )
+                mirror.sync_once()
+
+                self.assertEqual([reply[1] for reply in gateway.replies], ["done", "later"])
+                self.assertEqual(
+                    [(text, forced) for _, text, forced in terminal.agent_responses],
+                    [("done", True), ("later", True)],
+                )
+                self.assertIsNone(store.get_setting("external_session_terminal_mirror.codex.s1"))
+            finally:
+                store.close()
+
+    def test_remote_codex_turn_is_not_duplicated_into_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                )
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
+                )
+                store.add_session_bridge_prompt(Provider.CODEX, "s1", "from slack")
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "user_message", "message": "from slack"}},
+                    ),
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=2,
+                        metadata={"payload": {"type": "agent_message", "message": "done"}},
+                    ),
+                ]
+                terminal = FakeTerminalNotifier(
+                    [
+                        TerminalTarget(
+                            pid=101,
+                            tty="ttys002",
+                            cwd=Path(tmp),
+                            command="codex --remote ws://127.0.0.1:47684",
+                        )
+                    ]
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=terminal,
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(terminal.user_messages, [])
+                self.assertEqual(terminal.agent_responses, [])
             finally:
                 store.close()
 
