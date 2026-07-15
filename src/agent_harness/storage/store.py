@@ -1127,6 +1127,7 @@ class Store:
             "external_session_live_target.",
             "external_session_missing_target.",
             "external_session_summary.",
+            "external_session_terminal_mirror.",
             "session_channel_notice.",
         ):
             cursor = self.conn.execute(

@@ -75,12 +75,14 @@ DEFAULT_AGENT_AVATAR_BASE_URL = (
 )
 DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
+TERMINAL_MIRROR_PREFIX = "external_session_terminal_mirror."
 
 
 @dataclass(frozen=True)
 class RenderedSessionEvent:
     text: str
     author: str
+    mirror_to_terminal: bool = False
 
 
 class SessionMirror:
@@ -411,6 +413,8 @@ class SessionMirror:
         )
         max_line = cursor
         chunks: list[RenderedSessionEvent] = []
+        terminal_mirror_key = _terminal_mirror_key(session)
+        mirror_to_terminal = bool(self.store.get_setting(terminal_mirror_key))
         iter_events_after = getattr(provider, "iter_events_after", None)
         if callable(iter_events_after):
             events = iter_events_after(session.transcript_path, cursor)
@@ -423,6 +427,11 @@ class SessionMirror:
             max_line = max(max_line, line_number)
             if self._skip_claude_native_input_request(session, event):
                 continue
+            if _codex_event_ends_turn(event):
+                if mirror_to_terminal:
+                    self.store.delete_setting(terminal_mirror_key)
+                    mirror_to_terminal = False
+                continue
             rendered = render_session_event_chunk(event)
             if rendered is None:
                 continue
@@ -431,12 +440,48 @@ class SessionMirror:
                 session.session_id,
                 rendered.text,
             ):
+                if self._codex_terminal_needs_mirrored_turn(session):
+                    mirror_to_terminal = True
+                    self.store.set_setting(terminal_mirror_key, utc_now().isoformat())
+                    self._notify_terminal_user_message(session, rendered.text)
                 continue
             chunks.extend(
-                RenderedSessionEvent(text=chunk, author=rendered.author)
+                RenderedSessionEvent(
+                    text=chunk,
+                    author=rendered.author,
+                    mirror_to_terminal=(mirror_to_terminal and rendered.author == "assistant"),
+                )
                 for chunk in _slack_chunks(rendered.text)
             )
         return chunks, max_line
+
+    def _codex_terminal_needs_mirrored_turn(self, session: AgentSession) -> bool:
+        if session.provider != Provider.CODEX:
+            return False
+        targets = self.terminal_notifier.targets_for_session(session)
+        if not targets:
+            return False
+        return not any(
+            _codex_remote_enabled(target.command, self.codex_app_server_url) for target in targets
+        )
+
+    def _notify_terminal_user_message(self, session: AgentSession, text: str) -> None:
+        notify = getattr(self.terminal_notifier, "notify_user_message", None)
+        if not callable(notify):
+            return
+        try:
+            notify(session, text, force_tui=True)
+        except Exception:
+            LOGGER.debug("failed to mirror Slack reply into Codex terminal", exc_info=True)
+
+    def _notify_terminal_agent_message(self, session: AgentSession, text: str) -> None:
+        notify = getattr(self.terminal_notifier, "notify_agent_response", None)
+        if not callable(notify):
+            return
+        try:
+            notify(session, text, force_tui=True)
+        except Exception:
+            LOGGER.debug("failed to mirror agent output into Codex terminal", exc_info=True)
 
     def _skip_claude_native_input_request(
         self,
@@ -484,6 +529,8 @@ class SessionMirror:
                         persona=agent,
                         icon_url=icon_url,
                     )
+                    if chunk.mirror_to_terminal:
+                        self._notify_terminal_agent_message(session, chunk.text)
                     if self.on_agent_message is not None:
                         try:
                             self.on_agent_message(session, agent, thread, chunk.text, posted.ts)
@@ -1230,6 +1277,20 @@ def _is_codex_subagent_session(session: AgentSession) -> bool:
 
 def _session_channel_notice_key(session: AgentSession) -> str:
     return f"session_channel_notice.{session.provider.value}.{session.session_id}"
+
+
+def _terminal_mirror_key(session: AgentSession) -> str:
+    return f"{TERMINAL_MIRROR_PREFIX}{session.provider.value}.{session.session_id}"
+
+
+def _codex_event_ends_turn(event: AgentEvent) -> bool:
+    if event.provider != Provider.CODEX:
+        return False
+    payload = event.metadata.get("payload")
+    return isinstance(payload, dict) and payload.get("type") in {
+        "task_complete",
+        "turn_aborted",
+    }
 
 
 def render_session_event(event: AgentEvent) -> str | None:

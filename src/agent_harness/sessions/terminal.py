@@ -62,17 +62,36 @@ class SessionTerminalNotifier:
         self._process_cache: dict[Provider, tuple[float, list[TerminalTarget]]] = {}
         self._process_cache_lock = threading.RLock()
 
-    def notify_user_message(self, session: AgentSession, text: str) -> int:
+    def notify_user_message(
+        self,
+        session: AgentSession,
+        text: str,
+        *,
+        force_tui: bool = False,
+    ) -> int:
         return self._notify(
             session,
             "Slack reply",
             text,
             footer="Session is being resumed in the background.",
-            write_tui=self.write_user_tui_notice,
+            write_tui=self.write_user_tui_notice or force_tui,
+            force_tui=force_tui,
         )
 
-    def notify_agent_response(self, session: AgentSession, text: str) -> int:
-        return self._notify(session, "Slackgentic response", text, write_tui=True)
+    def notify_agent_response(
+        self,
+        session: AgentSession,
+        text: str,
+        *,
+        force_tui: bool = False,
+    ) -> int:
+        return self._notify(
+            session,
+            "Slackgentic response",
+            text,
+            write_tui=True,
+            force_tui=force_tui,
+        )
 
     def _notify(
         self,
@@ -81,6 +100,7 @@ class SessionTerminalNotifier:
         text: str,
         footer: str | None = None,
         write_tui: bool = True,
+        force_tui: bool = False,
     ) -> int:
         body = text.strip()
         if not body:
@@ -92,7 +112,7 @@ class SessionTerminalNotifier:
         except Exception:
             LOGGER.debug("failed to write session terminal notification", exc_info=True)
             return 0
-        if self.write_tui_notice and write_tui:
+        if (self.write_tui_notice or force_tui) and write_tui:
             self._notify_tui(session, label, body, footer)
         return 1
 
