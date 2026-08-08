@@ -39,6 +39,12 @@ SLACK_USER_REF_RE = re.compile(
 )
 SLACK_USER_AUTHOR_RE = re.compile(r"(?m)^(?P<user_id>[UW][A-Z0-9]{8,})(?=:)")
 
+# Slack rejects a message whose blocks array holds more than 50 items with
+# "invalid_blocks: no more than 50 items allowed". chat.update then falls back to
+# a text-only render, which silently strips every button off the message.
+SLACK_MAX_MESSAGE_BLOCKS = 50
+ROSTER_AGENT_BLOCK_COUNT = 3
+
 
 @dataclass(frozen=True)
 class AgentRosterStatus:
@@ -285,37 +291,79 @@ def build_team_roster_blocks(
             ],
         },
     ]
-    if engineers:
+    group_specs = (
+        (
+            "team.section.engineers",
+            f":hammer_and_wrench: *Engineers* — {len(engineers)}",
+            engineers,
+        ),
+        ("team.section.pms", f":clipboard: *Program managers* — {len(pms)}", pms),
+    )
+    shown_counts = _roster_group_allowances(group_specs, reserved=len(blocks))
+    hidden = 0
+    for block_id, heading, members in group_specs:
+        if not members:
+            continue
+        shown = shown_counts.get(block_id, 0)
+        hidden += len(members) - shown
+        if not shown:
+            continue
         blocks.append(
             {
                 "type": "context",
-                "block_id": "team.section.engineers",
+                "block_id": block_id,
+                "elements": [{"type": "mrkdwn", "text": heading}],
+            }
+        )
+        for agent in _sorted_roster_agents(members, statuses)[:shown]:
+            blocks.extend(_agent_roster_blocks(agent, statuses))
+    if hidden:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": "team.section.truncated",
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": f":hammer_and_wrench: *Engineers* — {len(engineers)}",
+                        "text": (
+                            f":information_source: {hidden} more "
+                            f"{'agent is' if hidden == 1 else 'agents are'} not listed here; "
+                            f"Slack allows {SLACK_MAX_MESSAGE_BLOCKS} blocks per message. "
+                            "Fire agents you no longer need to free up roster rows."
+                        ),
                     }
                 ],
             }
         )
-        for agent in _sorted_roster_agents(engineers, statuses):
-            blocks.extend(_agent_roster_blocks(agent, statuses))
-    if pms:
-        blocks.append(
-            {
-                "type": "context",
-                "block_id": "team.section.pms",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f":clipboard: *Program managers* — {len(pms)}",
-                    }
-                ],
-            }
-        )
-        for agent in _sorted_roster_agents(pms, statuses):
-            blocks.extend(_agent_roster_blocks(agent, statuses))
     return blocks
+
+
+def _roster_group_allowances(
+    group_specs: tuple[tuple[str, str, list[TeamAgent]], ...],
+    *,
+    reserved: int,
+) -> dict[str, int]:
+    """Decide how many agents per roster group fit inside Slack's block limit.
+
+    Each agent costs ``ROSTER_AGENT_BLOCK_COUNT`` blocks plus one heading block
+    per rendered group. Smaller groups are budgeted first so a long engineer
+    roster cannot push program managers out of the message entirely.
+    """
+
+    populated = [spec for spec in group_specs if spec[2]]
+    remaining = SLACK_MAX_MESSAGE_BLOCKS - reserved
+    full_cost = sum(1 + ROSTER_AGENT_BLOCK_COUNT * len(members) for _, _, members in populated)
+    if full_cost > remaining:
+        remaining -= 1  # leave room for the "not listed here" notice
+    allowances: dict[str, int] = {}
+    for block_id, _, members in sorted(populated, key=lambda spec: len(spec[2])):
+        if remaining < 1 + ROSTER_AGENT_BLOCK_COUNT:
+            allowances[block_id] = 0
+            continue
+        shown = min(len(members), (remaining - 1) // ROSTER_AGENT_BLOCK_COUNT)
+        allowances[block_id] = shown
+        remaining -= 1 + shown * ROSTER_AGENT_BLOCK_COUNT
+    return allowances
 
 
 def _agent_roster_blocks(
@@ -1020,7 +1068,7 @@ def slack_blocks_for_markdown_table(text: str) -> list[dict[str, Any]] | None:
         }
     )
     blocks.extend(_markdown_section_blocks(after))
-    return blocks[:50]
+    return blocks[:SLACK_MAX_MESSAGE_BLOCKS]
 
 
 def _extract_single_markdown_table(text: str) -> tuple[str, list[list[str]], str] | None:
