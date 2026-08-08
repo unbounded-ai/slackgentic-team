@@ -10,6 +10,7 @@ from agent_harness.models import (
     TeamAgentKind,
 )
 from agent_harness.slack import (
+    SLACK_MAX_MESSAGE_BLOCKS,
     AgentRosterStatus,
     build_external_session_capacity_blocks,
     build_setup_modal,
@@ -315,6 +316,66 @@ class SlackTests(unittest.TestCase):
         self.assertNotIn("Assign Project", engineer_labels)
         self.assertIn("Assign Project", pm_labels)
         self.assertNotIn("Assign", pm_labels)
+
+    def test_roster_stays_within_slack_block_limit_for_large_teams(self):
+        # Slack rejects more than 50 blocks with invalid_blocks, and chat.update then
+        # retries without blocks, which strips every hire button off the roster.
+        for team_size in range(1, 40):
+            agents = build_initial_model_team(codex_count=team_size, claude_count=0)
+            blocks = build_team_roster_blocks(agents)
+            self.assertLessEqual(
+                len(blocks),
+                SLACK_MAX_MESSAGE_BLOCKS,
+                f"roster for {team_size} agents rendered {len(blocks)} blocks",
+            )
+
+    def test_roster_keeps_hire_buttons_when_agent_rows_are_truncated(self):
+        agents = build_initial_model_team(codex_count=30, claude_count=0)
+        blocks = build_team_roster_blocks(agents)
+
+        self.assertLessEqual(len(blocks), SLACK_MAX_MESSAGE_BLOCKS)
+        roster_actions = next(
+            block for block in blocks if block.get("block_id") == "team.roster.actions"
+        )
+        action_ids = [element["action_id"] for element in roster_actions["elements"]]
+        self.assertIn("team.hire.codex", action_ids)
+        self.assertIn("team.hire.claude", action_ids)
+        self.assertIn("team.hire.auto", action_ids)
+
+        notice = next(
+            block for block in blocks if block.get("block_id") == "team.section.truncated"
+        )
+        shown = len([block for block in blocks if block.get("type") == "header"])
+        self.assertGreater(shown, 0)
+        self.assertLess(shown, len(agents))
+        self.assertIn(
+            f"{len(agents) - shown} more agents are not listed here",
+            notice["elements"][0]["text"],
+        )
+
+    def test_roster_truncation_notice_is_absent_for_small_teams(self):
+        agents = build_initial_model_team(codex_count=2, claude_count=2)
+        blocks = build_team_roster_blocks(agents)
+
+        self.assertNotIn(
+            "team.section.truncated",
+            [block.get("block_id") for block in blocks],
+        )
+        self.assertEqual(
+            len([block for block in blocks if block.get("type") == "header"]),
+            len(agents),
+        )
+
+    def test_roster_keeps_pms_visible_when_engineer_list_overflows(self):
+        engineers = build_initial_model_team(codex_count=30, claude_count=0)
+        pm = replace(engineers[0], agent_id="pm-1", handle="pm-one", kind=TeamAgentKind.PM)
+        blocks = build_team_roster_blocks([*engineers, pm])
+
+        self.assertLessEqual(len(blocks), SLACK_MAX_MESSAGE_BLOCKS)
+        block_ids = [block.get("block_id") for block in blocks]
+        self.assertIn("team.section.pms", block_ids)
+        self.assertIn("team.agent.pm-1", block_ids)
+        self.assertIn("team.agent.actions.pm-1", block_ids)
 
     def test_task_blocks_only_include_finish_button(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

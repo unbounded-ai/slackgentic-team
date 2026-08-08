@@ -404,12 +404,17 @@ class SlackGateway:
                 if error == "invalid_blocks" and "blocks" in current_kwargs:
                     if used_plain_text_fallback:
                         raise
+                    rejected_block_count = len(current_kwargs.get("blocks") or [])
                     if invalid_blocks_fallback is None:
                         current_kwargs.pop("blocks", None)
                     else:
                         current_kwargs["blocks"] = invalid_blocks_fallback
-                    LOGGER.info(
-                        "Slack rejected message blocks; retrying with text fallback",
+                    LOGGER.warning(
+                        "Slack rejected %d message blocks; retrying with text fallback "
+                        "(interactive buttons are dropped): %s",
+                        rejected_block_count,
+                        exc.response.get("errors")
+                        or exc.response.get("response_metadata", {}).get("messages"),
                         extra={"auto_rendered_blocks": auto_rendered_blocks},
                     )
                     used_plain_text_fallback = True
