@@ -488,7 +488,10 @@ class SlackAppTests(unittest.TestCase):
 
         self.assertTrue(_socket_mode_connection_stale(client, connected_at=10.0))
 
-    def test_socket_mode_connection_stale_when_no_pong_after_grace(self):
+    def test_socket_mode_connection_not_stale_while_connected_without_a_pong(self):
+        # slack_sdk's builtin connection leaves last_ping_pong_time at None on a
+        # healthy socket, so reconnecting once a grace timer expires recycled a
+        # live connection forever and dropped interactions during each handoff.
         client = types.SimpleNamespace(
             is_connected=lambda: True,
             current_session=types.SimpleNamespace(last_ping_pong_time=None),
@@ -502,11 +505,58 @@ class SlackAppTests(unittest.TestCase):
                 pong_grace_seconds=30.0,
             )
         )
+        self.assertFalse(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                monotonic_now=10_000.0,
+                pong_grace_seconds=30.0,
+            )
+        )
+
+    def test_socket_mode_connection_stale_when_dropped_without_a_pong(self):
+        client = types.SimpleNamespace(
+            is_connected=lambda: False,
+            current_session=types.SimpleNamespace(last_ping_pong_time=None),
+        )
+
         self.assertTrue(
             _socket_mode_connection_stale(
                 client,
                 connected_at=10.0,
-                monotonic_now=41.0,
+                monotonic_now=11.0,
+                pong_grace_seconds=30.0,
+            )
+        )
+
+    def test_socket_mode_connection_not_stale_when_session_cannot_report_pongs(self):
+        # slack_sdk's builtin Socket Mode client never exposes last_ping_pong_time.
+        # Treating that as staleness reconnected a live socket every grace period.
+        client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            current_session=types.SimpleNamespace(),
+        )
+
+        self.assertFalse(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                monotonic_now=10_000.0,
+                pong_grace_seconds=30.0,
+            )
+        )
+
+    def test_socket_mode_connection_stale_when_session_cannot_report_pongs_and_dropped(self):
+        client = types.SimpleNamespace(
+            is_connected=lambda: False,
+            current_session=types.SimpleNamespace(),
+        )
+
+        self.assertTrue(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                monotonic_now=11.0,
                 pong_grace_seconds=30.0,
             )
         )
