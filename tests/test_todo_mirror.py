@@ -11,8 +11,10 @@ from agent_harness.sessions.todo_mirror import (
     claude_todo_snapshot,
     codex_latest_plan_after,
     render_snapshot,
+    slack_text_length,
     todo_message_ts_key,
 )
+from agent_harness.slack import SLACK_MAX_UPDATE_TEXT_CHARS
 from agent_harness.storage.store import Store
 
 
@@ -22,6 +24,7 @@ class FakeGateway:
         self.updates = []
         self.fail_post = False
         self.fail_update = False
+        self.update_error = None
 
     def post_thread_reply(
         self,
@@ -41,7 +44,7 @@ class FakeGateway:
 
     def update_message(self, channel_id, ts, text, blocks=None):
         if self.fail_update:
-            raise RuntimeError("update failed")
+            raise self.update_error or RuntimeError("update failed")
         self.updates.append((channel_id, ts, text))
 
 
@@ -190,6 +193,38 @@ class RenderSnapshotTests(unittest.TestCase):
         text = render_snapshot(snapshot)
         self.assertIn("◻", text)
 
+    def test_long_snapshot_fits_slack_update_text_limit(self):
+        # Slack counts each glyph as its :shortcode:, so the raw text is well under
+        # the limit long before Slack agrees that it is.
+        snapshot = TodoSnapshot(
+            items=tuple(
+                TodoItem(
+                    title=f"Task number {index} with a reasonably long title", status="pending"
+                )
+                for index in range(200)
+            )
+        )
+        text = render_snapshot(snapshot)
+
+        self.assertLessEqual(slack_text_length(text), SLACK_MAX_UPDATE_TEXT_CHARS)
+        self.assertIn("more tasks not shown_", text)
+        self.assertTrue(text.startswith("*Tasks*"))
+
+    def test_snapshot_that_fits_has_no_truncation_note(self):
+        snapshot = TodoSnapshot(
+            items=tuple(TodoItem(title=f"Task {index}", status="pending") for index in range(5))
+        )
+        text = render_snapshot(snapshot)
+
+        self.assertNotIn("not shown", text)
+        self.assertEqual(len(text.splitlines()), 6)
+
+    def test_render_counts_glyphs_as_shortcodes(self):
+        snapshot = TodoSnapshot(items=(TodoItem(title="x", status="completed"),))
+        text = render_snapshot(snapshot)
+
+        self.assertGreater(slack_text_length(text), len(text))
+
 
 class TodoMirrorIntegrationTests(unittest.TestCase):
     def _store(self, tmp: Path) -> Store:
@@ -321,6 +356,72 @@ class TodoMirrorIntegrationTests(unittest.TestCase):
                 gateway.fail_post = False
                 mirror.sync_session(session, thread)
                 self.assertEqual(store.get_setting(todo_message_ts_key(session)), "170.000001")
+            finally:
+                store.close()
+
+    def test_rejected_update_is_not_resent_every_sync(self):
+        # A payload Slack calls msg_too_long will never succeed unchanged, so the
+        # mirror must stop retrying it instead of failing on every tick forever.
+        class Rejected(RuntimeError):
+            def __init__(self, message: str) -> None:
+                super().__init__(message)
+                self.response = {"error": "msg_too_long"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = self._store(home)
+            try:
+                gateway = FakeGateway()
+                mirror = TodoMirror(store, gateway, home=home)
+                session = _claude_session(home)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                tasks_dir = home / ".claude" / "tasks" / session.session_id
+                _write_claude_task(tasks_dir, 1, subject="first", status="pending")
+
+                mirror.sync_session(session, thread)
+                store.set_setting(todo_message_ts_key(session), "170.000001")
+
+                gateway.fail_update = True
+                gateway.update_error = Rejected("too long")
+                _write_claude_task(tasks_dir, 2, subject="second", status="pending")
+                mirror.sync_session(session, thread)
+
+                calls_before = len(gateway.updates)
+                # Same snapshot again: the mirror should not re-attempt the payload.
+                mirror.sync_session(session, thread)
+                gateway.fail_update = False
+                gateway.update_error = None
+                mirror.sync_session(session, thread)
+                self.assertEqual(len(gateway.updates), calls_before)
+
+                # A changed snapshot is still delivered.
+                _write_claude_task(tasks_dir, 3, subject="third", status="pending")
+                mirror.sync_session(session, thread)
+                self.assertEqual(len(gateway.updates), calls_before + 1)
+            finally:
+                store.close()
+
+    def test_transient_update_failure_is_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = self._store(home)
+            try:
+                gateway = FakeGateway()
+                mirror = TodoMirror(store, gateway, home=home)
+                session = _claude_session(home)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                tasks_dir = home / ".claude" / "tasks" / session.session_id
+                _write_claude_task(tasks_dir, 1, subject="first", status="pending")
+                mirror.sync_session(session, thread)
+                store.set_setting(todo_message_ts_key(session), "170.000001")
+
+                gateway.fail_update = True
+                _write_claude_task(tasks_dir, 2, subject="second", status="pending")
+                mirror.sync_session(session, thread)
+
+                gateway.fail_update = False
+                mirror.sync_session(session, thread)
+                self.assertTrue(any("second" in update[2] for update in gateway.updates))
             finally:
                 store.close()
 

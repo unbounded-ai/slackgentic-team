@@ -45,6 +45,15 @@ SLACK_USER_AUTHOR_RE = re.compile(r"(?m)^(?P<user_id>[UW][A-Z0-9]{8,})(?=:)")
 SLACK_MAX_MESSAGE_BLOCKS = 50
 ROSTER_AGENT_BLOCK_COUNT = 3
 
+# chat.update rejects a longer text with "msg_too_long". The limit is far lower
+# than chat.postMessage's, and Slack measures its own normalized form of the
+# text: unicode emoji become :shortcode: and & < > become entities, so a glyph
+# can cost more than 20 characters.
+SLACK_MAX_UPDATE_TEXT_CHARS = 4000
+# We cannot reproduce Slack's accounting exactly, and being a few characters over
+# means a permanent rejection, so aim well short of the hard limit.
+SLACK_UPDATE_TEXT_SAFETY_MARGIN = 400
+
 
 @dataclass(frozen=True)
 class AgentRosterStatus:

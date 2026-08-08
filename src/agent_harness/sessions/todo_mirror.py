@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_harness.models import AgentSession, Provider, SlackThreadRef
+from agent_harness.slack import SLACK_MAX_UPDATE_TEXT_CHARS, SLACK_UPDATE_TEXT_SAFETY_MARGIN
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.jsonl import iter_jsonl
 from agent_harness.storage.store import Store
@@ -20,6 +21,17 @@ _STATUS_GLYPHS = {
     "in_progress": "◼",
     "cancelled": "✖",
     "pending": "◻",
+}
+
+# Slack rewrites these glyphs to their :shortcode: form before enforcing the
+# chat.update text limit, so each one costs its shortcode length rather than a
+# single character. A long task list overruns the limit well before the raw
+# rendered text looks anywhere near it.
+_GLYPH_SHORTCODES = {
+    "✅": ":white_check_mark:",
+    "◼": ":black_medium_square:",
+    "✖": ":heavy_multiplication_x:",
+    "◻": ":white_medium_square:",
 }
 
 _DEFAULT_STATUS_GLYPH = _STATUS_GLYPHS["pending"]
@@ -75,12 +87,16 @@ class TodoMirror:
         if existing_ts:
             try:
                 self.gateway.update_message(thread.channel_id, existing_ts, text)
-            except Exception:
+            except Exception as exc:
                 LOGGER.exception(
                     "failed to update todo mirror for %s session %s",
                     session.provider.value,
                     session.session_id,
                 )
+                if _slack_rejected_payload(exc):
+                    # Slack will never accept this render, so remember it instead
+                    # of resending the identical payload on every sync tick.
+                    self._last_rendered[key] = text
                 return
         else:
             try:
@@ -114,13 +130,60 @@ def todo_message_ts_key(session: AgentSession) -> str:
     return f"{TODO_MESSAGE_TS_PREFIX}{session.provider.value}.{session.session_id}"
 
 
-def render_snapshot(snapshot: TodoSnapshot) -> str:
+def _slack_rejected_payload(exc: Exception) -> bool:
+    """True when Slack rejected the message itself rather than failing transiently."""
+
+    response = getattr(exc, "response", None)
+    getter = getattr(response, "get", None)
+    if not callable(getter):
+        return False
+    return getter("error") in {"msg_too_long", "invalid_blocks"}
+
+
+def render_snapshot(
+    snapshot: TodoSnapshot,
+    *,
+    limit: int = SLACK_MAX_UPDATE_TEXT_CHARS - SLACK_UPDATE_TEXT_SAFETY_MARGIN,
+) -> str:
+    total = len(snapshot.items)
     lines = [_HEADER]
+    shown = 0
     for item in snapshot.items:
-        glyph = _STATUS_GLYPHS.get(item.status, _DEFAULT_STATUS_GLYPH)
-        title = item.detail if item.status == "in_progress" and item.detail else item.title
-        lines.append(f"{glyph} {title}")
+        # Reserve room for the widest "more" note so breaking out later never
+        # pushes the finished message back over the limit.
+        trial = [*lines, _render_item(item)]
+        if shown + 1 < total:
+            trial.append(_hidden_note(total))
+        if slack_text_length("\n".join(trial)) > limit:
+            break
+        lines.append(_render_item(item))
+        shown += 1
+    hidden = total - shown
+    if hidden:
+        lines.append(_hidden_note(hidden))
     return "\n".join(lines)
+
+
+def slack_text_length(text: str) -> int:
+    """Length Slack charges for ``text``, approximating its normalized form."""
+
+    length = len(text)
+    for glyph, shortcode in _GLYPH_SHORTCODES.items():
+        length += text.count(glyph) * (len(shortcode) - len(glyph))
+    for char, entity in (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;")):
+        length += text.count(char) * (len(entity) - 1)
+    return length
+
+
+def _render_item(item: TodoItem) -> str:
+    glyph = _STATUS_GLYPHS.get(item.status, _DEFAULT_STATUS_GLYPH)
+    title = item.detail if item.status == "in_progress" and item.detail else item.title
+    return f"{glyph} {title}"
+
+
+def _hidden_note(hidden: int) -> str:
+    noun = "task" if hidden == 1 else "tasks"
+    return f"_+{hidden} more {noun} not shown_"
 
 
 def claude_todo_snapshot(home: Path, session_id: str) -> TodoSnapshot | None:

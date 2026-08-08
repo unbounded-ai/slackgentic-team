@@ -10047,10 +10047,14 @@ def _socket_mode_connection_stale(
     if isinstance(last_pong, (int, float)):
         now = time.time() if wall_now is None else wall_now
         return now - float(last_pong) > stale_seconds
-    if connected_at is None:
-        return False
-    now_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
-    return now_monotonic - connected_at > pong_grace_seconds
+    # No pong has been recorded. slack_sdk's builtin Socket Mode connection only
+    # fills last_ping_pong_time in when Slack echoes back a pong whose payload
+    # matches its own "<session id>:<ping time>" format, and on this transport it
+    # routinely stays None on a perfectly healthy socket. Recycling on the grace
+    # timer here tore down and rebuilt a live connection every grace period
+    # forever and dropped the interactions delivered during each handoff, so
+    # is_connected() above is the liveness signal we trust in that case.
+    return False
 
 
 def _is_stop_command(text: str) -> bool:
