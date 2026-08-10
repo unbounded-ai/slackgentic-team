@@ -9,7 +9,15 @@ from pathlib import Path
 # running, so a full scan skips it. Without a horizon the full scan turns every
 # transcript ever written into a live session, and its cost grows with total
 # history forever rather than with how much is actually running.
-DEFAULT_STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
+#
+# This also bounds what the session mirror polls each cycle, and polling is not
+# free: it reads a transcript end to end per session. A week was far too loose --
+# on a busy machine "written to this week" described 377 transcripts while only
+# five had a running process, costing about 5.3s of CPU per cycle and starving
+# the Slack listener so acks missed Slack's three second deadline. A day still
+# covers resuming yesterday's work, and anything older reappears as soon as
+# something writes to it.
+DEFAULT_STALE_AFTER_SECONDS = 24 * 60 * 60
 
 
 @dataclass(frozen=True)

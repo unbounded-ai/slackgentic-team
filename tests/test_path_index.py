@@ -32,7 +32,7 @@ class TranscriptPathIndexStaleFilterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fresh = _touch(root / "a" / "fresh.jsonl", age_seconds=60)
-            recent = _touch(root / "b" / "recent.jsonl", age_seconds=6 * 24 * 3600)
+            recent = _touch(root / "b" / "recent.jsonl", age_seconds=6 * 3600)
             stale = _touch(root / "c" / "stale.jsonl", age_seconds=30 * 24 * 3600)
 
             discovery = self._index(root).discover()
@@ -86,8 +86,8 @@ class TranscriptPathIndexStaleFilterTests(unittest.TestCase):
 
             self.assertEqual(discovery.paths, [])
 
-    def test_default_horizon_is_a_week(self):
-        self.assertEqual(DEFAULT_STALE_AFTER_SECONDS, 7 * 24 * 60 * 60)
+    def test_default_horizon_is_a_day(self):
+        self.assertEqual(DEFAULT_STALE_AFTER_SECONDS, 24 * 60 * 60)
 
     def test_real_clock_is_used_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
