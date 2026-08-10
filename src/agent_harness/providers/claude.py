@@ -17,7 +17,10 @@ from agent_harness.models import (
     UsageSnapshot,
     parse_timestamp,
 )
-from agent_harness.providers.path_index import TranscriptPathIndex
+from agent_harness.providers.path_index import (
+    DEFAULT_STALE_AFTER_SECONDS,
+    TranscriptPathIndex,
+)
 from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_line_number, tail_jsonl_records
 
 CLAUDE_LOCAL_EXIT_MARKERS = (
@@ -36,6 +39,7 @@ class ClaudeProvider:
         *,
         full_discovery_interval_seconds: float = 300.0,
         hot_path_retention_seconds: float | None = None,
+        stale_after_seconds: float | None = DEFAULT_STALE_AFTER_SECONDS,
     ):
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
@@ -49,6 +53,7 @@ class ClaudeProvider:
         self._path_index = TranscriptPathIndex(
             lambda: self.projects_root,
             full_scan_interval_seconds=full_discovery_interval_seconds,
+            stale_after_seconds=stale_after_seconds,
         )
 
     @property

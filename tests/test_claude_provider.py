@@ -41,7 +41,9 @@ class ClaudeProviderTests(unittest.TestCase):
             now = datetime(2026, 4, 27, 13, 0, tzinfo=UTC).timestamp()
             os.utime(path, (now, now))
 
-            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+            sessions = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            ).discover()
 
             self.assertEqual(len(sessions), 1)
             self.assertEqual(
@@ -85,7 +87,9 @@ class ClaudeProviderTests(unittest.TestCase):
             os.utime(path, (primary_mtime, primary_mtime))
             os.utime(subagent_path, (subagent_mtime, subagent_mtime))
 
-            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+            sessions = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            ).discover()
 
             self.assertEqual(len(sessions), 1)
             self.assertEqual(sessions[0].session_id, "session-1")
@@ -115,7 +119,9 @@ class ClaudeProviderTests(unittest.TestCase):
             ]
             path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
 
-            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+            sessions = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            ).discover()
 
             self.assertEqual(sessions[0].metadata["entrypoint"], "sdk-cli")
 
@@ -277,7 +283,9 @@ class ClaudeProviderTests(unittest.TestCase):
             now = datetime.now(UTC).timestamp()
             os.utime(path, (now, now))
 
-            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+            sessions = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            ).discover()
 
             self.assertEqual(sessions[0].status, SessionStatus.DONE)
 
@@ -326,7 +334,9 @@ class ClaudeProviderTests(unittest.TestCase):
             now = datetime.now(UTC).timestamp()
             os.utime(path, (now, now))
 
-            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+            sessions = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            ).discover()
 
             self.assertEqual(sessions[0].status, SessionStatus.DONE)
 
@@ -363,7 +373,9 @@ class ClaudeProviderTests(unittest.TestCase):
             now = datetime.now(UTC).timestamp()
             os.utime(path, (now, now))
 
-            sessions = ClaudeProvider(home=home, active_within_seconds=3600).discover()
+            sessions = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            ).discover()
 
             self.assertEqual(sessions[0].status, SessionStatus.DONE)
 

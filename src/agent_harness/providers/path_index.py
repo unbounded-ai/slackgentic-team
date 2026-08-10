@@ -5,6 +5,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+# A transcript untouched for this long cannot belong to a session that is still
+# running, so a full scan skips it. Without a horizon the full scan turns every
+# transcript ever written into a live session, and its cost grows with total
+# history forever rather than with how much is actually running.
+DEFAULT_STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
+
 
 @dataclass(frozen=True)
 class PathDiscovery:
@@ -19,12 +25,16 @@ class TranscriptPathIndex:
         *,
         pattern: str = "*.jsonl",
         full_scan_interval_seconds: float = 300.0,
+        stale_after_seconds: float | None = DEFAULT_STALE_AFTER_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ):
         self.root = root
         self.pattern = pattern
         self.full_scan_interval_seconds = max(0.0, full_scan_interval_seconds)
+        self.stale_after_seconds = stale_after_seconds
         self.monotonic = monotonic
+        self.wall_clock = wall_clock
         self._paths: set[Path] = set()
         self._last_full_scan_monotonic: float | None = None
 
@@ -48,7 +58,7 @@ class TranscriptPathIndex:
             return PathDiscovery([], full_scan=True)
 
         if self.full_scan_due():
-            paths = set(root.rglob(self.pattern))
+            paths = {path for path in root.rglob(self.pattern) if self._recent_enough(path)}
             self._paths = paths
             self._last_full_scan_monotonic = self.monotonic()
             return PathDiscovery(sorted(paths), full_scan=True)
@@ -74,3 +84,18 @@ class TranscriptPathIndex:
                 paths.add(path)
 
         return PathDiscovery(sorted(paths), full_scan=False)
+
+    def _recent_enough(self, path: Path) -> bool:
+        """True when ``path`` was modified recently enough to be a live session.
+
+        Hot paths and explicit scan roots bypass this: the caller already knows
+        it wants them. Only the unbounded full scan is filtered.
+        """
+
+        if self.stale_after_seconds is None:
+            return True
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            return False
+        return self.wall_clock() - modified_at <= self.stale_after_seconds
