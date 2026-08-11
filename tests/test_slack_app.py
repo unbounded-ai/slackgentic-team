@@ -88,6 +88,7 @@ from agent_harness.team import build_initial_model_team, create_agent_task, hire
 from agent_harness.team.commands import (
     FireCommand,
     FireEveryoneCommand,
+    HelpCommand,
     HireCommand,
     RosterCommand,
     ScheduledTasksCommand,
@@ -1201,6 +1202,27 @@ class SlackAppTests(unittest.TestCase):
                     if "nothing to hire for" in reply["text"]
                 ]
                 self.assertEqual(len(stale), 1)
+            finally:
+                store.close()
+
+    def test_help_command_posts_the_command_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    HelpCommand(), SlackReplyTarget(channel_id="C1", thread_ts=None)
+                )
+
+                self.assertEqual(len(gateway.posts), 1)
+                text = gateway.posts[0]["text"]
+                # Every documented command must be one the parser actually accepts.
+                for documented in ("roster", "sessions", "scheduled tasks", "hire", "fire", "help"):
+                    self.assertIn(documented, text)
+                self.assertIn("Slackgentic commands", text)
             finally:
                 store.close()
 

@@ -40,6 +40,11 @@ class UnassignedExternalSessionsCommand:
 
 
 @dataclass(frozen=True)
+class HelpCommand:
+    pass
+
+
+@dataclass(frozen=True)
 class RepoRootCommand:
     path: Path | None = None
 
@@ -51,6 +56,7 @@ TeamCommand = (
     | RosterCommand
     | ScheduledTasksCommand
     | UnassignedExternalSessionsCommand
+    | HelpCommand
     | RepoRootCommand
 )
 
@@ -60,7 +66,8 @@ def parse_team_command(text: str) -> TeamCommand | None:
     if not cleaned:
         return None
     return (
-        _parse_hire(cleaned)
+        _parse_help(cleaned)
+        or _parse_hire(cleaned)
         or _parse_fire(cleaned)
         or _parse_unassigned_external_sessions(cleaned)
         or _parse_scheduled_tasks(cleaned)
@@ -126,11 +133,23 @@ def _parse_unassigned_external_sessions(text: str) -> UnassignedExternalSessions
     ):
         return UnassignedExternalSessionsCommand()
     if re.match(
-        r"^(?:(?:show|list)\s+)?(?:unassigned|unclaimed)\s+sessions?\s*$",
+        r"^(?:(?:show|list)\s+)?(?:unassigned|unclaimed|active|live|open|current)"
+        r"\s+sessions?\s*$",
         text,
         flags=re.IGNORECASE,
     ):
         return UnassignedExternalSessionsCommand()
+    # Bare "sessions" is what people reach for first, so treat it as the same ask.
+    if re.match(r"^(?:(?:show|list)\s+)?sessions?\s*$", text, flags=re.IGNORECASE):
+        return UnassignedExternalSessionsCommand()
+    return None
+
+
+def _parse_help(text: str) -> HelpCommand | None:
+    if re.match(r"^(?:help|commands|\?)\s*$", text, re.IGNORECASE):
+        return HelpCommand()
+    if re.match(r"^(?:show|list)\s+(?:help|commands)\s*$", text, re.IGNORECASE):
+        return HelpCommand()
     return None
 
 
