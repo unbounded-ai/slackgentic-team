@@ -1118,6 +1118,92 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_capacity_hire_says_so_when_an_idle_agent_covers_the_backlog(self):
+        # Reusing an idle agent beats hiring, but the button says "Hire", so the
+        # click must not look like it did nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                store.set_setting("external_session_capacity_notice_ts.claude", "171.capacity")
+                store.set_setting("external_session_pending.claude.s1", "now")
+                for agent in build_initial_model_team(codex_count=0, claude_count=1):
+                    store.upsert_team_agent(agent)
+                store.upsert_session(
+                    AgentSession(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        transcript_path=Path(tmp) / "claude.jsonl",
+                        status=SessionStatus.ACTIVE,
+                    )
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.capacity"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire", count=1, provider=Provider.CLAUDE.value
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                # The existing agent took the session, and nobody new was hired.
+                self.assertEqual(len(store.list_team_agents()), 1)
+                self.assertIsNotNone(store.get_setting("external_session_agent.claude.s1"))
+                explanations = [
+                    reply["text"]
+                    for reply in gateway.thread_replies
+                    if "No hire needed" in reply["text"]
+                ]
+                self.assertEqual(len(explanations), 1)
+                self.assertIn("idle Claude agent", explanations[0])
+            finally:
+                store.close()
+
+    def test_capacity_hire_says_so_when_nothing_is_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_ROSTER_TS, "171.roster")
+                store.set_setting("external_session_capacity_notice_ts.claude", "171.capacity")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.capacity"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "team.hire", count=1, provider=Provider.CLAUDE.value
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(store.list_team_agents(), [])
+                stale = [
+                    reply["text"]
+                    for reply in gateway.thread_replies
+                    if "nothing to hire for" in reply["text"]
+                ]
+                self.assertEqual(len(stale), 1)
+            finally:
+                store.close()
+
     def test_external_capacity_notice_prompts_assign_when_agent_available(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
