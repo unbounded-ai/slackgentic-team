@@ -3259,10 +3259,21 @@ class SlackTeamController:
         kind = TeamAgentKind(kind_text) if kind_text else TeamAgentKind.ENGINEER
         external_capacity_hire = self._external_capacity_hire_clicked(provider, roster_ts)
         if external_capacity_hire and kind == TeamAgentKind.ENGINEER:
-            self._assign_available_agents_to_pending_external_sessions(channel_id, provider)
+            assigned = self._assign_available_agents_to_pending_external_sessions(
+                channel_id, provider
+            )
             if provider is not None:
                 count = self._pending_external_session_count(provider)
             if count == 0:
+                # Reusing an idle agent beats hiring, but the button said "Hire",
+                # so say what happened instead of silently doing nothing.
+                self._post_text(
+                    SlackReplyTarget(
+                        channel_id=channel_id,
+                        thread_ts=roster_ts or self.store.get_setting(SETTING_ROSTER_TS),
+                    ),
+                    _capacity_hire_noop_text(provider, assigned),
+                )
                 self._update_external_capacity_notice(channel_id, provider)
                 self._resume_pending_work_requests(channel_id)
                 roster_update_ts = self.store.get_setting(SETTING_ROSTER_TS) or roster_ts
@@ -10060,6 +10071,23 @@ def _socket_mode_connection_stale(
 def _is_stop_command(text: str) -> bool:
     cleaned = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
     return re.fullmatch(r"(?:please\s+)?stop[.!]?", cleaned, flags=re.IGNORECASE) is not None
+
+
+def _capacity_hire_noop_text(provider: Provider | None, assigned: int) -> str:
+    """Explain a capacity hire that did not need to hire anyone."""
+
+    label = provider.value.title() if provider is not None else "matching"
+    if assigned > 0:
+        agents = "agent" if assigned == 1 else "agents"
+        sessions = "session" if assigned == 1 else "sessions"
+        return (
+            f"No hire needed. {assigned} idle {label} {agents} picked up the waiting "
+            f"{sessions} instead."
+        )
+    return (
+        f"No {label} sessions are waiting any more, so there was nothing to hire for. "
+        "Use the roster's hire buttons if you want another agent regardless."
+    )
 
 
 def _payload_channel_id(payload: dict) -> str | None:
