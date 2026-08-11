@@ -88,6 +88,7 @@ from agent_harness.team import build_initial_model_team, create_agent_task, hire
 from agent_harness.team.commands import (
     FireCommand,
     FireEveryoneCommand,
+    HelpCommand,
     HireCommand,
     RosterCommand,
     ScheduledTasksCommand,
@@ -1118,14 +1119,19 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+<<<<<<< HEAD
     def test_capacity_hire_says_so_when_an_idle_agent_covers_the_backlog(self):
         # Reusing an idle agent beats hiring, but the button says "Hire", so the
         # click must not look like it did nothing.
+=======
+    def test_help_command_posts_the_command_reference(self):
+>>>>>>> 4741c79 (Add a help command and accept more session phrasings)
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
             try:
                 store.init_schema()
+<<<<<<< HEAD
                 store.set_setting(SETTING_ROSTER_TS, "171.roster")
                 store.set_setting("external_session_capacity_notice_ts.claude", "171.capacity")
                 store.set_setting("external_session_pending.claude.s1", "now")
@@ -1201,6 +1207,20 @@ class SlackAppTests(unittest.TestCase):
                     if "nothing to hire for" in reply["text"]
                 ]
                 self.assertEqual(len(stale), 1)
+=======
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    HelpCommand(), SlackReplyTarget(channel_id="C1", thread_ts=None)
+                )
+
+                self.assertEqual(len(gateway.posts), 1)
+                text = gateway.posts[0]["text"]
+                # Every documented command must be one the parser actually accepts.
+                for documented in ("roster", "sessions", "scheduled tasks", "hire", "fire", "help"):
+                    self.assertIn(documented, text)
+                self.assertIn("Slackgentic commands", text)
+>>>>>>> 4741c79 (Add a help command and accept more session phrasings)
             finally:
                 store.close()
 

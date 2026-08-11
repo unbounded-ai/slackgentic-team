@@ -5,6 +5,7 @@ from agent_harness.models import Provider
 from agent_harness.team.commands import (
     FireCommand,
     FireEveryoneCommand,
+    HelpCommand,
     HireCommand,
     RepoRootCommand,
     RosterCommand,
@@ -59,6 +60,38 @@ class TeamCommandTests(unittest.TestCase):
             parse_team_command('repo root "/tmp/my projects"'),
             RepoRootCommand(Path("/tmp/my projects")),
         )
+
+
+class HelpAndSessionPhrasingTests(unittest.TestCase):
+    def test_help_phrasings(self):
+        for text in ("help", "Help", "commands", "?", "show help", "list commands"):
+            with self.subTest(text=text):
+                self.assertIsInstance(parse_team_command(text), HelpCommand)
+
+    def test_session_phrasings_all_reach_the_same_command(self):
+        # "sessions" and "active sessions" are what people type first; before this
+        # only the "external"/"unassigned" spellings matched and the rest fell
+        # through to being treated as a task.
+        for text in (
+            "sessions",
+            "session",
+            "active sessions",
+            "live sessions",
+            "open sessions",
+            "current sessions",
+            "show sessions",
+            "list sessions",
+            "external sessions",
+            "unassigned sessions",
+            "unclaimed external sessions",
+        ):
+            with self.subTest(text=text):
+                self.assertIsInstance(parse_team_command(text), UnassignedExternalSessionsCommand)
+
+    def test_near_misses_are_not_commands(self):
+        for text in ("helpful stuff", "session notes", "help me fix this", "sessions are slow"):
+            with self.subTest(text=text):
+                self.assertIsNone(parse_team_command(text))
 
 
 if __name__ == "__main__":

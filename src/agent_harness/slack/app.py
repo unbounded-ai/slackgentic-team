@@ -225,6 +225,7 @@ from agent_harness.team.assignment import assign_work_request
 from agent_harness.team.commands import (
     FireCommand,
     FireEveryoneCommand,
+    HelpCommand,
     HireCommand,
     RepoRootCommand,
     RosterCommand,
@@ -942,6 +943,7 @@ class SlackTeamController:
             | RosterCommand
             | ScheduledTasksCommand
             | UnassignedExternalSessionsCommand
+            | HelpCommand
         ),
         target: SlackReplyTarget,
         *,
@@ -1017,6 +1019,9 @@ class SlackTeamController:
             return
         if isinstance(command, UnassignedExternalSessionsCommand):
             self._post_unassigned_external_sessions(target)
+            return
+        if isinstance(command, HelpCommand):
+            self._post_text(target, self.help_text())
             return
         self.post_roster(
             target.channel_id,
@@ -2769,6 +2774,36 @@ class SlackTeamController:
     def _refresh_external_capacity_notices(self, channel_id: str) -> None:
         for provider in Provider:
             self._update_external_capacity_notice(channel_id, provider)
+
+    def help_text(self) -> str:
+        """Command reference. Mirrors what ``parse_team_command`` accepts."""
+
+        command = self.slash_command
+        codex_command = f"codex --remote {self.codex_app_server_url}"
+        return "\n".join(
+            [
+                "*Slackgentic commands*",
+                f"Type these directly in the channel, or as `{command} <command>`.",
+                "",
+                "`status` — service, roster and session summary",
+                "`roster` / `show roster` — the agent roster with its controls",
+                "`sessions` / `active sessions` / `external sessions` — sessions started "
+                "outside Slack that are waiting for an agent",
+                "`scheduled tasks` — pending and claimed scheduled work",
+                "`hire 3 agents` — add capacity; `hire 2 claude agents` picks the provider",
+                "`fire @handle` — release one agent; `fire everyone` clears the roster",
+                "`repo root ~/code` — set where agents work",
+                "`help` — this list",
+                "",
+                "Write anything else to start a task, or `@agentname ...` to ask a specific "
+                "agent. In a task thread, `somebody ...` brings in another agent for a "
+                "subtask. Add `#dangerous-mode` to launch with Codex no-sandbox/no-approval "
+                "or Claude skip-permissions.",
+                f"Outside Slack: `{codex_command}` for Codex, or `{CLAUDE_EXTERNAL_COMMAND}` "
+                "for Claude (after `slackgentic claude-channel --install`), each of which "
+                "creates a tracking thread here.",
+            ]
+        )
 
     def post_channel_overview(self, channel_id: str) -> str:
         codex_command = f"codex --remote {self.codex_app_server_url}"
