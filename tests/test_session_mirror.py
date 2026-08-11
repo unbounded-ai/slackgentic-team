@@ -4103,6 +4103,101 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_tracked_session_is_retired_once_its_process_stays_gone(self):
+        # Discovery only knows when a transcript was last written, so a crashed
+        # session looks the same as an idle one. Once no provider process has
+        # matched for the grace period the session is retired and ignored, which
+        # frees its agent and stops it being re-adopted and re-announced.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX, "s1", "T1", SlackThreadRef("C1", "171.000001", "171.000001")
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    # No provider process anywhere: the owning terminal is gone.
+                    terminal_notifier=FakeTerminalNotifier([], provider_targets=[]),
+                    missing_target_grace_seconds=0,
+                )
+
+                # First cycle records that the process is missing; the next acts.
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(store.get_session(Provider.CODEX, "s1").status, SessionStatus.DONE)
+                self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+            finally:
+                store.close()
+
+    def test_missing_process_within_grace_keeps_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started,
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.codex.s1", agents[0].agent_id)
+                store.set_setting("external_session_live_target.codex.s1", "123")
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX, "s1", "T1", SlackThreadRef("C1", "171.000001", "171.000001")
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([], provider_targets=[]),
+                    missing_target_grace_seconds=3600,
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(store.get_session(Provider.CODEX, "s1").status, SessionStatus.IDLE)
+                self.assertIsNone(store.get_setting("external_session_ignored.codex.s1"))
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"), agents[0].agent_id
+                )
+                self.assertIsNotNone(store.get_setting("external_session_missing_target.codex.s1"))
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

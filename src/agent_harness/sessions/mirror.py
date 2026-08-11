@@ -70,6 +70,12 @@ EXTERNAL_SESSION_SUMMARY_PREFIX = "external_session_summary."
 PENDING_EXTERNAL_SESSION_PREFIX = "external_session_pending."
 CAPACITY_NOTICE_TS_PREFIX = "external_session_capacity_notice_ts."
 EXTERNAL_SESSION_START_MATCH_SECONDS = 300
+# How long a tracked session may go without a matching provider process before we
+# treat it as gone. Discovery only knows when a transcript was last written, which
+# cannot tell a crashed session from one sitting idle, so a session whose process
+# has disappeared for this long is retired and ignored. Without this the seat stays
+# occupied forever and the dead session keeps being re-adopted and re-announced.
+EXTERNAL_SESSION_MISSING_TARGET_GRACE_SECONDS = 300
 DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
@@ -105,9 +111,11 @@ class SessionMirror:
         home: Path | None = None,
         ignored_cwd_patterns: Iterable[str] = (),
         allowed_cwd_prefixes: Iterable[str] = (),
+        missing_target_grace_seconds: float = EXTERNAL_SESSION_MISSING_TARGET_GRACE_SECONDS,
     ):
         self.store = store
         self.gateway = gateway
+        self.missing_target_grace_seconds = missing_target_grace_seconds
         self.providers = list(providers)
         self.team_id = team_id
         self.channel_id = channel_id
@@ -655,8 +663,17 @@ class SessionMirror:
         if not was_tracked:
             return False
         missing_target_key = _external_session_missing_target_key(session)
-        self.store.set_setting(missing_target_key, utc_now().isoformat())
-        return False
+        missing_since = parse_timestamp(self.store.get_setting(missing_target_key))
+        if missing_since is None:
+            # First cycle without a process. Record it and give the process a
+            # chance to reappear; discovery and ps can briefly disagree.
+            self.store.set_setting(missing_target_key, utc_now().isoformat())
+            return False
+        if (utc_now() - missing_since).total_seconds() < self.missing_target_grace_seconds:
+            return False
+        self.store.delete_setting(missing_target_key)
+        self.store.delete_setting(_external_session_live_target_key(session))
+        return True
 
     def _live_terminal_target(self, session: AgentSession):
         targets = self.terminal_notifier.targets_for_session(session)
