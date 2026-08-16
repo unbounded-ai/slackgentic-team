@@ -40,6 +40,7 @@ class CodexProvider:
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
         self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
+        self._response_item_message_format: dict[Path, bool] = {}
         self._hot_path_retention_seconds = (
             hot_path_retention_seconds
             if hot_path_retention_seconds is not None
@@ -160,6 +161,7 @@ class CodexProvider:
         line_number: int,
     ) -> Iterator[AgentEvent]:
         session_id = _session_id_from_filename(transcript_path) or "unknown"
+        prefer_response_items = self._prefers_response_item_messages(transcript_path)
         for event_line_number, record in iter_jsonl(transcript_path, after_line=line_number):
             timestamp = parse_timestamp(record.get("timestamp"))
             record_type = str(record.get("type", "unknown"))
@@ -178,6 +180,13 @@ class CodexProvider:
                 )
                 continue
             payload = record.get("payload")
+            metadata = record
+            if (
+                prefer_response_items
+                and isinstance(payload, dict)
+                and payload.get("type") in {"agent_message", "user_message"}
+            ):
+                metadata = {**record, "_slackgentic_duplicate_message": True}
             if isinstance(payload, dict) and payload.get("type") == "token_count":
                 snapshot = parse_token_count(record, session_id)
                 yield AgentEvent(
@@ -199,8 +208,56 @@ class CodexProvider:
                 text=text,
                 source_path=transcript_path,
                 line_number=event_line_number,
-                metadata=record,
+                metadata=metadata,
             )
+
+    def response_item_recovery_cursor(
+        self,
+        transcript_path: Path,
+        last_line_number: int,
+        observed_after: datetime,
+    ) -> int | None:
+        """Return a safe cursor for transcripts skipped by the legacy mirror parser."""
+        if last_line_number <= 0 or not self._prefers_response_item_messages(transcript_path):
+            return None
+        first_visible_line: int | None = None
+        for line_number, record in iter_jsonl(transcript_path):
+            if line_number > last_line_number:
+                break
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") in {"agent_message", "user_message"}:
+                # This transcript emitted the legacy records that older Slackgentic
+                # versions already mirrored, so replaying response items would duplicate them.
+                return None
+            if not _is_visible_response_item_message(payload):
+                continue
+            timestamp = parse_timestamp(record.get("timestamp"))
+            if timestamp is None or timestamp < observed_after:
+                continue
+            if first_visible_line is None:
+                first_visible_line = line_number
+        return first_visible_line - 1 if first_visible_line is not None else None
+
+    def _prefers_response_item_messages(self, transcript_path: Path) -> bool:
+        cached = self._response_item_message_format.get(transcript_path)
+        if cached is not None:
+            return cached
+        legacy_message_seen = False
+        for index, (_, record) in enumerate(iter_jsonl(transcript_path), start=1):
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                if payload.get("type") == "message":
+                    self._response_item_message_format[transcript_path] = True
+                    return True
+                if payload.get("type") in {"agent_message", "user_message"}:
+                    legacy_message_seen = True
+            if index >= 64:
+                break
+        if legacy_message_seen:
+            self._response_item_message_format[transcript_path] = False
+        return False
 
     def last_event_line_number(self, transcript_path: Path) -> int:
         return last_jsonl_line_number(transcript_path)
@@ -301,6 +358,21 @@ def _event_text(record: dict[str, Any]) -> str | None:
         if payload.get("type") == "function_call_output":
             return "tool result"
     return None
+
+
+def _is_visible_response_item_message(payload: dict[str, Any]) -> bool:
+    if payload.get("type") != "message" or payload.get("role") not in {"assistant", "user"}:
+        return False
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("type") in {"input_text", "output_text", "text"}
+        and isinstance(item.get("text"), str)
+        and bool(item["text"].strip())
+        for item in content
+    )
 
 
 def _stat_signature(stat: os.stat_result) -> tuple[int, int]:

@@ -14,6 +14,7 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgentKind,
 )
+from agent_harness.providers.codex import CodexProvider
 from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.mirror import (
     SessionMirror,
@@ -93,6 +94,30 @@ class FailingReplyGateway(FakeGateway):
         raise RuntimeError("Slack post failed")
 
 
+class FailSecondReplyGateway(FakeGateway):
+    def post_thread_reply(
+        self,
+        thread,
+        text,
+        persona=None,
+        username=None,
+        icon_url=None,
+        icon_emoji=None,
+        blocks=None,
+    ):
+        if len(self.replies) == 1:
+            raise RuntimeError("Slack post failed")
+        return super().post_thread_reply(
+            thread,
+            text,
+            persona=persona,
+            username=username,
+            icon_url=icon_url,
+            icon_emoji=icon_emoji,
+            blocks=blocks,
+        )
+
+
 class FakeProvider:
     provider = Provider.CODEX
 
@@ -131,6 +156,15 @@ class CursorAwareProvider(FakeProvider):
     def last_event_line_number(self, transcript_path):
         self.last_line_calls.append(transcript_path)
         return self.last_line
+
+
+class StaticCodexProvider(CodexProvider):
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+
+    def discover(self):
+        return [self.session]
 
 
 class FakeTerminalNotifier:
@@ -304,6 +338,135 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(provider.iter_events_calls, 0)
                 self.assertEqual([reply[1] for reply in gateway.replies], ["new"])
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 6)
+            finally:
+                store.close()
+
+    def test_existing_thread_recovers_response_items_skipped_by_legacy_parser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=1, claude_count=0)
+                transcript_path = Path(tmp) / "codex.jsonl"
+                parent_time = datetime(2026, 4, 27, 12, 0, 1, tzinfo=UTC)
+                records = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "before observation"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-04-27T12:00:02.000Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "investigate this"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-04-27T12:00:03.000Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "fixed"}],
+                        },
+                    },
+                ]
+                transcript_path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=transcript_path,
+                    status=SessionStatus.ACTIVE,
+                )
+                thread_ts = f"{parent_time.timestamp():.6f}"
+                thread = SlackThreadRef("C1", thread_ts, thread_ts)
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                store.set_session_mirror_cursor(Provider.CODEX, "s1", 3)
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [StaticCodexProvider(session)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(
+                    [reply[1] for reply in gateway.replies], ["investigate this", "fixed"]
+                )
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 3)
+                self.assertIsNotNone(store.get_setting("codex_response_item_recovery.v1.codex.s1"))
+            finally:
+                store.close()
+
+    def test_response_item_transcript_mirrors_each_dual_format_message_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store, codex_count=1, claude_count=0)
+                transcript_path = Path(tmp) / "codex.jsonl"
+                records = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hello"}],
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-04-27T12:00:00.000Z",
+                        "payload": {"type": "user_message", "message": "hello"},
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-04-27T12:00:01.000Z",
+                        "payload": {"type": "agent_message", "message": "done"},
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-04-27T12:00:01.000Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "done"}],
+                        },
+                    },
+                ]
+                transcript_path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=transcript_path,
+                    status=SessionStatus.ACTIVE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [StaticCodexProvider(session)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual([reply[1] for reply in gateway.replies], ["hello", "done"])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 4)
             finally:
                 store.close()
 
@@ -1025,6 +1188,59 @@ class SessionMirrorTests(unittest.TestCase):
                     mirror.sync_once()
 
                 self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 0)
+            finally:
+                store.close()
+
+    def test_mirror_checkpoints_completed_events_before_later_post_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=1,
+                        metadata={"payload": {"type": "agent_message", "message": "first"}},
+                    ),
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="event_msg",
+                        line_number=2,
+                        metadata={"payload": {"type": "agent_message", "message": "second"}},
+                    ),
+                ]
+                store.upsert_slack_thread_for_session(
+                    Provider.CODEX,
+                    "s1",
+                    "T1",
+                    SlackThreadRef("C1", "171.thread", "171.parent"),
+                )
+                gateway = FailSecondReplyGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                with self.assertLogs("agent_harness.sessions.mirror", level="ERROR"):
+                    mirror.sync_once()
+
+                self.assertEqual([reply[1] for reply in gateway.replies], ["first"])
+                self.assertEqual(store.get_session_mirror_cursor(Provider.CODEX, "s1"), 1)
             finally:
                 store.close()
 
@@ -2403,6 +2619,102 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_managed_codex_response_item_session_is_not_mirrored_before_id_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "help", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_status(task.task_id, AgentTaskStatus.ACTIVE)
+                task = store.get_agent_task(task.task_id)
+                assert task is not None
+                transcript = Path(tmp) / "codex.jsonl"
+                records = [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "# AGENTS.md instructions for "
+                                        "/workspace/repos/example-project\n"
+                                        "<INSTRUCTIONS>Follow the guide.</INSTRUCTIONS>\n"
+                                        "<environment_context><cwd>"
+                                        "/workspace/repos/example-project</cwd>"
+                                        "</environment_context>"
+                                    ),
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": build_task_prompt(agent, task)}
+                            ],
+                        },
+                    },
+                ]
+                transcript.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="managed-s1",
+                    transcript_path=transcript,
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                )
+                events = [
+                    AgentEvent(
+                        provider=Provider.CODEX,
+                        session_id="managed-s1",
+                        timestamp=None,
+                        event_type="response_item",
+                        line_number=3,
+                        metadata={
+                            "payload": {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "managed visible"}],
+                            }
+                        },
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(gateway.parents, [])
+                self.assertIsNone(
+                    store.get_slack_thread_for_session(
+                        Provider.CODEX,
+                        "managed-s1",
+                        "T1",
+                        "C1",
+                    )
+                )
+                updated = store.get_agent_task(task.task_id)
+                assert updated is not None
+                self.assertEqual(updated.session_provider, Provider.CODEX)
+                self.assertEqual(updated.session_id, "managed-s1")
+            finally:
+                store.close()
+
     def test_stale_managed_claude_session_prompt_is_not_mirrored_as_external(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -3170,6 +3482,64 @@ class SessionMirrorTests(unittest.TestCase):
         self.assertIn("Which database should we migrate to?", rendered)
         self.assertIn("`Postgres` — Default", rendered)
         self.assertIn("`MySQL`", rendered)
+
+    def test_render_codex_response_item_messages_and_hides_context(self):
+        assistant = AgentEvent(
+            provider=Provider.CODEX,
+            session_id="s1",
+            timestamp=None,
+            event_type="response_item",
+            metadata={
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "first"},
+                        {"type": "output_text", "text": "second"},
+                    ],
+                }
+            },
+        )
+        user = AgentEvent(
+            provider=Provider.CODEX,
+            session_id="s1",
+            timestamp=None,
+            event_type="response_item",
+            metadata={
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ship it"}],
+                }
+            },
+        )
+        context = AgentEvent(
+            provider=Provider.CODEX,
+            session_id="s1",
+            timestamp=None,
+            event_type="response_item",
+            metadata={
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "# AGENTS.md instructions for /workspace/repos/example-project\n"
+                                "<INSTRUCTIONS>Follow the repository guide.</INSTRUCTIONS>\n"
+                                "<environment_context><cwd>/workspace/repos/example-project</cwd>"
+                                "</environment_context>"
+                            ),
+                        }
+                    ],
+                }
+            },
+        )
+
+        self.assertEqual(render_session_event(assistant), "first\n\nsecond")
+        self.assertEqual(render_session_event(user), "ship it")
+        self.assertIsNone(render_session_event(context))
 
     def test_render_codex_event_skips_slackgentic_mcp_request_user_input(self):
         event = AgentEvent(

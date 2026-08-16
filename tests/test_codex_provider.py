@@ -9,6 +9,117 @@ from agent_harness.providers.codex import CodexProvider
 
 
 class CodexProviderTests(unittest.TestCase):
+    def test_response_item_transcript_marks_legacy_messages_as_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-test-019dcf88-26b6-7cc3-a23e-3c9e45e12e24.jsonl"
+            records = [
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-04-27T12:00:00.000Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-04-27T12:00:00.000Z",
+                    "payload": {"type": "user_message", "message": "hello"},
+                },
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-04-27T12:00:01.000Z",
+                    "payload": {"type": "agent_message", "message": "done"},
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-04-27T12:00:01.000Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                },
+            ]
+            path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+
+            events = list(CodexProvider().iter_events(path))
+
+            self.assertFalse(events[0].metadata.get("_slackgentic_duplicate_message", False))
+            self.assertTrue(events[1].metadata["_slackgentic_duplicate_message"])
+            self.assertTrue(events[2].metadata["_slackgentic_duplicate_message"])
+            self.assertFalse(events[3].metadata.get("_slackgentic_duplicate_message", False))
+
+    def test_legacy_only_transcript_keeps_legacy_messages_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-test-019dcf88-26b6-7cc3-a23e-3c9e45e12e24.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-04-27T12:00:01.000Z",
+                        "payload": {"type": "agent_message", "message": "done"},
+                    }
+                )
+                + "\n"
+            )
+
+            event = next(CodexProvider().iter_events(path))
+
+            self.assertFalse(event.metadata.get("_slackgentic_duplicate_message", False))
+
+    def test_response_item_recovery_rewinds_only_schema_without_legacy_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-test-019dcf88-26b6-7cc3-a23e-3c9e45e12e24.jsonl"
+            records = [
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-04-27T12:00:00.000Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "before observation"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-04-27T12:00:02.000Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "after observation"}],
+                    },
+                },
+            ]
+            path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+            provider = CodexProvider()
+
+            recovered = provider.response_item_recovery_cursor(
+                path,
+                last_line_number=2,
+                observed_after=datetime(2026, 4, 27, 12, 0, 1, tzinfo=UTC),
+            )
+
+            self.assertEqual(recovered, 1)
+
+            records.insert(
+                2,
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-04-27T12:00:02.000Z",
+                    "payload": {"type": "agent_message", "message": "after observation"},
+                },
+            )
+            path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+            self.assertIsNone(
+                provider.response_item_recovery_cursor(
+                    path,
+                    last_line_number=3,
+                    observed_after=datetime(2026, 4, 27, 12, 0, 1, tzinfo=UTC),
+                )
+            )
+
     def test_discover_reuses_cached_session_when_transcript_is_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

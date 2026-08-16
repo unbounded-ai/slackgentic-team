@@ -10,6 +10,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_harness.internal_notifications import is_internal_task_notification_text
@@ -82,6 +83,7 @@ DEFAULT_AGENT_AVATAR_BASE_URL = (
 DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 TERMINAL_MIRROR_PREFIX = "external_session_terminal_mirror."
+CODEX_RESPONSE_ITEM_RECOVERY_PREFIX = "codex_response_item_recovery.v1."
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ class RenderedSessionEvent:
     text: str
     author: str
     mirror_to_terminal: bool = False
+    line_number: int = 0
 
 
 class SessionMirror:
@@ -261,7 +264,17 @@ class SessionMirror:
                 self._sync_todo_mirror(session, thread)
                 continue
             self._post_session_channel_notice_once(session, thread)
-            self._mirror_new_events(provider, session, thread, agent)
+            recovery_pending = self._prepare_codex_response_item_recovery(
+                provider,
+                session,
+                thread,
+            )
+            mirrored = self._mirror_new_events(provider, session, thread, agent)
+            if recovery_pending and mirrored:
+                self.store.set_setting(
+                    _codex_response_item_recovery_key(session),
+                    utc_now().isoformat(),
+                )
             self._sync_todo_mirror(session, thread)
         self._sync_capacity_notices(channel_id)
 
@@ -326,6 +339,11 @@ class SessionMirror:
             self.team_id,
             thread,
         )
+        if session.provider == Provider.CODEX:
+            self.store.set_setting(
+                _codex_response_item_recovery_key(session),
+                utc_now().isoformat(),
+            )
         self._notify_external_session_occupancy_changed(channel_id)
         if channel_notice:
             self._mark_session_channel_notice_posted(session)
@@ -403,12 +421,39 @@ class SessionMirror:
         session: AgentSession,
         thread: SlackThreadRef,
         agent: TeamAgent,
-    ) -> None:
+    ) -> bool:
         chunks, max_line = self._new_chunks(provider, session)
         if not self._post_chunks(session, thread, chunks, agent):
-            return
+            return False
         self._update_parent_summary(session, thread, chunks)
         self._update_cursor_if_needed(session, max_line)
+        return True
+
+    def _prepare_codex_response_item_recovery(
+        self,
+        provider: AgentProvider,
+        session: AgentSession,
+        thread: SlackThreadRef,
+    ) -> bool:
+        if session.provider != Provider.CODEX:
+            return False
+        setting_key = _codex_response_item_recovery_key(session)
+        if self.store.get_setting(setting_key):
+            return False
+        recovery_cursor = getattr(provider, "response_item_recovery_cursor", None)
+        observed_after = _slack_message_timestamp(thread.message_ts or thread.thread_ts)
+        if not callable(recovery_cursor) or observed_after is None:
+            self.store.set_setting(setting_key, utc_now().isoformat())
+            return False
+        cursor = self.store.get_session_mirror_cursor(session.provider, session.session_id)
+        recovered = recovery_cursor(session.transcript_path, cursor, observed_after)
+        if recovered is not None and recovered < cursor:
+            self.store.set_session_mirror_cursor(
+                session.provider,
+                session.session_id,
+                recovered,
+            )
+        return True
 
     def _new_chunks(
         self,
@@ -458,6 +503,7 @@ class SessionMirror:
                     text=chunk,
                     author=rendered.author,
                     mirror_to_terminal=(mirror_to_terminal and rendered.author == "assistant"),
+                    line_number=line_number,
                 )
                 for chunk in _slack_chunks(rendered.text)
             )
@@ -516,7 +562,7 @@ class SessionMirror:
         agent: TeamAgent,
     ) -> bool:
         icon_url = self._team_agent_icon_url(agent)
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             try:
                 if chunk.author == "user":
                     posted = self.gateway.post_thread_reply(
@@ -547,6 +593,11 @@ class SessionMirror:
                                 "failed to handle mirrored %s session agent message",
                                 session.provider.value,
                             )
+                next_line_number = (
+                    chunks[index + 1].line_number if index + 1 < len(chunks) else None
+                )
+                if chunk.line_number > 0 and next_line_number != chunk.line_number:
+                    self._update_cursor_if_needed(session, chunk.line_number)
             except Exception:
                 LOGGER.exception(
                     "failed to mirror %s session %s into Slack",
@@ -1272,6 +1323,9 @@ def _managed_prompt_from_record(provider: Provider, record: dict[str, object]) -
         if payload.get("type") == "user_message":
             message = payload.get("message")
             return message if isinstance(message, str) else None
+        if payload.get("type") == "message" and payload.get("role") == "user":
+            message = _codex_response_item_message_text(payload)
+            return None if _is_codex_context_message(message) else message or None
     return None
 
 
@@ -1300,6 +1354,19 @@ def _terminal_mirror_key(session: AgentSession) -> str:
     return f"{TERMINAL_MIRROR_PREFIX}{session.provider.value}.{session.session_id}"
 
 
+def _codex_response_item_recovery_key(session: AgentSession) -> str:
+    return f"{CODEX_RESPONSE_ITEM_RECOVERY_PREFIX}{session.provider.value}.{session.session_id}"
+
+
+def _slack_message_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=UTC)
+    except ValueError:
+        return None
+
+
 def _codex_event_ends_turn(event: AgentEvent) -> bool:
     if event.provider != Provider.CODEX:
         return False
@@ -1324,6 +1391,8 @@ def render_session_event_chunk(event: AgentEvent) -> RenderedSessionEvent | None
 
 
 def _render_codex_event(event: AgentEvent) -> RenderedSessionEvent | None:
+    if event.metadata.get("_slackgentic_duplicate_message") is True:
+        return None
     payload = event.metadata.get("payload")
     if not isinstance(payload, dict):
         return None
@@ -1340,10 +1409,48 @@ def _render_codex_event(event: AgentEvent) -> RenderedSessionEvent | None:
         if text and is_internal_task_notification_text(text):
             return None
         return RenderedSessionEvent(text, "user") if text else None
+    if event_type == "message" and payload.get("role") in {"assistant", "user"}:
+        text = _codex_response_item_message_text(payload)
+        if payload.get("role") == "user" and _is_codex_context_message(text):
+            return None
+        if text and is_internal_task_notification_text(text):
+            return None
+        author = "assistant" if payload.get("role") == "assistant" else "user"
+        return RenderedSessionEvent(text, author) if text else None
     if event_type == "function_call" and _is_codex_native_request_user_input(payload):
         text = _format_codex_request_user_input(payload)
         return RenderedSessionEvent(text, "assistant") if text else None
     return None
+
+
+def _codex_response_item_message_text(payload: dict) -> str:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"input_text", "output_text", "text"}:
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        cleaned = _clean_text(text)
+        if cleaned:
+            parts.append(cleaned)
+    return "\n\n".join(parts)
+
+
+def _is_codex_context_message(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped.startswith("# AGENTS.md instructions for ")
+        and "<INSTRUCTIONS>" in stripped
+        and "<environment_context>" in stripped
+    ) or (
+        stripped.startswith("<environment_context>") and stripped.endswith("</environment_context>")
+    )
 
 
 def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
