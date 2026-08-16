@@ -1129,6 +1129,7 @@ class Store:
             "external_session_summary.",
             "external_session_terminal_mirror.",
             "session_channel_notice.",
+            "codex_response_item_recovery.v1.",
         ):
             cursor = self.conn.execute(
                 "DELETE FROM settings WHERE key = ?",
