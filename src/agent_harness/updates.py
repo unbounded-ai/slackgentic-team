@@ -662,6 +662,20 @@ class SlackgenticUpdateRunner:
         candidate = self._candidate_for_version(version)
         if candidate is None:
             candidate = self._fallback_candidate(version)
+        running_version = current_package_version()
+        if not is_newer_version(candidate.version, running_version):
+            text = (
+                f"Slackgentic {candidate.release.tag_name} is no longer newer than the "
+                f"running version {running_version}. No changes were made."
+            )
+            self._clear_prompted_version(candidate.version)
+            self.update_message(
+                channel_id,
+                message_ts,
+                text,
+                self.status_blocks(candidate, text, False),
+            )
+            return None
         with self._upgrade_lock:
             installing = self.store.get_setting(SETTING_UPDATE_INSTALLING_VERSION)
             if installing:

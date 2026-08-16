@@ -530,6 +530,51 @@ class SlackAppTests(unittest.TestCase):
             )
         )
 
+    def test_socket_mode_connection_stale_when_sdk_retains_closed_socket(self):
+        client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            current_session=types.SimpleNamespace(
+                last_ping_pong_time=None,
+                sock=types.SimpleNamespace(fileno=lambda: -1),
+            ),
+        )
+
+        self.assertTrue(_socket_mode_connection_stale(client, connected_at=10.0))
+
+    def test_socket_mode_connection_stale_when_socket_has_no_peer(self):
+        def getpeername():
+            raise OSError("socket is not connected")
+
+        client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            current_session=types.SimpleNamespace(
+                last_ping_pong_time=None,
+                sock=types.SimpleNamespace(fileno=lambda: 9, getpeername=getpeername),
+            ),
+        )
+
+        self.assertTrue(_socket_mode_connection_stale(client, connected_at=10.0))
+
+    def test_socket_mode_connection_accepts_live_transport_without_a_pong(self):
+        client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            current_session=types.SimpleNamespace(
+                last_ping_pong_time=None,
+                sock=types.SimpleNamespace(
+                    fileno=lambda: 9,
+                    getpeername=lambda: ("192.0.2.1", 443),
+                ),
+            ),
+        )
+
+        self.assertFalse(
+            _socket_mode_connection_stale(
+                client,
+                connected_at=10.0,
+                monotonic_now=10_000.0,
+            )
+        )
+
     def test_socket_mode_connection_not_stale_when_session_cannot_report_pongs(self):
         # slack_sdk's builtin Socket Mode client never exposes last_ping_pong_time.
         # Treating that as staleness reconnected a live socket every grace period.

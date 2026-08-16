@@ -10089,6 +10089,8 @@ def _socket_mode_connection_stale(
     if callable(is_connected) and not is_connected():
         return True
     current_session = getattr(client, "current_session", None)
+    if _socket_mode_transport_closed(current_session):
+        return True
     last_pong = getattr(current_session, "last_ping_pong_time", None)
     if isinstance(last_pong, (int, float)):
         now = time.time() if wall_now is None else wall_now
@@ -10099,7 +10101,33 @@ def _socket_mode_connection_stale(
     # routinely stays None on a perfectly healthy socket. Recycling on the grace
     # timer here tore down and rebuilt a live connection every grace period
     # forever and dropped the interactions delivered during each handoff, so
-    # is_connected() above is the liveness signal we trust in that case.
+    # rely on the SDK liveness signal plus the transport probe above in that case.
+    return False
+
+
+def _socket_mode_transport_closed(session) -> bool:
+    """Detect a closed SDK socket that its shallow liveness check still accepts."""
+
+    missing = object()
+    sock = getattr(session, "sock", missing)
+    if sock is missing:
+        return False
+    if sock is None:
+        return True
+    fileno = getattr(sock, "fileno", None)
+    if callable(fileno):
+        try:
+            descriptor = fileno()
+            if isinstance(descriptor, int) and descriptor < 0:
+                return True
+        except (OSError, ValueError):
+            return True
+    getpeername = getattr(sock, "getpeername", None)
+    if callable(getpeername):
+        try:
+            getpeername()
+        except (OSError, ValueError):
+            return True
     return False
 
 
