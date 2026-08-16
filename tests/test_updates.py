@@ -12,6 +12,7 @@ from agent_harness.storage.store import Store
 from agent_harness.updates import (
     SETTING_UPDATE_CANDIDATE_PREFIX,
     SETTING_UPDATE_INSTALLED_VERSION,
+    SETTING_UPDATE_INSTALLING_VERSION,
     SETTING_UPDATE_LAST_ERROR,
     SETTING_UPDATE_PROMPTED_VERSION,
     SETTING_UPDATE_RESTART_HELPER,
@@ -468,6 +469,62 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertIn("created_at", payload)
                 self.assertEqual(payload["message_ts"], "171")
                 self.assertEqual(payload["version"], "0.2.0")
+            finally:
+                store.close()
+
+    def test_start_upgrade_rejects_older_target_without_installing(self):
+        from agent_harness import __version__
+
+        stale_version = "0.1.67"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                candidate = UpdateCandidate(
+                    current_version="0.1.0",
+                    release=ReleaseInfo(version=stale_version, tag_name=f"v{stale_version}"),
+                    repository="example-org/example-repo",
+                )
+                store.set_setting(
+                    f"slackgentic.update.candidate.{stale_version}", candidate.to_json()
+                )
+                store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, stale_version)
+                installs = []
+                updates = []
+                action_flags = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return None
+
+                class Updater:
+                    def install(self, release):
+                        installs.append(release)
+                        return UpgradeResult(True, UpgradePlan("test upgrade", ()))
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=Updater(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: "171",
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(text),
+                    status_blocks=lambda update, status, include_actions: (
+                        action_flags.append(include_actions) or []
+                    ),
+                )
+
+                thread = runner.start_upgrade(stale_version, "C1", "171")
+
+                self.assertIsNone(thread)
+                self.assertEqual(installs, [])
+                self.assertIn("is no longer newer than the running version", updates[-1])
+                self.assertIn(__version__, updates[-1])
+                self.assertFalse(action_flags[-1])
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_INSTALLING_VERSION))
+                self.assertIsNone(store.get_setting(SETTING_UPDATE_PROMPTED_VERSION))
             finally:
                 store.close()
 

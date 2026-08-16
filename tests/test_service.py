@@ -300,7 +300,7 @@ class ServiceTests(unittest.TestCase):
                 path.write_text("different")
                 self.assertFalse(installed_services_match([spec]))
 
-    def test_install_services_on_macos_does_not_bootout_unchanged_services(self):
+    def test_install_services_on_macos_restarts_unchanged_services_without_bootout(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ServiceSpec(
                 name="slackgentic-team",
@@ -333,7 +333,35 @@ class ServiceTests(unittest.TestCase):
                 for call_args in run.call_args_list
                 if call_args.args[0][:2] == ["launchctl", "bootout"]
             ]
+            kickstarts = [
+                call_args.args[0]
+                for call_args in run.call_args_list
+                if call_args.args[0][:2] == ["launchctl", "kickstart"]
+            ]
         self.assertEqual(bootouts, [])
+        self.assertEqual(
+            kickstarts,
+            [
+                [
+                    "launchctl",
+                    "kickstart",
+                    "-k",
+                    "gui/501/com.slackgentic-team.codex-app-server",
+                ],
+                [
+                    "launchctl",
+                    "kickstart",
+                    "-k",
+                    "gui/501/com.slackgentic-team.daemon",
+                ],
+                [
+                    "launchctl",
+                    "kickstart",
+                    "gui/501/com.slackgentic-team.codex-app-server",
+                ],
+                ["launchctl", "kickstart", "gui/501/com.slackgentic-team.daemon"],
+            ],
+        )
 
     def test_install_services_on_macos_rolls_back_plist_when_bootstrap_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

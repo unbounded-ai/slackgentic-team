@@ -391,7 +391,11 @@ def _install_launchd_services(specs: list[ServiceSpec]) -> list[Path]:
         for spec in ordered_specs:
             path = _launchd_path(spec.label)
             if path not in changed_paths:
-                _start_launchd(spec.label)
+                status = _start_launchd(spec.label, restart_if_running=True)
+                if status != 0:
+                    raise RuntimeError(
+                        f"launchctl kickstart failed with exit code {status} for {spec.label}"
+                    )
                 continue
             _bootout_launchd(spec.label)
             _bootstrap_launchd(spec.label)
@@ -410,12 +414,16 @@ def _uninstall_launchd(label: str) -> Path:
     return path
 
 
-def _start_launchd(label: str) -> int:
+def _start_launchd(label: str, *, restart_if_running: bool = False) -> int:
     path = _launchd_path(label)
     if path.exists():
         _bootstrap_launchd(label, ignore_already_loaded=True)
+    command = ["launchctl", "kickstart"]
+    if restart_if_running:
+        command.append("-k")
+    command.append(_launchd_target(label))
     completed = subprocess.run(
-        ["launchctl", "kickstart", _launchd_target(label)],
+        command,
         check=False,
     )
     return completed.returncode
