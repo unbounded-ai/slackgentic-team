@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
@@ -15,6 +15,7 @@ from agent_harness.models import (
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
     AgentTask,
+    Loop,
     Provider,
     SlackThreadRef,
     TeamAgent,
@@ -28,6 +29,9 @@ from agent_harness.team import (
 )
 from agent_harness.team.routing import parse_lightweight_handles
 from agent_harness.updates import UpdateCandidate
+
+if TYPE_CHECKING:
+    from agent_harness.loops import LoopSpec
 
 SLACK_PERMALINK_RE = re.compile(
     r"https://(?P<workspace>[^/]+)/archives/(?P<channel>[A-Z0-9]+)/p(?P<packed_ts>\d{16})"
@@ -73,6 +77,95 @@ class UnassignedExternalSessionListItem:
     summary: str | None = None
     assignable_agents: tuple[TeamAgent, ...] = ()
     thread_url: str | None = None
+
+
+def build_loop_preview_blocks(
+    loop: Loop,
+    spec: LoopSpec,
+    *,
+    next_run_text: str,
+    include_actions: bool = True,
+    footer: str | None = None,
+) -> list[dict[str, Any]]:
+    visibility = loop.visibility.value
+    provider = loop.provider.value
+    model = f" · Model: `{loop.model}`" if loop.model else ""
+    cwd = f"\n• Working directory: `{loop.cwd}`" if loop.cwd else ""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"{spec.bot_name} — ready to create"[:150],
+            },
+        },
+        {
+            "type": "section",
+            "block_id": f"loop.preview.details.{loop.loop_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"• Channel: `#{spec.channel_name}` ({visibility}) · Provider: {provider}{model}\n"
+                    f"• Schedule: {spec.schedule_description} (next run {next_run_text})\n"
+                    f"• Permissions: {loop.permission_mode.value}{cwd}\n"
+                    f"• Icon: :{spec.icon.emoji}:"
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "block_id": f"loop.preview.mission.{loop.loop_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Mission*\n{spec.mission[:2600]}",
+            },
+        },
+        {
+            "type": "context",
+            "block_id": f"loop.preview.edits.{loop.loop_id}",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Reply to adjust: `name: …` · `icon: :emoji:|https://…` · "
+                        "`channel: #…` · `visibility: public|private` · `schedule: …` · "
+                        "`task: …` · `cwd: …` · `permissions: …` · `provider: …` · "
+                        "`model: …`"
+                    ),
+                }
+            ],
+        },
+    ]
+    if footer:
+        blocks.append(
+            {
+                "type": "context",
+                "block_id": f"loop.preview.footer.{loop.loop_id}",
+                "elements": [{"type": "mrkdwn", "text": footer[:2900]}],
+            }
+        )
+    if include_actions:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"loop.preview.actions.{loop.loop_id}",
+                "elements": [
+                    _button(
+                        "Create loop",
+                        "loop.approve",
+                        encode_action_value("loop.approve", loop_id=loop.loop_id),
+                        "primary",
+                    ),
+                    _button(
+                        "Cancel",
+                        "loop.cancel",
+                        encode_action_value("loop.cancel", loop_id=loop.loop_id),
+                        "danger",
+                    ),
+                ],
+            }
+        )
+    return blocks
 
 
 PROVIDER_SORT_ORDER = {
