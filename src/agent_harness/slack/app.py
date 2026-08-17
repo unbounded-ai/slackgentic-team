@@ -254,6 +254,8 @@ from agent_harness.slack import (
     build_idle_release_closed_blocks,
     build_idle_release_dismissed_blocks,
     build_idle_release_prompt_blocks,
+    build_loop_create_guide_blocks,
+    build_loop_create_modal,
     build_loop_dangerous_confirmation_blocks,
     build_loop_list_item_blocks,
     build_loop_preview_blocks,
@@ -594,6 +596,13 @@ class SlackTeamController:
             self._update_from_action(decoded, channel_id, message_ts)
         elif action_name.startswith("pm_initiative."):
             self._pm_initiative_from_action(decoded, payload, channel_id, message_ts)
+        elif action_name == "loop.create.open":
+            self._open_loop_create_modal(
+                decoded,
+                channel_id,
+                message_ts,
+                payload.get("trigger_id"),
+            )
         elif action_name.startswith("loop."):
             self._loop_from_action(decoded, payload, channel_id, message_ts)
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
@@ -619,6 +628,8 @@ class SlackTeamController:
             return self._handle_roster_work_submission(payload, async_success=async_success)
         if callback_id == "external.session.assign":
             return self._handle_external_session_assign_submission(payload)
+        if callback_id == "loop.create":
+            return self._handle_loop_create_submission(payload, async_success=async_success)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -699,6 +710,17 @@ class SlackTeamController:
         loop_command = parse_loop_command(text)
         if isinstance(loop_command, (LoopListCommand, LoopHelpCommand)):
             self._handle_main_loop_command(loop_command, channel_id)
+            return
+        if looks_like_loop_create_request(text):
+            request = parse_loop_create_request(text)
+            if request is not None and not request.description:
+                self._post_loop_create_guide(channel_id)
+            elif request is not None:
+                self._start_loop_create_request(
+                    channel_id,
+                    payload.get("user_id"),
+                    text,
+                )
             return
         if text.lower() in {"setup", "init", "configure"}:
             trigger_id = payload.get("trigger_id")
@@ -1665,7 +1687,7 @@ class SlackTeamController:
         if isinstance(command, LoopListCommand):
             self._post_loop_list(channel_id)
             return
-        self.gateway.post_message(channel_id, self._loop_help_text())
+        self._post_loop_create_guide(channel_id)
 
     def _handle_loop_command(self, loop: Loop, command, *, event: dict | None = None) -> None:
         latest = self.store.get_loop(loop.loop_id) or loop
@@ -2280,7 +2302,8 @@ class SlackTeamController:
         if not request.description:
             self.gateway.post_thread_reply(
                 thread,
-                "Describe the recurring job after `loop create`.",
+                "Create a recurring loop and its Slack channel.",
+                blocks=build_loop_create_guide_blocks(anchor_thread_ts=thread.thread_ts),
             )
             return True
         active_statuses = (
@@ -2373,6 +2396,117 @@ class SlackTeamController:
             return True
         self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
+
+    def _post_loop_create_guide(self, channel_id: str) -> None:
+        self.gateway.post_message(
+            channel_id,
+            "Create a recurring loop and its Slack channel.",
+            blocks=build_loop_create_guide_blocks(),
+        )
+
+    def _open_loop_create_modal(
+        self,
+        payload: dict,
+        channel_id: str,
+        message_ts: str | None,
+        trigger_id: str | None,
+    ) -> None:
+        if not trigger_id:
+            self._post_loop_create_guide(channel_id)
+            return
+        anchor_thread_ts = payload.get("anchor_thread_ts") or message_ts
+        self.gateway.open_view(
+            trigger_id,
+            build_loop_create_modal(
+                channel_id=channel_id,
+                anchor_thread_ts=(
+                    str(anchor_thread_ts) if isinstance(anchor_thread_ts, str) else None
+                ),
+                guide_message_ts=message_ts,
+            ),
+        )
+
+    def _handle_loop_create_submission(
+        self,
+        payload: dict,
+        *,
+        async_success: bool = False,
+    ) -> dict | None:
+        view = payload.get("view") or {}
+        metadata = _decode_loop_create_metadata(view.get("private_metadata"))
+        values = view.get("state", {}).get("values", {})
+        mission = (_view_plain_value(values, "loop_mission", "value") or "").strip()
+        if not mission:
+            return _view_errors("loop_mission", "Describe what the loop should do.")
+        schedule = (_view_plain_value(values, "loop_schedule", "value") or "").strip()
+        if not schedule:
+            return _view_errors("loop_schedule", "Describe when the loop should run.")
+        visibility = _view_selected_value(values, "loop_visibility", "value") or "private"
+        if visibility not in {"private", "public"}:
+            return _view_errors("loop_visibility", "Choose private or public.")
+        provider = _view_selected_value(values, "loop_provider", "value") or "automatic"
+        if provider not in {"automatic", Provider.CODEX.value, Provider.CLAUDE.value}:
+            return _view_errors("loop_provider", "Choose a supported provider.")
+        channel_id = metadata.get("channel_id") or self._configured_agent_channel_id()
+        if not channel_id:
+            return _view_errors("loop_mission", "No main agent channel is configured.")
+        owner = (payload.get("user") or {}).get("id")
+        if not isinstance(owner, str) or not owner:
+            return _view_errors("loop_mission", "Slack did not identify the loop owner.")
+
+        description = f"{mission}; Schedule: {schedule}"
+        provider_option = "" if provider == "automatic" else f" provider={provider}"
+        command = f"loop create {description} #{visibility}{provider_option}"
+
+        def callback() -> None:
+            guide_message_ts = metadata.get("guide_message_ts")
+            if guide_message_ts:
+                self.gateway.update_message(
+                    channel_id,
+                    guide_message_ts,
+                    "🔁 Loop details submitted. Generating the preview…",
+                )
+            self._start_loop_create_request(
+                channel_id,
+                owner,
+                command,
+                anchor_thread_ts=metadata.get("anchor_thread_ts"),
+            )
+
+        if async_success:
+            self._run_after_view_ack("loop-create", callback)
+        else:
+            callback()
+        return None
+
+    def _start_loop_create_request(
+        self,
+        channel_id: str,
+        owner: str | None,
+        command: str,
+        *,
+        anchor_thread_ts: str | None = None,
+    ) -> bool:
+        if not isinstance(owner, str) or not owner:
+            return False
+        request_ts = anchor_thread_ts
+        if not request_ts:
+            posted = self.gateway.post_message(
+                channel_id,
+                "🔁 Loop details submitted. Generating the preview…",
+            )
+            request_ts = posted.ts
+        return self._handle_loop_create_request(
+            {
+                "type": "message",
+                "channel": channel_id,
+                "ts": request_ts,
+                "user": owner,
+                "text": command,
+            },
+            channel_id,
+            command,
+        )
 
     def _handle_loop_preview_reply(self, event: dict, channel_id: str, text: str) -> bool:
         thread_ts = event.get("thread_ts")
@@ -5043,7 +5177,8 @@ class SlackTeamController:
                 "outside Slack that are waiting for an agent",
                 "`scheduled tasks` — pending and claimed scheduled work",
                 "`loops` / `loop list` — recurring loop bots and their controls",
-                "`loop help` — loop creation and loop-channel commands",
+                "`loop create` — guided recurring loop and channel creation",
+                "`loop help` — loop creation help",
                 "`hire 3 agents` — add capacity; `hire 2 claude agents` picks the provider",
                 "`fire @handle` — release one agent; `fire everyone` clears the roster",
                 "`repo root ~/code` — set where agents work",
@@ -14367,6 +14502,18 @@ def _modal_option(text: str, value: str, description: str | None = None) -> dict
 
 
 def _decode_roster_work_metadata(value) -> dict[str, str]:
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _decode_loop_create_metadata(value) -> dict[str, str]:
     if not isinstance(value, str) or not value:
         return {}
     try:

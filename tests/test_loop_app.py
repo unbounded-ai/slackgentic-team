@@ -271,6 +271,222 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(len(self.gateway.uploads), 2)
         self.assertIn("Loop created", self.gateway.updates[-1]["text"])
 
+    def test_bare_loop_create_replies_with_guided_create_button(self):
+        self.controller.handle_event(
+            {
+                "event": {
+                    "type": "message",
+                    "channel": "CMAIN",
+                    "ts": "101.000001",
+                    "user": "UOWNER",
+                    "text": "loop create",
+                }
+            }
+        )
+
+        self.assertEqual(self.store.list_loops(), [])
+        guide = self.gateway.thread_replies[-1]
+        self.assertEqual(guide["thread"].thread_ts, "101.000001")
+        self.assertIn("loop.create.open", str(guide["blocks"]))
+        self.assertIn("You do not need to create the channel", str(guide["blocks"]))
+
+    def test_bare_loop_create_slash_command_posts_guided_create_button(self):
+        self.controller.handle_slash_command(
+            {
+                "channel_id": "CMAIN",
+                "user_id": "UOWNER",
+                "user_name": "owner",
+                "text": "loop create",
+            }
+        )
+
+        self.assertEqual(self.store.list_loops(), [])
+        self.assertIn("loop.create.open", str(self.gateway.posts[-1]["blocks"]))
+        self.assertIn("Create a recurring loop", self.gateway.posts[-1]["text"])
+
+    def test_loop_create_button_opens_guided_modal(self):
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "value": encode_action_value(
+                            "loop.create.open",
+                            anchor_thread_ts="101.000001",
+                        )
+                    }
+                ],
+                "channel": {"id": "CMAIN"},
+                "message": {"ts": "101.000002"},
+                "user": {"id": "UOWNER"},
+                "trigger_id": "TRIGGER1",
+            }
+        )
+
+        trigger_id, modal = self.gateway.views[-1]
+        self.assertEqual(trigger_id, "TRIGGER1")
+        self.assertEqual(modal["callback_id"], "loop.create")
+        self.assertEqual(modal["submit"]["text"], "Preview loop")
+        self.assertEqual(
+            json.loads(modal["private_metadata"]),
+            {
+                "anchor_thread_ts": "101.000001",
+                "channel_id": "CMAIN",
+                "guide_message_ts": "101.000002",
+            },
+        )
+        self.assertIn("loop_mission", str(modal["blocks"]))
+        self.assertIn("loop_schedule", str(modal["blocks"]))
+
+    def test_loop_create_modal_validates_required_fields(self):
+        response = self.controller.handle_view_submission(
+            {
+                "type": "view_submission",
+                "user": {"id": "UOWNER"},
+                "view": {
+                    "callback_id": "loop.create",
+                    "private_metadata": json.dumps({"channel_id": "CMAIN"}),
+                    "state": {
+                        "values": {
+                            "loop_mission": {"value": {"value": "  "}},
+                            "loop_schedule": {"value": {"value": "every hour"}},
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(
+            response,
+            {
+                "response_action": "errors",
+                "errors": {"loop_mission": "Describe what the loop should do."},
+            },
+        )
+        self.assertEqual(self.store.list_loops(), [])
+
+    def test_loop_create_modal_starts_existing_preview_flow(self):
+        response = self.controller.handle_view_submission(
+            {
+                "type": "view_submission",
+                "user": {"id": "UOWNER"},
+                "view": {
+                    "callback_id": "loop.create",
+                    "private_metadata": json.dumps(
+                        {
+                            "channel_id": "CMAIN",
+                            "anchor_thread_ts": "101.000001",
+                            "guide_message_ts": "101.000002",
+                        }
+                    ),
+                    "state": {
+                        "values": {
+                            "loop_mission": {"value": {"value": "Inspect deployment health"}},
+                            "loop_schedule": {"value": {"value": "Every weekday at 9am PT"}},
+                            "loop_visibility": {"value": {"selected_option": {"value": "public"}}},
+                            "loop_provider": {"value": {"selected_option": {"value": "claude"}}},
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertIsNone(response)
+        loops = self.store.list_loops()
+        self.assertEqual(len(loops), 1)
+        loop = loops[0]
+        self.assertEqual(loop.status, LoopStatus.RESOLVING)
+        self.assertEqual(loop.anchor_thread_ts, "101.000001")
+        self.assertEqual(loop.visibility, LoopVisibility.PUBLIC)
+        self.assertEqual(loop.provider, Provider.CLAUDE)
+        self.assertEqual(
+            loop.mission,
+            "Inspect deployment health; Schedule: Every weekday at 9am PT",
+        )
+        self.assertIn("Inspect deployment health", self.runtime.started[-1][0].prompt)
+        self.assertIn("Every weekday at 9am PT", self.runtime.started[-1][0].prompt)
+        self.assertEqual(self.gateway.updates[-1]["ts"], "101.000002")
+        self.assertIn("Generating the preview", self.gateway.updates[-1]["text"])
+
+    def test_guided_loop_creation_reaches_approved_channel_end_to_end(self):
+        self.controller.handle_view_submission(
+            {
+                "type": "view_submission",
+                "user": {"id": "UOWNER"},
+                "view": {
+                    "callback_id": "loop.create",
+                    "private_metadata": json.dumps(
+                        {
+                            "channel_id": "CMAIN",
+                            "anchor_thread_ts": "102.000001",
+                        }
+                    ),
+                    "state": {
+                        "values": {
+                            "loop_mission": {"value": {"value": "Inspect service health"}},
+                            "loop_schedule": {"value": {"value": "Every hour"}},
+                            "loop_visibility": {"value": {"selected_option": {"value": "public"}}},
+                            "loop_provider": {"value": {"selected_option": {"value": "codex"}}},
+                        }
+                    },
+                },
+            }
+        )
+        loop = self.store.list_loops()[0]
+        task = self.store.list_agent_tasks(include_done=True)[0]
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        assert agent is not None
+        signal = AGENT_LOOP_SIGNAL_PREFIX + json.dumps(
+            {
+                "title": "Service Health Watch",
+                "bot_name": "Service Health Bot",
+                "channel_name": "loop-service-health",
+                "mission": "Inspect service health and report material failures.",
+                "schedule": {"frequency": "interval", "interval_seconds": 3600},
+                "icon": {"emoji": "heartbeat"},
+            }
+        )
+
+        self.assertTrue(
+            self.controller.handle_runtime_agent_control(
+                task,
+                agent,
+                SlackThreadRef(loop.anchor_channel_id, loop.anchor_thread_ts),
+                signal,
+            )
+        )
+        preview = self.store.get_loop(loop.loop_id)
+        assert preview is not None
+        self.assertEqual(preview.status, LoopStatus.AWAITING_APPROVAL)
+        self.assertIn("loop.approve", str(self.gateway.thread_replies[-1]["blocks"]))
+
+        self.controller.handle_block_action(self._action_payload("loop.approve", loop.loop_id))
+
+        active = self.store.get_loop(loop.loop_id)
+        assert active is not None
+        self.assertEqual(active.status, LoopStatus.ACTIVE)
+        self.assertEqual(active.channel_id, "CNEW")
+        self.assertEqual(self.gateway.channels[-1], ("loop-service-health", False))
+        self.assertEqual(self.gateway.invites[-1], ("CNEW", ["UOWNER"]))
+
+    def test_inline_loop_create_slash_command_starts_preview_flow(self):
+        self.controller.handle_slash_command(
+            {
+                "channel_id": "CMAIN",
+                "user_id": "UOWNER",
+                "user_name": "owner",
+                "text": (
+                    "loop create inspect CI failures; Schedule: every hour #private provider=codex"
+                ),
+            }
+        )
+
+        loops = self.store.list_loops()
+        self.assertEqual(len(loops), 1)
+        self.assertEqual(loops[0].status, LoopStatus.RESOLVING)
+        self.assertEqual(loops[0].provider, Provider.CODEX)
+        self.assertEqual(loops[0].anchor_thread_ts, self.gateway.posts[0]["ts"])
+        self.assertIn("Resolving your loop", self.gateway.thread_replies[-1]["text"])
+
     def test_malformed_spec_retries_then_cleans_up(self):
         loop, task, agent = self._request_loop()
         thread = SlackThreadRef(loop.anchor_channel_id, loop.anchor_thread_ts)
