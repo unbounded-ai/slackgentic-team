@@ -391,7 +391,14 @@ def _install_launchd_services(specs: list[ServiceSpec]) -> list[Path]:
         for spec in ordered_specs:
             path = _launchd_path(spec.label)
             if path not in changed_paths:
-                status = _start_launchd(spec.label, restart_if_running=True)
+                # The long-lived app-server owns WebSocket sessions used by
+                # interactive Codex clients. Restart the daemon to load updated
+                # Python, but leave an unchanged app-server alive so upgrades do
+                # not sever those sessions.
+                status = _start_launchd(
+                    spec.label,
+                    restart_if_running=spec.label != MACOS_CODEX_APP_SERVER_LABEL,
+                )
                 if status != 0:
                     raise RuntimeError(
                         f"launchctl kickstart failed with exit code {status} for {spec.label}"
@@ -483,19 +490,34 @@ def _install_systemd_services(specs: list[ServiceSpec]) -> list[Path]:
     for spec in specs:
         ensure_service_python_shims(spec)
     paths: list[Path] = []
+    changed_paths: set[Path] = set()
     for spec in specs:
         path, content = render_service(spec)
         path.parent.mkdir(parents=True, exist_ok=True)
         spec.log_dir.mkdir(parents=True, exist_ok=True)
         assert isinstance(content, str)
-        path.write_text(content)
+        previous = path.read_text() if path.exists() else None
+        if previous != content:
+            path.write_text(content)
+            changed_paths.add(path)
         paths.append(path)
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     for spec in _codex_first_specs(specs):
-        subprocess.run(["systemctl", "--user", "stop", f"{spec.name}.service"], check=False)
+        service = f"{spec.name}.service"
+        path = _systemd_path(spec.name)
+        if spec.name.endswith(f"-{CODEX_APP_SERVER_SERVICE_SUFFIX}") and path not in changed_paths:
+            # Enabling an already-running unchanged service is a no-op. Avoid a
+            # stop/start cycle because it would disconnect active WebSocket
+            # clients during every Slackgentic update.
+            subprocess.run(
+                ["systemctl", "--user", "enable", "--now", service],
+                check=True,
+            )
+            continue
+        subprocess.run(["systemctl", "--user", "stop", service], check=False)
         subprocess.run(
-            ["systemctl", "--user", "enable", "--now", f"{spec.name}.service"],
+            ["systemctl", "--user", "enable", "--now", service],
             check=True,
         )
     return paths

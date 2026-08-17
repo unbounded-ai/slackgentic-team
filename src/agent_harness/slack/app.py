@@ -12673,17 +12673,61 @@ class SocketModeSlackApp:
     def _reconnect_socket_mode(self, client, *, new_endpoint: bool) -> None:
         """Re-establish a stale or dropped Slack Socket Mode connection.
 
-        slack_sdk closes the previous session inline inside ``connect()``. That
-        teardown races the dying session's own monitor thread: the connection
-        nulls ``self.sock`` between slack_sdk's ``sock is not None`` guard and
-        the ``sock.close()`` call, raising ``AttributeError``. When it fires,
-        slack_sdk never swaps in the freshly connected session, so the client
-        stays pinned to a dead socket (``is_connected()`` keeps returning
-        ``False``) while the new session is leaked. Realtime Slack delivery then
-        stalls until the backfill loop recovers the missed replies minutes
-        later. Tear the stale session down ourselves first so the reconnect has
-        nothing live to close, and retry once if the close still races.
+        The SDK's CLOSE callback reconnects automatically. Our liveness loop
+        used to reconnect at the same time, leaving each side free to create a
+        replacement before the other had retired the old transport. During an
+        update restart that race could turn into a reconnect storm and exhaust
+        the process file-descriptor limit.
+
+        Serialize on the SDK's connection lock, re-check liveness after taking
+        it, disable the competing automatic callback, and detach the old session
+        before closing it. ``connect()`` then has no stale session to close a
+        second time and re-enables the normal SDK auto-reconnect behavior after
+        the replacement is installed.
         """
+
+        operation_lock = getattr(client, "connect_operation_lock", None)
+        if operation_lock is None:
+            self._reconnect_socket_mode_legacy(client, new_endpoint=new_endpoint)
+            return
+        observed_session = getattr(client, "current_session", None)
+        acquired = operation_lock.acquire(blocking=True, timeout=5)
+        if not acquired:
+            raise RuntimeError("timed out waiting for the Slack reconnect lock")
+        try:
+            is_connected = getattr(client, "is_connected", None)
+            current_session = getattr(client, "current_session", None)
+            if (
+                callable(is_connected)
+                and is_connected()
+                and not _socket_mode_transport_closed(current_session)
+                and (not new_endpoint or current_session is not observed_session)
+            ):
+                return
+
+            if hasattr(client, "auto_reconnect_enabled"):
+                client.auto_reconnect_enabled = False
+            state = getattr(client, "current_session_state", None)
+            if state is not None and hasattr(state, "terminated"):
+                state.terminated = True
+            if hasattr(client, "current_session"):
+                client.current_session = None
+            if current_session is not None:
+                try:
+                    current_session.close()
+                except Exception:
+                    LOGGER.debug(
+                        "ignoring error tearing down stale Slack socket",
+                        exc_info=True,
+                    )
+            if new_endpoint:
+                client.wss_uri = client.issue_new_wss_url()
+            client.connect()
+        finally:
+            operation_lock.release()
+
+    def _reconnect_socket_mode_legacy(self, client, *, new_endpoint: bool) -> None:
+        """Reconnect compatible test/alternate clients without SDK internals."""
 
         def _connect() -> None:
             if new_endpoint:

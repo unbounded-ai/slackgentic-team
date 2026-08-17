@@ -827,6 +827,131 @@ class SlackAppTests(unittest.TestCase):
 
         self.assertEqual(events, ["disconnect", "connect"])
 
+    def test_reconnect_socket_mode_serializes_and_detaches_old_transport(self):
+        events = []
+
+        class FakeSession:
+            def close(session_self):
+                events.append("close-old")
+                if client.auto_reconnect_enabled:
+                    events.append("automatic-reconnect")
+
+        class FakeClient:
+            def __init__(self):
+                self.connect_operation_lock = threading.Lock()
+                self.current_session = FakeSession()
+                self.current_session_state = types.SimpleNamespace(terminated=False)
+                self.auto_reconnect_enabled = True
+                self.wss_uri = "wss://old.example/socket"
+
+            def is_connected(self):
+                return False
+
+            def issue_new_wss_url(self):
+                events.append("new-endpoint")
+                return "wss://new.example/socket"
+
+            def connect(self):
+                events.append("connect")
+                self.assert_detached = self.current_session is None
+                self.current_session = types.SimpleNamespace(
+                    sock=types.SimpleNamespace(
+                        fileno=lambda: 9,
+                        getpeername=lambda: ("192.0.2.1", 443),
+                    )
+                )
+                self.auto_reconnect_enabled = True
+
+        app = object.__new__(SocketModeSlackApp)
+        client = FakeClient()
+
+        app._reconnect_socket_mode(client, new_endpoint=True)
+
+        self.assertEqual(events, ["close-old", "new-endpoint", "connect"])
+        self.assertTrue(client.assert_detached)
+        self.assertTrue(client.current_session_state.terminated)
+        self.assertTrue(client.connect_operation_lock.acquire(blocking=False))
+        client.connect_operation_lock.release()
+
+    def test_reconnect_socket_mode_replaces_connected_but_stale_transport(self):
+        events = []
+
+        class FakeSession:
+            def __init__(self, name):
+                self.name = name
+
+            def close(self):
+                events.append(f"close-{self.name}")
+
+        class FakeClient:
+            def __init__(self):
+                self.connect_operation_lock = threading.Lock()
+                self.current_session = FakeSession("stale")
+                self.current_session_state = types.SimpleNamespace(terminated=False)
+                self.auto_reconnect_enabled = True
+                self.wss_uri = "wss://old.example/socket"
+
+            def is_connected(self):
+                return True
+
+            def issue_new_wss_url(self):
+                events.append("new-endpoint")
+                return "wss://new.example/socket"
+
+            def connect(self):
+                events.append("connect")
+                self.current_session = FakeSession("replacement")
+
+        app = object.__new__(SocketModeSlackApp)
+        client = FakeClient()
+
+        app._reconnect_socket_mode(client, new_endpoint=True)
+
+        self.assertEqual(events, ["close-stale", "new-endpoint", "connect"])
+        self.assertEqual(client.current_session.name, "replacement")
+
+    def test_reconnect_socket_mode_failed_endpoint_does_not_leak_old_session(self):
+        events = []
+
+        class FakeSession:
+            def close(self):
+                events.append("close-old")
+
+        class FakeClient:
+            def __init__(self):
+                self.connect_operation_lock = threading.Lock()
+                self.current_session = FakeSession()
+                self.current_session_state = types.SimpleNamespace(terminated=False)
+                self.auto_reconnect_enabled = True
+                self.wss_uri = "wss://old.example/socket"
+                self.endpoint_attempts = 0
+
+            def is_connected(self):
+                return False
+
+            def issue_new_wss_url(self):
+                self.endpoint_attempts += 1
+                events.append("new-endpoint")
+                if self.endpoint_attempts == 1:
+                    raise RuntimeError("Slack endpoint unavailable")
+                return "wss://new.example/socket"
+
+            def connect(self):
+                events.append("connect")
+                self.current_session = types.SimpleNamespace(sock=object())
+
+        app = object.__new__(SocketModeSlackApp)
+        client = FakeClient()
+
+        with self.assertRaisesRegex(RuntimeError, "Slack endpoint unavailable"):
+            app._reconnect_socket_mode(client, new_endpoint=True)
+        self.assertIsNone(client.current_session)
+        self.assertFalse(client.auto_reconnect_enabled)
+
+        app._reconnect_socket_mode(client, new_endpoint=True)
+
+        self.assertEqual(events, ["close-old", "new-endpoint", "new-endpoint", "connect"])
+
     def test_socket_mode_acknowledged_requests_run_on_worker(self):
         submitted = []
         handled = []
