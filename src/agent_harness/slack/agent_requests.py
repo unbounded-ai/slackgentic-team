@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from secrets import token_urlsafe
 from typing import Any
 
-from agent_harness.models import SlackThreadRef
+from agent_harness.models import LOOP_ID_METADATA_KEY, SlackThreadRef
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
@@ -143,6 +143,7 @@ class SlackAgentRequestHandler:
             pending.method,
             pending.params,
             pending.thread,
+            allowed_slack_user_id=self._allowed_slack_user_id(thread),
         )
         text, blocks = _request_message(pending)
         try:
@@ -161,6 +162,20 @@ class SlackAgentRequestHandler:
         pending.message_ts = posted.ts
         self.store.update_slack_agent_request_message_ts(pending.token, posted.ts)
         return pending
+
+    def _allowed_slack_user_id(self, thread: SlackThreadRef) -> str | None:
+        if self.store is None:
+            return None
+        task = self.store.get_managed_thread_task(thread.channel_id, thread.thread_ts)
+        if task is None:
+            task = self.store.get_agent_task_by_thread(thread.channel_id, thread.thread_ts)
+        if task is None:
+            return None
+        loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
+        if not isinstance(loop_id, str):
+            return None
+        loop = self.store.get_loop(loop_id)
+        return loop.owner_slack_user_id if loop is not None else None
 
     def wait_for_persistent_request(
         self,
@@ -238,6 +253,16 @@ class SlackAgentRequestHandler:
     ) -> bool:
         row = self.store.get_slack_agent_request(token) if self.store else None
         if row is None:
+            return True
+        allowed_user = row["allowed_slack_user_id"]
+        actor = payload.get("slack_user_id")
+        if allowed_user and actor != allowed_user:
+            if isinstance(actor, str) and actor:
+                self.gateway.post_ephemeral(
+                    channel_id,
+                    actor,
+                    "Only the loop owner can respond to this.",
+                )
             return True
         pending = _pending_from_row(row, fallback_channel_id=channel_id)
         if row["resolved_at"]:

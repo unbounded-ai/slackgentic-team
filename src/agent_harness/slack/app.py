@@ -34,10 +34,14 @@ from agent_harness.deferred import (
 from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.loop_icons import write_loop_badge
 from agent_harness.loops import (
+    AGENT_LOOP_FETCH_SIGNAL_PREFIX,
     AGENT_LOOP_SIGNAL_PREFIX,
+    LOOP_FETCH_MAX_PER_RUN,
+    LOOP_IGNORED_NOTICE_INTERVAL_SECONDS,
     MAX_ACTIVE_LOOPS,
     MAX_LOOP_RESOLUTION_ATTEMPTS,
     LoopSpec,
+    build_loop_fetch_result,
     build_loop_resolution_prompt,
     create_loop_agent,
     default_loop_provider,
@@ -45,8 +49,11 @@ from agent_harness.loops import (
     looks_like_loop_create_request,
     loop_spec_from_json,
     loop_spec_to_json,
+    loop_visible_messages,
     normalize_loop_channel_name,
+    parse_agent_loop_fetch_signal,
     parse_agent_loop_signal,
+    parse_loop_command,
     parse_loop_create_request,
     provisional_loop_agent,
 )
@@ -58,6 +65,7 @@ from agent_harness.models import (
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
+    LOOP_RUN_ID_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -73,6 +81,7 @@ from agent_harness.models import (
     DeferredWork,
     DeferredWorkStatus,
     Loop,
+    LoopJournalEntry,
     LoopOverlapPolicy,
     LoopStatus,
     LoopVisibility,
@@ -316,6 +325,8 @@ SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
 SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
 SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
+SETTING_LOOP_IGNORED_NOTICE_PREFIX = "slack.loop_ignored_notice."
+LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
 UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE = 20
 _PM_BLOCKER_PREFIX = "pm.blocker."
 _PM_STATUS_MESSAGE_PREFIX = "pm.status_message."
@@ -527,7 +538,7 @@ class SlackTeamController:
         elif action_name == "roster.work.open":
             self._open_roster_work_modal(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name.startswith("task."):
-            self._task_from_action(decoded, channel_id, message_ts)
+            self._task_from_action(decoded, payload, channel_id, message_ts)
         elif action_name.startswith("schedule."):
             self._schedule_from_action(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name in {"external.session.detach", "external.session.finish"}:
@@ -546,7 +557,13 @@ class SlackTeamController:
         elif action_name.startswith("loop."):
             self._loop_from_action(decoded, payload, channel_id, message_ts)
         elif action_name in AGENT_REQUEST_ACTIONS and self.session_bridge is not None:
-            self.session_bridge.handle_agent_request_block_action(decoded, channel_id, message_ts)
+            request_payload = dict(decoded)
+            request_payload["slack_user_id"] = (payload.get("user") or {}).get("id")
+            self.session_bridge.handle_agent_request_block_action(
+                request_payload,
+                channel_id,
+                message_ts,
+            )
 
     def handle_view_submission(
         self,
@@ -618,10 +635,24 @@ class SlackTeamController:
         if not channel_id:
             LOGGER.warning("Slack slash command had no channel_id")
             return
+        loop = self._loop_for_channel(channel_id)
+        if loop is not None and payload.get("user_id") != loop.owner_slack_user_id:
+            user_id = payload.get("user_id")
+            if isinstance(user_id, str) and user_id:
+                self.gateway.post_ephemeral(
+                    channel_id,
+                    user_id,
+                    "Only the loop owner can use loop commands here.",
+                )
+            return
         self._remember_human_user(
             payload.get("user_id"),
             {"display_name": payload.get("user_name"), "name": payload.get("user_name")},
         )
+        if loop is not None:
+            # Loop command rendering is added with the loop surface; routing and
+            # owner authorization live here at the trust boundary.
+            return
         if text.lower() in {"setup", "init", "configure"}:
             trigger_id = payload.get("trigger_id")
             if trigger_id:
@@ -681,10 +712,13 @@ class SlackTeamController:
             and reaction_name
         ):
             return
-        if not self._is_agent_channel(channel_id):
+        loop = self._loop_for_channel(channel_id)
+        if not self._is_agent_channel(channel_id) and loop is None:
             return
         user_id = event.get("user")
         if isinstance(user_id, str) and self._is_bot_user(user_id):
+            return
+        if loop is not None and user_id != loop.owner_slack_user_id:
             return
         processed_key = _slack_reaction_processed_key(_reaction_event_dedupe_id(event))
         with self._slack_message_lock:
@@ -803,15 +837,21 @@ class SlackTeamController:
         event_type = event.get("type")
         if event_type not in {"message", "app_mention"}:
             return None, None
-        if event.get("subtype"):
+        channel_id = event.get("channel")
+        if not channel_id:
+            return None, None
+        loop = self._loop_for_channel(channel_id)
+        subtype = event.get("subtype")
+        if loop is None and subtype:
+            return None, None
+        if loop is not None and subtype not in {None, "bot_message", "thread_broadcast"}:
             return None, None
         bot_id = event.get("bot_id")
         if bot_id and (self.ignored_bot_id is None or bot_id == self.ignored_bot_id):
             return None, None
         if not event.get("user"):
             return None, None
-        channel_id = event.get("channel")
-        if not channel_id or not self._is_agent_channel(channel_id):
+        if not self._is_agent_channel(channel_id) and loop is None:
             return None, None
         message_ts = event.get("ts")
         if not message_ts:
@@ -825,6 +865,10 @@ class SlackTeamController:
         return channel_id, message_ts
 
     def _handle_unprocessed_user_message_event(self, event: dict, channel_id: str) -> None:
+        loop = self._loop_for_channel(channel_id)
+        if loop is not None:
+            self._handle_loop_channel_message(loop, event)
+            return
         self._remember_human_user(event.get("user"), event.get("user_profile"))
         text = event.get("text") or ""
         if self._handle_loop_preview_reply(event, channel_id, text):
@@ -1441,6 +1485,131 @@ class SlackTeamController:
                     )
         return CAPACITY_MESSAGE
 
+    def _handle_loop_channel_message(self, loop: Loop, event: dict) -> None:
+        user_id = event.get("user")
+        if user_id != loop.owner_slack_user_id:
+            self._handle_loop_foreign_message(loop, event)
+            return
+        self._remember_human_user(user_id, event.get("user_profile"))
+        text = (event.get("text") or "").strip()
+        if not text:
+            return
+        if parse_loop_command(text) is not None:
+            # The command surface is layered above this security gate. Owner
+            # commands must never fall through to notes or ordinary team work.
+            return
+        thread_ts = event.get("thread_ts")
+        is_thread_reply = bool(thread_ts) and thread_ts != event.get("ts")
+        if is_thread_reply and isinstance(thread_ts, str):
+            task = self.store.get_original_agent_task_by_thread(loop.channel_id or "", thread_ts)
+            if (
+                task is not None
+                and task.metadata.get(LOOP_ID_METADATA_KEY) == loop.loop_id
+                and self._handle_loop_run_thread_reply(loop, task, event, text)
+            ):
+                return
+        self._record_loop_owner_note(loop, event, text)
+
+    def _handle_loop_run_thread_reply(
+        self,
+        loop: Loop,
+        task: AgentTask,
+        event: dict,
+        text: str,
+    ) -> bool:
+        if not loop.channel_id or not task.thread_ts:
+            return False
+        message_ts = event.get("ts")
+        self._mark_message_acknowledged(loop.channel_id, message_ts)
+        active = self._active_thread_task_for_agent(task, loop.channel_id, task.thread_ts) or task
+        if self.runtime and self.runtime.send_to_task(
+            active.task_id,
+            _live_thread_followup_prompt(text),
+        ):
+            self._remember_request_message_for_task(active, message_ts)
+            self._mark_message_in_progress(loop.channel_id, message_ts)
+            return True
+        agent = self.store.get_team_agent(loop.agent_id)
+        if agent is None:
+            return True
+        request = WorkRequest(
+            prompt=text,
+            assignment_mode=AssignmentMode.SPECIFIC,
+            requested_handle=agent.handle,
+        )
+        started = self._continue_same_thread_agent_task(
+            request,
+            active,
+            agent,
+            SlackThreadRef(loop.channel_id, task.thread_ts, task.parent_message_ts),
+            requested_by_slack_user=loop.owner_slack_user_id,
+            request_message_ts=message_ts,
+            try_live_send=False,
+        )
+        if started:
+            self._mark_message_in_progress(loop.channel_id, message_ts)
+        return True
+
+    def _record_loop_owner_note(self, loop: Loop, event: dict, text: str) -> None:
+        now = utc_now()
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                loop_id=loop.loop_id,
+                kind="owner_note",
+                content=text,
+                created_at=now,
+                thread_ts=event.get("thread_ts") or event.get("ts"),
+            )
+        )
+        if loop.channel_id and event.get("ts"):
+            self.gateway.add_reaction(loop.channel_id, event["ts"], "inbox_tray")
+        live = self._live_loop_run_task(loop)
+        if live is not None and self.runtime is not None:
+            self.runtime.send_to_task(live.task_id, f"Owner note (mid-run): {text}")
+
+    def _live_loop_run_task(self, loop: Loop) -> AgentTask | None:
+        run = self.store.running_loop_run(loop.loop_id)
+        if run is not None and run.task_id:
+            task = self.store.get_agent_task(run.task_id)
+            if task is not None and task.status == AgentTaskStatus.ACTIVE:
+                return task
+        matches = [
+            task
+            for task in self.store.list_agent_tasks(include_done=True)
+            if task.metadata.get(LOOP_ID_METADATA_KEY) == loop.loop_id
+            and task.kind == AgentTaskKind.LOOP_RUN
+            and task.status == AgentTaskStatus.ACTIVE
+        ]
+        return max(matches, key=lambda item: item.created_at) if matches else None
+
+    def _handle_loop_foreign_message(self, loop: Loop, event: dict) -> None:
+        channel_id = loop.channel_id or event.get("channel")
+        message_ts = event.get("ts")
+        user_id = event.get("user")
+        if not all(isinstance(value, str) and value for value in (channel_id, message_ts, user_id)):
+            return
+        self.gateway.add_reaction(channel_id, message_ts, "no_entry_sign")
+        notice_key = f"{SETTING_LOOP_IGNORED_NOTICE_PREFIX}{channel_id}.{user_id}"
+        now = utc_now()
+        previous = parse_timestamp(self.store.get_setting(notice_key))
+        if (
+            previous is not None
+            and (now - previous).total_seconds() < LOOP_IGNORED_NOTICE_INTERVAL_SECONDS
+        ):
+            return
+        agent = self.store.get_team_agent(loop.agent_id)
+        bot_name = agent.full_name if agent is not None else loop.title
+        self.gateway.post_ephemeral(
+            channel_id,
+            user_id,
+            f"Heads up: *{bot_name}* only takes instructions from "
+            f"<@{loop.owner_slack_user_id}>. Your message stays in the channel for humans, "
+            "but it is never shown to the agent (this prevents prompt injection). "
+            "It was marked with 🚫.",
+        )
+        self.store.set_setting(notice_key, now.isoformat())
+
     def _handle_loop_create_request(self, event: dict, channel_id: str, text: str) -> bool:
         if not looks_like_loop_create_request(text):
             return False
@@ -1802,6 +1971,112 @@ class SlackTeamController:
                 parsed.error or "invalid loop specification",
             )
         self._present_loop_preview(loop, parsed.spec, resolution_task=task)
+        return True
+
+    def _handle_loop_fetch_signal(
+        self,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
+        if task.kind != AgentTaskKind.LOOP_RUN or not isinstance(loop_id, str):
+            self.gateway.post_thread_reply(
+                thread,
+                "That loop fetch signal is not valid outside a loop run.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        loop = self.store.get_loop(loop_id)
+        if loop is None or not loop.channel_id:
+            return self._inject_loop_fetch_result(task, "Loop fetch failed: loop channel missing.")
+        parsed = parse_agent_loop_fetch_signal(signal)
+        if parsed.request is None:
+            return self._inject_loop_fetch_result(
+                task,
+                f"Loop fetch rejected: {parsed.error or 'invalid request'}.",
+            )
+        target_run = None
+        target_thread_ts: str | None = None
+        if parsed.request.run_number is not None:
+            target_run = self.store.get_loop_run_by_number(
+                loop.loop_id,
+                parsed.request.run_number,
+            )
+            target_thread_ts = target_run.thread_ts if target_run is not None else None
+        elif parsed.request.thread_permalink:
+            ref = parse_thread_ref(parsed.request.thread_permalink)
+            if ref is None or ref.channel_id != loop.channel_id or not ref.thread_ts:
+                return self._inject_loop_fetch_result(
+                    task,
+                    "Loop fetch rejected: the requested thread is outside this loop channel.",
+                )
+            target_thread_ts = ref.thread_ts
+            target_run = self.store.get_loop_run_by_thread(loop.loop_id, target_thread_ts)
+        if target_run is None or not target_thread_ts:
+            return self._inject_loop_fetch_result(
+                task,
+                "Loop fetch failed: that run thread does not exist.",
+            )
+        count = int(task.metadata.get(LOOP_FETCH_COUNT_METADATA_KEY) or 0)
+        if count >= LOOP_FETCH_MAX_PER_RUN:
+            return self._inject_loop_fetch_result(
+                task,
+                "Loop fetch budget exhausted for this run.",
+            )
+        metadata = dict(task.metadata)
+        metadata[LOOP_FETCH_COUNT_METADATA_KEY] = count + 1
+        updated_task = replace(task, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(updated_task)
+        try:
+            messages = self.gateway.thread_messages(
+                loop.channel_id,
+                target_thread_ts,
+                limit=200,
+            )
+        except Exception:
+            LOGGER.warning(
+                "failed to fetch loop run thread %s:%s",
+                loop.channel_id,
+                target_thread_ts,
+                exc_info=True,
+            )
+            return self._inject_loop_fetch_result(
+                updated_task,
+                "Loop fetch failed: Slack history is temporarily unavailable.",
+            )
+        visible = loop_visible_messages(
+            loop,
+            messages,
+            own_bot_id=self.ignored_bot_id,
+        )
+        rendered: list[str] = []
+        for message in visible:
+            content = str(message.get("text") or "").strip()
+            if not content or is_internal_task_notification_text(content):
+                continue
+            author = (
+                "Owner"
+                if message.get("user") == loop.owner_slack_user_id and not message.get("bot_id")
+                else agent.full_name
+            )
+            rendered.append(f"{author}: {content}")
+        payload = build_loop_fetch_result(
+            run_number=target_run.run_number,
+            rendered_messages="\n".join(rendered),
+        )
+        return self._inject_loop_fetch_result(updated_task, payload)
+
+    def _inject_loop_fetch_result(self, task: AgentTask, payload: str) -> bool:
+        if self.runtime is None:
+            return True
+        if self.runtime.send_to_task(task.task_id, payload):
+            return True
+        interrupted = self.runtime.interrupt_task(task.task_id)
+        if interrupted:
+            self.runtime.send_to_interrupted_task(task.task_id, payload)
         return True
 
     def _retry_loop_resolution(
@@ -2939,7 +3214,10 @@ class SlackTeamController:
         return self.store.get_session(provider, session_id)
 
     def _slash_command_target_channel_id(self, payload: dict) -> str | None:
-        return self._configured_agent_channel_id() or payload.get("channel_id")
+        source_channel = payload.get("channel_id")
+        if isinstance(source_channel, str) and self._loop_for_channel(source_channel) is not None:
+            return source_channel
+        return self._configured_agent_channel_id() or source_channel
 
     def _configured_agent_channel_id(self) -> str | None:
         return (
@@ -4413,6 +4691,7 @@ class SlackTeamController:
     def _task_from_action(
         self,
         payload: dict,
+        slack_payload: dict,
         channel_id: str,
         message_ts: str | None,
     ) -> None:
@@ -4421,6 +4700,18 @@ class SlackTeamController:
             return
         action = payload["action"]
         task = self.store.get_agent_task(str(task_id))
+        if task is not None:
+            loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
+            loop = self.store.get_loop(loop_id) if isinstance(loop_id, str) else None
+            actor = (slack_payload.get("user") or {}).get("id")
+            if loop is not None and actor != loop.owner_slack_user_id:
+                if isinstance(actor, str) and actor:
+                    self.gateway.post_ephemeral(
+                        channel_id,
+                        actor,
+                        "Only the loop owner can control this run.",
+                    )
+                return
         thread_ts = task.thread_ts if task and task.thread_ts else message_ts
         thread = SlackThreadRef(channel_id=channel_id, thread_ts=thread_ts or "")
         if action in {"task.done", "task.finish", "task.cancel", "task.pause"}:
@@ -5497,11 +5788,12 @@ class SlackTeamController:
         if not isinstance(delegate_to_agent_id, str):
             delegate_to_agent_id = agent.agent_id
         metadata["delegate_to_agent_id"] = delegate_to_agent_id
-        metadata = self._with_linked_thread_context(
-            metadata,
-            request.prompt,
-            current_thread=thread,
-        )
+        if not task.metadata.get(LOOP_ID_METADATA_KEY):
+            metadata = self._with_linked_thread_context(
+                metadata,
+                request.prompt,
+                current_thread=thread,
+            )
         delegate_prompt = task.metadata.get("delegate_prompt")
         if not isinstance(delegate_prompt, str) or not delegate_prompt.strip():
             delegate_prompt = REVIEW_DELEGATE_PROMPT
@@ -5665,11 +5957,12 @@ class SlackTeamController:
         metadata = self._thread_task_metadata(task, thread.channel_id, thread.thread_ts)
         if message_ts:
             metadata["request_message_ts"] = message_ts
-        metadata = self._with_linked_thread_context(
-            metadata,
-            request.prompt,
-            current_thread=thread,
-        )
+        if not task.metadata.get(LOOP_ID_METADATA_KEY):
+            metadata = self._with_linked_thread_context(
+                metadata,
+                request.prompt,
+                current_thread=thread,
+            )
         metadata["delegated_from_task_id"] = task.task_id
         metadata["delegated_from_agent_id"] = agent.agent_id
         result = assign_work_request(
@@ -6056,11 +6349,12 @@ class SlackTeamController:
                 metadata[key] = previous_task.metadata[key]
         if request_message_ts:
             metadata = _metadata_with_request_message_ts(metadata, request_message_ts)
-        metadata = self._with_linked_thread_context(
-            metadata,
-            request.prompt,
-            current_thread=thread,
-        )
+        if not previous_task.metadata.get(LOOP_ID_METADATA_KEY):
+            metadata = self._with_linked_thread_context(
+                metadata,
+                request.prompt,
+                current_thread=thread,
+            )
         if request.dangerous_mode or _task_dangerous_mode(previous_task):
             metadata[DANGEROUS_MODE_METADATA_KEY] = True
         task = replace(
@@ -6229,11 +6523,12 @@ class SlackTeamController:
             metadata.pop(ACTIVE_THREAD_FOLLOWUP_MESSAGE_TS_METADATA_KEY, None)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(latest)
         metadata = metadata_with_pr_urls(metadata, prompt)
-        metadata = self._with_linked_thread_context(
-            metadata,
-            prompt,
-            current_thread=thread,
-        )
+        if not latest.metadata.get(LOOP_ID_METADATA_KEY):
+            metadata = self._with_linked_thread_context(
+                metadata,
+                prompt,
+                current_thread=thread,
+            )
         updated = replace(
             latest,
             prompt=prompt,
@@ -6511,6 +6806,8 @@ class SlackTeamController:
             return self._create_deferred_work_from_agent(task, agent, thread, signal)
         if is_agent_pm_plan_signal(signal):
             return self._create_pm_initiative_from_agent(task, agent, thread, signal)
+        if re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_LOOP_FETCH_SIGNAL_PREFIX):
+            return self._handle_loop_fetch_signal(task, agent, thread, signal)
         if re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_LOOP_SIGNAL_PREFIX):
             return self._create_loop_from_agent(task, agent, thread, signal)
         return False
@@ -8954,11 +9251,26 @@ class SlackTeamController:
         }
         if parent_task.metadata.get("cwd"):
             metadata["cwd"] = parent_task.metadata["cwd"]
+        loop_id = parent_task.metadata.get(LOOP_ID_METADATA_KEY)
+        loop = self.store.get_loop(loop_id) if isinstance(loop_id, str) else None
+        if loop is not None:
+            metadata[LOOP_ID_METADATA_KEY] = loop.loop_id
+            for key in (
+                LOOP_RUN_ID_METADATA_KEY,
+                PERMISSION_MODE_METADATA_KEY,
+                MODEL_OVERRIDE_METADATA_KEY,
+            ):
+                if key in parent_task.metadata:
+                    metadata[key] = parent_task.metadata[key]
         parent_pr_urls = pr_urls_from_metadata(parent_task.metadata)
         if parent_pr_urls:
             metadata[PR_URL_METADATA_KEY] = parent_pr_urls[0]
             metadata[PR_URLS_METADATA_KEY] = list(parent_pr_urls)
-        context = self._thread_context(channel_id, thread_ts)
+        context = (
+            self._loop_thread_context(loop, channel_id, thread_ts)
+            if loop is not None
+            else self._thread_context(channel_id, thread_ts)
+        )
         prompt_context = f"Original task: {_task_original_prompt(parent_task)}"
         if context:
             metadata["thread_context"] = f"{prompt_context}\n{context}"
@@ -9110,6 +9422,40 @@ class SlackTeamController:
             if is_internal_task_notification_text(text):
                 continue
             author = self._thread_context_author(message)
+            lines.append(f"{author}: {text}")
+        context = "\n".join(lines)
+        return context[-6000:] if context else None
+
+    def _loop_thread_context(
+        self,
+        loop: Loop,
+        channel_id: str,
+        thread_ts: str,
+    ) -> str | None:
+        if loop.channel_id != channel_id:
+            return None
+        try:
+            messages = self.gateway.thread_messages(channel_id, thread_ts, limit=20)
+        except Exception:
+            LOGGER.debug("failed to fetch sanitized loop thread context", exc_info=True)
+            return None
+        visible = loop_visible_messages(
+            loop,
+            messages,
+            own_bot_id=self.ignored_bot_id,
+        )
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        bot_name = agent.full_name if agent is not None else loop.title
+        lines: list[str] = []
+        for message in visible[-12:]:
+            text = str(message.get("text") or "").strip()
+            if not text or is_internal_task_notification_text(text):
+                continue
+            author = (
+                "Owner"
+                if message.get("user") == loop.owner_slack_user_id and not message.get("bot_id")
+                else bot_name
+            )
             lines.append(f"{author}: {text}")
         context = "\n".join(lines)
         return context[-6000:] if context else None
@@ -9519,6 +9865,9 @@ class SlackTeamController:
         configured = self._configured_agent_channel_id()
         return configured is None or configured == channel_id
 
+    def _loop_for_channel(self, channel_id: str) -> Loop | None:
+        return self.store.get_loop_by_channel(channel_id)
+
     def _remember_human_user(self, user_id: str | None, profile: object = None) -> None:
         if not user_id:
             return
@@ -9855,44 +10204,62 @@ class SlackMessageBackfill:
         include_threads: bool = True,
         thread_oldest: str | None = None,
     ) -> _SlackBackfillResult:
-        channel_id = self.controller._configured_agent_channel_id()
-        if not channel_id:
+        channel_ids = list(
+            dict.fromkeys(
+                filter(
+                    None,
+                    [
+                        self.controller._configured_agent_channel_id(),
+                        *self.store.list_loop_channel_ids(),
+                    ],
+                )
+            )
+        )
+        if not channel_ids:
             return _SlackBackfillResult(
                 recovered=0,
                 channel_history_ok=True,
                 thread_history_ok=True,
             )
-        scan = self._events_since(
-            channel_id,
-            oldest,
-            include_threads=include_threads,
-            thread_oldest=thread_oldest,
-        )
         recovered = 0
-        for event in sorted(scan.events, key=lambda item: _slack_ts_sort_key(item.get("ts"))):
-            event_channel_id, message_ts = self.controller._recoverable_user_message_ref(event)
-            if event_channel_id is None or message_ts is None:
-                continue
-            if self.controller._slack_message_processed(event_channel_id, message_ts):
-                if not self.controller._processed_slack_message_needs_backfill(event):
+        channel_history_ok = True
+        thread_history_ok = True
+        for channel_id in channel_ids:
+            scan = self._events_since(
+                channel_id,
+                oldest,
+                include_threads=include_threads,
+                thread_oldest=thread_oldest,
+            )
+            channel_history_ok = channel_history_ok and scan.channel_history_ok
+            thread_history_ok = thread_history_ok and scan.thread_history_ok
+            for event in sorted(
+                scan.events,
+                key=lambda item: _slack_ts_sort_key(item.get("ts")),
+            ):
+                event_channel_id, message_ts = self.controller._recoverable_user_message_ref(event)
+                if event_channel_id is None or message_ts is None:
                     continue
-                self.controller._clear_slack_message_processed(event_channel_id, message_ts)
-            try:
-                self.controller.handle_event({"event": event})
-                recovered += 1
-            except Exception:
-                LOGGER.exception(
-                    "failed to process backfilled Slack message %s:%s",
-                    event_channel_id,
-                    message_ts,
-                )
-        scan_finished_at = float(self.now())
-        for thread_ts in scan.scanned_thread_ts:
-            self._record_thread_scan(channel_id, thread_ts, scan_finished_at)
+                if self.controller._slack_message_processed(event_channel_id, message_ts):
+                    if not self.controller._processed_slack_message_needs_backfill(event):
+                        continue
+                    self.controller._clear_slack_message_processed(event_channel_id, message_ts)
+                try:
+                    self.controller.handle_event({"event": event})
+                    recovered += 1
+                except Exception:
+                    LOGGER.exception(
+                        "failed to process backfilled Slack message %s:%s",
+                        event_channel_id,
+                        message_ts,
+                    )
+            scan_finished_at = float(self.now())
+            for thread_ts in scan.scanned_thread_ts:
+                self._record_thread_scan(channel_id, thread_ts, scan_finished_at)
         return _SlackBackfillResult(
             recovered=recovered,
-            channel_history_ok=scan.channel_history_ok,
-            thread_history_ok=scan.thread_history_ok,
+            channel_history_ok=channel_history_ok,
+            thread_history_ok=thread_history_ok,
         )
 
     def _thread_scan_due(self, now: float, previous: float | None) -> bool:
