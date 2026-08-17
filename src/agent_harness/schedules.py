@@ -85,6 +85,20 @@ class AgentScheduleParseResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ParsedRecurrence:
+    recurrence: dict[str, object]
+    timezone: str | None
+    next_run_at: datetime
+    description: str
+
+
+@dataclass(frozen=True)
+class RecurrenceParseResult:
+    recurrence: ParsedRecurrence | None = None
+    error: str | None = None
+
+
 def looks_like_schedule_request(text: str) -> bool:
     normalized = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip().lower()
     return any(normalized.startswith(f"{verb} ") for verb in SCHEDULE_VERBS)
@@ -350,19 +364,39 @@ def _parse_recurring_schedule(
     *,
     now: datetime,
 ) -> AgentScheduleParseResult:
+    parsed = parse_recurrence_payload(schedule, now=now)
+    if parsed.error:
+        return AgentScheduleParseResult(error=parsed.error)
+    assert parsed.recurrence is not None
+    recurrence = parsed.recurrence
+    return AgentScheduleParseResult(
+        schedule=ParsedAgentSchedule(
+            request=request,
+            schedule_kind=ScheduledWorkKind.RECURRING,
+            next_run_at=recurrence.next_run_at,
+            recurrence=recurrence.recurrence,
+            timezone=recurrence.timezone,
+            description=recurrence.description,
+        )
+    )
+
+
+def parse_recurrence_payload(
+    schedule: dict[str, object],
+    *,
+    now: datetime,
+) -> RecurrenceParseResult:
     frequency = schedule.get("frequency")
     if frequency not in {"daily", "weekly", "interval"}:
-        return AgentScheduleParseResult(
-            error="recurring frequency must be daily, weekly, or interval"
-        )
+        return RecurrenceParseResult(error="recurring frequency must be daily, weekly, or interval")
     if frequency == "interval":
-        return _parse_interval_recurring_schedule(schedule, request, now=now)
+        return _parse_interval_recurrence_payload(schedule, now=now)
     timezone = _timezone(schedule.get("timezone"))
     if timezone is None:
-        return AgentScheduleParseResult(error="recurring schedule must include IANA timezone")
+        return RecurrenceParseResult(error="recurring schedule must include IANA timezone")
     time_text = schedule.get("time")
     if not isinstance(time_text, str) or _time_from_text(time_text) is None:
-        return AgentScheduleParseResult(error="recurring schedule time must be HH:MM")
+        return RecurrenceParseResult(error="recurring schedule time must be HH:MM")
     recurrence: dict[str, object] = {
         "frequency": frequency,
         "time": time_text,
@@ -371,22 +405,18 @@ def _parse_recurring_schedule(
     if frequency == "weekly":
         weekday = _weekday(schedule.get("weekday"))
         if weekday is None:
-            return AgentScheduleParseResult(
-                error="weekly recurring schedule must include weekday 0-6"
-            )
+            return RecurrenceParseResult(error="weekly recurring schedule must include weekday 0-6")
         recurrence["weekday"] = weekday
     next_run_at = parse_timestamp(schedule.get("next_run_at"))
     if next_run_at is None:
         next_run_at = next_run_after(recurrence, after=now)
     if next_run_at is None:
-        return AgentScheduleParseResult(error="could not compute recurring next_run_at")
+        return RecurrenceParseResult(error="could not compute recurring next_run_at")
     if next_run_at <= now:
-        return AgentScheduleParseResult(error="next_run_at must be in the future")
+        return RecurrenceParseResult(error="next_run_at must be in the future")
     description = _description(schedule, fallback=f"{frequency} at {time_text} {timezone}")
-    return AgentScheduleParseResult(
-        schedule=ParsedAgentSchedule(
-            request=request,
-            schedule_kind=ScheduledWorkKind.RECURRING,
+    return RecurrenceParseResult(
+        recurrence=ParsedRecurrence(
             next_run_at=next_run_at,
             recurrence=recurrence,
             timezone=timezone,
@@ -395,15 +425,14 @@ def _parse_recurring_schedule(
     )
 
 
-def _parse_interval_recurring_schedule(
+def _parse_interval_recurrence_payload(
     schedule: dict[str, object],
-    request: WorkRequest,
     *,
     now: datetime,
-) -> AgentScheduleParseResult:
+) -> RecurrenceParseResult:
     interval_seconds = interval_seconds_from_recurrence(schedule)
     if interval_seconds is None:
-        return AgentScheduleParseResult(
+        return RecurrenceParseResult(
             error="interval recurring schedule must include a positive interval"
         )
     recurrence: dict[str, object] = {
@@ -412,21 +441,19 @@ def _parse_interval_recurring_schedule(
     }
     timezone = _timezone(schedule.get("timezone"))
     if schedule.get("timezone") is not None and timezone is None:
-        return AgentScheduleParseResult(error="timezone must be an IANA timezone name")
+        return RecurrenceParseResult(error="timezone must be an IANA timezone name")
     if timezone:
         recurrence["timezone"] = timezone
     next_run_at = parse_timestamp(schedule.get("next_run_at"))
     if next_run_at is None:
         next_run_at = next_run_after(recurrence, after=now)
     if next_run_at is None:
-        return AgentScheduleParseResult(error="could not compute recurring next_run_at")
+        return RecurrenceParseResult(error="could not compute recurring next_run_at")
     if next_run_at <= now:
-        return AgentScheduleParseResult(error="next_run_at must be in the future")
+        return RecurrenceParseResult(error="next_run_at must be in the future")
     description = _description(schedule, fallback=format_interval_seconds(interval_seconds))
-    return AgentScheduleParseResult(
-        schedule=ParsedAgentSchedule(
-            request=request,
-            schedule_kind=ScheduledWorkKind.RECURRING,
+    return RecurrenceParseResult(
+        recurrence=ParsedRecurrence(
             next_run_at=next_run_at,
             recurrence=recurrence,
             timezone=timezone,
