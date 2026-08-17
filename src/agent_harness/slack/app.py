@@ -432,6 +432,7 @@ SLACK_SOCKET_WORKER_THREADS = 4
 SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
 SLACK_SOCKET_PONG_GRACE_SECONDS = 30.0
 SLACK_SOCKET_STALE_SECONDS = 30.0
+SLACK_SOCKET_STABLE_SECONDS = 30.0
 CAPACITY_MESSAGE = (
     "No agents are available right now. Hire more agents and I will resume this thread "
     "automatically."
@@ -12431,6 +12432,7 @@ class SocketModeSlackApp:
         )
         self._request_slots = threading.BoundedSemaphore(SLACK_SOCKET_MAX_PENDING_REQUESTS)
         self._shutdown = threading.Event()
+        self._socket_mode_ready = threading.Event()
         self.store = Store(config.state_db)
         self.store.init_schema()
         self.gateway = SlackGateway(config.slack.bot_token)
@@ -12479,7 +12481,7 @@ class SocketModeSlackApp:
             checker=UpdateChecker(GitHubReleaseSource(config.updates.repository)),
             updater=SelfUpdater(repository=config.updates.repository),
             channel_id=self.controller.update_channel_id,
-            prompt=self.controller.post_update_prompt,
+            prompt=self._post_update_prompt,
             update_message=self.gateway.update_message,
             status_blocks=lambda candidate, status, include_actions: build_update_prompt_blocks(
                 candidate,
@@ -12616,6 +12618,12 @@ class SocketModeSlackApp:
     def request_shutdown(self) -> None:
         self._shutdown.set()
 
+    def _post_update_prompt(self, channel_id: str, candidate: UpdateCandidate) -> str | None:
+        if not self._socket_mode_ready.is_set():
+            LOGGER.warning("deferring Slackgentic update prompt while Socket Mode is disconnected")
+            return None
+        return self.controller.post_update_prompt(channel_id, candidate)
+
     def _restart_after_update(self) -> None:
         from agent_harness.service import installed_services_match, restart_service
 
@@ -12703,13 +12711,7 @@ class SocketModeSlackApp:
     def run_forever(self) -> None:
         import signal
 
-        from slack_sdk.socket_mode import SocketModeClient
         from slack_sdk.socket_mode.response import SocketModeResponse
-
-        client = SocketModeClient(
-            app_token=self.config.slack.app_token or "",
-            web_client=self.gateway.client,
-        )
 
         def listener(socket_client, request) -> None:
             if _is_view_submission_request(request):
@@ -12727,11 +12729,16 @@ class SocketModeSlackApp:
             )
             self._submit_acknowledged_request(request)
 
-        client.socket_mode_request_listeners.append(listener)
         shutdown = getattr(self, "_shutdown", threading.Event())
         self._shutdown = shutdown
         shutdown.clear()
+        socket_ready = getattr(self, "_socket_mode_ready", threading.Event())
+        self._socket_mode_ready = socket_ready
+        socket_ready.clear()
+        client = None
         socket_connected_at: float | None = None
+        socket_stable = False
+        update_checks_started = False
 
         def _request_shutdown(_signum=None, _frame=None) -> None:
             shutdown.set()
@@ -12748,47 +12755,81 @@ class SocketModeSlackApp:
         try:
             connect_backoff = LoopBackoff(base_seconds=1.0, max_seconds=60.0)
             while not shutdown.is_set():
-                try:
-                    client.connect()
+                if client is None:
+                    try:
+                        client = self._create_socket_mode_client()
+                        client.socket_mode_request_listeners.append(listener)
+                        client.connect()
+                        is_connected = getattr(client, "is_connected", None)
+                        if callable(is_connected) and not is_connected():
+                            raise RuntimeError(
+                                "Slack Socket Mode connect returned without an active transport"
+                            )
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception:
+                        socket_ready.clear()
+                        self._close_socket_mode_client(client)
+                        client = None
+                        log_loop_failure(
+                            LOGGER,
+                            "failed to connect Slack Socket Mode client",
+                            connect_backoff,
+                        )
+                        if connect_backoff.wait(shutdown):
+                            break
+                        continue
                     socket_connected_at = time.monotonic()
+                    socket_stable = False
+                    socket_ready.set()
+                    if not update_checks_started:
+                        self.update_runner.start()
+                        update_checks_started = True
+
+                now = time.monotonic()
+                if (
+                    not socket_stable
+                    and socket_connected_at is not None
+                    and now - socket_connected_at >= SLACK_SOCKET_STABLE_SECONDS
+                ):
+                    socket_stable = True
                     connect_backoff.reset()
-                    break
-                except Exception:
-                    log_loop_failure(
-                        LOGGER,
-                        "failed to connect Slack Socket Mode client",
-                        connect_backoff,
-                    )
-                    if connect_backoff.wait(shutdown):
-                        break
-            if not shutdown.is_set():
-                self.update_runner.start()
-            while not shutdown.is_set():
+
                 is_connected = getattr(client, "is_connected", None)
                 disconnected = callable(is_connected) and not is_connected()
                 stale = _socket_mode_connection_stale(
                     client,
                     connected_at=socket_connected_at,
                 )
-                if stale and not disconnected:
+                reconnect_event = getattr(client, "reconnect_requested", None)
+                reconnect_requested = bool(
+                    reconnect_event is not None
+                    and callable(getattr(reconnect_event, "is_set", None))
+                    and reconnect_event.is_set()
+                )
+                if disconnected or stale or reconnect_requested:
+                    if reconnect_requested:
+                        reason = "the SDK requested a fresh endpoint"
+                    elif stale and not disconnected:
+                        reason = "the active transport failed its liveness check"
+                    else:
+                        reason = "the active transport disconnected"
+                    socket_ready.clear()
+                    self._close_socket_mode_client(client)
+                    client = None
+                    socket_connected_at = None
+                    socket_stable = False
+                    delay = connect_backoff.record_failure()
                     LOGGER.warning(
-                        "Slack Socket Mode connection is stale; reconnecting (session id: %s)",
-                        client.session_id(),
+                        "retired Slack Socket Mode client because %s; creating a fresh "
+                        "client in %.1fs after %d consecutive short-lived connections",
+                        reason,
+                        delay,
+                        connect_backoff.failures,
                     )
-                if disconnected or stale:
-                    try:
-                        self._reconnect_socket_mode(client, new_endpoint=stale)
-                        socket_connected_at = time.monotonic()
-                        connect_backoff.reset()
-                    except Exception:
-                        log_loop_failure(
-                            LOGGER,
-                            "failed to reconnect Slack Socket Mode client",
-                            connect_backoff,
-                        )
-                        if connect_backoff.wait(shutdown):
-                            break
-                        continue
+                    if shutdown.wait(delay):
+                        break
+                    continue
                 if shutdown.wait(timeout=1.0):
                     break
         except KeyboardInterrupt:
@@ -12799,89 +12840,26 @@ class SocketModeSlackApp:
                     signal.signal(sig, previous)
                 except (ValueError, OSError, TypeError):
                     continue
-            try:
-                client.close()
-            except Exception:
-                LOGGER.debug("failed to close Slack socket client cleanly", exc_info=True)
+            socket_ready.clear()
+            self._close_socket_mode_client(client)
             self.close()
 
-    def _reconnect_socket_mode(self, client, *, new_endpoint: bool) -> None:
-        """Re-establish a stale or dropped Slack Socket Mode connection.
+    def _create_socket_mode_client(self):
+        from agent_harness.slack.socket_mode import SupervisedSocketModeClient
 
-        The SDK's CLOSE callback reconnects automatically. Our liveness loop
-        used to reconnect at the same time, leaving each side free to create a
-        replacement before the other had retired the old transport. During an
-        update restart that race could turn into a reconnect storm and exhaust
-        the process file-descriptor limit.
+        return SupervisedSocketModeClient(
+            app_token=self.config.slack.app_token or "",
+            web_client=self.gateway.client,
+        )
 
-        Serialize on the SDK's connection lock, re-check liveness after taking
-        it, disable the competing automatic callback, and detach the old session
-        before closing it. ``connect()`` then has no stale session to close a
-        second time and re-enables the normal SDK auto-reconnect behavior after
-        the replacement is installed.
-        """
-
-        operation_lock = getattr(client, "connect_operation_lock", None)
-        if operation_lock is None:
-            self._reconnect_socket_mode_legacy(client, new_endpoint=new_endpoint)
+    @staticmethod
+    def _close_socket_mode_client(client) -> None:
+        if client is None:
             return
-        observed_session = getattr(client, "current_session", None)
-        acquired = operation_lock.acquire(blocking=True, timeout=5)
-        if not acquired:
-            raise RuntimeError("timed out waiting for the Slack reconnect lock")
         try:
-            is_connected = getattr(client, "is_connected", None)
-            current_session = getattr(client, "current_session", None)
-            if (
-                callable(is_connected)
-                and is_connected()
-                and not _socket_mode_transport_closed(current_session)
-                and (not new_endpoint or current_session is not observed_session)
-            ):
-                return
-
-            if hasattr(client, "auto_reconnect_enabled"):
-                client.auto_reconnect_enabled = False
-            state = getattr(client, "current_session_state", None)
-            if state is not None and hasattr(state, "terminated"):
-                state.terminated = True
-            if hasattr(client, "current_session"):
-                client.current_session = None
-            if current_session is not None:
-                try:
-                    current_session.close()
-                except Exception:
-                    LOGGER.debug(
-                        "ignoring error tearing down stale Slack socket",
-                        exc_info=True,
-                    )
-            if new_endpoint:
-                client.wss_uri = client.issue_new_wss_url()
-            client.connect()
-        finally:
-            operation_lock.release()
-
-    def _reconnect_socket_mode_legacy(self, client, *, new_endpoint: bool) -> None:
-        """Reconnect compatible test/alternate clients without SDK internals."""
-
-        def _connect() -> None:
-            if new_endpoint:
-                client.connect_to_new_endpoint(force=True)
-            else:
-                client.connect()
-
-        try:
-            client.disconnect()
+            client.close()
         except Exception:
-            LOGGER.debug("ignoring error tearing down stale Slack socket", exc_info=True)
-        try:
-            _connect()
-        except AttributeError:
-            LOGGER.debug(
-                "retrying Slack Socket Mode reconnect after a racy session close",
-                exc_info=True,
-            )
-            _connect()
+            LOGGER.debug("failed to close Slack socket client cleanly", exc_info=True)
 
     def handle_request(self, request) -> dict | None:
         if request.type == "interactive":

@@ -82,6 +82,7 @@ from agent_harness.slack.app import (
     _socket_mode_connection_stale,
 )
 from agent_harness.slack.client import PostedMessage
+from agent_harness.slack.socket_mode import SupervisedSocketModeClient
 from agent_harness.storage.store import Store
 from agent_harness.team import (
     DEFAULT_AGENT_AVATAR_BASE_URL,
@@ -665,10 +666,9 @@ class SlackAppTests(unittest.TestCase):
         update_starts = []
 
         class FakeSocketModeClient:
-            def __init__(self, app_token, web_client):
-                self.app_token = app_token
-                self.web_client = web_client
+            def __init__(self):
                 self.socket_mode_request_listeners = []
+                self.reconnect_requested = threading.Event()
 
             def connect(self):
                 connect_calls.append("connect")
@@ -678,6 +678,8 @@ class SlackAppTests(unittest.TestCase):
 
             def close(self):
                 closed_clients.append(True)
+
+        clients = [FakeSocketModeClient(), FakeSocketModeClient()]
 
         class FakeSocketModeResponse:
             def __init__(self, envelope_id, payload=None):
@@ -693,8 +695,6 @@ class SlackAppTests(unittest.TestCase):
                 self.failures += 1
                 return False
 
-        socket_mode_module = types.ModuleType("slack_sdk.socket_mode")
-        socket_mode_module.SocketModeClient = FakeSocketModeClient
         response_module = types.ModuleType("slack_sdk.socket_mode.response")
         response_module.SocketModeResponse = FakeSocketModeResponse
         app = object.__new__(SocketModeSlackApp)
@@ -703,12 +703,12 @@ class SlackAppTests(unittest.TestCase):
         app.close = lambda: closed_apps.append(True)
         app.handle_request = lambda request: None
         app.update_runner = types.SimpleNamespace(start=lambda: update_starts.append(True))
+        app._create_socket_mode_client = lambda: clients.pop(0)
 
         with (
             patch.dict(
                 sys.modules,
                 {
-                    "slack_sdk.socket_mode": socket_mode_module,
                     "slack_sdk.socket_mode.response": response_module,
                 },
             ),
@@ -719,18 +719,23 @@ class SlackAppTests(unittest.TestCase):
 
         self.assertEqual(connect_calls, ["connect", "connect"])
         self.assertEqual(update_starts, [])
-        self.assertEqual(closed_clients, [True])
+        self.assertEqual(closed_clients, [True, True])
         self.assertEqual(closed_apps, [True])
 
     def test_update_checks_start_only_after_socket_mode_connects(self):
         events = []
 
         class FakeSocketModeClient:
-            def __init__(self, app_token, web_client):
+            def __init__(self):
                 self.socket_mode_request_listeners = []
+                self.reconnect_requested = threading.Event()
+                self.current_session = types.SimpleNamespace(last_ping_pong_time=None)
 
             def connect(self):
                 events.append("connect")
+
+            def is_connected(self):
+                return True
 
             def close(self):
                 events.append("close")
@@ -740,8 +745,6 @@ class SlackAppTests(unittest.TestCase):
                 self.envelope_id = envelope_id
                 self.payload = payload
 
-        socket_mode_module = types.ModuleType("slack_sdk.socket_mode")
-        socket_mode_module.SocketModeClient = FakeSocketModeClient
         response_module = types.ModuleType("slack_sdk.socket_mode.response")
         response_module.SocketModeResponse = FakeSocketModeResponse
         app = object.__new__(SocketModeSlackApp)
@@ -750,6 +753,7 @@ class SlackAppTests(unittest.TestCase):
         app.close = lambda: events.append("app-close")
         app.handle_request = lambda request: None
         app._shutdown = threading.Event()
+        app._create_socket_mode_client = FakeSocketModeClient
 
         def start_updates():
             events.append("update-start")
@@ -760,7 +764,6 @@ class SlackAppTests(unittest.TestCase):
         with patch.dict(
             sys.modules,
             {
-                "slack_sdk.socket_mode": socket_mode_module,
                 "slack_sdk.socket_mode.response": response_module,
             },
         ):
@@ -768,189 +771,204 @@ class SlackAppTests(unittest.TestCase):
 
         self.assertEqual(events, ["connect", "update-start", "close", "app-close"])
 
-    def test_reconnect_socket_mode_recovers_from_racy_session_close(self):
+    def test_socket_mode_replaces_whole_clients_and_backs_off_across_short_connections(self):
         events = []
+        clients = []
 
-        class FakeStaleClient:
-            def __init__(self):
-                self.endpoint_calls = 0
-
-            def disconnect(self):
-                events.append("disconnect")
-
-            def connect_to_new_endpoint(self, force=False):
-                self.endpoint_calls += 1
-                events.append(f"connect_to_new_endpoint(force={force})")
-                if self.endpoint_calls == 1:
-                    # slack_sdk closes the racing old session inline and blows up
-                    # with this exact error before swapping in the new session.
-                    raise AttributeError("'NoneType' object has no attribute 'close'")
-
-            def connect(self):  # pragma: no cover - not used in the stale path
-                events.append("connect")
-
-        app = object.__new__(SocketModeSlackApp)
-        client = FakeStaleClient()
-
-        app._reconnect_socket_mode(client, new_endpoint=True)
-
-        # We tear the stale session down ourselves first, then retry the
-        # endpoint reconnect once past the racy close so realtime delivery
-        # actually recovers instead of staying pinned to a dead socket.
-        self.assertEqual(
-            events,
-            [
-                "disconnect",
-                "connect_to_new_endpoint(force=True)",
-                "connect_to_new_endpoint(force=True)",
-            ],
-        )
-
-    def test_reconnect_socket_mode_tolerates_disconnect_failure(self):
-        events = []
-
-        class FakeClient:
-            def disconnect(self):
-                events.append("disconnect")
-                raise AttributeError("'NoneType' object has no attribute 'close'")
+        class FakeSocketModeClient:
+            def __init__(self, generation, request_reconnect):
+                self.generation = generation
+                self.socket_mode_request_listeners = []
+                self.reconnect_requested = threading.Event()
+                self.current_session = types.SimpleNamespace(last_ping_pong_time=None)
+                if request_reconnect:
+                    self.reconnect_requested.set()
 
             def connect(self):
-                events.append("connect")
+                events.append(f"connect-{self.generation}")
+                if self.generation == 4:
+                    app._shutdown.set()
 
             def connect_to_new_endpoint(self, force=False):  # pragma: no cover
-                events.append("connect_to_new_endpoint")
-
-        app = object.__new__(SocketModeSlackApp)
-
-        # A racy teardown during our own disconnect must not abort the reconnect.
-        app._reconnect_socket_mode(FakeClient(), new_endpoint=False)
-
-        self.assertEqual(events, ["disconnect", "connect"])
-
-    def test_reconnect_socket_mode_serializes_and_detaches_old_transport(self):
-        events = []
-
-        class FakeSession:
-            def close(session_self):
-                events.append("close-old")
-                if client.auto_reconnect_enabled:
-                    events.append("automatic-reconnect")
-
-        class FakeClient:
-            def __init__(self):
-                self.connect_operation_lock = threading.Lock()
-                self.current_session = FakeSession()
-                self.current_session_state = types.SimpleNamespace(terminated=False)
-                self.auto_reconnect_enabled = True
-                self.wss_uri = "wss://old.example/socket"
-
-            def is_connected(self):
-                return False
-
-            def issue_new_wss_url(self):
-                events.append("new-endpoint")
-                return "wss://new.example/socket"
-
-            def connect(self):
-                events.append("connect")
-                self.assert_detached = self.current_session is None
-                self.current_session = types.SimpleNamespace(
-                    sock=types.SimpleNamespace(
-                        fileno=lambda: 9,
-                        getpeername=lambda: ("192.0.2.1", 443),
-                    )
-                )
-                self.auto_reconnect_enabled = True
-
-        app = object.__new__(SocketModeSlackApp)
-        client = FakeClient()
-
-        app._reconnect_socket_mode(client, new_endpoint=True)
-
-        self.assertEqual(events, ["close-old", "new-endpoint", "connect"])
-        self.assertTrue(client.assert_detached)
-        self.assertTrue(client.current_session_state.terminated)
-        self.assertTrue(client.connect_operation_lock.acquire(blocking=False))
-        client.connect_operation_lock.release()
-
-    def test_reconnect_socket_mode_replaces_connected_but_stale_transport(self):
-        events = []
-
-        class FakeSession:
-            def __init__(self, name):
-                self.name = name
-
-            def close(self):
-                events.append(f"close-{self.name}")
-
-        class FakeClient:
-            def __init__(self):
-                self.connect_operation_lock = threading.Lock()
-                self.current_session = FakeSession("stale")
-                self.current_session_state = types.SimpleNamespace(terminated=False)
-                self.auto_reconnect_enabled = True
-                self.wss_uri = "wss://old.example/socket"
+                raise AssertionError("only the Slackgentic supervisor may reconnect")
 
             def is_connected(self):
                 return True
 
-            def issue_new_wss_url(self):
-                events.append("new-endpoint")
-                return "wss://new.example/socket"
+            def close(self):
+                events.append(f"close-{self.generation}")
+
+        class FakeBackoff:
+            def __init__(self, **kwargs):
+                self.failures = 0
+                self.next_delay = 1.0
+
+            def reset(self):
+                events.append("reset-backoff")
+                self.failures = 0
+                self.next_delay = 1.0
+
+            def record_failure(self):
+                delay = self.next_delay
+                self.failures += 1
+                self.next_delay *= 2
+                events.append(f"backoff-{delay:g}")
+                return 0.0
+
+            def wait(self, stop_event):  # pragma: no cover - connect succeeds
+                raise AssertionError("connect-failure wait was not expected")
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id, payload=None):
+                self.envelope_id = envelope_id
+                self.payload = payload
+
+        def create_client():
+            generation = len(clients) + 1
+            client = FakeSocketModeClient(generation, request_reconnect=generation < 4)
+            clients.append(client)
+            return client
+
+        response_module = types.ModuleType("slack_sdk.socket_mode.response")
+        response_module.SocketModeResponse = FakeSocketModeResponse
+        app = object.__new__(SocketModeSlackApp)
+        app.close = lambda: events.append("app-close")
+        app.handle_request = lambda request: None
+        app.update_runner = types.SimpleNamespace(start=lambda: events.append("update-start"))
+        app._shutdown = threading.Event()
+        app._create_socket_mode_client = create_client
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"slack_sdk.socket_mode.response": response_module},
+            ),
+            patch("agent_harness.slack.app.LoopBackoff", FakeBackoff),
+        ):
+            app.run_forever()
+
+        self.assertEqual(
+            events,
+            [
+                "connect-1",
+                "update-start",
+                "close-1",
+                "backoff-1",
+                "connect-2",
+                "close-2",
+                "backoff-2",
+                "connect-3",
+                "close-3",
+                "backoff-4",
+                "connect-4",
+                "close-4",
+                "app-close",
+            ],
+        )
+
+    def test_socket_mode_connect_returning_disconnected_is_a_failed_generation(self):
+        events = []
+
+        class FakeSocketModeClient:
+            def __init__(self):
+                self.socket_mode_request_listeners = []
 
             def connect(self):
                 events.append("connect")
-                self.current_session = FakeSession("replacement")
-
-        app = object.__new__(SocketModeSlackApp)
-        client = FakeClient()
-
-        app._reconnect_socket_mode(client, new_endpoint=True)
-
-        self.assertEqual(events, ["close-stale", "new-endpoint", "connect"])
-        self.assertEqual(client.current_session.name, "replacement")
-
-    def test_reconnect_socket_mode_failed_endpoint_does_not_leak_old_session(self):
-        events = []
-
-        class FakeSession:
-            def close(self):
-                events.append("close-old")
-
-        class FakeClient:
-            def __init__(self):
-                self.connect_operation_lock = threading.Lock()
-                self.current_session = FakeSession()
-                self.current_session_state = types.SimpleNamespace(terminated=False)
-                self.auto_reconnect_enabled = True
-                self.wss_uri = "wss://old.example/socket"
-                self.endpoint_attempts = 0
 
             def is_connected(self):
                 return False
 
-            def issue_new_wss_url(self):
-                self.endpoint_attempts += 1
-                events.append("new-endpoint")
-                if self.endpoint_attempts == 1:
-                    raise RuntimeError("Slack endpoint unavailable")
-                return "wss://new.example/socket"
+            def close(self):
+                events.append("close")
 
-            def connect(self):
-                events.append("connect")
-                self.current_session = types.SimpleNamespace(sock=object())
+        class StopAfterFailureBackoff:
+            def __init__(self, **kwargs):
+                self.failures = 0
+                self.next_delay = 0.0
 
+            def wait(self, stop_event):
+                self.failures += 1
+                stop_event.set()
+                return True
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id, payload=None):
+                self.envelope_id = envelope_id
+                self.payload = payload
+
+        response_module = types.ModuleType("slack_sdk.socket_mode.response")
+        response_module.SocketModeResponse = FakeSocketModeResponse
         app = object.__new__(SocketModeSlackApp)
-        client = FakeClient()
+        app.close = lambda: events.append("app-close")
+        app.handle_request = lambda request: None
+        app.update_runner = types.SimpleNamespace(start=lambda: events.append("update-start"))
+        app._create_socket_mode_client = FakeSocketModeClient
 
-        with self.assertRaisesRegex(RuntimeError, "Slack endpoint unavailable"):
-            app._reconnect_socket_mode(client, new_endpoint=True)
-        self.assertIsNone(client.current_session)
-        self.assertFalse(client.auto_reconnect_enabled)
+        with (
+            patch.dict(
+                sys.modules,
+                {"slack_sdk.socket_mode.response": response_module},
+            ),
+            patch("agent_harness.slack.app.LoopBackoff", StopAfterFailureBackoff),
+            patch("agent_harness.slack.app.log_loop_failure"),
+        ):
+            app.run_forever()
 
-        app._reconnect_socket_mode(client, new_endpoint=True)
+        self.assertEqual(events, ["connect", "close", "app-close"])
 
-        self.assertEqual(events, ["close-old", "new-endpoint", "new-endpoint", "connect"])
+    def test_supervised_socket_mode_client_converts_sdk_reconnects_to_signals(self):
+        with patch(
+            "agent_harness.slack.socket_mode.SocketModeClient.__init__",
+            return_value=None,
+        ) as sdk_init:
+            client = SupervisedSocketModeClient(app_token="xapp-test")
+
+        kwargs = sdk_init.call_args.kwargs
+        self.assertFalse(kwargs["auto_reconnect_enabled"])
+        close_listener = kwargs["on_close_listeners"][-1]
+        self.assertFalse(client.reconnect_requested.is_set())
+
+        client.connect_to_new_endpoint(force=True)
+        self.assertTrue(client.reconnect_requested.is_set())
+
+        client.reconnect_requested.clear()
+        close_listener(1001, "going away")
+        self.assertTrue(client.reconnect_requested.is_set())
+
+    def test_supervised_socket_mode_client_closes_sdk_session_runner(self):
+        events = []
+        client = object.__new__(SupervisedSocketModeClient)
+        client.current_session_runner = types.SimpleNamespace(
+            is_alive=lambda: True,
+            shutdown=lambda: events.append("runner-shutdown"),
+        )
+
+        with patch(
+            "agent_harness.slack.socket_mode.SocketModeClient.close",
+            side_effect=lambda: events.append("sdk-close"),
+        ):
+            client.close()
+
+        self.assertEqual(events, ["sdk-close", "runner-shutdown"])
+
+    def test_update_prompt_waits_for_healthy_socket_mode(self):
+        calls = []
+        candidate = object()
+        app = object.__new__(SocketModeSlackApp)
+        app._socket_mode_ready = threading.Event()
+        app.controller = types.SimpleNamespace(
+            post_update_prompt=lambda channel_id, update: (
+                calls.append((channel_id, update)) or "171.000001"
+            )
+        )
+
+        self.assertIsNone(app._post_update_prompt("C1", candidate))
+        self.assertEqual(calls, [])
+
+        app._socket_mode_ready.set()
+        self.assertEqual(app._post_update_prompt("C1", candidate), "171.000001")
+        self.assertEqual(calls, [("C1", candidate)])
 
     def test_socket_mode_acknowledged_requests_run_on_worker(self):
         submitted = []
