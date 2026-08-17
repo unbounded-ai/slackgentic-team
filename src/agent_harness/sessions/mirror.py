@@ -15,6 +15,7 @@ from pathlib import Path
 
 from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.models import (
+    WORKER_KINDS,
     AgentEvent,
     AgentSession,
     AgentTask,
@@ -55,6 +56,7 @@ from agent_harness.slack import (
 )
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
+from agent_harness.team import agent_icon_url
 
 LOGGER = logging.getLogger(__name__)
 SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
@@ -77,11 +79,6 @@ EXTERNAL_SESSION_START_MATCH_SECONDS = 300
 # has disappeared for this long is retired and ignored. Without this the seat stays
 # occupied forever and the dead session keeps being re-adopted and re-announced.
 EXTERNAL_SESSION_MISSING_TARGET_GRACE_SECONDS = 300
-DEFAULT_AGENT_AVATAR_BASE_URL = (
-    "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
-)
-DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
-SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 TERMINAL_MIRROR_PREFIX = "external_session_terminal_mirror."
 CODEX_RESPONSE_ITEM_RECOVERY_PREFIX = "codex_response_item_recovery.v1."
 
@@ -640,7 +637,7 @@ class SessionMirror:
         assigned_agent_id = self.store.get_setting(setting_key)
         if assigned_agent_id:
             agent = self._assigned_external_session_agent(session)
-            if agent is not None and agent.kind != TeamAgentKind.PM:
+            if agent is not None and agent.kind in WORKER_KINDS:
                 self._mark_session_not_pending(session)
                 return agent
             self.store.delete_setting(setting_key)
@@ -653,7 +650,7 @@ class SessionMirror:
                 self._mark_session_not_pending(session)
                 return None
         active_agents = [
-            agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.PM
+            agent for agent in self.store.list_team_agents() if agent.kind in WORKER_KINDS
         ]
         if not active_agents:
             self._mark_session_pending(session)
@@ -661,7 +658,7 @@ class SessionMirror:
             return None
         assigned_agent_ids = self._active_external_agent_ids(active_session_keys, setting_key)
         idle_agents = [
-            agent for agent in self.store.idle_team_agents() if agent.kind != TeamAgentKind.PM
+            agent for agent in self.store.idle_team_agents() if agent.kind in WORKER_KINDS
         ]
         available = [
             agent
@@ -1067,14 +1064,7 @@ class SessionMirror:
         return len(self.store.list_settings(prefix))
 
     def _team_agent_icon_url(self, agent: TeamAgent) -> str | None:
-        base_url = (
-            self.store.get_setting(SETTING_AGENT_AVATAR_BASE_URL)
-            or os.environ.get("SLACKGENTIC_AGENT_AVATAR_BASE_URL")
-            or DEFAULT_AGENT_AVATAR_BASE_URL
-        ).strip()
-        if base_url.lower() in DISABLED_AVATAR_BASE_VALUES:
-            return None
-        return f"{base_url.rstrip('/')}/{agent.avatar_slug}.png"
+        return agent_icon_url(self.store, agent)
 
     def _human_display_name(self) -> str:
         configured = self.store.get_setting(HUMAN_DISPLAY_NAME_SETTING)

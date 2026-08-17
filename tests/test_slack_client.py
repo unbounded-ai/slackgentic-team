@@ -1,7 +1,10 @@
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 from slack_sdk.errors import SlackApiError
 
+from agent_harness.models import SlackThreadRef, TeamAgentKind
 from agent_harness.slack.client import SlackGateway
 from agent_harness.team import build_initial_model_team, build_initialization_messages
 
@@ -12,6 +15,10 @@ class FakeSlackClient:
         self.updates = []
         self.archived_channels = []
         self.pins = []
+        self.ephemerals = []
+        self.topics = []
+        self.uploads = []
+        self.channel_infos = []
 
     def auth_test(self):
         return type("SlackResponse", (), {"data": {"ok": True, "bot_id": "B1"}})()
@@ -46,6 +53,22 @@ class FakeSlackClient:
     def pins_add(self, **kwargs):
         self.pins.append(kwargs)
         return {"ok": True}
+
+    def chat_postEphemeral(self, **kwargs):
+        self.ephemerals.append(kwargs)
+        return {"ok": True}
+
+    def conversations_setTopic(self, **kwargs):
+        self.topics.append(kwargs)
+        return {"ok": True}
+
+    def files_upload_v2(self, **kwargs):
+        self.uploads.append(kwargs)
+        return {"ok": True}
+
+    def conversations_info(self, **kwargs):
+        self.channel_infos.append(kwargs)
+        return {"ok": True, "channel": {"id": kwargs["channel"], "is_archived": False}}
 
 
 class FakeSlackResponse(dict):
@@ -131,6 +154,15 @@ class AlreadyPinnedClient(FakeSlackClient):
         )
 
 
+class MissingFilesScopeClient(FakeSlackClient):
+    def files_upload_v2(self, **kwargs):
+        self.uploads.append(kwargs)
+        raise SlackApiError(
+            "missing scope",
+            FakeSlackResponse({"ok": False, "error": "missing_scope"}),
+        )
+
+
 class InvalidUpdateBlocksOnceClient(FakeSlackClient):
     def __init__(self):
         super().__init__()
@@ -184,6 +216,19 @@ class SlackGatewayTests(unittest.TestCase):
         gateway.post_thread_reply(SlackThreadRef("C1", "171.000001"), "hello", username="localuser")
 
         self.assertEqual(gateway.client.messages[0]["username"], "localuser")
+
+    def test_loop_identity_uses_bare_display_name(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+        agent = replace(
+            build_initial_model_team(codex_count=1, claude_count=0)[0],
+            full_name="Billing Bot",
+            kind=TeamAgentKind.LOOP,
+        )
+
+        gateway.post_thread_reply(SlackThreadRef("C1", "171.000001"), "hello", persona=agent)
+
+        self.assertEqual(gateway.client.messages[0]["username"], "Billing Bot")
 
     def test_post_thread_reply_renders_markdown_table_as_block(self):
         gateway = object.__new__(SlackGateway)
@@ -249,6 +294,34 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertTrue(gateway.archive_channel("C1"))
 
         self.assertEqual(gateway.client.archived_channels, ["C1"])
+
+    def test_loop_gateway_wrappers_call_slack_apis(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        self.assertTrue(gateway.post_ephemeral("C1", "U1", "owner only"))
+        self.assertTrue(gateway.set_channel_topic("C1", "loop topic"))
+        self.assertTrue(
+            gateway.upload_file(
+                "C1",
+                Path("/tmp/example-loop-icon.png"),
+                title="Loop badge",
+                thread_ts="171.000001",
+            )
+        )
+        self.assertEqual(gateway.channel_info("C1")["id"], "C1")
+        self.assertEqual(gateway.client.ephemerals[0]["user"], "U1")
+        self.assertEqual(gateway.client.topics[0]["topic"], "loop topic")
+        self.assertEqual(gateway.client.uploads[0]["thread_ts"], "171.000001")
+        self.assertEqual(gateway.client.channel_infos, [{"channel": "C1"}])
+
+    def test_badge_upload_degrades_when_files_scope_is_missing(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = MissingFilesScopeClient()
+
+        self.assertFalse(gateway.upload_file("C1", Path("/tmp/example-loop-icon.png")))
+        self.assertFalse(gateway.upload_file("C1", Path("/tmp/example-loop-icon.png")))
+        self.assertEqual(len(gateway.client.uploads), 2)
 
     def test_pin_message_ignores_already_pinned(self):
         gateway = object.__new__(SlackGateway)

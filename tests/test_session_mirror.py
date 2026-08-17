@@ -1917,6 +1917,40 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_external_session_assignment_does_not_use_loop_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                loop_agent = replace(
+                    build_initial_model_team(codex_count=1, claude_count=0)[0],
+                    kind=TeamAgentKind.LOOP,
+                )
+                store.upsert_team_agent(loop_agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.ACTIVE,
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once(backfill_new_sessions=False)
+
+                self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
+                self.assertIsNotNone(store.get_setting("external_session_pending.codex.s1"))
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertIn("No Codex team seat is available", gateway.posts[0][1])
+            finally:
+                store.close()
+
     def test_external_session_clears_pm_assignment_without_worker_takeover(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

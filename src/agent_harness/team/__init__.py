@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import re
 from collections.abc import Sequence
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 
 from agent_harness.models import (
     DEFAULT_TEAM_AGENT_KIND,
+    WORKER_KINDS,
     AgentTask,
     AgentTaskKind,
     AgentTaskStatus,
@@ -29,6 +31,11 @@ MAX_TEAM_AGENTS = 500
 AGENT_LIMIT_MESSAGE = "You definitely do not need that many agents."
 HANDLE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 AGENT_CONTEXT_PLACEHOLDER = "outside-work context"
+SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
+DEFAULT_AGENT_AVATAR_BASE_URL = (
+    "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
+)
+DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 
 COLORS = [
     "#2457a6",
@@ -757,7 +764,7 @@ def build_initial_model_team(
 def least_represented_provider(agents: list[TeamAgent]) -> Provider:
     counts = {Provider.CODEX: 0, Provider.CLAUDE: 0}
     for agent in agents:
-        if agent.provider_preference in counts:
+        if agent.kind in WORKER_KINDS and agent.provider_preference in counts:
             counts[agent.provider_preference] += 1
     provider_order = {Provider.CODEX: 0, Provider.CLAUDE: 1}
     return min(counts, key=lambda provider: (counts[provider], provider_order[provider]))
@@ -780,6 +787,22 @@ def agent_identity_label(agent: TeamAgent) -> str:
     return f"{agent.full_name} [{provider}] @{agent.handle}"
 
 
+def agent_icon_url(store, agent: TeamAgent) -> str | None:
+    explicit = agent.metadata.get("icon_url")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    if agent.kind == TeamAgentKind.LOOP:
+        return None
+    base_url = (
+        store.get_setting(SETTING_AGENT_AVATAR_BASE_URL)
+        or os.environ.get("SLACKGENTIC_AGENT_AVATAR_BASE_URL")
+        or DEFAULT_AGENT_AVATAR_BASE_URL
+    ).strip()
+    if base_url.lower() in DISABLED_AVATAR_BASE_VALUES:
+        return None
+    return f"{base_url.rstrip('/')}/{agent.avatar_slug}.png"
+
+
 def agent_personal_context(agent: TeamAgent) -> str:
     configured = agent.metadata.get("personal_context")
     if isinstance(configured, str) and configured.strip():
@@ -794,6 +817,12 @@ def agent_personal_context(agent: TeamAgent) -> str:
 
 
 def runtime_personality_prompt(agent: TeamAgent) -> str:
+    if agent.kind == TeamAgentKind.LOOP:
+        return (
+            f"You are {agent.full_name}, the single-mission automation bot known in Slack as "
+            f"@{agent.handle}. You are not a general teammate: stay on the loop mission, do not "
+            "accept unrelated work, and do not roleplay."
+        )
     base = (
         f"You are {agent.full_name}, known in Slack as @{agent.handle}. "
         "Personal context is explicitly included so it can lightly carry into "
@@ -989,20 +1018,19 @@ def pick_idle_agent(
     if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
         normalized = normalize_handle(request.requested_handle)
         for agent in agents:
-            if agent.handle == normalized:
+            if agent.handle == normalized and agent.kind != TeamAgentKind.LOOP:
                 return agent
         return None
-    # ANYONE mode: PM-kind agents are reserved for PM duties (planning,
-    # requirements gathering, status answering) and never picked up generic
-    # worker tasks. PM resolvers are always routed via AssignmentMode.SPECIFIC.
-    candidates = [agent for agent in agents if agent.kind != TeamAgentKind.PM]
+    # ANYONE mode is limited to worker kinds. PM resolvers are routed via
+    # AssignmentMode.SPECIFIC, while loop agents are never generic workers.
+    candidates = [agent for agent in agents if agent.kind in WORKER_KINDS]
     if not candidates:
         return None
     if request.task_kind == AgentTaskKind.REVIEW:
         if author_agent and author_agent.provider_preference is not None:
             cross_model = [
                 agent
-                for agent in agents
+                for agent in candidates
                 if agent.provider_preference is not None
                 and agent.provider_preference != author_agent.provider_preference
             ]
@@ -1010,7 +1038,7 @@ def pick_idle_agent(
                 candidates = cross_model
         else:
             claude_reviewers = [
-                agent for agent in agents if agent.provider_preference == Provider.CLAUDE
+                agent for agent in candidates if agent.provider_preference == Provider.CLAUDE
             ]
             if claude_reviewers:
                 candidates = claude_reviewers

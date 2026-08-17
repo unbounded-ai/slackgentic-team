@@ -8,6 +8,7 @@ from datetime import datetime
 
 from agent_harness.models import (
     DEFAULT_PERMISSION_MODE,
+    WORKER_KINDS,
     AgentTaskKind,
     AssignmentMode,
     PermissionMode,
@@ -874,7 +875,7 @@ def filter_pm_agents(agents: list[TeamAgent] | tuple[TeamAgent, ...]) -> list[Te
 
 
 def filter_worker_agents(agents: list[TeamAgent] | tuple[TeamAgent, ...]) -> list[TeamAgent]:
-    return [agent for agent in agents if agent.kind != TeamAgentKind.PM]
+    return [agent for agent in agents if agent.kind in WORKER_KINDS]
 
 
 @dataclass(frozen=True)

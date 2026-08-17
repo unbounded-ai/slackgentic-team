@@ -238,17 +238,18 @@ def build_team_roster_blocks(
     agents: list[TeamAgent],
     statuses: dict[str, AgentRosterStatus] | None = None,
 ) -> list[dict[str, Any]]:
-    engineers = [agent for agent in agents if not agent.is_pm]
-    pms = [agent for agent in agents if agent.is_pm]
+    visible_agents = [agent for agent in agents if agent.kind != TeamAgentKind.LOOP]
+    engineers = [agent for agent in visible_agents if not agent.is_pm]
+    pms = [agent for agent in visible_agents if agent.is_pm]
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*Agent team*  {len(agents)} active lightweight handles "
+                    f"*Agent team*  {len(visible_agents)} active lightweight handles "
                     f"({len(engineers)} engineers, {len(pms)} PMs)\n"
-                    f"{_provider_breakdown_text(agents)}"
+                    f"{_provider_breakdown_text(visible_agents)}"
                 ),
             },
         },

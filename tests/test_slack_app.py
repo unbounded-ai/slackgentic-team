@@ -64,7 +64,6 @@ from agent_harness.slack import encode_action_value
 from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
     CLAUDE_CHANNEL_PERMISSION_METHOD,
-    DEFAULT_AGENT_AVATAR_BASE_URL,
     IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY,
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
@@ -84,7 +83,12 @@ from agent_harness.slack.app import (
 )
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
-from agent_harness.team import build_initial_model_team, create_agent_task, hire_team_agents
+from agent_harness.team import (
+    DEFAULT_AGENT_AVATAR_BASE_URL,
+    build_initial_model_team,
+    create_agent_task,
+    hire_team_agents,
+)
 from agent_harness.team.commands import (
     FireCommand,
     FireEveryoneCommand,
@@ -136,6 +140,10 @@ class FakeGateway:
         self.thread_history_messages = {}
         self.channel_message_calls = []
         self.thread_message_calls = []
+        self.ephemerals = []
+        self.topics = []
+        self.uploads = []
+        self.channel_infos = {}
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -160,6 +168,21 @@ class FakeGateway:
 
     def invite_users(self, channel_id, user_ids):
         self.invites.append((channel_id, user_ids))
+
+    def post_ephemeral(self, channel_id, user_id, text):
+        self.ephemerals.append((channel_id, user_id, text))
+        return True
+
+    def set_channel_topic(self, channel_id, topic):
+        self.topics.append((channel_id, topic))
+        return True
+
+    def upload_file(self, channel_id, path, *, title=None, thread_ts=None):
+        self.uploads.append((channel_id, path, title, thread_ts))
+        return True
+
+    def channel_info(self, channel_id):
+        return self.channel_infos.get(channel_id)
 
     def open_view(self, trigger_id, view):
         self.views.append((trigger_id, view))
@@ -2338,6 +2361,38 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(store.list_team_agents(), [])
                 self.assertTrue(gateway.posts)
+            finally:
+                store.close()
+
+    def test_team_fire_commands_do_not_stop_loop_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                engineer, second = build_initial_model_team(2, 0)
+                loop_agent = replace(
+                    second,
+                    agent_id="loopagent-test",
+                    handle="billing-loop",
+                    kind=TeamAgentKind.LOOP,
+                )
+                store.upsert_team_agent(engineer)
+                store.upsert_team_agent(loop_agent)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_team_command(
+                    FireCommand(handle=loop_agent.handle),
+                    SlackReplyTarget(channel_id="C1", thread_ts="171.000001"),
+                )
+                controller.handle_team_command(
+                    FireEveryoneCommand(),
+                    SlackReplyTarget(channel_id="C1", thread_ts="171.000001"),
+                )
+
+                remaining = store.list_team_agents()
+                self.assertEqual([agent.agent_id for agent in remaining], [loop_agent.agent_id])
+                self.assertTrue(any("Use `loop stop`" in post["text"] for post in gateway.posts))
             finally:
                 store.close()
 

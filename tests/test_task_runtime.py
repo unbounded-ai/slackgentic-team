@@ -14,6 +14,7 @@ from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
+    MODEL_OVERRIDE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     AgentTaskKind,
@@ -869,6 +870,41 @@ class TaskRuntimeTests(unittest.TestCase):
                 _macos_tcc_protected_cwd_issue(Path("/Volumes/External/repo"), home=home) or "",
             )
             self.assertIsNone(_macos_tcc_protected_cwd_issue(home / "code" / "repo", home=home))
+
+    def test_runtime_passes_task_model_override_to_launch_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "repo"
+            project.mkdir()
+            store = Store(home / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "use the selected model", "C1"),
+                    metadata={MODEL_OVERRIDE_METADATA_KEY: "example-model"},
+                )
+                store.upsert_agent_task(task)
+                launched = []
+
+                def process_factory(request):
+                    launched.append(request)
+                    return OneShotProcess(request)
+
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(default_cwd=project),
+                    process_factory=process_factory,
+                    home=home,
+                )
+
+                self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001")))
+                self.assertEqual(launched[0].model, "example-model")
+                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+            finally:
+                store.close()
 
     def test_runtime_refuses_macos_tcc_protected_working_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

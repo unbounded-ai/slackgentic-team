@@ -297,6 +297,24 @@ class SlackTests(unittest.TestCase):
         self.assertFalse(engineer_header["text"]["text"].startswith("PM · "))
         self.assertTrue(pm_header["text"]["text"].startswith("PM · "))
 
+    def test_roster_omits_loop_agents_entirely(self):
+        engineer = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        loop_agent = replace(
+            engineer,
+            agent_id="loop-1",
+            handle="billing-loop",
+            full_name="Billing Bot",
+            kind=TeamAgentKind.LOOP,
+        )
+
+        blocks = build_team_roster_blocks([engineer, loop_agent])
+        rendered = str(blocks)
+
+        self.assertIn("1 active lightweight handles", rendered)
+        self.assertIn(engineer.handle, rendered)
+        self.assertNotIn("billing-loop", rendered)
+        self.assertNotIn("Billing Bot", rendered)
+
     def test_roster_renders_assign_project_for_pms(self):
         engineer = build_initial_model_team(codex_count=1, claude_count=0)[0]
         pm = replace(engineer, agent_id="pm-1", handle="pm-one", kind=TeamAgentKind.PM)
