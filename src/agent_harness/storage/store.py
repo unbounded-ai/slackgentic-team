@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import suppress
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent_harness.models import (
@@ -21,8 +21,17 @@ from agent_harness.models import (
     ControlMode,
     DeferredWork,
     DeferredWorkStatus,
+    Loop,
+    LoopJournalEntry,
+    LoopOverlapPolicy,
+    LoopRun,
+    LoopRunKind,
+    LoopRunStatus,
+    LoopStatus,
+    LoopVisibility,
     PendingWorkRequest,
     PendingWorkRequestStatus,
+    PermissionMode,
     PmInitiative,
     PmInitiativeStatus,
     PmSubtask,
@@ -217,6 +226,7 @@ CREATE TABLE IF NOT EXISTS slack_agent_requests (
   answers_json TEXT NOT NULL DEFAULT '{}',
   response_json TEXT,
   resolved_at TEXT,
+  allowed_slack_user_id TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -289,6 +299,83 @@ CREATE TABLE IF NOT EXISTS scheduled_work_requests (
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_work_due
   ON scheduled_work_requests(status, next_run_at, created_at);
+
+CREATE TABLE IF NOT EXISTS loops (
+  loop_id TEXT NOT NULL PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  owner_slack_user_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  mission TEXT NOT NULL,
+  channel_id TEXT,
+  channel_name TEXT,
+  visibility TEXT NOT NULL DEFAULT 'private',
+  provider TEXT NOT NULL,
+  model TEXT,
+  permission_mode TEXT NOT NULL DEFAULT 'safe-auto',
+  cwd TEXT,
+  recurrence_json TEXT NOT NULL DEFAULT '{}',
+  timezone TEXT,
+  next_run_at TEXT,
+  status TEXT NOT NULL,
+  overlap_policy TEXT NOT NULL DEFAULT 'skip',
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  run_count INTEGER NOT NULL DEFAULT 0,
+  pending_spec_json TEXT,
+  anchor_channel_id TEXT NOT NULL,
+  anchor_thread_ts TEXT NOT NULL,
+  preview_message_ts TEXT,
+  charter_message_ts TEXT,
+  last_run_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  FOREIGN KEY(agent_id) REFERENCES team_agents(agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_loops_status_due
+  ON loops(status, next_run_at, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_loops_channel ON loops(channel_id);
+
+CREATE TABLE IF NOT EXISTS loop_runs (
+  run_id TEXT NOT NULL PRIMARY KEY,
+  loop_id TEXT NOT NULL,
+  run_number INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'scheduled',
+  due_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  task_id TEXT,
+  thread_ts TEXT,
+  summary_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(loop_id) REFERENCES loops(loop_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_runs_loop
+  ON loop_runs(loop_id, run_number);
+
+CREATE INDEX IF NOT EXISTS idx_loop_runs_thread
+  ON loop_runs(loop_id, thread_ts);
+
+CREATE TABLE IF NOT EXISTS loop_journal (
+  entry_id TEXT NOT NULL PRIMARY KEY,
+  loop_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  run_id TEXT,
+  thread_ts TEXT,
+  content TEXT NOT NULL,
+  superseded_by TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(loop_id) REFERENCES loops(loop_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_journal_loop
+  ON loop_journal(loop_id, created_at);
 
 CREATE TABLE IF NOT EXISTS deferred_work_requests (
   deferred_id TEXT NOT NULL PRIMARY KEY,
@@ -416,6 +503,7 @@ class Store:
             self.conn.executescript(SCHEMA)
             self._ensure_team_agent_kind_column()
             self._ensure_pm_initiative_pending_plan_columns()
+            self._ensure_slack_agent_request_owner_column()
             self.conn.commit()
 
     def _ensure_team_agent_kind_column(self) -> None:
@@ -433,6 +521,14 @@ class Store:
             self.conn.execute("ALTER TABLE pm_initiatives ADD COLUMN pending_plan_json TEXT")
         if "pending_plan_message_ts" not in columns:
             self.conn.execute("ALTER TABLE pm_initiatives ADD COLUMN pending_plan_message_ts TEXT")
+
+    def _ensure_slack_agent_request_owner_column(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(slack_agent_requests)").fetchall()
+        columns = {row["name"] for row in rows}
+        if "allowed_slack_user_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE slack_agent_requests ADD COLUMN allowed_slack_user_id TEXT"
+            )
 
     def upsert_session(self, session: AgentSession) -> None:
         self.conn.execute(
@@ -1964,6 +2060,480 @@ class Store:
             self.conn.commit()
         return int(cursor.rowcount)
 
+    def create_loop(self, loop: Loop) -> Loop:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO loops (
+                  loop_id, agent_id, owner_slack_user_id, title, mission, channel_id,
+                  channel_name, visibility, provider, model, permission_mode, cwd,
+                  recurrence_json, timezone, next_run_at, status, overlap_policy,
+                  consecutive_failures, run_count, pending_spec_json, anchor_channel_id,
+                  anchor_thread_ts, preview_message_ts, charter_message_ts, last_run_at,
+                  last_error, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _loop_values(loop),
+            )
+            self.conn.commit()
+        return loop
+
+    def get_loop(self, loop_id: str) -> Loop | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+        return _loop_from_row(row) if row else None
+
+    def get_loop_by_channel(self, channel_id: str) -> Loop | None:
+        statuses = (
+            LoopStatus.ACTIVE.value,
+            LoopStatus.PAUSED.value,
+            LoopStatus.AWAITING_APPROVAL.value,
+        )
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM loops
+                WHERE channel_id = ? AND status IN (?, ?, ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (channel_id, *statuses),
+            ).fetchone()
+        return _loop_from_row(row) if row else None
+
+    def get_loop_by_agent(self, agent_id: str) -> Loop | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loops WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+        return _loop_from_row(row) if row else None
+
+    def list_loops(
+        self,
+        *,
+        statuses: tuple[LoopStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> list[Loop]:
+        params: list[object] = []
+        where = ""
+        if statuses is not None:
+            if not statuses:
+                return []
+            where = f"WHERE status IN ({', '.join('?' for _ in statuses)})"
+            params.extend(status.value for status in statuses)
+        params.append(limit)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM loops
+                {where}
+                ORDER BY created_at, loop_id
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_loop_from_row(row) for row in rows]
+
+    def list_due_loops(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 20,
+    ) -> list[Loop]:
+        reference = now or utc_now()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM loops
+                WHERE status = ? AND next_run_at IS NOT NULL AND next_run_at <= ?
+                ORDER BY next_run_at, created_at, loop_id
+                LIMIT ?
+                """,
+                (LoopStatus.ACTIVE.value, reference.isoformat(), limit),
+            ).fetchall()
+        return [_loop_from_row(row) for row in rows]
+
+    def list_loop_channel_ids(self) -> list[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT channel_id FROM loops
+                WHERE status IN (?, ?) AND channel_id IS NOT NULL
+                ORDER BY created_at, loop_id
+                """,
+                (LoopStatus.ACTIVE.value, LoopStatus.PAUSED.value),
+            ).fetchall()
+        return [row["channel_id"] for row in rows]
+
+    def claim_due_loop(
+        self,
+        loop_id: str,
+        *,
+        expected_next_run_at: datetime,
+        new_next_run_at: datetime | None,
+    ) -> Loop | None:
+        now = utc_now()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE loops
+                SET next_run_at = ?, last_run_at = ?, run_count = run_count + 1,
+                    updated_at = ?
+                WHERE loop_id = ? AND status = ? AND next_run_at = ?
+                """,
+                (
+                    new_next_run_at.isoformat() if new_next_run_at else None,
+                    now.isoformat(),
+                    now.isoformat(),
+                    loop_id,
+                    LoopStatus.ACTIVE.value,
+                    expected_next_run_at.isoformat(),
+                ),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = self.conn.execute(
+                "SELECT * FROM loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+        return _loop_from_row(row) if row else None
+
+    def update_loop_status(
+        self,
+        loop_id: str,
+        status: LoopStatus,
+        *,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET status = ?, last_error = ?, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (status.value, error, utc_now().isoformat(), loop_id),
+            )
+            self.conn.commit()
+
+    def update_loop_identity(
+        self,
+        loop_id: str,
+        *,
+        title: str,
+        mission: str,
+        channel_name: str | None,
+        visibility: LoopVisibility,
+        provider: Provider,
+        model: str | None,
+        permission_mode: PermissionMode,
+        cwd: str | None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET title = ?, mission = ?, channel_name = ?, visibility = ?, provider = ?,
+                    model = ?, permission_mode = ?, cwd = ?, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (
+                    title,
+                    mission,
+                    channel_name,
+                    visibility.value,
+                    provider.value,
+                    model,
+                    permission_mode.value,
+                    cwd,
+                    utc_now().isoformat(),
+                    loop_id,
+                ),
+            )
+            self.conn.commit()
+
+    def update_loop_channel(
+        self,
+        loop_id: str,
+        *,
+        channel_id: str,
+        channel_name: str,
+        charter_message_ts: str,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET channel_id = ?, channel_name = ?, charter_message_ts = ?, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (
+                    channel_id,
+                    channel_name,
+                    charter_message_ts,
+                    utc_now().isoformat(),
+                    loop_id,
+                ),
+            )
+            self.conn.commit()
+
+    def update_loop_schedule(
+        self,
+        loop_id: str,
+        *,
+        recurrence: dict[str, object],
+        timezone: str | None,
+        next_run_at: datetime | None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET recurrence_json = ?, timezone = ?, next_run_at = ?, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (
+                    json.dumps(recurrence, sort_keys=True),
+                    timezone,
+                    next_run_at.isoformat() if next_run_at else None,
+                    utc_now().isoformat(),
+                    loop_id,
+                ),
+            )
+            self.conn.commit()
+
+    def update_loop_pending_spec(
+        self,
+        loop_id: str,
+        spec_json: str | None,
+        *,
+        preview_message_ts: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET pending_spec_json = ?,
+                    preview_message_ts = COALESCE(?, preview_message_ts),
+                    updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (spec_json, preview_message_ts, utc_now().isoformat(), loop_id),
+            )
+            self.conn.commit()
+
+    def record_loop_failure(self, loop_id: str, error: str) -> int:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET consecutive_failures = consecutive_failures + 1,
+                    last_error = ?, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (error, utc_now().isoformat(), loop_id),
+            )
+            row = self.conn.execute(
+                "SELECT consecutive_failures FROM loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+            self.conn.commit()
+        return int(row["consecutive_failures"]) if row else 0
+
+    def reset_loop_failures(self, loop_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET consecutive_failures = 0, last_error = NULL, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (utc_now().isoformat(), loop_id),
+            )
+            self.conn.commit()
+
+    def create_loop_run(self, run: LoopRun) -> LoopRun:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO loop_runs (
+                  run_id, loop_id, run_number, kind, due_at, started_at, finished_at,
+                  status, task_id, thread_ts, summary_json, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _loop_run_values(run),
+            )
+            self.conn.commit()
+        return run
+
+    def get_loop_run(self, run_id: str) -> LoopRun | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loop_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return _loop_run_from_row(row) if row else None
+
+    def get_loop_run_by_thread(self, loop_id: str, thread_ts: str) -> LoopRun | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM loop_runs
+                WHERE loop_id = ? AND thread_ts = ?
+                ORDER BY run_number DESC LIMIT 1
+                """,
+                (loop_id, thread_ts),
+            ).fetchone()
+        return _loop_run_from_row(row) if row else None
+
+    def get_loop_run_by_task(self, task_id: str) -> LoopRun | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loop_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return _loop_run_from_row(row) if row else None
+
+    def get_loop_run_by_number(self, loop_id: str, run_number: int) -> LoopRun | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loop_runs WHERE loop_id = ? AND run_number = ? LIMIT 1",
+                (loop_id, run_number),
+            ).fetchone()
+        return _loop_run_from_row(row) if row else None
+
+    def list_loop_runs(self, loop_id: str, *, limit: int = 20) -> list[LoopRun]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM loop_runs
+                WHERE loop_id = ?
+                ORDER BY run_number DESC, created_at DESC
+                LIMIT ?
+                """,
+                (loop_id, limit),
+            ).fetchall()
+        return [_loop_run_from_row(row) for row in rows]
+
+    def running_loop_run(self, loop_id: str) -> LoopRun | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT * FROM loop_runs
+                WHERE loop_id = ? AND status = ?
+                ORDER BY run_number DESC LIMIT 1
+                """,
+                (loop_id, LoopRunStatus.RUNNING.value),
+            ).fetchone()
+        return _loop_run_from_row(row) if row else None
+
+    def update_loop_run(
+        self,
+        run_id: str,
+        *,
+        status: LoopRunStatus | None = None,
+        task_id: str | None = None,
+        thread_ts: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+        summary_json: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        params: list[object] = []
+        updates = (
+            ("status", status.value if status else None),
+            ("task_id", task_id),
+            ("thread_ts", thread_ts),
+            ("started_at", started_at.isoformat() if started_at else None),
+            ("finished_at", finished_at.isoformat() if finished_at else None),
+            ("summary_json", summary_json),
+            ("error", error),
+        )
+        for column, value in updates:
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if not assignments:
+            return
+        assignments.append("updated_at = ?")
+        params.extend((utc_now().isoformat(), run_id))
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE loop_runs SET {', '.join(assignments)} WHERE run_id = ?",
+                tuple(params),
+            )
+            self.conn.commit()
+
+    def add_loop_journal_entry(self, entry: LoopJournalEntry) -> LoopJournalEntry:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO loop_journal (
+                  entry_id, loop_id, kind, run_id, thread_ts, content,
+                  superseded_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _loop_journal_values(entry),
+            )
+            self.conn.commit()
+        return entry
+
+    def list_loop_journal(
+        self,
+        loop_id: str,
+        *,
+        include_superseded: bool = False,
+        limit: int = 200,
+    ) -> list[LoopJournalEntry]:
+        superseded_clause = "" if include_superseded else "AND superseded_by IS NULL"
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT * FROM (
+                  SELECT * FROM loop_journal
+                  WHERE loop_id = ? {superseded_clause}
+                  ORDER BY created_at DESC, entry_id DESC
+                  LIMIT ?
+                )
+                ORDER BY created_at, entry_id
+                """,
+                (loop_id, limit),
+            ).fetchall()
+        return [_loop_journal_from_row(row) for row in rows]
+
+    def supersede_loop_journal_entries(
+        self,
+        loop_id: str,
+        *,
+        before: datetime,
+        compaction_entry_id: str,
+    ) -> int:
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE loop_journal
+                SET superseded_by = ?
+                WHERE loop_id = ? AND created_at <= ? AND entry_id != ?
+                  AND superseded_by IS NULL
+                  AND kind IN ('run_summary', 'system', 'compaction')
+                """,
+                (
+                    compaction_entry_id,
+                    loop_id,
+                    before.isoformat(),
+                    compaction_entry_id,
+                ),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
     def create_deferred_work_request(
         self,
         thread: SlackThreadRef,
@@ -2939,6 +3509,138 @@ def _scheduled_work_from_row(row: sqlite3.Row) -> ScheduledWork:
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
         last_run_at=parse_timestamp(row["last_run_at"]),
         last_task_id=row["last_task_id"],
+    )
+
+
+def _loop_values(loop: Loop) -> tuple[object, ...]:
+    return (
+        loop.loop_id,
+        loop.agent_id,
+        loop.owner_slack_user_id,
+        loop.title,
+        loop.mission,
+        loop.channel_id,
+        loop.channel_name,
+        loop.visibility.value,
+        loop.provider.value,
+        loop.model,
+        loop.permission_mode.value,
+        loop.cwd,
+        json.dumps(loop.recurrence, sort_keys=True),
+        loop.timezone,
+        loop.next_run_at.isoformat() if loop.next_run_at else None,
+        loop.status.value,
+        loop.overlap_policy.value,
+        loop.consecutive_failures,
+        loop.run_count,
+        loop.pending_spec_json,
+        loop.anchor_channel_id,
+        loop.anchor_thread_ts,
+        loop.preview_message_ts,
+        loop.charter_message_ts,
+        loop.last_run_at.isoformat() if loop.last_run_at else None,
+        loop.last_error,
+        loop.created_at.isoformat(),
+        loop.updated_at.isoformat(),
+        json.dumps(loop.metadata, sort_keys=True),
+    )
+
+
+def _loop_from_row(row: sqlite3.Row) -> Loop:
+    return Loop(
+        loop_id=row["loop_id"],
+        agent_id=row["agent_id"],
+        owner_slack_user_id=row["owner_slack_user_id"],
+        title=row["title"],
+        mission=row["mission"],
+        channel_id=row["channel_id"],
+        channel_name=row["channel_name"],
+        visibility=LoopVisibility(row["visibility"]),
+        provider=Provider(row["provider"]),
+        model=row["model"],
+        permission_mode=PermissionMode(row["permission_mode"]),
+        cwd=row["cwd"],
+        recurrence=json.loads(row["recurrence_json"] or "{}"),
+        timezone=row["timezone"],
+        next_run_at=parse_timestamp(row["next_run_at"]),
+        status=LoopStatus(row["status"]),
+        overlap_policy=LoopOverlapPolicy(row["overlap_policy"]),
+        consecutive_failures=int(row["consecutive_failures"]),
+        run_count=int(row["run_count"]),
+        pending_spec_json=row["pending_spec_json"],
+        anchor_channel_id=row["anchor_channel_id"],
+        anchor_thread_ts=row["anchor_thread_ts"],
+        preview_message_ts=row["preview_message_ts"],
+        charter_message_ts=row["charter_message_ts"],
+        last_run_at=parse_timestamp(row["last_run_at"]),
+        last_error=row["last_error"],
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+        metadata=json.loads(row["metadata_json"] or "{}"),
+    )
+
+
+def _loop_run_values(run: LoopRun) -> tuple[object, ...]:
+    return (
+        run.run_id,
+        run.loop_id,
+        run.run_number,
+        run.kind.value,
+        run.due_at.isoformat(),
+        run.started_at.isoformat() if run.started_at else None,
+        run.finished_at.isoformat() if run.finished_at else None,
+        run.status.value,
+        run.task_id,
+        run.thread_ts,
+        run.summary_json,
+        run.error,
+        run.created_at.isoformat(),
+        run.updated_at.isoformat(),
+    )
+
+
+def _loop_run_from_row(row: sqlite3.Row) -> LoopRun:
+    return LoopRun(
+        run_id=row["run_id"],
+        loop_id=row["loop_id"],
+        run_number=int(row["run_number"]),
+        kind=LoopRunKind(row["kind"]),
+        due_at=parse_timestamp(row["due_at"]) or utc_now(),
+        started_at=parse_timestamp(row["started_at"]),
+        finished_at=parse_timestamp(row["finished_at"]),
+        status=LoopRunStatus(row["status"]),
+        task_id=row["task_id"],
+        thread_ts=row["thread_ts"],
+        summary_json=row["summary_json"],
+        error=row["error"],
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+    )
+
+
+def _loop_journal_values(entry: LoopJournalEntry) -> tuple[object, ...]:
+    return (
+        entry.entry_id,
+        entry.loop_id,
+        entry.kind,
+        entry.run_id,
+        entry.thread_ts,
+        entry.content,
+        entry.superseded_by,
+        entry.created_at.isoformat(),
+    )
+
+
+def _loop_journal_from_row(row: sqlite3.Row) -> LoopJournalEntry:
+    return LoopJournalEntry(
+        entry_id=row["entry_id"],
+        loop_id=row["loop_id"],
+        kind=row["kind"],
+        run_id=row["run_id"],
+        thread_ts=row["thread_ts"],
+        content=row["content"],
+        superseded_by=row["superseded_by"],
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
     )
 
 

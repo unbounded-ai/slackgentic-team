@@ -8,6 +8,7 @@ from agent_harness.schedules import (
     build_schedule_resolution_prompt,
     next_run_after,
     parse_agent_schedule_signal,
+    parse_recurrence_payload,
 )
 
 
@@ -108,6 +109,31 @@ class ScheduleControlTests(unittest.TestCase):
         self.assertEqual(parsed.schedule.recurrence["frequency"], "interval")
         self.assertEqual(parsed.schedule.recurrence["interval_seconds"], 7200)
         self.assertEqual(parsed.schedule.description, "every 2 hours")
+
+    def test_public_recurrence_parser_preserves_schedule_semantics(self):
+        now = datetime(2026, 5, 15, 20, 0, tzinfo=UTC)
+
+        parsed = parse_recurrence_payload(
+            {
+                "frequency": "weekly",
+                "weekday": 1,
+                "time": "09:30",
+                "timezone": "America/New_York",
+                "description": "every Tuesday morning",
+            },
+            now=now,
+        )
+
+        self.assertIsNone(parsed.error)
+        assert parsed.recurrence is not None
+        self.assertEqual(parsed.recurrence.recurrence["frequency"], "weekly")
+        self.assertEqual(parsed.recurrence.recurrence["weekday"], 1)
+        self.assertEqual(parsed.recurrence.timezone, "America/New_York")
+        self.assertEqual(parsed.recurrence.description, "every Tuesday morning")
+        self.assertEqual(
+            parsed.recurrence.next_run_at,
+            datetime(2026, 5, 19, 13, 30, tzinfo=UTC),
+        )
 
     def test_schedule_signal_rejects_unknown_target(self):
         payload = {

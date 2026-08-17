@@ -13,6 +13,12 @@ ORIGINAL_TASK_METADATA_KEY = "original_task"
 ROSTER_SUMMARY_METADATA_KEY = "roster_summary"
 PR_URL_METADATA_KEY = "pr_url"
 PR_URLS_METADATA_KEY = "pr_urls"
+LOOP_ID_METADATA_KEY = "loop_id"
+LOOP_RUN_ID_METADATA_KEY = "loop_run_id"
+LOOP_RESOLUTION_METADATA_KEY = "loop_resolution"
+LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY = "loop_resolution_original_text"
+LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY = "loop_resolution_attempts"
+MODEL_OVERRIDE_METADATA_KEY = "model_override"
 EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
 DEFERRED_WORK_DEPENDENCY_PREFIX = "deferred_work:"
 SCHEDULED_WORK_DEPENDENCY_PREFIX = "scheduled_work:"
@@ -53,9 +59,11 @@ class TeamAgentStatus(StrEnum):
 class TeamAgentKind(StrEnum):
     ENGINEER = "engineer"
     PM = "pm"
+    LOOP = "loop"
 
 
 DEFAULT_TEAM_AGENT_KIND = TeamAgentKind.ENGINEER
+WORKER_KINDS = frozenset({TeamAgentKind.ENGINEER})
 
 
 class AgentTaskStatus(StrEnum):
@@ -68,6 +76,7 @@ class AgentTaskStatus(StrEnum):
 class AgentTaskKind(StrEnum):
     WORK = "work"
     REVIEW = "review"
+    LOOP_RUN = "loop_run"
 
 
 class PendingWorkRequestStatus(StrEnum):
@@ -93,6 +102,36 @@ class ScheduledWorkStatus(StrEnum):
 class ScheduledWorkKind(StrEnum):
     ONE_OFF = "one_off"
     RECURRING = "recurring"
+
+
+class LoopStatus(StrEnum):
+    RESOLVING = "resolving"
+    AWAITING_APPROVAL = "awaiting_approval"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+
+
+class LoopRunStatus(StrEnum):
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class LoopRunKind(StrEnum):
+    SCHEDULED = "scheduled"
+    MANUAL = "manual"
+    COMPACTION = "compaction"
+
+
+class LoopOverlapPolicy(StrEnum):
+    SKIP = "skip"
+
+
+class LoopVisibility(StrEnum):
+    PUBLIC = "public"
+    PRIVATE = "private"
 
 
 class DeferredWorkStatus(StrEnum):
@@ -323,6 +362,69 @@ class ScheduledWork:
     timezone: str | None = None
     last_run_at: datetime | None = None
     last_task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Loop:
+    loop_id: str
+    agent_id: str
+    owner_slack_user_id: str
+    title: str
+    mission: str
+    provider: Provider
+    permission_mode: PermissionMode
+    recurrence: dict[str, Any]
+    status: LoopStatus
+    overlap_policy: LoopOverlapPolicy
+    anchor_channel_id: str
+    anchor_thread_ts: str
+    created_at: datetime
+    updated_at: datetime
+    channel_id: str | None = None
+    channel_name: str | None = None
+    visibility: LoopVisibility = LoopVisibility.PRIVATE
+    model: str | None = None
+    cwd: str | None = None
+    timezone: str | None = None
+    next_run_at: datetime | None = None
+    consecutive_failures: int = 0
+    run_count: int = 0
+    pending_spec_json: str | None = None
+    preview_message_ts: str | None = None
+    charter_message_ts: str | None = None
+    last_run_at: datetime | None = None
+    last_error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LoopRun:
+    run_id: str
+    loop_id: str
+    run_number: int
+    kind: LoopRunKind
+    due_at: datetime
+    status: LoopRunStatus
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    task_id: str | None = None
+    thread_ts: str | None = None
+    summary_json: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class LoopJournalEntry:
+    entry_id: str
+    loop_id: str
+    kind: str
+    content: str
+    created_at: datetime
+    run_id: str | None = None
+    thread_ts: str | None = None
+    superseded_by: str | None = None
 
 
 @dataclass(frozen=True)
