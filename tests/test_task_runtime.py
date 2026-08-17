@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
+from agent_harness.loops import AGENT_LOOP_SIGNAL_PREFIX, LOOP_SIGNAL_PREFIXES_LONGEST_FIRST
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
@@ -542,6 +543,30 @@ class ScheduleSignalProcess(OneShotProcess):
                         "item": {
                             "type": "agent_message",
                             "text": f"Schedule created.\n{signal}",
+                        },
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
+class LoopSignalProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            signal = (
+                f"{AGENT_LOOP_SIGNAL_PREFIX}"
+                '{"title":"CI Watch","bot_name":"CI Bot","mission":"Check CI",'
+                '"schedule":{"frequency":"interval","interval_seconds":300}}'
+            )
+            return (
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": f"Loop created.\n{signal}",
                         },
                     }
                 )
@@ -1905,6 +1930,18 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(visible, "Plan below for approval.")
         self.assertEqual(signals, [signal])
+
+    def test_loop_control_signals_are_classified_distinctly_longest_first(self):
+        signals = [
+            f'{prefix}{{"value":"example"}}' for prefix in LOOP_SIGNAL_PREFIXES_LONGEST_FIRST
+        ]
+
+        visible, extracted = _extract_agent_control_signals(
+            "Visible progress.\n" + "\n".join(signals)
+        )
+
+        self.assertEqual(visible, "Visible progress.")
+        self.assertEqual(extracted, signals)
 
     def test_parse_agent_timer_signal_accepts_delay(self):
         now = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
@@ -4835,6 +4872,40 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(gateway.replies, [])
                 self.assertEqual(len(seen_controls), 1)
                 self.assertTrue(seen_controls[0].startswith(AGENT_SCHEDULE_SIGNAL_PREFIX))
+            finally:
+                store.close()
+
+    def test_runtime_hides_loop_resolution_text_and_dispatches_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "resolve loop", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                seen_controls = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=LoopSignalProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        seen_controls.append(signal) or True
+                    ),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(50):
+                    if seen_controls:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(len(seen_controls), 1)
+                self.assertTrue(seen_controls[0].startswith(AGENT_LOOP_SIGNAL_PREFIX))
             finally:
                 store.close()
 

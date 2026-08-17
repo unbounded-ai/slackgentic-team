@@ -20,6 +20,10 @@ from agent_harness.bash_policy import (
 from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.internal_notifications import filter_internal_task_notifications
+from agent_harness.loops import (
+    AGENT_LOOP_SIGNAL_PREFIX,
+    LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,
+)
 from agent_harness.models import (
     MODEL_OVERRIDE_METADATA_KEY,
     AgentTask,
@@ -908,6 +912,7 @@ class ManagedTaskRuntime:
                 is_agent_roster_status_signal(signal)
                 or is_agent_reaction_signal(signal)
                 or is_agent_pm_plan_signal(signal)
+                or _is_loop_control_signal(signal)
             ):
                 # PM_PLAN must dispatch in the same chunk it arrives in:
                 # managed Claude keeps its process alive across turns with
@@ -916,11 +921,13 @@ class ManagedTaskRuntime:
                 # human approval would never reach the dispatcher there
                 # and the approval card would never post.
                 self._handle_immediate_agent_control_signal(running, signal)
+                if _is_resolution_control_signal(signal):
+                    hide_visible_text = True
             elif signal == AGENT_THREAD_DONE_SIGNAL:
                 terminal_signals.append(signal)
             else:
                 deferred_signals.append(signal)
-                if _is_schedule_control_signal(signal):
+                if _is_resolution_control_signal(signal):
                     hide_visible_text = True
         running.control_signals.extend(deferred_signals)
 
@@ -2020,13 +2027,21 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
         if normalized.startswith(AGENT_PM_PLAN_SIGNAL_PREFIX):
             signals.append(line.strip())
             continue
+        if any(normalized.startswith(prefix) for prefix in LOOP_SIGNAL_PREFIXES_LONGEST_FIRST):
+            signals.append(line.strip())
+            continue
         visible_lines.append(line)
     return "\n".join(visible_lines).strip(), signals
 
 
-def _is_schedule_control_signal(signal: str) -> bool:
+def _is_resolution_control_signal(signal: str) -> bool:
     normalized = re.sub(r"\s+", " ", signal.strip()).upper()
-    return normalized.startswith(AGENT_SCHEDULE_SIGNAL_PREFIX)
+    return normalized.startswith((AGENT_SCHEDULE_SIGNAL_PREFIX, AGENT_LOOP_SIGNAL_PREFIX))
+
+
+def _is_loop_control_signal(signal: str) -> bool:
+    normalized = re.sub(r"\s+", " ", signal.strip()).upper()
+    return any(normalized.startswith(prefix) for prefix in LOOP_SIGNAL_PREFIXES_LONGEST_FIRST)
 
 
 def is_agent_roster_status_signal(signal: str) -> bool:
@@ -2835,6 +2850,7 @@ def _claude_json_chunks(
 
 
 _SIGNAL_LINE_PREFIXES: tuple[str, ...] = (
+    *LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,
     AGENT_PM_PLAN_SIGNAL_PREFIX,
     AGENT_DEFERRED_SIGNAL_PREFIX,
     AGENT_SCHEDULE_SIGNAL_PREFIX,
