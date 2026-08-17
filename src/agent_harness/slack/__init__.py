@@ -80,6 +80,158 @@ class UnassignedExternalSessionListItem:
     thread_url: str | None = None
 
 
+def build_loop_create_guide_blocks(
+    *,
+    anchor_thread_ts: str | None = None,
+) -> list[dict[str, Any]]:
+    action_payload: dict[str, str] = {}
+    if anchor_thread_ts:
+        action_payload["anchor_thread_ts"] = anchor_thread_ts
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Create a loop"},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "A loop runs a recurring task in its own Slack channel. "
+                    "You do not need to create the channel yourself."
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*1.* Describe the task and schedule\n"
+                    "*2.* Review the generated mission, channel, bot, and schedule\n"
+                    "*3.* Click *Create loop* on the preview"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": "loop.create.actions",
+            "elements": [
+                _button(
+                    "Create a loop",
+                    "loop.create.open",
+                    encode_action_value("loop.create.open", **action_payload),
+                    "primary",
+                )
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Prefer text? Use `loop create <task and schedule>` "
+                        "in the main agent channel."
+                    ),
+                }
+            ],
+        },
+    ]
+
+
+def build_loop_create_modal(
+    *,
+    channel_id: str,
+    anchor_thread_ts: str | None = None,
+    guide_message_ts: str | None = None,
+) -> dict[str, Any]:
+    metadata = {"channel_id": channel_id}
+    if anchor_thread_ts:
+        metadata["anchor_thread_ts"] = anchor_thread_ts
+    if guide_message_ts:
+        metadata["guide_message_ts"] = guide_message_ts
+    automatic = _option("Automatic", "automatic", "Use the configured default provider")
+    private = _option("Private", "private")
+    return {
+        "type": "modal",
+        "callback_id": "loop.create",
+        "private_metadata": json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+        "title": {"type": "plain_text", "text": "Create a loop"},
+        "submit": {"type": "plain_text", "text": "Preview loop"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "loop_mission",
+                "label": {"type": "plain_text", "text": "What should the loop do?"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "multiline": True,
+                    "max_length": 2800,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Check cloud costs and report material anomalies",
+                    },
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_schedule",
+                "label": {"type": "plain_text", "text": "When should it run?"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "max_length": 300,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Every weekday at 9am PT",
+                    },
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_visibility",
+                "label": {"type": "plain_text", "text": "Channel visibility"},
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "value",
+                    "initial_option": private,
+                    "options": [private, _option("Public", "public")],
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_provider",
+                "label": {"type": "plain_text", "text": "Provider"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "value",
+                    "initial_option": automatic,
+                    "options": [
+                        automatic,
+                        _option("Codex", Provider.CODEX.value),
+                        _option("Claude", Provider.CLAUDE.value),
+                    ],
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Next, Slackgentic generates a preview. The channel is only "
+                            "created after you approve it."
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+
 def build_loop_preview_blocks(
     loop: Loop,
     spec: LoopSpec,

@@ -169,7 +169,12 @@ provider process or an open terminal session.
 ### Loops
 
 A loop is a recurring, predefined task run by a purpose-built bot in its own
-Slack channel. Create one from the main agent channel:
+Slack channel. In the main agent channel, run `loop create` (or
+`/slackgentic loop create`) and click **Create a loop** to open the guided form.
+Slackgentic creates the loop channel after you review and approve the preview;
+you do not create it manually.
+
+You can also describe the loop inline:
 
 ```text
 loop create check cloud billing every morning at 9am PT, report anomalies, and open a PR when there is a concrete fix #private provider=claude
