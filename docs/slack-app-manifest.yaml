@@ -25,6 +25,7 @@ oauth_config:
       - chat:write
       - chat:write.customize
       - commands
+      - files:write
       - pins:write
       - groups:history
       - groups:read
@@ -32,6 +33,7 @@ oauth_config:
       - groups:write.invites
       - reactions:read
       - reactions:write
+      - users:read
 settings:
   event_subscriptions:
     bot_events:

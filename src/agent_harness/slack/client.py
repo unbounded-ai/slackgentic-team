@@ -4,9 +4,10 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from agent_harness.models import SlackThreadRef, TeamAgent
+from agent_harness.models import SlackThreadRef, TeamAgent, TeamAgentKind
 from agent_harness.slack import normalize_slack_mrkdwn, slack_blocks_for_markdown_table
 from agent_harness.team import TeamChatMessage
 
@@ -67,6 +68,92 @@ class SlackGateway:
                 return False
             raise
         return True
+
+    def post_ephemeral(self, channel_id: str, user_id: str, text: str) -> bool:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self._call_slack_with_retries(
+                self.client.chat_postEphemeral,
+                {
+                    "channel": channel_id,
+                    "user": user_id,
+                    "text": normalize_slack_mrkdwn(text),
+                },
+                auto_rendered_blocks=False,
+                invalid_blocks_fallback=None,
+            )
+        except SlackApiError as exc:
+            if exc.response.get("error") in {"user_not_in_channel", "channel_not_found"}:
+                return False
+            raise
+        return True
+
+    def set_channel_topic(self, channel_id: str, topic: str) -> bool:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self._call_slack_with_retries(
+                self.client.conversations_setTopic,
+                {"channel": channel_id, "topic": topic},
+                auto_rendered_blocks=False,
+                invalid_blocks_fallback=None,
+            )
+        except SlackApiError:
+            LOGGER.debug("failed to set Slack channel topic", exc_info=True)
+            return False
+        return True
+
+    def upload_file(
+        self,
+        channel_id: str,
+        path: Path,
+        *,
+        title: str | None = None,
+        thread_ts: str | None = None,
+    ) -> bool:
+        from slack_sdk.errors import SlackApiError
+
+        kwargs: dict[str, Any] = {"channel": channel_id, "file": str(path)}
+        if title:
+            kwargs["title"] = title
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        try:
+            self._call_slack_with_retries(
+                self.client.files_upload_v2,
+                kwargs,
+                auto_rendered_blocks=False,
+                invalid_blocks_fallback=None,
+            )
+        except SlackApiError as exc:
+            if exc.response.get("error") == "missing_scope":
+                if not getattr(self, "_logged_missing_files_scope", False):
+                    LOGGER.warning(
+                        "Slack files:write scope is unavailable; loop badge uploads are disabled"
+                    )
+                    self._logged_missing_files_scope = True
+                return False
+            raise
+        return True
+
+    def channel_info(self, channel_id: str) -> dict[str, Any] | None:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            response = self._call_slack_with_retries(
+                self.client.conversations_info,
+                {"channel": channel_id},
+                auto_rendered_blocks=False,
+                invalid_blocks_fallback=None,
+            )
+        except SlackApiError as exc:
+            if exc.response.get("error") in {"channel_not_found", "not_in_channel"}:
+                return None
+            raise
+        data = getattr(response, "data", response)
+        channel = dict(data).get("channel") if data is not None else None
+        return dict(channel) if isinstance(channel, dict) else None
 
     def open_view(self, trigger_id: str, view: dict[str, Any]) -> None:
         self.client.views_open(trigger_id=trigger_id, view=view)
@@ -477,6 +564,8 @@ class SlackGateway:
 
 def _identity_name(identity: TeamAgent) -> str:
     name = getattr(identity, "username", identity.full_name)
+    if getattr(identity, "kind", None) == TeamAgentKind.LOOP:
+        return name
     provider = getattr(identity, "provider_preference", None) or getattr(identity, "provider", None)
     if provider is None:
         return name

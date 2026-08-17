@@ -40,6 +40,7 @@ from agent_harness.models import (
     PR_URL_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
+    WORKER_KINDS,
     AgentSession,
     AgentTask,
     AgentTaskKind,
@@ -211,6 +212,7 @@ from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
     MAX_TEAM_AGENTS,
+    agent_icon_url,
     agent_personal_context,
     build_initialization_messages,
     create_agent_task,
@@ -278,7 +280,6 @@ TASK_STATUS_REACTIONS = (
     "memo",
     "thinking_face",
 )
-SETTING_AGENT_AVATAR_BASE_URL = "slack.agent_avatar_base_url"
 SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
 SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN = "slack.backfill.last_thread_scan_unix"
 SETTING_SLACK_BACKFILL_THREAD_SCAN_PREFIX = "slack.backfill.thread_scan_unix."
@@ -350,10 +351,6 @@ SLACK_SOCKET_WORKER_THREADS = 4
 SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
 SLACK_SOCKET_PONG_GRACE_SECONDS = 30.0
 SLACK_SOCKET_STALE_SECONDS = 30.0
-DEFAULT_AGENT_AVATAR_BASE_URL = (
-    "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
-)
-DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 CAPACITY_MESSAGE = (
     "No agents are available right now. Hire more agents and I will resume this thread "
     "automatically."
@@ -819,7 +816,7 @@ class SlackTeamController:
             return
         if self._handle_task_thread_reply(event, channel_id, text):
             return
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         thread = self._request_thread_anchor(event, channel_id, text)
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
         if multi_requests:
@@ -976,6 +973,16 @@ class SlackTeamController:
             self.refresh_or_post_roster(target.channel_id)
             return
         if isinstance(command, FireCommand):
+            existing = self.store.get_team_agent(command.handle)
+            if existing is not None and existing.kind == TeamAgentKind.LOOP:
+                loop = self.store.get_loop_by_agent(existing.agent_id)
+                destination = f" in <#{loop.channel_id}>" if loop and loop.channel_id else ""
+                self.gateway.post_message(
+                    target.channel_id,
+                    f"Use `loop stop`{destination} to stop @{existing.handle}.",
+                    thread_ts=target.thread_ts,
+                )
+                return
             fired = self.store.fire_team_agent(command.handle)
             if fired is None:
                 self.gateway.post_message(
@@ -992,7 +999,9 @@ class SlackTeamController:
             self.refresh_or_post_roster(target.channel_id)
             return
         if isinstance(command, FireEveryoneCommand):
-            agents = self.store.list_team_agents()
+            agents = [
+                agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.LOOP
+            ]
             for agent in agents:
                 self.store.fire_team_agent(agent.agent_id)
             self.gateway.post_message(
@@ -1151,7 +1160,7 @@ class SlackTeamController:
     def _resume_pending_work_requests(self, channel_id: str) -> int:
         resumed = 0
         for pending in self.store.list_pending_work_requests(channel_id=channel_id):
-            if not self.store.idle_team_agents():
+            if not filter_worker_agents(self.store.idle_team_agents()):
                 break
             if self._try_resume_pending_work_request(pending):
                 resumed += 1
@@ -1403,7 +1412,7 @@ class SlackTeamController:
         ):
             return False
         raw_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text).strip()
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         pm_agents = filter_pm_agents(active_agents)
         targeted_pm_handle: str | None = None
         if pm_agents:
@@ -1476,7 +1485,7 @@ class SlackTeamController:
         guards). Callers are responsible for posting the thread parent
         before invoking this helper.
         """
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         pm_agents = filter_pm_agents(active_agents)
         if not active_agents:
             self._post_capacity_message(
@@ -1614,7 +1623,7 @@ class SlackTeamController:
         if not looks_like_deferred_request(deferred_text):
             return False
         thread = self._request_thread_anchor(event, channel_id, text)
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         if not active_agents:
             self._post_capacity_message(
                 SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts)
@@ -1681,7 +1690,9 @@ class SlackTeamController:
     def _occupied_handle_task_ids(self) -> list[tuple[str, str]]:
         occupied: list[tuple[str, str]] = []
         seen_handles: set[str] = set()
-        agents = self.store.list_team_agents()
+        agents = [
+            agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.LOOP
+        ]
         agents_by_id = {agent.agent_id: agent for agent in agents}
         for agent in agents:
             task = self.store.active_task_for_agent(agent.agent_id)
@@ -1807,7 +1818,7 @@ class SlackTeamController:
         if not looks_like_schedule_request(schedule_text):
             return False
         thread = self._request_thread_anchor(event, channel_id, text)
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         if not active_agents:
             self._post_capacity_message(
                 SlackReplyTarget(channel_id=channel_id, thread_ts=thread.thread_ts)
@@ -2279,9 +2290,9 @@ class SlackTeamController:
             agent = self.store.get_team_agent(agent_id)
             if agent is None:
                 continue
-            if agent.kind == TeamAgentKind.PM:
+            if agent.kind not in WORKER_KINDS:
                 self.store.delete_setting(key)
-                if session is not None:
+                if session is not None and agent.kind == TeamAgentKind.PM:
                     self.store.set_setting(
                         _external_session_ignored_setting_key(session),
                         utc_now().isoformat(),
@@ -2417,7 +2428,7 @@ class SlackTeamController:
         available_by_provider: dict[Provider, list] = {}
         busy_agent_ids = self._busy_agent_ids_for_assignment()
         for agent in agents:
-            if agent.kind == TeamAgentKind.PM or agent.provider_preference is None:
+            if agent.kind not in WORKER_KINDS or agent.provider_preference is None:
                 continue
             if provider is not None and agent.provider_preference != provider:
                 continue
@@ -2552,7 +2563,7 @@ class SlackTeamController:
         if not assigned_agent_id:
             return True
         assigned_agent = self.store.get_team_agent(assigned_agent_id)
-        if assigned_agent is not None and assigned_agent.kind != TeamAgentKind.PM:
+        if assigned_agent is not None and assigned_agent.kind in WORKER_KINDS:
             return False
         self.store.delete_setting(setting_key)
         return True
@@ -2562,7 +2573,7 @@ class SlackTeamController:
         return [
             agent
             for agent in self.store.idle_team_agents()
-            if agent.kind != TeamAgentKind.PM
+            if agent.kind in WORKER_KINDS
             and agent.provider_preference == session.provider
             and agent.agent_id not in busy_agent_ids
         ]
@@ -2665,8 +2676,8 @@ class SlackTeamController:
         agent = self.store.get_team_agent(agent_id)
         if agent is None:
             return "That agent is no longer active."
-        if agent.kind == TeamAgentKind.PM:
-            return "PM agents cannot own outside-Slack sessions."
+        if agent.kind not in WORKER_KINDS:
+            return "Only worker agents can own outside-Slack sessions."
         if agent.provider_preference != provider:
             return f"@{agent.handle} does not match the {provider.value} session provider."
         assignable_agent_ids = {
@@ -2861,7 +2872,9 @@ class SlackTeamController:
         thread_ts: str | None = None,
         remember: bool = True,
     ) -> str:
-        agents = self.store.list_team_agents()
+        agents = [
+            agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.LOOP
+        ]
         statuses = self._roster_statuses(agents)
         text = _roster_text(agents, statuses)
         blocks = build_team_roster_blocks(agents, statuses)
@@ -2954,7 +2967,9 @@ class SlackTeamController:
             return self.post_roster(channel_id)
 
     def _current_roster_payload(self) -> tuple[str, list[dict]]:
-        agents = self.store.list_team_agents()
+        agents = [
+            agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.LOOP
+        ]
         statuses = self._roster_statuses(agents)
         return _roster_text(agents, statuses), build_team_roster_blocks(agents, statuses)
 
@@ -3073,7 +3088,7 @@ class SlackTeamController:
         return True
 
     def post_initial_introductions(self, channel_id: str) -> None:
-        agents = self.store.list_team_agents()
+        agents = self._regular_team_agents()
         messages = build_initialization_messages(agents)
         if messages:
             self.gateway.post_team_initialization(
@@ -3362,6 +3377,8 @@ class SlackTeamController:
         detached_count = 0
         if handle:
             agent = self.store.get_team_agent(str(handle), include_fired=True)
+            if agent is not None and agent.kind == TeamAgentKind.LOOP:
+                return
             if agent is not None:
                 detached_count = self._detach_external_sessions_for_agent(
                     agent.agent_id,
@@ -4393,7 +4410,7 @@ class SlackTeamController:
         assigned_agent_id = self.store.get_setting(setting_key)
         if assigned_agent_id:
             assigned_agent = self.store.get_team_agent(assigned_agent_id)
-            if assigned_agent is not None and assigned_agent.kind != TeamAgentKind.PM:
+            if assigned_agent is not None and assigned_agent.kind in WORKER_KINDS:
                 return True
             self.store.delete_setting(setting_key)
             if assigned_agent is not None and assigned_agent.kind == TeamAgentKind.PM:
@@ -4408,7 +4425,7 @@ class SlackTeamController:
             agent
             for agent in self.store.idle_team_agents()
             if agent.provider_preference == session.provider
-            and agent.kind != TeamAgentKind.PM
+            and agent.kind in WORKER_KINDS
             and agent.agent_id not in external_busy_agent_ids
         ]
         if not available:
@@ -4427,7 +4444,7 @@ class SlackTeamController:
         return True
 
     def _handle_external_thread_work_request(self, session, event: dict, text: str) -> bool:
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         channel_id = event["channel"]
         thread_ts = event["thread_ts"]
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
@@ -4527,7 +4544,7 @@ class SlackTeamController:
         text: str,
         parent_agent,
     ) -> bool:
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         channel_id = event["channel"]
         thread_ts = event["thread_ts"]
         current_thread = SlackThreadRef(channel_id, thread_ts)
@@ -4653,7 +4670,7 @@ class SlackTeamController:
         task = self._record_task_pr_urls(task, agent, thread, text)
         if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         final_handle_request = _agent_authored_final_handle_callback_request(
             text,
             active_agents,
@@ -4774,7 +4791,7 @@ class SlackTeamController:
         text: str,
         message_ts: str | None = None,
     ) -> bool:
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         multi_requests = _multi_specific_work_requests(text, active_agents, split_newlines=True)
         if multi_requests:
             handled = False
@@ -5831,7 +5848,7 @@ class SlackTeamController:
         thread: SlackThreadRef,
         signal: str,
     ) -> bool:
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         parsed = parse_agent_schedule_signal(
             signal,
             known_handles=[item.handle for item in active_agents],
@@ -5897,7 +5914,7 @@ class SlackTeamController:
         original_text = task.metadata.get(SCHEDULE_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
         if not isinstance(original_text, str) or not original_text.strip():
             original_text = task.prompt
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         retry_prompt = build_schedule_resolution_prompt(
             original_text,
             [item.handle for item in active_agents],
@@ -5933,7 +5950,7 @@ class SlackTeamController:
         thread: SlackThreadRef,
         signal: str,
     ) -> bool:
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         occupied_task_ids = dict(self._occupied_handle_task_ids())
         parsed = parse_agent_deferred_signal(
             signal,
@@ -6011,7 +6028,7 @@ class SlackTeamController:
         original_text = task.metadata.get(DEFERRED_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY)
         if not isinstance(original_text, str) or not original_text.strip():
             original_text = task.prompt
-        active_agents = self.store.list_team_agents()
+        active_agents = self._regular_team_agents()
         occupied_meta = task.metadata.get(DEFERRED_RESOLUTION_OCCUPIED_HANDLES_METADATA_KEY) or []
         occupied: list[dict[str, str]] = []
         if isinstance(occupied_meta, list):
@@ -8690,14 +8707,12 @@ class SlackTeamController:
             LOGGER.debug("failed to restore active task action buttons", exc_info=True)
 
     def _agent_icon_url(self, agent) -> str | None:
-        base_url = (
-            self.store.get_setting(SETTING_AGENT_AVATAR_BASE_URL)
-            or os.environ.get("SLACKGENTIC_AGENT_AVATAR_BASE_URL")
-            or DEFAULT_AGENT_AVATAR_BASE_URL
-        ).strip()
-        if base_url.lower() in DISABLED_AVATAR_BASE_VALUES:
-            return None
-        return f"{base_url.rstrip('/')}/{agent.avatar_slug}.png"
+        return agent_icon_url(self.store, agent)
+
+    def _regular_team_agents(self) -> list[TeamAgent]:
+        return [
+            agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.LOOP
+        ]
 
     def _is_agent_channel(self, channel_id: str) -> bool:
         configured = self._configured_agent_channel_id()

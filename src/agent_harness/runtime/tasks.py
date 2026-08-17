@@ -21,6 +21,7 @@ from agent_harness.config import AgentCommandConfig
 from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.internal_notifications import filter_internal_task_notifications
 from agent_harness.models import (
+    MODEL_OVERRIDE_METADATA_KEY,
     AgentTask,
     AgentTaskStatus,
     PermissionMode,
@@ -291,6 +292,11 @@ class ManagedTaskRuntime:
             prompt=build_task_prompt(agent, task),
             cwd=cwd,
             permission_mode=mode,
+            model=(
+                str(task.metadata[MODEL_OVERRIDE_METADATA_KEY])
+                if task.metadata.get(MODEL_OVERRIDE_METADATA_KEY)
+                else None
+            ),
             resume_session_id=(
                 task.session_id
                 if task.session_id

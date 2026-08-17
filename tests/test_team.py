@@ -12,6 +12,7 @@ from agent_harness.models import (
     AgentTaskKind,
     AssignmentMode,
     Provider,
+    TeamAgentKind,
     TeamAgentStatus,
     WorkRequest,
 )
@@ -21,6 +22,7 @@ from agent_harness.team import (
     AVATAR_IDENTITY_BANK,
     DEFAULT_AVATAR_BANK_SIZE,
     DEFAULT_TEAM_SIZE,
+    agent_icon_url,
     build_initial_model_team,
     build_initial_team,
     build_initialization_messages,
@@ -30,6 +32,7 @@ from agent_harness.team import (
     hire_team_agents,
     least_represented_provider,
     pick_idle_agent,
+    runtime_personality_prompt,
 )
 from agent_harness.team.assignment import assign_work_request
 
@@ -133,6 +136,21 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(least_represented_provider(agents), Provider.CLAUDE)
         hired = hire_team_agents(agents, 1)
         self.assertEqual(hired[0].provider_preference, Provider.CLAUDE)
+
+    def test_provider_balance_ignores_loop_agents(self):
+        workers = build_initial_model_team(codex_count=1, claude_count=0)
+        loop_agents = [
+            replace(
+                workers[0],
+                agent_id=f"loop-{index}",
+                handle=f"loop-{index}",
+                provider_preference=Provider.CLAUDE,
+                kind=TeamAgentKind.LOOP,
+            )
+            for index in range(2, 7)
+        ]
+
+        self.assertEqual(least_represented_provider([*workers, *loop_agents]), Provider.CLAUDE)
 
     def test_hire_team_agents_sets_pm_kind(self):
         from agent_harness.models import TeamAgentKind
@@ -398,6 +416,55 @@ class TeamTests(unittest.TestCase):
         self.assertIsNotNone(picked)
         assert picked is not None
         self.assertEqual(picked.handle, pm.handle)
+
+    def test_pick_idle_agent_never_routes_generic_or_specific_work_to_loop(self):
+        loop_agent = replace(
+            build_initial_model_team(codex_count=1, claude_count=0)[0],
+            handle="billing-loop",
+            kind=TeamAgentKind.LOOP,
+        )
+
+        self.assertIsNone(
+            pick_idle_agent(
+                [loop_agent],
+                WorkRequest(prompt="generic work", assignment_mode=AssignmentMode.ANYONE),
+            )
+        )
+        self.assertIsNone(
+            pick_idle_agent(
+                [loop_agent],
+                WorkRequest(
+                    prompt="specific work",
+                    assignment_mode=AssignmentMode.SPECIFIC,
+                    requested_handle=loop_agent.handle,
+                ),
+            )
+        )
+
+    def test_loop_personality_and_icon_resolution_are_purpose_built(self):
+        loop_agent = replace(
+            build_initial_model_team(codex_count=1, claude_count=0)[0],
+            full_name="Billing Bot",
+            kind=TeamAgentKind.LOOP,
+            metadata={"icon_url": "https://example.com/loop.png"},
+        )
+        prompt = runtime_personality_prompt(loop_agent)
+
+        self.assertIn("single-mission automation bot", prompt)
+        self.assertIn("not a general teammate", prompt)
+        self.assertNotIn("Personal context", prompt)
+        store = type(
+            "SettingsStore",
+            (),
+            {"get_setting": lambda self, key: "https://example.com/avatars"},
+        )()
+        self.assertEqual(agent_icon_url(store, loop_agent), "https://example.com/loop.png")
+        self.assertIsNone(agent_icon_url(store, replace(loop_agent, metadata={})))
+        worker = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        self.assertEqual(
+            agent_icon_url(store, worker),
+            f"https://example.com/avatars/{worker.avatar_slug}.png",
+        )
 
     def test_handoff_request_uses_plain_target_handle_on_new_paragraph(self):
         sender, target = build_initial_model_team(codex_count=2, claude_count=0)

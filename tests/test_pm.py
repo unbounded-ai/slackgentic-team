@@ -672,7 +672,8 @@ class PmAgentFilterTests(unittest.TestCase):
 
         pm = self._mk_agent("alice", TeamAgentKind.PM)
         eng = self._mk_agent("bob", TeamAgentKind.ENGINEER)
-        agents = [pm, eng]
+        loop = self._mk_agent("loop-bot", TeamAgentKind.LOOP)
+        agents = [pm, eng, loop]
         self.assertEqual([a.handle for a in filter_pm_agents(agents)], ["alice"])
         self.assertEqual([a.handle for a in filter_worker_agents(agents)], ["bob"])
 
