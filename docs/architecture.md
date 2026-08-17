@@ -339,3 +339,64 @@ due occurrence is queued as pending work so it can resume when capacity opens.
 One-off schedules move to `done` after their due occurrence is launched or
 queued; recurring schedules compute their next run after each due occurrence.
 Marking a thread done cancels pending schedules for that thread.
+
+## Loops
+
+Loops are recurring single-mission automations with a dedicated Slack channel
+and purpose-built `TeamAgentKind.LOOP` identity. Creation begins in the main
+agent channel. A managed resolver converts the owner's description into a
+validated `SLACKGENTIC: LOOP` specification, and the owner approves the
+resulting mission, recurrence, channel, visibility, identity, provider, working
+directory, and permission mode before any channel or scheduled work is created.
+
+The durable state is split across three tables:
+
+- `loops` owns identity, schedule, channel, next occurrence, status, and failure
+  count.
+- `loop_runs` records every scheduled, manual, skipped, and compaction
+  occurrence.
+- `loop_journal` stores owner notes, run summaries, harness events, and
+  compaction snapshots.
+
+`LoopRunner` uses the same polling and backoff shape as scheduled work. A due
+occurrence atomically advances `next_run_at` and increments the run number, so
+daemon downtime fires once on recovery rather than backfilling every missed
+interval. Overlap policy is `skip`: a due occurrence is recorded as skipped
+while the current run continues. Each actual occurrence starts a fresh managed
+provider session in a new thread; continuity comes from the rendered journal,
+not session reuse.
+
+Run prompts combine the standing mission with a bounded journal snapshot. The
+agent records a validated `LOOP_SUMMARY`; missing summaries receive one bounded
+follow-up before the harness writes a fallback entry. `LOOP_FETCH` can retrieve
+at most five earlier run threads per occurrence, from the same loop channel
+only. `LOOP_COMPACT` replaces redundant run/system memory while owner notes are
+never superseded. Compaction is also queued automatically when un-superseded
+memory crosses the configured threshold. Three consecutive runtime failures
+pause the loop and notify its owner; a mission result whose summary status is
+`failed` still counts as a successfully completed harness run.
+
+The owner boundary is enforced before ordinary Slack command and work routing:
+
+- SI-1: Non-owner messages, replies, bot posts, files, and attachments never
+  enter prompts, journal memory, summaries, or retrieval results.
+- SI-2: Loop follow-ups use only loop-sanitized thread context.
+- SI-3: Every ignored message is marked, while explanatory ephemerals are
+  rate-limited per user and channel.
+- SI-4: Non-owners never replace the remembered human identity.
+- SI-5: Retrieval rejects any permalink outside the loop channel before
+  fetching history.
+- SI-6: Approval, task, permission, and request controls are owner-only.
+- SI-7: Commands from non-owners have no effect.
+- SI-8: Message edits and deletes never mutate loop memory.
+- SI-9: Channel topics, purposes, member profiles, and display names are not
+  loop context.
+- SI-10: Loop agents are excluded from every generic worker and roster pool.
+- SI-11: Public and private loop channels enforce the identical boundary.
+- SI-12: Resolver, run, retrieval, and compaction prompts restate that foreign
+  content is withheld.
+
+Loop tasks accept only loop lifecycle control lines and `THREAD_DONE`; generic
+timer, delegation, review, and PM controls are swallowed. The backfill scanner
+includes active and paused loop channels, but routes recovered events through
+the same owner gate and sanitizer as live Socket Mode events.

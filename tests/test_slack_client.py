@@ -200,6 +200,19 @@ class SlackGatewayTests(unittest.TestCase):
 
         self.assertEqual(gateway.auth_test()["bot_id"], "B1")
 
+    def test_auth_scopes_reads_response_headers(self):
+        gateway = object.__new__(SlackGateway)
+        response = FakeSlackResponse(
+            {"ok": True},
+            headers={"x-oauth-scopes": "chat:write, chat:write.customize,files:write"},
+        )
+        gateway.client = type("Client", (), {"auth_test": lambda self: response})()
+
+        self.assertEqual(
+            gateway.auth_scopes(),
+            {"chat:write", "chat:write.customize", "files:write"},
+        )
+
     def test_user_display_name_uses_slack_profile(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = FakeSlackClient()

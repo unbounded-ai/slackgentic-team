@@ -220,6 +220,26 @@ class LoopCreationFlowTests(unittest.TestCase):
         thread = SlackThreadRef(loop.channel_id, run.thread_ts, run.thread_ts)
         return task, agent, run, thread
 
+    def _send_loop_command(
+        self,
+        loop,
+        text: str,
+        ts: str,
+        *,
+        user: str = "UOWNER",
+        thread_ts: str | None = None,
+    ):
+        event = {
+            "type": "message",
+            "channel": loop.channel_id,
+            "ts": ts,
+            "user": user,
+            "text": text,
+        }
+        if thread_ts:
+            event["thread_ts"] = thread_ts
+        self.controller.handle_event({"event": event})
+
     def test_creation_resolves_previews_and_approves_channel(self):
         loop = self._resolve_loop()
 
@@ -1295,6 +1315,236 @@ class LoopCreationFlowTests(unittest.TestCase):
                 for reply in self.gateway.thread_replies
             )
         )
+
+    def test_loop_status_command_renders_schedule_runs_memory_and_controls(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+
+        self._send_loop_command(loop, "loop status", "300.000001")
+
+        reply = self.gateway.thread_replies[-1]
+        rendered = str(reply["blocks"])
+        self.assertIn("Billing Bot status", rendered)
+        self.assertIn("Recent runs", rendered)
+        self.assertIn("Consecutive failures", rendered)
+        self.assertIn("loop.pause", rendered)
+        self.assertIn("loop.stop.request", rendered)
+        self.assertIn("run #1", rendered)
+
+    def test_main_loop_list_posts_one_actionable_card_per_loop(self):
+        loop = self._activate_loop()
+        posts_before = len(self.gateway.posts)
+
+        self.controller.handle_event(
+            {
+                "event": {
+                    "type": "message",
+                    "channel": "CMAIN",
+                    "ts": "301.000001",
+                    "user": "UOWNER",
+                    "text": "loops",
+                }
+            }
+        )
+
+        posts = self.gateway.posts[posts_before:]
+        self.assertEqual(len(posts), 2)
+        self.assertIn("Loops", posts[0]["text"])
+        self.assertIn(f"<#{loop.channel_id}>", str(posts[1]["blocks"]))
+        self.assertIn("loop.pause", str(posts[1]["blocks"]))
+
+    def test_pause_resume_and_run_now_commands_drive_lifecycle(self):
+        loop = self._activate_loop()
+        self._send_loop_command(loop, "loop pause", "302.000001")
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+        self.assertEqual(paused.status, LoopStatus.PAUSED)
+
+        self._send_loop_command(paused, "loop resume", "302.000002")
+        resumed = self.store.get_loop(loop.loop_id)
+        assert resumed is not None
+        self.assertEqual(resumed.status, LoopStatus.ACTIVE)
+        self.assertIsNotNone(resumed.next_run_at)
+
+        self._send_loop_command(resumed, "loop run now", "302.000003")
+        run = self.store.running_loop_run(loop.loop_id)
+        assert run is not None
+        self.assertEqual(run.kind, LoopRunKind.MANUAL)
+        journal = self.store.list_loop_journal(loop.loop_id)
+        self.assertTrue(any("paused by owner" in entry.content for entry in journal))
+        self.assertTrue(any("loop resumed" in entry.content for entry in journal))
+
+    def test_identity_cwd_and_permission_commands_apply_to_future_runs(self):
+        loop = self._activate_loop()
+        self._send_loop_command(loop, "loop name: Ledger Watch Bot", "303.000001")
+        self._send_loop_command(loop, "loop icon: :ledger:", "303.000002")
+        self._send_loop_command(
+            loop,
+            f"loop cwd: {self.temp_dir.name}",
+            "303.000003",
+        )
+        self._send_loop_command(loop, "loop permissions: locked", "303.000004")
+
+        agent = self.store.get_team_agent(loop.agent_id)
+        current = self.store.get_loop(loop.loop_id)
+        assert agent is not None and current is not None
+        self.assertEqual(agent.full_name, "Ledger Watch Bot")
+        self.assertEqual(agent.handle, "ledger-watch-bot")
+        self.assertEqual(agent.icon_emoji, ":ledger:")
+        self.assertEqual(current.cwd, str(Path(self.temp_dir.name).resolve()))
+        self.assertEqual(current.permission_mode, PermissionMode.LOCKED)
+
+        self._send_loop_command(current, "loop permissions: dangerous", "303.000005")
+        confirmation = self.gateway.thread_replies[-1]
+        self.assertIn("loop.permissions.confirm", str(confirmation["blocks"]))
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "value": encode_action_value(
+                            "loop.permissions.confirm",
+                            loop_id=loop.loop_id,
+                        )
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": confirmation["ts"]},
+                "user": {"id": "UOWNER"},
+            }
+        )
+        dangerous = self.store.get_loop(loop.loop_id)
+        assert dangerous is not None
+        self.assertEqual(dangerous.permission_mode, PermissionMode.DANGEROUS)
+
+    def test_schedule_task_and_icon_regeneration_use_hidden_update_resolvers(self):
+        loop = self._activate_loop()
+        base_payload = {
+            "title": "Cloud Billing Watch",
+            "bot_name": "Billing Bot",
+            "channel_name": "loop-cloud-billing",
+            "mission": "Inspect cloud billing and report material anomalies.",
+            "schedule": {"frequency": "interval", "interval_seconds": 600},
+            "icon": {"emoji": "money_with_wings"},
+        }
+
+        self._send_loop_command(
+            loop,
+            "loop schedule: every ten minutes",
+            "304.000001",
+        )
+        schedule_task, schedule_agent, schedule_thread = self.runtime.started[-1]
+        self.assertEqual(schedule_task.metadata["loop_update_kind"], "schedule")
+        self.controller.handle_runtime_agent_control(
+            schedule_task,
+            schedule_agent,
+            schedule_thread,
+            AGENT_LOOP_SIGNAL_PREFIX + json.dumps(base_payload),
+        )
+        scheduled = self.store.get_loop(loop.loop_id)
+        assert scheduled is not None
+        self.assertEqual(scheduled.recurrence["interval_seconds"], 600)
+        self.assertEqual(scheduled.status, LoopStatus.ACTIVE)
+
+        task_payload = {
+            **base_payload,
+            "mission": "Inspect billing, explain anomalies, and record concrete fixes.",
+        }
+        self._send_loop_command(scheduled, "loop task: include concrete fixes", "304.000002")
+        task_task, task_agent, task_thread = self.runtime.started[-1]
+        self.controller.handle_runtime_agent_control(
+            task_task,
+            task_agent,
+            task_thread,
+            AGENT_LOOP_SIGNAL_PREFIX + json.dumps(task_payload),
+        )
+        updated = self.store.get_loop(loop.loop_id)
+        assert updated is not None
+        self.assertEqual(updated.mission, task_payload["mission"])
+
+        icon_payload = {**task_payload, "icon": {"emoji": "sparkles"}}
+        self._send_loop_command(updated, "loop icon: regenerate", "304.000003")
+        icon_task, icon_agent, icon_thread = self.runtime.started[-1]
+        self.controller.handle_runtime_agent_control(
+            icon_task,
+            icon_agent,
+            icon_thread,
+            AGENT_LOOP_SIGNAL_PREFIX + json.dumps(icon_payload),
+        )
+        regenerated_agent = self.store.get_team_agent(loop.agent_id)
+        assert regenerated_agent is not None
+        self.assertEqual(regenerated_agent.icon_emoji, ":sparkles:")
+        journal = self.store.list_loop_journal(loop.loop_id)
+        self.assertTrue(any("schedule changed" in entry.content for entry in journal))
+        self.assertTrue(any("mission changed" in entry.content for entry in journal))
+        self.assertTrue(any("icon regenerated" in entry.content for entry in journal))
+
+    def test_malformed_active_loop_update_does_not_cancel_loop(self):
+        loop = self._activate_loop()
+        self._send_loop_command(loop, "loop schedule: every ten minutes", "305.000001")
+        task, agent, thread = self.runtime.started[-1]
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SIGNAL_PREFIX + "{}",
+        )
+
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertEqual(current.status, LoopStatus.ACTIVE)
+        retry = self.store.get_agent_task(task.task_id)
+        assert retry is not None
+        self.assertEqual(retry.metadata[LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY], 1)
+
+    def test_stop_archive_requires_confirmation_then_closes_loop(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        self._send_loop_command(loop, "loop stop archive", "306.000001")
+        confirmation = self.gateway.thread_replies[-1]
+        self.assertIn("loop.stop.confirm", str(confirmation["blocks"]))
+
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "value": encode_action_value(
+                            "loop.stop.confirm",
+                            loop_id=loop.loop_id,
+                            archive=True,
+                        )
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": confirmation["ts"]},
+                "user": {"id": "UOWNER"},
+            }
+        )
+
+        stopped = self.store.get_loop(loop.loop_id)
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        assert stopped is not None and agent is not None
+        self.assertEqual(stopped.status, LoopStatus.CANCELLED)
+        self.assertEqual(agent.status, TeamAgentStatus.FIRED)
+        self.assertEqual(self.gateway.archived_channels, [loop.channel_id])
+        run = self.store.list_loop_runs(loop.loop_id)[0]
+        self.assertEqual(run.status, LoopRunStatus.FAILED)
+        self.assertEqual(run.error, "loop stopped by owner")
+
+    def test_loop_help_works_through_slash_command_in_loop_channel(self):
+        loop = self._activate_loop()
+
+        self.controller.handle_slash_command(
+            {
+                "channel_id": loop.channel_id,
+                "user_id": "UOWNER",
+                "user_name": "owner",
+                "text": "loop help",
+            }
+        )
+
+        self.assertIn("Loop commands", self.gateway.posts[-1]["text"])
+        self.assertEqual(self.gateway.posts[-1]["channel_id"], loop.channel_id)
 
 
 if __name__ == "__main__":

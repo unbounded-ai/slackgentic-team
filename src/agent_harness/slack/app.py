@@ -46,13 +46,28 @@ from agent_harness.loops import (
     LOOP_SUMMARY_NUDGE_ATTEMPTS,
     MAX_ACTIVE_LOOPS,
     MAX_LOOP_RESOLUTION_ATTEMPTS,
+    LoopCompactNowCommand,
+    LoopCwdCommand,
+    LoopHelpCommand,
+    LoopIconCommand,
+    LoopListCommand,
+    LoopNameCommand,
+    LoopPauseCommand,
+    LoopPermissionsCommand,
+    LoopResumeCommand,
+    LoopRunNowCommand,
+    LoopScheduleCommand,
     LoopSpec,
+    LoopStatusCommand,
+    LoopStopCommand,
+    LoopTaskCommand,
     build_loop_compaction_prompt,
     build_loop_fetch_result,
     build_loop_resolution_prompt,
     build_loop_run_prompt,
     create_loop_agent,
     default_loop_provider,
+    describe_loop_schedule,
     format_loop_timestamp,
     looks_like_loop_create_request,
     loop_spec_from_json,
@@ -239,7 +254,11 @@ from agent_harness.slack import (
     build_idle_release_closed_blocks,
     build_idle_release_dismissed_blocks,
     build_idle_release_prompt_blocks,
+    build_loop_dangerous_confirmation_blocks,
+    build_loop_list_item_blocks,
     build_loop_preview_blocks,
+    build_loop_status_blocks,
+    build_loop_stop_confirmation_blocks,
     build_setup_modal,
     build_task_thread_blocks,
     build_team_roster_blocks,
@@ -345,6 +364,8 @@ SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
 SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
 LOOP_SUMMARY_NUDGE_METADATA_KEY = "loop_summary_nudge"
+LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
+LOOP_UPDATE_OLD_VALUE_METADATA_KEY = "loop_update_old_value"
 UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE = 20
 _PM_BLOCKER_PREFIX = "pm.blocker."
 _PM_STATUS_MESSAGE_PREFIX = "pm.status_message."
@@ -669,8 +690,15 @@ class SlackTeamController:
             {"display_name": payload.get("user_name"), "name": payload.get("user_name")},
         )
         if loop is not None:
-            # Loop command rendering is added with the loop surface; routing and
-            # owner authorization live here at the trust boundary.
+            command = parse_loop_command(text)
+            if command is not None:
+                self._handle_loop_command(loop, command)
+            else:
+                self._post_loop_help(loop)
+            return
+        loop_command = parse_loop_command(text)
+        if isinstance(loop_command, (LoopListCommand, LoopHelpCommand)):
+            self._handle_main_loop_command(loop_command, channel_id)
             return
         if text.lower() in {"setup", "init", "configure"}:
             trigger_id = payload.get("trigger_id")
@@ -906,6 +934,10 @@ class SlackTeamController:
             channel_id=channel_id,
             thread_ts=event.get("thread_ts"),
         )
+        loop_command = parse_loop_command(text)
+        if isinstance(loop_command, (LoopListCommand, LoopHelpCommand)):
+            self._handle_main_loop_command(loop_command, channel_id)
+            return
         command = parse_team_command(text)
         if command:
             self.handle_team_command(command, target, requested_by_slack_user=event.get("user"))
@@ -1513,9 +1545,9 @@ class SlackTeamController:
         text = (event.get("text") or "").strip()
         if not text:
             return
-        if parse_loop_command(text) is not None:
-            # The command surface is layered above this security gate. Owner
-            # commands must never fall through to notes or ordinary team work.
+        command = parse_loop_command(text)
+        if command is not None:
+            self._handle_loop_command(loop, command, event=event)
             return
         thread_ts = event.get("thread_ts")
         is_thread_reply = bool(thread_ts) and thread_ts != event.get("ts")
@@ -1628,6 +1660,610 @@ class SlackTeamController:
             "It was marked with 🚫.",
         )
         self.store.set_setting(notice_key, now.isoformat())
+
+    def _handle_main_loop_command(self, command, channel_id: str) -> None:
+        if isinstance(command, LoopListCommand):
+            self._post_loop_list(channel_id)
+            return
+        self.gateway.post_message(channel_id, self._loop_help_text())
+
+    def _handle_loop_command(self, loop: Loop, command, *, event: dict | None = None) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if isinstance(command, (LoopStatusCommand, LoopListCommand)):
+            self._post_loop_status(latest, event=event)
+            return
+        if isinstance(command, LoopPauseCommand):
+            self._pause_loop(latest, event=event)
+            return
+        if isinstance(command, LoopResumeCommand):
+            self._resume_loop(latest, event=event)
+            return
+        if isinstance(command, LoopRunNowCommand):
+            if not self.fire_loop_now(latest):
+                self._post_loop_surface(
+                    latest,
+                    "This loop must be active before it can run.",
+                    event=event,
+                )
+            return
+        if isinstance(command, LoopScheduleCommand):
+            self._start_loop_update_resolution(
+                latest,
+                kind="schedule",
+                override_text=command.text,
+                event=event,
+            )
+            return
+        if isinstance(command, LoopTaskCommand):
+            self._start_loop_update_resolution(
+                latest,
+                kind="task",
+                override_text=command.text,
+                event=event,
+            )
+            return
+        if isinstance(command, LoopNameCommand):
+            self._rename_loop_agent(latest, command.name, event=event)
+            return
+        if isinstance(command, LoopIconCommand):
+            self._update_loop_icon(latest, command.value, event=event)
+            return
+        if isinstance(command, LoopCwdCommand):
+            cwd = _validated_repo_root(command.path)
+            if cwd is None:
+                self._post_loop_surface(
+                    latest,
+                    "Use an existing local folder path for `loop cwd:`.",
+                    event=event,
+                )
+                return
+            self._update_loop_identity_values(latest, cwd=str(cwd))
+            self._append_loop_system_entry(latest, f"working directory changed to {cwd}")
+            self._post_loop_surface(
+                latest,
+                f"Working directory set to `{cwd}` for future runs.",
+                event=event,
+            )
+            return
+        if isinstance(command, LoopPermissionsCommand):
+            if command.permission_mode == PermissionMode.DANGEROUS:
+                self._post_loop_surface(
+                    latest,
+                    "Confirm dangerous permissions for future runs.",
+                    blocks=build_loop_dangerous_confirmation_blocks(latest),
+                    event=event,
+                )
+                return
+            self._set_loop_permissions(latest, command.permission_mode, event=event)
+            return
+        if isinstance(command, LoopCompactNowCommand):
+            if self.request_loop_compaction(latest):
+                self._append_loop_system_entry(latest, "memory compaction requested by owner")
+                self._post_loop_surface(
+                    latest,
+                    "🧹 Memory compaction queued.",
+                    event=event,
+                )
+            return
+        if isinstance(command, LoopStopCommand):
+            self._post_loop_surface(
+                latest,
+                "Confirm stopping this loop.",
+                blocks=build_loop_stop_confirmation_blocks(
+                    latest,
+                    archive=command.archive,
+                ),
+                event=event,
+            )
+            return
+        self._post_loop_help(latest, event=event)
+
+    def _post_loop_surface(
+        self,
+        loop: Loop,
+        text: str,
+        *,
+        blocks: list[dict] | None = None,
+        event: dict | None = None,
+    ):
+        if not loop.channel_id:
+            return None
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        if event is not None:
+            thread_ts = event.get("thread_ts") or event.get("ts")
+            if isinstance(thread_ts, str) and thread_ts:
+                return self.gateway.post_thread_reply(
+                    SlackThreadRef(loop.channel_id, thread_ts, event.get("ts")),
+                    text,
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent) if agent is not None else None,
+                    blocks=blocks,
+                )
+        if agent is not None:
+            return self.gateway.post_session_parent(
+                loop.channel_id,
+                text,
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+                blocks=blocks,
+            )
+        return self.gateway.post_message(loop.channel_id, text, blocks=blocks)
+
+    def _post_loop_status(self, loop: Loop, *, event: dict | None = None) -> None:
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        bot_name = agent.full_name if agent is not None else loop.title
+        run_lines: list[str] = []
+        for run in self.store.list_loop_runs(loop.loop_id, limit=5):
+            target = f"run #{run.run_number}"
+            if loop.channel_id and run.thread_ts:
+                with suppress(Exception):
+                    permalink = self.gateway.permalink(loop.channel_id, run.thread_ts)
+                    if permalink:
+                        target = f"<{permalink}|run #{run.run_number}>"
+            run_lines.append(f"- {target} · {run.kind.value} · {run.status.value}")
+        entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
+        memory_chars = sum(len(entry.content) for entry in entries)
+        next_run_text = (
+            format_loop_timestamp(loop.next_run_at, loop.timezone)
+            if loop.next_run_at is not None and loop.status == LoopStatus.ACTIVE
+            else "paused"
+            if loop.status == LoopStatus.PAUSED
+            else "none"
+        )
+        schedule_text = describe_loop_schedule(loop.recurrence, loop.timezone)
+        blocks = build_loop_status_blocks(
+            loop,
+            bot_name=bot_name,
+            schedule_text=schedule_text,
+            next_run_text=next_run_text,
+            run_lines=run_lines,
+            memory_chars=memory_chars,
+        )
+        self._post_loop_surface(
+            loop,
+            f"{bot_name}: {loop.status.value}; next run {next_run_text}.",
+            blocks=blocks,
+            event=event,
+        )
+
+    def _post_loop_list(self, channel_id: str) -> None:
+        loops = self.store.list_loops(limit=100)
+        if not loops:
+            self.gateway.post_message(
+                channel_id,
+                "No loops yet. Create one with `loop create <recurring task>`.",
+            )
+            return
+        self.gateway.post_message(channel_id, f"*Loops* · {len(loops)} total")
+        for loop in loops:
+            agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+            bot_name = agent.full_name if agent is not None else loop.title
+            channel_text = (
+                f"<#{loop.channel_id}>"
+                if loop.channel_id
+                else f"`#{loop.channel_name}`"
+                if loop.channel_name
+                else "channel pending"
+            )
+            next_run_text = (
+                format_loop_timestamp(loop.next_run_at, loop.timezone)
+                if loop.next_run_at is not None and loop.status == LoopStatus.ACTIVE
+                else loop.status.value
+            )
+            summary = self._latest_loop_summary(loop.loop_id)
+            blocks = build_loop_list_item_blocks(
+                loop,
+                bot_name=bot_name,
+                channel_text=channel_text,
+                next_run_text=next_run_text,
+                last_summary=_shorten(summary, 240) if summary else None,
+            )
+            self.gateway.post_message(
+                channel_id,
+                f"{bot_name} · {loop.status.value} · {next_run_text}",
+                blocks=blocks,
+            )
+
+    def _pause_loop(self, loop: Loop, *, event: dict | None = None) -> bool:
+        if loop.status == LoopStatus.PAUSED:
+            self._post_loop_surface(loop, "This loop is already paused.", event=event)
+            return False
+        if loop.status != LoopStatus.ACTIVE:
+            self._post_loop_surface(loop, f"This loop is {loop.status.value}.", event=event)
+            return False
+        self.store.update_loop_status(loop.loop_id, LoopStatus.PAUSED)
+        self._append_loop_system_entry(loop, "loop paused by owner")
+        self._post_loop_surface(loop, "⏸ Loop paused.", event=event)
+        return True
+
+    def _resume_loop(self, loop: Loop, *, event: dict | None = None) -> bool:
+        if loop.status == LoopStatus.ACTIVE:
+            self._post_loop_surface(loop, "This loop is already active.", event=event)
+            return False
+        if loop.status != LoopStatus.PAUSED:
+            self._post_loop_surface(loop, f"This loop is {loop.status.value}.", event=event)
+            return False
+        next_run_at = next_run_after(loop.recurrence, after=utc_now())
+        if next_run_at is None:
+            self._post_loop_surface(loop, "The stored schedule is invalid.", event=event)
+            return False
+        self.store.update_loop_schedule(
+            loop.loop_id,
+            recurrence=loop.recurrence,
+            timezone=loop.timezone,
+            next_run_at=next_run_at,
+        )
+        self.store.update_loop_status(loop.loop_id, LoopStatus.ACTIVE)
+        self._append_loop_system_entry(
+            loop,
+            f"loop resumed; next run {format_loop_timestamp(next_run_at, loop.timezone)}",
+        )
+        self._post_loop_surface(
+            loop,
+            f"▶ Loop resumed. Next run {format_loop_timestamp(next_run_at, loop.timezone)}.",
+            event=event,
+        )
+        return True
+
+    def _rename_loop_agent(self, loop: Loop, name: str, *, event: dict | None = None) -> None:
+        agent = self.store.get_team_agent(loop.agent_id)
+        cleaned = re.sub(r"\s+", " ", name).strip()
+        if agent is None or not cleaned:
+            self._post_loop_surface(loop, "`loop name:` needs a name.", event=event)
+            return
+        handle = self._unique_loop_handle(cleaned, agent.agent_id)
+        words = re.findall(r"[A-Za-z0-9]+", cleaned)
+        initials = "".join(word[0].upper() for word in words[:3]) or "LB"
+        metadata = dict(agent.metadata)
+        metadata["bot_name"] = cleaned
+        self.store.upsert_team_agent(
+            replace(
+                agent,
+                handle=handle,
+                full_name=_shorten(cleaned, 80),
+                initials=initials,
+                metadata=metadata,
+            )
+        )
+        self._append_loop_system_entry(loop, f"bot renamed from {agent.full_name} to {cleaned}")
+        self._post_loop_surface(
+            loop,
+            f"Bot renamed to *{cleaned}* (`@{handle}`).",
+            event=event,
+        )
+
+    def _unique_loop_handle(self, name: str, agent_id: str) -> str:
+        base = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")
+        if not base or not base[0].isalpha():
+            base = f"loop-{base}".strip("-")
+        base = (base or "loop-bot")[:32].rstrip("-_")
+        if len(base) < 2:
+            base = "loop-bot"
+        existing = {
+            agent.handle
+            for agent in self.store.list_team_agents(include_fired=True)
+            if agent.agent_id != agent_id
+        }
+        suffix = 1
+        while True:
+            suffix_text = "" if suffix == 1 else str(suffix)
+            candidate = f"{base[: 32 - len(suffix_text)]}{suffix_text}".rstrip("-_")
+            try:
+                normalized = normalize_handle(candidate)
+            except ValueError:
+                normalized = "loop-bot"
+            if normalized not in existing:
+                return normalized
+            suffix += 1
+
+    def _update_loop_icon(self, loop: Loop, value: str, *, event: dict | None = None) -> None:
+        cleaned = value.strip()
+        if cleaned.lower() == "regenerate":
+            self._start_loop_update_resolution(
+                loop,
+                kind="icon",
+                override_text="Generate a new icon for this existing loop.",
+                event=event,
+            )
+            return
+        agent = self.store.get_team_agent(loop.agent_id)
+        if agent is None:
+            return
+        metadata = dict(agent.metadata)
+        metadata["icon_badge"] = None
+        if re.fullmatch(r":[a-z0-9_+\-]+:", cleaned):
+            metadata["icon_url"] = None
+            updated = replace(agent, icon_emoji=cleaned, metadata=metadata)
+        elif cleaned.startswith("https://") and not any(char.isspace() for char in cleaned):
+            metadata["icon_url"] = cleaned
+            updated = replace(agent, metadata=metadata)
+        else:
+            self._post_loop_surface(
+                loop,
+                "Icon must be a Slack `:emoji:`, an `https://` URL, or `regenerate`.",
+                event=event,
+            )
+            return
+        self.store.upsert_team_agent(updated)
+        self._append_loop_system_entry(loop, f"loop icon changed to {cleaned}")
+        self._post_loop_surface(loop, f"Loop icon updated to {cleaned}.", event=event)
+
+    def _set_loop_permissions(
+        self,
+        loop: Loop,
+        mode: PermissionMode,
+        *,
+        event: dict | None = None,
+    ) -> None:
+        self._update_loop_identity_values(loop, permission_mode=mode)
+        self._append_loop_system_entry(loop, f"permissions changed to {mode.value}")
+        self._post_loop_surface(
+            loop,
+            f"Permissions set to `{mode.value}` for future runs.",
+            event=event,
+        )
+
+    def _update_loop_identity_values(
+        self,
+        loop: Loop,
+        *,
+        mission: str | None = None,
+        permission_mode: PermissionMode | None = None,
+        cwd: str | None = None,
+    ) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        self.store.update_loop_identity(
+            latest.loop_id,
+            title=latest.title,
+            mission=mission if mission is not None else latest.mission,
+            channel_name=latest.channel_name,
+            visibility=latest.visibility,
+            provider=latest.provider,
+            model=latest.model,
+            permission_mode=permission_mode or latest.permission_mode,
+            cwd=cwd if cwd is not None else latest.cwd,
+        )
+
+    def _append_loop_system_entry(self, loop: Loop, content: str) -> None:
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                loop_id=loop.loop_id,
+                kind="system",
+                content=content,
+                created_at=utc_now(),
+            )
+        )
+
+    def _post_loop_help(self, loop: Loop, *, event: dict | None = None) -> None:
+        self._post_loop_surface(loop, self._loop_help_text(), event=event)
+
+    def _loop_help_text(self) -> str:
+        return (
+            "*Loop commands*\n"
+            "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
+            "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
+            "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
+            "`loop permissions: locked|safe-auto|dangerous` · `loop compact now`\n"
+            "`loop stop` · `loop stop archive` · `loop help`\n\n"
+            "Only the loop owner can use these commands. Other members' messages are never "
+            "shown to the loop agent."
+        )
+
+    def _start_loop_update_resolution(
+        self,
+        loop: Loop,
+        *,
+        kind: str,
+        override_text: str,
+        event: dict | None,
+    ) -> bool:
+        if self.runtime is None or not loop.channel_id:
+            self._post_loop_surface(loop, "The loop resolver is unavailable.", event=event)
+            return False
+        agent = self.store.get_team_agent(loop.agent_id)
+        if agent is None:
+            return False
+        active_helper = next(
+            (
+                task
+                for task in self.store.list_agent_tasks()
+                if task.metadata.get(LOOP_ID_METADATA_KEY) == loop.loop_id
+                and task.metadata.get(LOOP_UPDATE_KIND_METADATA_KEY)
+                and task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
+            ),
+            None,
+        )
+        if active_helper is not None:
+            self._post_loop_surface(
+                loop,
+                "Another loop update is already being resolved.",
+                event=event,
+            )
+            return False
+        schedule = describe_loop_schedule(loop.recurrence, loop.timezone)
+        request = (
+            f"Existing mission: {loop.mission}\n"
+            f"Existing schedule: {schedule}\n\n"
+            f"OWNER OVERRIDE ({kind.upper()}): {override_text.strip()}"
+        )
+        if event is not None:
+            thread_ts = event.get("thread_ts") or event.get("ts")
+            if not isinstance(thread_ts, str) or not thread_ts:
+                return False
+            thread = SlackThreadRef(loop.channel_id, thread_ts, event.get("ts"))
+            posted = self.gateway.post_thread_reply(thread, "🔁 Resolving the loop update…")
+        else:
+            posted = self.gateway.post_message(loop.channel_id, "🔁 Resolving the loop update…")
+            thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
+        task = create_agent_task(
+            agent,
+            build_loop_resolution_prompt(request, now=utc_now()),
+            loop.channel_id,
+            loop.owner_slack_user_id,
+        )
+        old_value = schedule if kind == "schedule" else loop.mission if kind == "task" else "icon"
+        metadata: dict[str, object] = {
+            LOOP_RESOLUTION_METADATA_KEY: True,
+            LOOP_ID_METADATA_KEY: loop.loop_id,
+            LOOP_UPDATE_KIND_METADATA_KEY: kind,
+            LOOP_UPDATE_OLD_VALUE_METADATA_KEY: old_value,
+            LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY: request,
+            LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
+            ASSIGNMENT_PROMPT_METADATA_KEY: override_text,
+            PERMISSION_MODE_METADATA_KEY: loop.permission_mode.value,
+        }
+        if loop.model:
+            metadata[MODEL_OVERRIDE_METADATA_KEY] = loop.model
+        if loop.cwd:
+            metadata["cwd"] = loop.cwd
+        task = replace(
+            task,
+            thread_ts=thread.thread_ts,
+            parent_message_ts=posted.ts,
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(task)
+        if self.runtime.start_task(task, agent, thread):
+            return True
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        self.gateway.post_thread_reply(
+            thread,
+            "I could not start the loop update resolver.",
+            persona=agent,
+            icon_url=self._agent_icon_url(agent),
+        )
+        return False
+
+    def _apply_loop_update_resolution(
+        self,
+        loop: Loop,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+        spec: LoopSpec,
+    ) -> bool:
+        kind = task.metadata.get(LOOP_UPDATE_KIND_METADATA_KEY)
+        old_value = str(task.metadata.get(LOOP_UPDATE_OLD_VALUE_METADATA_KEY) or "")
+        if kind == "schedule":
+            next_run_at = next_run_after(spec.recurrence, after=utc_now())
+            if next_run_at is None:
+                return self._retry_loop_update_resolution(
+                    loop,
+                    task,
+                    agent,
+                    thread,
+                    "the resolved schedule has no next occurrence",
+                )
+            self.store.update_loop_schedule(
+                loop.loop_id,
+                recurrence=spec.recurrence,
+                timezone=spec.timezone,
+                next_run_at=next_run_at,
+            )
+            new_value = describe_loop_schedule(spec.recurrence, spec.timezone)
+            content = f"schedule changed from {old_value} to {new_value}"
+            confirmation = (
+                f"Schedule updated to *{new_value}*. Next run "
+                f"{format_loop_timestamp(next_run_at, spec.timezone)}."
+            )
+        elif kind == "task":
+            self._update_loop_identity_values(loop, mission=spec.mission)
+            content = f"mission changed from {old_value} to {spec.mission}"
+            confirmation = f"Mission updated to: {spec.mission}"
+        elif kind == "icon":
+            current_agent = self.store.get_team_agent(loop.agent_id)
+            if current_agent is None:
+                return True
+            badge = spec.icon.badge
+            metadata = dict(current_agent.metadata)
+            metadata["icon_url"] = None
+            metadata["icon_badge"] = (
+                {
+                    "background": badge.background,
+                    "glyph": badge.glyph,
+                    "glyph_color": badge.glyph_color,
+                    "shape": badge.shape,
+                }
+                if badge is not None
+                else None
+            )
+            self.store.upsert_team_agent(
+                replace(
+                    current_agent,
+                    icon_emoji=f":{spec.icon.emoji}:",
+                    metadata=metadata,
+                )
+            )
+            if badge is not None and loop.channel_id:
+                try:
+                    badge_path = self._loop_badge_path(loop.loop_id)
+                    write_loop_badge(badge_path, badge)
+                    self.gateway.upload_file(
+                        loop.channel_id,
+                        badge_path,
+                        title=f"{current_agent.full_name} badge",
+                        thread_ts=thread.thread_ts,
+                    )
+                except Exception:
+                    LOGGER.warning("failed to render regenerated loop badge", exc_info=True)
+            content = f"loop icon regenerated as :{spec.icon.emoji}:"
+            confirmation = f"Loop icon regenerated as :{spec.icon.emoji}:."
+        else:
+            return True
+        self._append_loop_system_entry(loop, content)
+        self._finish_loop_resolution_task(task)
+        latest_agent = self.store.get_team_agent(loop.agent_id, include_fired=True) or agent
+        self.gateway.post_thread_reply(
+            thread,
+            confirmation,
+            persona=latest_agent,
+            icon_url=self._agent_icon_url(latest_agent),
+        )
+        return True
+
+    def _retry_loop_update_resolution(
+        self,
+        loop: Loop,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+        error: str,
+    ) -> bool:
+        attempts = int(task.metadata.get(LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY) or 0)
+        if attempts >= MAX_LOOP_RESOLUTION_ATTEMPTS or self.runtime is None:
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not apply that loop update: {error}.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        original = str(task.metadata.get(LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY) or task.prompt)
+        metadata = dict(task.metadata)
+        metadata[LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
+        updated = replace(
+            task,
+            prompt=build_loop_resolution_prompt(
+                original,
+                now=utc_now(),
+                validation_error=error,
+            ),
+            status=AgentTaskStatus.ACTIVE,
+            updated_at=utc_now(),
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(updated)
+        if not self.runtime.start_task(updated, agent, thread):
+            self.store.update_agent_task_status(updated.task_id, AgentTaskStatus.CANCELLED)
+            self.gateway.post_thread_reply(
+                thread,
+                "I could not restart the loop update resolver.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+        return True
 
     def _handle_loop_create_request(self, event: dict, channel_id: str, text: str) -> bool:
         if not looks_like_loop_create_request(text):
@@ -1978,6 +2614,24 @@ class SlackTeamController:
                 icon_url=self._agent_icon_url(agent),
             )
             return True
+        update_kind = task.metadata.get(LOOP_UPDATE_KIND_METADATA_KEY)
+        if isinstance(update_kind, str):
+            parsed = parse_agent_loop_signal(signal, now=utc_now())
+            if parsed.spec is None:
+                return self._retry_loop_update_resolution(
+                    loop,
+                    task,
+                    agent,
+                    thread,
+                    parsed.error or "invalid loop update specification",
+                )
+            return self._apply_loop_update_resolution(
+                loop,
+                task,
+                agent,
+                thread,
+                parsed.spec,
+            )
         if loop.status not in {LoopStatus.RESOLVING, LoopStatus.AWAITING_APPROVAL}:
             return True
         parsed = parse_agent_loop_signal(signal, now=utc_now())
@@ -4388,6 +5042,8 @@ class SlackTeamController:
                 "`sessions` / `active sessions` / `external sessions` — sessions started "
                 "outside Slack that are waiting for an agent",
                 "`scheduled tasks` — pending and claimed scheduled work",
+                "`loops` / `loop list` — recurring loop bots and their controls",
+                "`loop help` — loop creation and loop-channel commands",
                 "`hire 3 agents` — add capacity; `hire 2 claude agents` picks the provider",
                 "`fire @handle` — release one agent; `fire everyone` clears the roster",
                 "`repo root ~/code` — set where agents work",
@@ -5592,6 +6248,62 @@ class SlackTeamController:
                 )
             return
         action = payload.get("action")
+        if action == "loop.pause":
+            self._pause_loop(loop)
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts)
+            return
+        if action == "loop.resume":
+            self._resume_loop(loop)
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts)
+            return
+        if action == "loop.stop.request":
+            self.gateway.post_message(
+                channel_id,
+                f"Confirm stopping {loop.title}.",
+                blocks=build_loop_stop_confirmation_blocks(loop, archive=False),
+                thread_ts=message_ts,
+            )
+            return
+        if action == "loop.stop.confirm":
+            self._stop_loop(
+                loop,
+                archive=payload.get("archive") is True,
+                channel_id=channel_id,
+                message_ts=message_ts,
+            )
+            return
+        if action in {"loop.stop.dismiss", "loop.permissions.dismiss"}:
+            if message_ts:
+                self._try_update_message(
+                    channel_id,
+                    message_ts,
+                    "No changes made.",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": "_No changes made._"},
+                        }
+                    ],
+                )
+            return
+        if action == "loop.permissions.confirm":
+            self._set_loop_permissions(loop, PermissionMode.DANGEROUS)
+            if message_ts:
+                self._try_update_message(
+                    channel_id,
+                    message_ts,
+                    "Dangerous permissions enabled for future runs.",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Dangerous permissions enabled* for future runs.",
+                            },
+                        }
+                    ],
+                )
+            return
         if action == "loop.cancel":
             self._cancel_loop_from_action(loop, message_ts)
             return
@@ -5605,6 +6317,88 @@ class SlackTeamController:
             )
             return
         self._approve_loop(loop, message_ts=message_ts)
+
+    def _refresh_loop_action_card(
+        self,
+        loop_id: str,
+        channel_id: str,
+        message_ts: str | None,
+    ) -> None:
+        if not message_ts:
+            return
+        loop = self.store.get_loop(loop_id)
+        if loop is None:
+            return
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        bot_name = agent.full_name if agent is not None else loop.title
+        channel_text = f"<#{loop.channel_id}>" if loop.channel_id else "channel pending"
+        next_run_text = (
+            format_loop_timestamp(loop.next_run_at, loop.timezone)
+            if loop.next_run_at is not None and loop.status == LoopStatus.ACTIVE
+            else loop.status.value
+        )
+        summary = self._latest_loop_summary(loop.loop_id)
+        self._try_update_message(
+            channel_id,
+            message_ts,
+            f"{bot_name} · {loop.status.value} · {next_run_text}",
+            blocks=build_loop_list_item_blocks(
+                loop,
+                bot_name=bot_name,
+                channel_text=channel_text,
+                next_run_text=next_run_text,
+                last_summary=_shorten(summary, 240) if summary else None,
+            ),
+        )
+
+    def _stop_loop(
+        self,
+        loop: Loop,
+        *,
+        archive: bool,
+        channel_id: str,
+        message_ts: str | None,
+    ) -> None:
+        if loop.status == LoopStatus.CANCELLED:
+            return
+        running = self.store.running_loop_run(loop.loop_id)
+        if running is not None:
+            if running.task_id:
+                task = self.store.get_agent_task(running.task_id)
+                if task is not None and self.runtime is not None:
+                    with suppress(Exception):
+                        self.runtime.stop_task(task.task_id, AgentTaskStatus.CANCELLED)
+                if task is not None:
+                    self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            self.store.update_loop_run(
+                running.run_id,
+                status=LoopRunStatus.FAILED,
+                finished_at=utc_now(),
+                error="loop stopped by owner",
+            )
+        self._append_loop_system_entry(loop, "loop stopped by owner")
+        self.store.update_loop_status(loop.loop_id, LoopStatus.CANCELLED)
+        self.store.fire_team_agent(loop.agent_id)
+        text = "Loop stopped."
+        if archive and loop.channel_id:
+            text = "Loop stopped and channel archived."
+        if message_ts:
+            self._try_update_message(
+                channel_id,
+                message_ts,
+                text,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*{text}*"},
+                    }
+                ],
+            )
+        else:
+            self.gateway.post_message(channel_id, text)
+        if archive and loop.channel_id:
+            with suppress(Exception):
+                self.gateway.archive_channel(loop.channel_id)
 
     def _cancel_loop_from_action(self, loop: Loop, message_ts: str | None) -> None:
         if loop.status not in {LoopStatus.RESOLVING, LoopStatus.AWAITING_APPROVAL}:
