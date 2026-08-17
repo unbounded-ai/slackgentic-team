@@ -300,7 +300,7 @@ class ServiceTests(unittest.TestCase):
                 path.write_text("different")
                 self.assertFalse(installed_services_match([spec]))
 
-    def test_install_services_on_macos_restarts_unchanged_services_without_bootout(self):
+    def test_install_services_on_macos_preserves_unchanged_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ServiceSpec(
                 name="slackgentic-team",
@@ -345,7 +345,6 @@ class ServiceTests(unittest.TestCase):
                 [
                     "launchctl",
                     "kickstart",
-                    "-k",
                     "gui/501/com.slackgentic-team.codex-app-server",
                 ],
                 [
@@ -670,7 +669,57 @@ class ServiceTests(unittest.TestCase):
             ]
         )
 
-    def test_install_services_on_linux_replaces_then_starts_codex_first(self):
+    def test_install_services_on_linux_preserves_app_server_then_restarts_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ServiceSpec(
+                name="slackgentic-team",
+                executable=Path(tmp) / "slackgentic",
+                args=["slack", "serve"],
+                working_directory=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+            )
+            codex = build_codex_app_server_service_spec(
+                executable=Path(tmp) / "codex",
+                working_directory=Path(tmp),
+            )
+            with (
+                patch("agent_harness.service.platform.system", return_value="Linux"),
+                patch(
+                    "agent_harness.service._systemd_path",
+                    side_effect=lambda name: Path(tmp) / f"{name}.service",
+                ),
+                patch("agent_harness.service.subprocess.run") as run,
+            ):
+                run.return_value = subprocess.CompletedProcess([], 0)
+                Path(tmp, "slackgentic-team.service").write_text(render_systemd_unit(daemon))
+                Path(tmp, "slackgentic-team-codex-app-server.service").write_text(
+                    render_systemd_unit(codex)
+                )
+
+                install_services([daemon, codex])
+
+        run.assert_has_calls(
+            [
+                call(["systemctl", "--user", "daemon-reload"], check=True),
+                call(
+                    [
+                        "systemctl",
+                        "--user",
+                        "enable",
+                        "--now",
+                        "slackgentic-team-codex-app-server.service",
+                    ],
+                    check=True,
+                ),
+                call(["systemctl", "--user", "stop", "slackgentic-team.service"], check=False),
+                call(
+                    ["systemctl", "--user", "enable", "--now", "slackgentic-team.service"],
+                    check=True,
+                ),
+            ]
+        )
+
+    def test_install_services_on_linux_restarts_changed_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ServiceSpec(
                 name="slackgentic-team",
@@ -695,34 +744,14 @@ class ServiceTests(unittest.TestCase):
 
                 install_services([daemon, codex])
 
-        run.assert_has_calls(
+        run.assert_any_call(
             [
-                call(["systemctl", "--user", "daemon-reload"], check=True),
-                call(
-                    [
-                        "systemctl",
-                        "--user",
-                        "stop",
-                        "slackgentic-team-codex-app-server.service",
-                    ],
-                    check=False,
-                ),
-                call(
-                    [
-                        "systemctl",
-                        "--user",
-                        "enable",
-                        "--now",
-                        "slackgentic-team-codex-app-server.service",
-                    ],
-                    check=True,
-                ),
-                call(["systemctl", "--user", "stop", "slackgentic-team.service"], check=False),
-                call(
-                    ["systemctl", "--user", "enable", "--now", "slackgentic-team.service"],
-                    check=True,
-                ),
-            ]
+                "systemctl",
+                "--user",
+                "stop",
+                "slackgentic-team-codex-app-server.service",
+            ],
+            check=False,
         )
 
 
