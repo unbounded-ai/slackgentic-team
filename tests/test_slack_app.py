@@ -144,6 +144,7 @@ class FakeGateway:
         self.topics = []
         self.uploads = []
         self.channel_infos = {}
+        self.archived_channels = []
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -165,6 +166,10 @@ class FakeGateway:
     def create_channel(self, name, is_private):
         self.channels.append((name, is_private))
         return "CNEW"
+
+    def archive_channel(self, channel_id):
+        self.archived_channels.append(channel_id)
+        return True
 
     def invite_users(self, channel_id, user_ids):
         self.invites.append((channel_id, user_ids))

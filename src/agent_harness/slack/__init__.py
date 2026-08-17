@@ -16,6 +16,7 @@ from agent_harness.models import (
     AgentSession,
     AgentTask,
     Loop,
+    LoopStatus,
     Provider,
     SlackThreadRef,
     TeamAgent,
@@ -166,6 +167,185 @@ def build_loop_preview_blocks(
             }
         )
     return blocks
+
+
+def build_loop_status_blocks(
+    loop: Loop,
+    *,
+    bot_name: str,
+    schedule_text: str,
+    next_run_text: str,
+    run_lines: list[str],
+    memory_chars: int,
+) -> list[dict[str, Any]]:
+    runs = "\n".join(run_lines) if run_lines else "- No runs yet."
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{bot_name} status"[:150]},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*State:* {loop.status.value}\n"
+                    f"*Schedule:* {schedule_text}\n"
+                    f"*Next run:* {next_run_text}\n"
+                    f"*Memory:* {memory_chars:,} characters\n"
+                    f"*Consecutive failures:* {loop.consecutive_failures}"
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Recent runs*\n{runs}"},
+        },
+    ]
+    actions = _loop_management_buttons(loop)
+    if actions:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"loop.status.actions.{loop.loop_id}",
+                "elements": actions,
+            }
+        )
+    return blocks
+
+
+def build_loop_list_item_blocks(
+    loop: Loop,
+    *,
+    bot_name: str,
+    channel_text: str,
+    next_run_text: str,
+    last_summary: str | None,
+) -> list[dict[str, Any]]:
+    summary = f"\n*Last run:* {last_summary}" if last_summary else ""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "block_id": f"loop.list.item.{loop.loop_id}",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{bot_name}* · {channel_text}\n"
+                    f"State: {loop.status.value} · Next: {next_run_text}{summary}"
+                ),
+            },
+        }
+    ]
+    actions = _loop_management_buttons(loop)
+    if actions:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"loop.list.actions.{loop.loop_id}",
+                "elements": actions,
+            }
+        )
+    return blocks
+
+
+def build_loop_stop_confirmation_blocks(loop: Loop, *, archive: bool) -> list[dict[str, Any]]:
+    archive_text = " and archive its channel" if archive else ""
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"Stop *{loop.title}*{archive_text}? This cannot be resumed.",
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"loop.stop.confirm.{loop.loop_id}",
+            "elements": [
+                _button(
+                    "Stop loop",
+                    "loop.stop.confirm",
+                    encode_action_value(
+                        "loop.stop.confirm",
+                        loop_id=loop.loop_id,
+                        archive=archive,
+                    ),
+                    "danger",
+                ),
+                _button(
+                    "Keep running",
+                    "loop.stop.dismiss",
+                    encode_action_value("loop.stop.dismiss", loop_id=loop.loop_id),
+                ),
+            ],
+        },
+    ]
+
+
+def build_loop_dangerous_confirmation_blocks(loop: Loop) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"Set *{loop.title}* to `dangerous` permissions? Future runs may bypass "
+                    "provider approval and sandbox protections."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"loop.permissions.confirm.{loop.loop_id}",
+            "elements": [
+                _button(
+                    "Use dangerous mode",
+                    "loop.permissions.confirm",
+                    encode_action_value(
+                        "loop.permissions.confirm",
+                        loop_id=loop.loop_id,
+                    ),
+                    "danger",
+                ),
+                _button(
+                    "Cancel",
+                    "loop.permissions.dismiss",
+                    encode_action_value("loop.permissions.dismiss", loop_id=loop.loop_id),
+                ),
+            ],
+        },
+    ]
+
+
+def _loop_management_buttons(loop: Loop) -> list[dict[str, Any]]:
+    elements: list[dict[str, Any]] = []
+    if loop.status == LoopStatus.ACTIVE:
+        elements.append(
+            _button(
+                "Pause",
+                "loop.pause",
+                encode_action_value("loop.pause", loop_id=loop.loop_id),
+            )
+        )
+    elif loop.status == LoopStatus.PAUSED:
+        elements.append(
+            _button(
+                "Resume",
+                "loop.resume",
+                encode_action_value("loop.resume", loop_id=loop.loop_id),
+                "primary",
+            )
+        )
+    if loop.status in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
+        elements.append(
+            _button(
+                "Stop",
+                "loop.stop.request",
+                encode_action_value("loop.stop.request", loop_id=loop.loop_id),
+                "danger",
+            )
+        )
+    return elements
 
 
 PROVIDER_SORT_ORDER = {

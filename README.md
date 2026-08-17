@@ -166,6 +166,51 @@ Agents can schedule one-off follow-ups in the same thread. Slackgentic stores
 those timers in the daemon state database, so the wakeup is not tied to a
 provider process or an open terminal session.
 
+### Loops
+
+A loop is a recurring, predefined task run by a purpose-built bot in its own
+Slack channel. Create one from the main agent channel:
+
+```text
+loop create check cloud billing every morning at 9am PT, report anomalies, and open a PR when there is a concrete fix #private provider=claude
+```
+
+Slackgentic resolves the request into a mission, recurrence, channel name, bot
+name, and icon, then posts a preview with Create/Cancel controls. After approval
+it creates the channel, invites the owner, pins a charter, and starts a fresh
+managed provider session for each due run. Run summaries and owner notes form a
+durable journal; older run detail is available through bounded retrieval, and
+long journals compact automatically.
+
+Inside the loop channel, only the owner can instruct the bot. Other members'
+messages remain visible to people, but Slackgentic marks them with 🚫 and never
+puts their text, attachments, profile data, or reactions into the agent's
+prompt, journal, thread context, or history retrieval.
+
+| Command | Effect |
+|---|---|
+| `loop status` | Show state, schedule, recent runs, memory size, and failures |
+| `loop pause` / `loop resume` | Pause or resume scheduled occurrences |
+| `loop run now` | Start a manual occurrence without changing the schedule |
+| `loop schedule: <text>` | Re-resolve only the recurrence |
+| `loop task: <text>` | Re-resolve only the standing mission |
+| `loop name: <text>` | Rename the loop bot |
+| `loop icon: :emoji:` | Set an emoji; URLs and `regenerate` are also accepted |
+| `loop cwd: <path>` | Set the working directory for future runs |
+| `loop permissions: <mode>` | Use `locked`, `safe-auto`, or confirmed `dangerous` mode |
+| `loop compact now` | Queue memory compaction |
+| `loop stop [archive]` | Stop the loop, optionally archiving its channel |
+| `loop help` | Show the in-channel command reference |
+
+Use `loops` or `loop list` in the main agent channel to see every loop and its
+Pause/Resume/Stop controls. Loops intentionally cannot delegate to roster
+agents, start PM initiatives, or read Slack file and attachment contents.
+
+Loop badge uploads use the optional `files:write` scope. Existing installations
+should run `slackgentic slack update-manifest` and reinstall the Slack app to
+enable uploads; all loop behavior except badge uploads works without that
+scope.
+
 ### PM Initiatives
 
 For larger projects, hand the team a project description and let a

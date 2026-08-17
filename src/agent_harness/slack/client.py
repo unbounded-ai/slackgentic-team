@@ -163,6 +163,12 @@ class SlackGateway:
         data = getattr(response, "data", response)
         return dict(data)
 
+    def auth_scopes(self) -> set[str]:
+        response = self.client.auth_test()
+        headers = getattr(response, "headers", None) or {}
+        raw = headers.get("x-oauth-scopes") or headers.get("X-OAuth-Scopes") or ""
+        return {scope.strip() for scope in str(raw).split(",") if scope.strip()}
+
     def bot_user_id(self) -> str | None:
         cached = getattr(self, "_bot_user_id_cache", None)
         if cached is not None:

@@ -825,6 +825,8 @@ def _sqlite_state_paths(path: Path) -> list[Path]:
 
 def _slack_doctor(config) -> int:
     from agent_harness.runtime.power import format_power_doctor_lines, inspect_macos_power
+    from agent_harness.slack.client import SlackGateway
+    from agent_harness.storage.store import Store
 
     checks = [
         ("SLACK_BOT_TOKEN", bool(config.slack.bot_token)),
@@ -844,6 +846,46 @@ def _slack_doctor(config) -> int:
     print("power")
     for line in format_power_doctor_lines(inspect_macos_power()):
         print(f"  {line}")
+    gateway = None
+    if config.slack.bot_token:
+        gateway = SlackGateway(config.slack.bot_token)
+        try:
+            scopes = gateway.auth_scopes()
+        except Exception as exc:
+            print(f"failed Slack scope check: {exc}")
+            ok = False
+        else:
+            customize = "chat:write.customize" in scopes
+            print(f"{'ok' if customize else 'missing'} loop persona scope chat:write.customize")
+            print(
+                f"{'ok' if 'files:write' in scopes else 'optional missing'} "
+                "loop badge scope files:write"
+            )
+            ok = ok and customize
+    loops = []
+    if config.state_db.exists():
+        store = Store(config.state_db)
+        try:
+            loops = store.list_loops(limit=1_000)
+        except Exception:
+            loops = []
+        finally:
+            store.close()
+    if loops:
+        print(f"loops {len(loops)} configured")
+    if gateway is not None:
+        for loop in loops:
+            if not loop.channel_id or loop.status.value not in {"active", "paused"}:
+                continue
+            try:
+                channel = gateway.channel_info(loop.channel_id)
+            except Exception as exc:
+                print(f"failed loop channel check {loop.loop_id}: {exc}")
+                ok = False
+                continue
+            available = channel is not None and not channel.get("is_archived")
+            print(f"{'ok' if available else 'unavailable'} loop channel {loop.loop_id}")
+            ok = ok and available
     return 0 if ok else 2
 
 

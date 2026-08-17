@@ -2,16 +2,133 @@ import io
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.cli import main
+from agent_harness.cli import _slack_doctor, main
+from agent_harness.config import AgentCommandConfig, AppConfig, SlackConfig
+from agent_harness.models import (
+    Loop,
+    LoopOverlapPolicy,
+    LoopStatus,
+    LoopVisibility,
+    PermissionMode,
+    Provider,
+    TeamAgentKind,
+)
 from agent_harness.service import UnsafeServiceRestartError
 from agent_harness.slack.app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
 from agent_harness.storage.store import Store
+from agent_harness.team import build_initial_model_team
 
 
 class CliTests(unittest.TestCase):
+    def test_slack_doctor_checks_loop_scopes_and_channels(self):
+        class FakeSlackGateway:
+            def __init__(self, bot_token):
+                self.bot_token = bot_token
+
+            def auth_scopes(self):
+                return {"chat:write.customize"}
+
+            def channel_info(self, channel_id):
+                return {"id": channel_id, "is_archived": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = Path(tmp) / "state.sqlite"
+            store = Store(state_db)
+            store.init_schema()
+            try:
+                agent = replace(
+                    build_initial_model_team(codex_count=1, claude_count=0)[0],
+                    agent_id="loopagent_example",
+                    handle="example-loop",
+                    kind=TeamAgentKind.LOOP,
+                )
+                store.upsert_team_agent(agent)
+                now = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+                store.create_loop(
+                    Loop(
+                        loop_id="loop_example",
+                        agent_id=agent.agent_id,
+                        owner_slack_user_id="UOWNER",
+                        title="Example Watch",
+                        mission="Check an example signal.",
+                        channel_id="CEXAMPLE",
+                        channel_name="loop-example-watch",
+                        visibility=LoopVisibility.PRIVATE,
+                        provider=Provider.CODEX,
+                        permission_mode=PermissionMode.SAFE_AUTO,
+                        recurrence={"frequency": "interval", "interval_seconds": 3600},
+                        timezone=None,
+                        next_run_at=now + timedelta(hours=1),
+                        status=LoopStatus.ACTIVE,
+                        overlap_policy=LoopOverlapPolicy.SKIP,
+                        anchor_channel_id="CMAIN",
+                        anchor_thread_ts="100.001",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            finally:
+                store.close()
+            config = AppConfig(
+                config_file=Path("/tmp/example-config.json"),
+                state_db=state_db,
+                slack=SlackConfig(
+                    SLACK_BOT_TOKEN="xoxb-example",
+                    SLACK_APP_TOKEN="xapp-example",
+                ),
+                commands=AgentCommandConfig(default_cwd=Path("/tmp/example-project")),
+            )
+            output = io.StringIO()
+            with (
+                patch("agent_harness.cli.shutil.which", return_value="/usr/bin/example"),
+                patch("agent_harness.runtime.power.inspect_macos_power", return_value=None),
+                patch("agent_harness.runtime.power.format_power_doctor_lines", return_value=[]),
+                patch("agent_harness.slack.client.SlackGateway", FakeSlackGateway),
+                redirect_stdout(output),
+            ):
+                code = _slack_doctor(config)
+
+        self.assertEqual(code, 0)
+        self.assertIn("ok loop persona scope chat:write.customize", output.getvalue())
+        self.assertIn("optional missing loop badge scope files:write", output.getvalue())
+        self.assertIn("ok loop channel loop_example", output.getvalue())
+
+    def test_slack_doctor_fails_without_persona_scope(self):
+        class FakeSlackGateway:
+            def __init__(self, bot_token):
+                self.bot_token = bot_token
+
+            def auth_scopes(self):
+                return {"chat:write"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                config_file=Path("/tmp/example-config.json"),
+                state_db=Path(tmp) / "state.sqlite",
+                slack=SlackConfig(
+                    SLACK_BOT_TOKEN="xoxb-example",
+                    SLACK_APP_TOKEN="xapp-example",
+                ),
+                commands=AgentCommandConfig(default_cwd=Path("/tmp/example-project")),
+            )
+            output = io.StringIO()
+            with (
+                patch("agent_harness.cli.shutil.which", return_value="/usr/bin/example"),
+                patch("agent_harness.runtime.power.inspect_macos_power", return_value=None),
+                patch("agent_harness.runtime.power.format_power_doctor_lines", return_value=[]),
+                patch("agent_harness.slack.client.SlackGateway", FakeSlackGateway),
+                redirect_stdout(output),
+            ):
+                code = _slack_doctor(config)
+
+        self.assertEqual(code, 2)
+        self.assertIn("missing loop persona scope chat:write.customize", output.getvalue())
+
     def test_reset_state_requires_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "state.sqlite"
