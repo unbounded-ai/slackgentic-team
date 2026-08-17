@@ -1398,14 +1398,15 @@ class Store:
         *,
         message_ts: str | None = None,
         answers: dict[str, str] | None = None,
+        allowed_slack_user_id: str | None = None,
     ) -> None:
         with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO slack_agent_requests (
                   token, provider_label, method, params_json, thread_channel_id,
-                  thread_ts, message_ts, answers_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  thread_ts, message_ts, answers_json, allowed_slack_user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token,
@@ -1416,6 +1417,7 @@ class Store:
                     thread.thread_ts,
                     message_ts,
                     json.dumps(answers or {}, sort_keys=True),
+                    allowed_slack_user_id,
                     utc_now().isoformat(),
                 ),
             )
@@ -1462,7 +1464,8 @@ class Store:
             return self.conn.execute(
                 """
                 SELECT token, provider_label, method, params_json, thread_channel_id,
-                       thread_ts, message_ts, answers_json, response_json, resolved_at
+                       thread_ts, message_ts, answers_json, response_json, resolved_at,
+                       allowed_slack_user_id
                 FROM slack_agent_requests
                 WHERE token = ?
                 """,
@@ -1508,7 +1511,7 @@ class Store:
                         """
                         SELECT token, provider_label, method, params_json, thread_channel_id,
                                thread_ts, message_ts, answers_json, response_json,
-                               resolved_at, created_at
+                               resolved_at, allowed_slack_user_id, created_at
                         FROM slack_agent_requests
                         WHERE resolved_at IS NULL
                         ORDER BY created_at
@@ -1521,7 +1524,7 @@ class Store:
                     """
                     SELECT token, provider_label, method, params_json, thread_channel_id,
                            thread_ts, message_ts, answers_json, response_json,
-                           resolved_at, created_at
+                           resolved_at, allowed_slack_user_id, created_at
                     FROM slack_agent_requests
                     WHERE resolved_at IS NULL AND method = ?
                     ORDER BY created_at

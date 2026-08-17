@@ -15,6 +15,7 @@ class FakeGateway:
     def __init__(self):
         self.replies = []
         self.updates = []
+        self.ephemerals = []
 
     def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
         ts = f"1712345678.{len(self.replies):06d}"
@@ -23,6 +24,10 @@ class FakeGateway:
 
     def update_message(self, channel_id, ts, text, blocks=None):
         self.updates.append({"channel_id": channel_id, "ts": ts, "text": text, "blocks": blocks})
+
+    def post_ephemeral(self, channel_id, user_id, text):
+        self.ephemerals.append((channel_id, user_id, text))
+        return True
 
 
 class FailingFullRequestGateway(FakeGateway):
