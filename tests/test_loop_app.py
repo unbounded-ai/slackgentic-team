@@ -1,13 +1,18 @@
 import json
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_harness.loops import (
+    AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
     AGENT_LOOP_SIGNAL_PREFIX,
+    AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
+    LOOP_COMPACTION_TRIGGER_CHARS,
     build_loop_compaction_prompt,
     build_loop_fetch_result,
     build_loop_resolution_prompt,
@@ -20,6 +25,7 @@ from agent_harness.models import (
     AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
+    LoopJournalEntry,
     LoopRun,
     LoopRunKind,
     LoopRunStatus,
@@ -35,7 +41,7 @@ from agent_harness.models import (
 )
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
-from agent_harness.slack.app import SlackMessageBackfill, SlackTeamController
+from agent_harness.slack.app import LoopRunner, SlackMessageBackfill, SlackTeamController
 from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent
 from tests.test_slack_app import FakeGateway, FakeRuntime
@@ -191,6 +197,28 @@ class LoopCreationFlowTests(unittest.TestCase):
         thread = SlackThreadRef(loop.channel_id, thread_ts, thread_ts)
         self.store.upsert_managed_thread_task(task, thread)
         return task, agent, run
+
+    def _make_loop_due(self, loop):
+        due_at = utc_now() - timedelta(seconds=1)
+        self.store.update_loop_schedule(
+            loop.loop_id,
+            recurrence=loop.recurrence,
+            timezone=loop.timezone,
+            next_run_at=due_at,
+        )
+        due = self.store.get_loop(loop.loop_id)
+        assert due is not None
+        return due, due_at
+
+    def _running_task_and_run(self, loop):
+        run = self.store.running_loop_run(loop.loop_id)
+        assert run is not None and run.task_id is not None
+        task = self.store.get_agent_task(run.task_id)
+        assert task is not None
+        agent = self.store.get_team_agent(loop.agent_id)
+        assert agent is not None
+        thread = SlackThreadRef(loop.channel_id, run.thread_ts, run.thread_ts)
+        return task, agent, run, thread
 
     def test_creation_resolves_previews_and_approves_channel(self):
         loop = self._resolve_loop()
@@ -803,6 +831,470 @@ class LoopCreationFlowTests(unittest.TestCase):
                 {"event": {**base_event, "user": "UOWNER", "event_ts": "207.2"}}
             )
             relay.assert_called_once()
+
+    def test_loop_runner_claims_due_occurrence_and_starts_fresh_run(self):
+        loop = self._activate_loop()
+        _, due_at = self._make_loop_due(loop)
+        self.runtime.started.clear()
+        runner = LoopRunner(self.store, self.controller, poll_seconds=0.01)
+
+        self.assertEqual(runner.sync_once(), 1)
+
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertEqual(current.run_count, 1)
+        self.assertGreater(current.next_run_at, due_at)
+        task, agent, run, thread = self._running_task_and_run(current)
+        self.assertEqual(run.kind, LoopRunKind.SCHEDULED)
+        self.assertEqual(run.due_at, due_at)
+        self.assertEqual(task.kind, AgentTaskKind.LOOP_RUN)
+        self.assertEqual(task.channel_id, loop.channel_id)
+        self.assertEqual(task.thread_ts, run.thread_ts)
+        self.assertEqual(task.requested_by_slack_user, "UOWNER")
+        self.assertEqual(task.metadata[LOOP_ID_METADATA_KEY], loop.loop_id)
+        self.assertEqual(task.metadata[LOOP_RUN_ID_METADATA_KEY], run.run_id)
+        self.assertEqual(task.metadata["permission_mode"], loop.permission_mode.value)
+        self.assertEqual(task.metadata["model_override"], loop.model)
+        self.assertIsNone(task.session_id)
+        self.assertIn("[LOOP HARNESS: state]", task.prompt)
+        self.assertEqual(self.runtime.started, [(task, agent, thread)])
+        self.assertIn("▶ Run #1", self.gateway.posts[-1]["text"])
+
+    def test_scheduled_overlap_advances_schedule_and_records_skipped_run(self):
+        loop = self._activate_loop()
+        first_due, _ = self._make_loop_due(loop)
+        self.controller.fire_due_loop(first_due)
+        running = self.store.running_loop_run(loop.loop_id)
+        assert running is not None
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        second_due, due_at = self._make_loop_due(current)
+        starts_before = len(self.runtime.started)
+
+        self.assertTrue(self.controller.fire_due_loop(second_due))
+
+        runs = self.store.list_loop_runs(loop.loop_id)
+        skipped = next(item for item in runs if item.status == LoopRunStatus.SKIPPED)
+        self.assertEqual(skipped.run_number, 2)
+        self.assertEqual(skipped.kind, LoopRunKind.SCHEDULED)
+        self.assertEqual(skipped.due_at, due_at)
+        self.assertIn(f"run #{running.run_number}", skipped.error)
+        self.assertEqual(len(self.runtime.started), starts_before)
+        advanced = self.store.get_loop(loop.loop_id)
+        assert advanced is not None
+        self.assertGreater(advanced.next_run_at, due_at)
+        self.assertIn("Skipped this occurrence", self.gateway.posts[-1]["text"])
+
+    def test_manual_run_leaves_schedule_untouched(self):
+        loop = self._activate_loop()
+        scheduled_for = loop.next_run_at
+
+        self.assertTrue(self.controller.fire_loop_now(loop))
+
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertEqual(current.next_run_at, scheduled_for)
+        run = self.store.running_loop_run(loop.loop_id)
+        assert run is not None
+        self.assertEqual(run.kind, LoopRunKind.MANUAL)
+
+    def test_concurrent_manual_runs_start_once_and_record_overlap(self):
+        loop = self._activate_loop()
+        starts_before = len(self.runtime.started)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def fire():
+            barrier.wait()
+            results.append(self.controller.fire_loop_now(loop))
+
+        workers = [threading.Thread(target=fire) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(results, [True, True])
+        runs = self.store.list_loop_runs(loop.loop_id)
+        self.assertEqual(
+            [run.status for run in runs].count(LoopRunStatus.RUNNING),
+            1,
+        )
+        self.assertEqual(
+            [run.status for run in runs].count(LoopRunStatus.SKIPPED),
+            1,
+        )
+        self.assertEqual(len(self.runtime.started), starts_before + 1)
+
+    def test_loop_summary_finalizes_run_and_writes_durable_journal(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        signal = AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + json.dumps(
+            {
+                "summary": "Checked recent billing and found no anomaly.",
+                "status": "ok",
+                "carry": {"last_invoice": "example-001"},
+            }
+        )
+        self.controller.handle_runtime_agent_control(task, agent, thread, signal)
+
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertIsNotNone(finished.finished_at)
+        self.assertEqual(
+            self.store.get_agent_task(task.task_id).status,
+            AgentTaskStatus.DONE,
+        )
+        entries = self.store.list_loop_journal(loop.loop_id)
+        summaries = [entry for entry in entries if entry.kind == "run_summary"]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("[ok] Checked recent billing", summaries[0].content)
+        self.assertIn('Carried state: {"last_invoice": "example-001"}', summaries[0].content)
+        self.assertIn("https://example.slack.com/archives/", summaries[0].content)
+
+    def test_invalid_loop_summary_posts_only_one_nudge(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        replies_before = len(self.gateway.thread_replies)
+
+        for _ in range(2):
+            self.controller.handle_runtime_agent_control(
+                task,
+                agent,
+                thread,
+                AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":""}',
+            )
+
+        nudges = self.gateway.thread_replies[replies_before:]
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("could not record that run summary", nudges[0]["text"])
+
+    def test_failed_mission_summary_is_a_successful_harness_run(self):
+        loop = self._activate_loop()
+        self.store.record_loop_failure(loop.loop_id, "prior runtime failure")
+        self.store.record_loop_failure(loop.loop_id, "prior runtime failure")
+        loop = self.store.get_loop(loop.loop_id)
+        assert loop is not None
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + '{"summary":"The mission found a service failure.","status":"failed"}',
+        )
+
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        finished = self.store.get_loop_run(run.run_id)
+        current = self.store.get_loop(loop.loop_id)
+        assert finished is not None and current is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertEqual(current.status, LoopStatus.ACTIVE)
+        self.assertEqual(current.consecutive_failures, 0)
+
+    def test_thread_done_finalizes_loop_without_posting_roster(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"thread complete"}',
+        )
+        posts_before = len(self.gateway.posts)
+
+        handled = self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            "SLACKGENTIC: THREAD_DONE",
+        )
+
+        self.assertTrue(handled)
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertEqual(len(self.gateway.posts), posts_before)
+
+    def test_loop_run_swallow_generic_task_control_signals(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        with patch.object(
+            self.controller,
+            "_schedule_agent_timer",
+            side_effect=AssertionError("loop runs cannot schedule generic timers"),
+        ):
+            handled = self.controller.handle_runtime_agent_control(
+                task,
+                agent,
+                thread,
+                'SLACKGENTIC: TIMER {"delay_seconds":60,"prompt":"delegate"}',
+            )
+        self.assertTrue(handled)
+
+    def test_missing_summary_gets_one_nudge_then_falls_back(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        still_running = self.store.get_loop_run(run.run_id)
+        assert still_running is not None
+        self.assertEqual(still_running.status, LoopRunStatus.RUNNING)
+        nudged_task = self.store.get_agent_task(task.task_id)
+        assert nudged_task is not None
+        self.assertTrue(nudged_task.metadata["loop_summary_nudge"])
+        self.assertIn(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX, self.runtime.sent[-1][1])
+
+        self.runtime.send_to_task = lambda task_id, message: False
+        self.controller.handle_runtime_task_done(nudged_task, agent, thread)
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        entries = self.store.list_loop_journal(loop.loop_id)
+        self.assertIn("completed without a summary", entries[-1].content)
+
+    def test_spawn_failure_marks_run_failed(self):
+        loop = self._activate_loop()
+        self.runtime.start_task = lambda task, agent, thread: False
+
+        self.assertTrue(self.controller.fire_loop_now(loop))
+
+        run = self.store.list_loop_runs(loop.loop_id)[0]
+        self.assertEqual(run.status, LoopRunStatus.FAILED)
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertEqual(current.consecutive_failures, 1)
+        self.assertIn("runtime could not start", current.last_error)
+
+    def test_three_cancelled_runs_pause_loop_and_notify_owner(self):
+        loop = self._activate_loop()
+        for expected_failures in range(1, 4):
+            current = self.store.get_loop(loop.loop_id)
+            assert current is not None
+            self.assertTrue(self.controller.fire_loop_now(current))
+            task, agent, run, thread = self._running_task_and_run(current)
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+            cancelled = self.store.get_agent_task(task.task_id)
+            assert cancelled is not None
+            self.controller.handle_runtime_task_done(cancelled, agent, thread)
+            failed = self.store.get_loop_run(run.run_id)
+            assert failed is not None
+            self.assertEqual(failed.status, LoopRunStatus.FAILED)
+            after = self.store.get_loop(loop.loop_id)
+            assert after is not None
+            self.assertEqual(after.consecutive_failures, expected_failures)
+
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+        self.assertEqual(paused.status, LoopStatus.PAUSED)
+        self.assertTrue(
+            any(
+                "Paused after 3 consecutive failed runs" in post["text"]
+                for post in self.gateway.posts
+            )
+        )
+
+    def test_inline_compaction_supersedes_run_memory_but_preserves_owner_notes(self):
+        loop = self._activate_loop()
+        now = utc_now()
+        old_summary = LoopJournalEntry(
+            "journal_old_summary",
+            loop.loop_id,
+            "run_summary",
+            "run #0: old detail",
+            now - timedelta(minutes=2),
+        )
+        owner_note = LoopJournalEntry(
+            "journal_owner_note",
+            loop.loop_id,
+            "owner_note",
+            "Never discard this standing instruction.",
+            now - timedelta(minutes=1),
+        )
+        self.store.add_loop_journal_entry(old_summary)
+        self.store.add_loop_journal_entry(owner_note)
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+
+        handled = self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_COMPACT_SIGNAL_PREFIX
+            + json.dumps({"snapshot": "Durable compacted memory."}),
+        )
+
+        self.assertTrue(handled)
+        all_entries = self.store.list_loop_journal(
+            loop.loop_id,
+            include_superseded=True,
+            limit=100,
+        )
+        old = next(entry for entry in all_entries if entry.entry_id == old_summary.entry_id)
+        owner = next(entry for entry in all_entries if entry.entry_id == owner_note.entry_id)
+        snapshot = next(entry for entry in all_entries if entry.kind == "compaction")
+        self.assertEqual(old.superseded_by, snapshot.entry_id)
+        self.assertIsNone(owner.superseded_by)
+        self.assertEqual(snapshot.run_id, run.run_id)
+        visible = self.store.list_loop_journal(loop.loop_id)
+        self.assertIn(owner_note, visible)
+        self.assertTrue(any(entry.content == "Durable compacted memory." for entry in visible))
+
+    def test_finalization_queues_and_runner_starts_automatic_compaction(self):
+        loop = self._activate_loop()
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                "journal_large_system",
+                loop.loop_id,
+                "system",
+                "x" * (LOOP_COMPACTION_TRIGGER_CHARS + 1),
+                utc_now(),
+            )
+        )
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"run complete"}',
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+        pending = self.store.get_loop(loop.loop_id)
+        assert pending is not None
+        self.assertTrue(pending.metadata["compaction_pending"])
+        starts_before = len(self.runtime.started)
+
+        runner = LoopRunner(self.store, self.controller, poll_seconds=0.01)
+        self.assertEqual(runner.sync_once(), 1)
+
+        compacting = self.store.running_loop_run(loop.loop_id)
+        assert compacting is not None
+        self.assertEqual(compacting.kind, LoopRunKind.COMPACTION)
+        self.assertEqual(len(self.runtime.started), starts_before + 1)
+        compaction_task = self.store.get_agent_task(compacting.task_id)
+        assert compaction_task is not None
+        self.assertIn("[LOOP HARNESS: memory compaction]", compaction_task.prompt)
+        self.assertIn("x" * 100, compaction_task.prompt)
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertNotIn("compaction_pending", current.metadata)
+
+        compaction_agent = self.store.get_team_agent(loop.agent_id)
+        assert compaction_agent is not None
+        compaction_thread = SlackThreadRef(
+            loop.channel_id,
+            compacting.thread_ts,
+            compacting.thread_ts,
+        )
+        self.controller.handle_runtime_agent_control(
+            compaction_task,
+            compaction_agent,
+            compaction_thread,
+            AGENT_LOOP_COMPACT_SIGNAL_PREFIX + '{"snapshot":"automatic snapshot"}',
+        )
+        self.controller.handle_runtime_task_done(
+            compaction_task,
+            compaction_agent,
+            compaction_thread,
+        )
+        compacted = self.store.get_loop_run(compacting.run_id)
+        assert compacted is not None
+        self.assertEqual(compacted.status, LoopRunStatus.DONE)
+        self.assertFalse(
+            any(
+                entry.kind == "run_summary" and entry.run_id == compacting.run_id
+                for entry in self.store.list_loop_journal(
+                    loop.loop_id,
+                    include_superseded=True,
+                    limit=100,
+                )
+            )
+        )
+
+    def test_loop_fetch_budget_is_durable_across_stale_task_callbacks(self):
+        loop = self._activate_loop()
+        task, agent, run = self._create_running_loop_task(loop)
+        self.gateway.thread_history_messages[(loop.channel_id, run.thread_ts)] = [
+            {"ts": run.thread_ts, "user": "UOWNER", "text": "trusted history"}
+        ]
+        thread = SlackThreadRef(loop.channel_id, run.thread_ts)
+
+        for _ in range(6):
+            self.controller.handle_runtime_agent_control(
+                task,
+                agent,
+                thread,
+                AGENT_LOOP_FETCH_SIGNAL_PREFIX + '{"run":1}',
+            )
+
+        fetch_calls = [
+            call
+            for call in self.gateway.thread_message_calls
+            if call[0] == loop.channel_id and call[1] == run.thread_ts
+        ]
+        self.assertEqual(len(fetch_calls), 5)
+        self.assertIn("budget exhausted", self.runtime.sent[-1][1])
+        current_task = self.store.get_agent_task(task.task_id)
+        assert current_task is not None
+        self.assertEqual(current_task.metadata["loop_fetch_count"], 5)
+
+    def test_restart_reconciliation_finalizes_terminal_loop_run(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"recovered summary"}',
+        )
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+
+        self.assertEqual(self.controller.reconcile_loop_runs(), 1)
+
+        reconciled = self.store.get_loop_run(run.run_id)
+        assert reconciled is not None
+        self.assertEqual(reconciled.status, LoopRunStatus.DONE)
+
+    def test_dead_loop_channel_pauses_and_notifies_anchor_thread(self):
+        loop = self._activate_loop()
+
+        class DeadChannelError(RuntimeError):
+            def __init__(self, message):
+                super().__init__(message)
+                self.response = {"error": "is_archived"}
+
+        with patch.object(
+            self.gateway,
+            "post_session_parent",
+            side_effect=DeadChannelError("archived"),
+        ):
+            self.assertTrue(self.controller.fire_loop_now(loop))
+
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+        self.assertEqual(paused.status, LoopStatus.PAUSED)
+        self.assertIn("is_archived", paused.last_error)
+        self.assertTrue(
+            any(
+                reply["thread"].channel_id == loop.anchor_channel_id and "Paused" in reply["text"]
+                for reply in self.gateway.thread_replies
+            )
+        )
 
 
 if __name__ == "__main__":

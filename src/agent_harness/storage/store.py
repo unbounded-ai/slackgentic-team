@@ -2153,13 +2153,27 @@ class Store:
             rows = self.conn.execute(
                 """
                 SELECT * FROM loops
-                WHERE status = ? AND next_run_at IS NOT NULL AND next_run_at <= ?
-                ORDER BY next_run_at, created_at, loop_id
-                LIMIT ?
+                WHERE status = ?
+                ORDER BY created_at, loop_id
                 """,
-                (LoopStatus.ACTIVE.value, reference.isoformat(), limit),
+                (LoopStatus.ACTIVE.value,),
             ).fetchall()
-        return [_loop_from_row(row) for row in rows]
+        loops = [_loop_from_row(row) for row in rows]
+        runnable = [
+            loop
+            for loop in loops
+            if loop.metadata.get("compaction_pending") is True
+            or (loop.next_run_at is not None and loop.next_run_at <= reference)
+        ]
+        runnable.sort(
+            key=lambda loop: (
+                0 if loop.metadata.get("compaction_pending") is True else 1,
+                loop.next_run_at or loop.created_at,
+                loop.created_at,
+                loop.loop_id,
+            )
+        )
+        return runnable[:limit]
 
     def list_loop_channel_ids(self) -> list[str]:
         with self._lock:
@@ -2310,6 +2324,81 @@ class Store:
                 ),
             )
             self.conn.commit()
+
+    def update_loop_metadata(self, loop_id: str, metadata: dict[str, object]) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loops
+                SET metadata_json = ?, updated_at = ?
+                WHERE loop_id = ?
+                """,
+                (json.dumps(metadata, sort_keys=True), utc_now().isoformat(), loop_id),
+            )
+            self.conn.commit()
+
+    def claim_manual_loop_run(self, loop_id: str) -> Loop | None:
+        now = utc_now()
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE loops
+                SET last_run_at = ?, run_count = run_count + 1, updated_at = ?
+                WHERE loop_id = ? AND status = ? AND channel_id IS NOT NULL
+                """,
+                (now.isoformat(), now.isoformat(), loop_id, LoopStatus.ACTIVE.value),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = self.conn.execute(
+                "SELECT * FROM loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+        return _loop_from_row(row) if row else None
+
+    def claim_pending_loop_compaction(self, loop_id: str) -> Loop | None:
+        now = utc_now()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            loop = _loop_from_row(row)
+            if (
+                loop.status != LoopStatus.ACTIVE
+                or not loop.channel_id
+                or loop.metadata.get("compaction_pending") is not True
+            ):
+                return None
+            metadata = dict(loop.metadata)
+            metadata.pop("compaction_pending", None)
+            cursor = self.conn.execute(
+                """
+                UPDATE loops
+                SET metadata_json = ?, last_run_at = ?, run_count = run_count + 1,
+                    updated_at = ?
+                WHERE loop_id = ? AND status = ? AND metadata_json = ?
+                """,
+                (
+                    json.dumps(metadata, sort_keys=True),
+                    now.isoformat(),
+                    now.isoformat(),
+                    loop_id,
+                    LoopStatus.ACTIVE.value,
+                    row["metadata_json"],
+                ),
+            )
+            self.conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            claimed_row = self.conn.execute(
+                "SELECT * FROM loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+        return _loop_from_row(claimed_row) if claimed_row else None
 
     def update_loop_pending_spec(
         self,

@@ -34,15 +34,23 @@ from agent_harness.deferred import (
 from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.loop_icons import write_loop_badge
 from agent_harness.loops import (
+    AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
     AGENT_LOOP_SIGNAL_PREFIX,
+    AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
+    LOOP_COMPACTION_TRIGGER_CHARS,
     LOOP_FETCH_MAX_PER_RUN,
     LOOP_IGNORED_NOTICE_INTERVAL_SECONDS,
+    LOOP_MAX_CONSECUTIVE_FAILURES,
+    LOOP_RUNNER_POLL_FLOOR_SECONDS,
+    LOOP_SUMMARY_NUDGE_ATTEMPTS,
     MAX_ACTIVE_LOOPS,
     MAX_LOOP_RESOLUTION_ATTEMPTS,
     LoopSpec,
+    build_loop_compaction_prompt,
     build_loop_fetch_result,
     build_loop_resolution_prompt,
+    build_loop_run_prompt,
     create_loop_agent,
     default_loop_provider,
     format_loop_timestamp,
@@ -51,11 +59,14 @@ from agent_harness.loops import (
     loop_spec_to_json,
     loop_visible_messages,
     normalize_loop_channel_name,
+    parse_agent_loop_compact_signal,
     parse_agent_loop_fetch_signal,
     parse_agent_loop_signal,
+    parse_agent_loop_summary_signal,
     parse_loop_command,
     parse_loop_create_request,
     provisional_loop_agent,
+    render_loop_journal,
 )
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
@@ -83,6 +94,9 @@ from agent_harness.models import (
     Loop,
     LoopJournalEntry,
     LoopOverlapPolicy,
+    LoopRun,
+    LoopRunKind,
+    LoopRunStatus,
     LoopStatus,
     LoopVisibility,
     PendingWorkRequest,
@@ -326,7 +340,11 @@ SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
 SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
 SETTING_LOOP_IGNORED_NOTICE_PREFIX = "slack.loop_ignored_notice."
+SETTING_LOOP_SUMMARY_NUDGE_PREFIX = "slack.loop_summary_nudge."
+SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
+SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
+LOOP_SUMMARY_NUDGE_METADATA_KEY = "loop_summary_nudge"
 UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE = 20
 _PM_BLOCKER_PREFIX = "pm.blocker."
 _PM_STATUS_MESSAGE_PREFIX = "pm.status_message."
@@ -502,6 +520,7 @@ class SlackTeamController:
         self.default_cwd = default_cwd or Path.cwd()
         self.update_runner: SlackgenticUpdateRunner | None = None
         self._slack_message_lock = threading.Lock()
+        self._loop_fire_lock = threading.Lock()
         self._normalize_existing_agents()
 
     def set_update_runner(self, update_runner: SlackgenticUpdateRunner | None) -> None:
@@ -1973,6 +1992,285 @@ class SlackTeamController:
         self._present_loop_preview(loop, parsed.spec, resolution_task=task)
         return True
 
+    def fire_due_loop(self, loop: Loop) -> bool:
+        with self._loop_fire_lock:
+            return self._fire_due_loop_locked(loop)
+
+    def _fire_due_loop_locked(self, loop: Loop) -> bool:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if latest.status != LoopStatus.ACTIVE or not latest.channel_id:
+            return True
+        now = utc_now()
+        compaction_pending = latest.metadata.get("compaction_pending") is True
+        if not compaction_pending and (latest.next_run_at is None or latest.next_run_at > now):
+            return True
+        existing = self._running_loop_run_after_reconcile(latest.loop_id)
+        if existing is not None:
+            if compaction_pending:
+                return False
+            due_at = latest.next_run_at
+            if due_at is None:
+                return True
+            claimed = self.store.claim_due_loop(
+                latest.loop_id,
+                expected_next_run_at=due_at,
+                new_next_run_at=next_run_after(latest.recurrence, after=now),
+            )
+            if claimed is None:
+                return True
+            return self._record_skipped_loop_run(
+                claimed,
+                kind=LoopRunKind.SCHEDULED,
+                due_at=due_at,
+                active_run=existing,
+            )
+        if compaction_pending:
+            claimed = self.store.claim_pending_loop_compaction(latest.loop_id)
+            if claimed is None:
+                return True
+            return self._start_loop_run(
+                claimed,
+                kind=LoopRunKind.COMPACTION,
+                due_at=now,
+            )
+        due_at = latest.next_run_at
+        if due_at is None:
+            return True
+        claimed = self.store.claim_due_loop(
+            latest.loop_id,
+            expected_next_run_at=due_at,
+            new_next_run_at=next_run_after(latest.recurrence, after=now),
+        )
+        if claimed is None:
+            return True
+        return self._start_loop_run(
+            claimed,
+            kind=LoopRunKind.SCHEDULED,
+            due_at=due_at,
+        )
+
+    def fire_loop_now(self, loop: Loop) -> bool:
+        with self._loop_fire_lock:
+            return self._fire_loop_now_locked(loop)
+
+    def _fire_loop_now_locked(self, loop: Loop) -> bool:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if latest.status != LoopStatus.ACTIVE or not latest.channel_id:
+            return False
+        existing = self._running_loop_run_after_reconcile(latest.loop_id)
+        claimed = self.store.claim_manual_loop_run(latest.loop_id)
+        if claimed is None:
+            return False
+        now = utc_now()
+        if existing is not None:
+            return self._record_skipped_loop_run(
+                claimed,
+                kind=LoopRunKind.MANUAL,
+                due_at=now,
+                active_run=existing,
+            )
+        return self._start_loop_run(
+            claimed,
+            kind=LoopRunKind.MANUAL,
+            due_at=now,
+        )
+
+    def request_loop_compaction(self, loop: Loop) -> bool:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if latest.status not in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
+            return False
+        metadata = dict(latest.metadata)
+        metadata["compaction_pending"] = True
+        self.store.update_loop_metadata(latest.loop_id, metadata)
+        return True
+
+    def _running_loop_run_after_reconcile(self, loop_id: str) -> LoopRun | None:
+        run = self.store.running_loop_run(loop_id)
+        if run is None:
+            return None
+        self._reconcile_loop_run(run)
+        return self.store.running_loop_run(loop_id)
+
+    def _record_skipped_loop_run(
+        self,
+        loop: Loop,
+        *,
+        kind: LoopRunKind,
+        due_at,
+        active_run: LoopRun,
+    ) -> bool:
+        now = utc_now()
+        run = LoopRun(
+            run_id=f"looprun_{uuid.uuid4().hex[:12]}",
+            loop_id=loop.loop_id,
+            run_number=loop.run_count,
+            kind=kind,
+            due_at=due_at,
+            status=LoopRunStatus.SKIPPED,
+            created_at=now,
+            updated_at=now,
+            started_at=now,
+            finished_at=now,
+            error=f"run #{active_run.run_number} was still in progress",
+        )
+        self.store.create_loop_run(run)
+        agent = self.store.get_team_agent(loop.agent_id)
+        if agent is None or not loop.channel_id:
+            return True
+        try:
+            self.gateway.post_session_parent(
+                loop.channel_id,
+                f"⏭ Skipped this occurrence — run #{active_run.run_number} is still in progress.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+        except Exception as exc:
+            if _slack_error_code(exc) in _PM_DEAD_THREAD_SLACK_ERRORS:
+                self._pause_loop_for_dead_channel(loop, str(_slack_error_code(exc)))
+                return True
+            raise
+        return True
+
+    def _start_loop_run(
+        self,
+        loop: Loop,
+        *,
+        kind: LoopRunKind,
+        due_at,
+    ) -> bool:
+        agent = self.store.get_team_agent(loop.agent_id)
+        if agent is None or not loop.channel_id:
+            return True
+        now = utc_now()
+        run = LoopRun(
+            run_id=f"looprun_{uuid.uuid4().hex[:12]}",
+            loop_id=loop.loop_id,
+            run_number=loop.run_count,
+            kind=kind,
+            due_at=due_at,
+            status=LoopRunStatus.RUNNING,
+            created_at=now,
+            updated_at=now,
+            started_at=now,
+        )
+        if kind == LoopRunKind.COMPACTION:
+            header_text = "🧹 Compacting memory"
+        else:
+            header_text = (
+                f"▶ Run #{run.run_number} · {format_loop_timestamp(run.due_at, loop.timezone)}"
+            )
+            previous_summary = self._latest_loop_summary(loop.loop_id)
+            if previous_summary:
+                header_text += f"\n_Last run: {_shorten(previous_summary, 240)}_"
+        try:
+            posted = self.gateway.post_session_parent(
+                loop.channel_id,
+                header_text,
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+        except Exception as exc:
+            error_code = _slack_error_code(exc)
+            failed = replace(
+                run,
+                status=LoopRunStatus.FAILED,
+                finished_at=utc_now(),
+                error=error_code or str(exc),
+            )
+            self.store.create_loop_run(failed)
+            if error_code in _PM_DEAD_THREAD_SLACK_ERRORS:
+                self._pause_loop_for_dead_channel(loop, error_code or "loop channel unavailable")
+                return True
+            self._record_loop_failure(loop, failed, error_code or str(exc))
+            return True
+        thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
+        run = replace(run, thread_ts=posted.ts)
+        self.store.create_loop_run(run)
+        entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
+        journal = (
+            render_loop_journal(
+                entries,
+                budget=sum(len(entry.content) for entry in entries) + len(entries) * 128 + 10_000,
+            )
+            if kind == LoopRunKind.COMPACTION
+            else render_loop_journal(entries)
+        )
+        prompt = (
+            build_loop_compaction_prompt(
+                loop,
+                journal_rendered=journal,
+                bot_name=agent.full_name,
+            )
+            if kind == LoopRunKind.COMPACTION
+            else build_loop_run_prompt(
+                loop,
+                run,
+                journal_rendered=journal,
+                now=now,
+                bot_name=agent.full_name,
+            )
+        )
+        task = create_agent_task(
+            agent,
+            prompt,
+            loop.channel_id,
+            loop.owner_slack_user_id,
+            kind=AgentTaskKind.LOOP_RUN,
+        )
+        metadata: dict[str, object] = {
+            LOOP_ID_METADATA_KEY: loop.loop_id,
+            LOOP_RUN_ID_METADATA_KEY: run.run_id,
+            PERMISSION_MODE_METADATA_KEY: loop.permission_mode.value,
+        }
+        if loop.cwd:
+            metadata["cwd"] = loop.cwd
+        if loop.model:
+            metadata[MODEL_OVERRIDE_METADATA_KEY] = loop.model
+        task = replace(
+            task,
+            thread_ts=thread.thread_ts,
+            parent_message_ts=thread.message_ts,
+            metadata=metadata,
+        )
+        self.store.upsert_agent_task(task)
+        self.store.update_loop_run(run.run_id, task_id=task.task_id)
+        self.store.upsert_managed_thread_task(task, thread)
+        if self._start_runtime_task(task, agent, thread):
+            return True
+        latest_task = self.store.get_agent_task(task.task_id) or task
+        if latest_task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        self._record_loop_failure(loop, run, "the loop runtime could not start")
+        return True
+
+    def _latest_loop_summary(self, loop_id: str) -> str | None:
+        for run in self.store.list_loop_runs(loop_id, limit=50):
+            if not run.summary_json:
+                continue
+            try:
+                payload = json.loads(run.summary_json)
+            except json.JSONDecodeError:
+                continue
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if isinstance(summary, str) and summary.strip():
+                return summary.strip().replace("\n", " ")
+        return None
+
+    def _pause_loop_for_dead_channel(self, loop: Loop, error: str) -> None:
+        message = f"Loop channel unavailable: {error}"
+        self.store.update_loop_status(loop.loop_id, LoopStatus.PAUSED, error=message)
+        self._add_loop_journal_once(
+            loop,
+            kind="system",
+            content=message,
+            dedupe_content=message,
+        )
+        with suppress(Exception):
+            self.gateway.post_thread_reply(
+                SlackThreadRef(loop.anchor_channel_id, loop.anchor_thread_ts),
+                f"<@{loop.owner_slack_user_id}> ⏸ Paused *{loop.title}*: {message}.",
+            )
+
     def _handle_loop_fetch_signal(
         self,
         task: AgentTask,
@@ -1980,6 +2278,7 @@ class SlackTeamController:
         thread: SlackThreadRef,
         signal: str,
     ) -> bool:
+        task = self.store.get_agent_task(task.task_id) or task
         loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
         if task.kind != AgentTaskKind.LOOP_RUN or not isinstance(loop_id, str):
             self.gateway.post_thread_reply(
@@ -2077,6 +2376,407 @@ class SlackTeamController:
         interrupted = self.runtime.interrupt_task(task.task_id)
         if interrupted:
             self.runtime.send_to_interrupted_task(task.task_id, payload)
+        return True
+
+    def _handle_loop_summary_signal(
+        self,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        if task.kind != AgentTaskKind.LOOP_RUN or not isinstance(run_id, str):
+            self.gateway.post_thread_reply(
+                thread,
+                "That loop summary signal is not valid outside a loop run.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        run = self.store.get_loop_run(run_id)
+        if run is None:
+            self.gateway.post_thread_reply(
+                thread,
+                "That loop summary refers to an unknown run, so I ignored it.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        if run.status != LoopRunStatus.RUNNING:
+            return True
+        parsed = parse_agent_loop_summary_signal(signal)
+        if parsed.summary is None:
+            key = f"{SETTING_LOOP_INVALID_SUMMARY_PREFIX}{run.run_id}"
+            if not self.store.get_setting(key):
+                self.gateway.post_thread_reply(
+                    thread,
+                    "I could not record that run summary: "
+                    f"{parsed.error or 'invalid summary payload'}.",
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                )
+                self.store.set_setting(key, utc_now().isoformat())
+            return True
+        payload = {
+            "summary": parsed.summary.summary,
+            "status": parsed.summary.status,
+            "carry": parsed.summary.carry,
+        }
+        self.store.update_loop_run(
+            run.run_id,
+            summary_json=json.dumps(payload, sort_keys=True),
+        )
+        return True
+
+    def _handle_loop_compact_signal(
+        self,
+        task: AgentTask,
+        agent: TeamAgent,
+        thread: SlackThreadRef,
+        signal: str,
+    ) -> bool:
+        loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
+        run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        if (
+            task.kind != AgentTaskKind.LOOP_RUN
+            or not isinstance(loop_id, str)
+            or not isinstance(run_id, str)
+        ):
+            self.gateway.post_thread_reply(
+                thread,
+                "That loop compaction signal is not valid outside a loop run.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        loop = self.store.get_loop(loop_id)
+        run = self.store.get_loop_run(run_id)
+        if loop is None or run is None or run.status != LoopRunStatus.RUNNING:
+            return True
+        parsed = parse_agent_loop_compact_signal(signal)
+        if parsed.snapshot is None:
+            self.gateway.post_thread_reply(
+                thread,
+                f"I could not compact loop memory: {parsed.error or 'invalid compaction payload'}.",
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+            )
+            return True
+        if any(
+            entry.kind == "compaction" and entry.run_id == run.run_id
+            for entry in self.store.list_loop_journal(
+                loop.loop_id,
+                include_superseded=True,
+                limit=10_000,
+            )
+        ):
+            return True
+        now = utc_now()
+        entry = LoopJournalEntry(
+            entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+            loop_id=loop.loop_id,
+            kind="compaction",
+            content=parsed.snapshot,
+            created_at=now,
+            run_id=run.run_id,
+            thread_ts=run.thread_ts,
+        )
+        self.store.add_loop_journal_entry(entry)
+        superseded = self.store.supersede_loop_journal_entries(
+            loop.loop_id,
+            before=entry.created_at,
+            compaction_entry_id=entry.entry_id,
+        )
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                loop_id=loop.loop_id,
+                kind="system",
+                content=f"memory compacted ({superseded} entries -> snapshot)",
+                created_at=utc_now(),
+                run_id=run.run_id,
+                thread_ts=run.thread_ts,
+            )
+        )
+        return True
+
+    def finalize_loop_run(self, run: LoopRun, task: AgentTask) -> bool:
+        current_run = self.store.get_loop_run(run.run_id) or run
+        if current_run.status != LoopRunStatus.RUNNING:
+            return True
+        loop = self.store.get_loop(current_run.loop_id)
+        if loop is None:
+            return True
+        current_task = self.store.get_agent_task(task.task_id) or task
+        if current_task.status == AgentTaskStatus.CANCELLED:
+            self._record_loop_failure(
+                loop,
+                current_run,
+                current_run.error or "the managed loop task was cancelled",
+            )
+            return True
+        if current_run.kind == LoopRunKind.COMPACTION:
+            compacted = any(
+                entry.kind == "compaction" and entry.run_id == current_run.run_id
+                for entry in self.store.list_loop_journal(
+                    loop.loop_id,
+                    include_superseded=True,
+                    limit=10_000,
+                )
+            )
+            if not compacted:
+                self._record_loop_failure(
+                    loop,
+                    current_run,
+                    "the compaction run completed without a memory snapshot",
+                )
+                return True
+            self._mark_loop_task_done(current_task)
+            self.store.update_loop_run(
+                current_run.run_id,
+                status=LoopRunStatus.DONE,
+                finished_at=utc_now(),
+            )
+            self.store.reset_loop_failures(loop.loop_id)
+            return True
+        if not current_run.summary_json and self._start_loop_summary_nudge(
+            loop,
+            current_run,
+            current_task,
+        ):
+            return False
+        current_run = self.store.get_loop_run(current_run.run_id) or current_run
+        self._mark_loop_task_done(current_task)
+        if not self._loop_run_has_journal_entry(current_run, "run_summary"):
+            content = self._loop_run_summary_journal_content(loop, current_run)
+            self.store.add_loop_journal_entry(
+                LoopJournalEntry(
+                    entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                    loop_id=loop.loop_id,
+                    kind="run_summary",
+                    content=content,
+                    created_at=utc_now(),
+                    run_id=current_run.run_id,
+                    thread_ts=current_run.thread_ts,
+                )
+            )
+        self.store.update_loop_run(
+            current_run.run_id,
+            status=LoopRunStatus.DONE,
+            finished_at=utc_now(),
+        )
+        self.store.reset_loop_failures(loop.loop_id)
+        self._queue_loop_compaction_if_needed(loop)
+        return True
+
+    def _start_loop_summary_nudge(
+        self,
+        loop: Loop,
+        run: LoopRun,
+        task: AgentTask,
+    ) -> bool:
+        if self.runtime is None or task.metadata.get(LOOP_SUMMARY_NUDGE_METADATA_KEY):
+            return False
+        key = f"{SETTING_LOOP_SUMMARY_NUDGE_PREFIX}{run.run_id}"
+        attempts = int(self.store.get_setting(key) or 0)
+        if attempts >= LOOP_SUMMARY_NUDGE_ATTEMPTS:
+            return False
+        metadata = dict(task.metadata)
+        metadata[LOOP_SUMMARY_NUDGE_METADATA_KEY] = True
+        marked = replace(task, metadata=metadata, updated_at=utc_now())
+        self.store.upsert_agent_task(marked)
+        self.store.set_setting(key, str(attempts + 1))
+        agent = self.store.get_team_agent(loop.agent_id)
+        if agent is None or not run.thread_ts:
+            return False
+        request = WorkRequest(
+            prompt=(
+                "Emit only the required hidden loop summary line now: "
+                f'{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{{"summary": "<3-5 sentences>", '
+                '"status": "ok|found_issue|action_taken|failed", "carry": {}}}'
+            ),
+            assignment_mode=AssignmentMode.SPECIFIC,
+            requested_handle=agent.handle,
+            permission_mode=loop.permission_mode,
+        )
+        return self._continue_same_thread_agent_task(
+            request,
+            marked,
+            agent,
+            SlackThreadRef(loop.channel_id or task.channel_id, run.thread_ts, run.thread_ts),
+            requested_by_slack_user=loop.owner_slack_user_id,
+            try_live_send=True,
+        )
+
+    def _mark_loop_task_done(self, task: AgentTask) -> None:
+        latest = self.store.get_agent_task(task.task_id) or task
+        if latest.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+
+    def _loop_run_summary_journal_content(self, loop: Loop, run: LoopRun) -> str:
+        if not run.summary_json:
+            return f"run #{run.run_number}: completed without a summary"
+        try:
+            payload = json.loads(run.summary_json)
+        except json.JSONDecodeError:
+            return f"run #{run.run_number}: completed without a summary"
+        if not isinstance(payload, dict):
+            return f"run #{run.run_number}: completed without a summary"
+        summary = str(payload.get("summary") or "completed without a summary").strip()
+        status = str(payload.get("status") or "ok")
+        content = (
+            f"run #{run.run_number} ({format_loop_timestamp(run.due_at, loop.timezone)}): "
+            f"[{status}] {summary}"
+        )
+        if loop.channel_id and run.thread_ts:
+            with suppress(Exception):
+                permalink = self.gateway.permalink(loop.channel_id, run.thread_ts)
+                if permalink:
+                    content += f" (thread: {permalink})"
+        carry = payload.get("carry")
+        if isinstance(carry, dict) and carry:
+            content += f"\nCarried state: {json.dumps(carry, sort_keys=True)}"
+        return content
+
+    def _loop_run_has_journal_entry(self, run: LoopRun, kind: str) -> bool:
+        return any(
+            entry.run_id == run.run_id and entry.kind == kind
+            for entry in self.store.list_loop_journal(
+                run.loop_id,
+                include_superseded=True,
+                limit=10_000,
+            )
+        )
+
+    def _queue_loop_compaction_if_needed(self, loop: Loop) -> None:
+        entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
+        size = sum(
+            len(entry.content) for entry in entries if entry.kind in {"run_summary", "system"}
+        )
+        if size <= LOOP_COMPACTION_TRIGGER_CHARS:
+            return
+        latest = self.store.get_loop(loop.loop_id) or loop
+        metadata = dict(latest.metadata)
+        metadata["compaction_pending"] = True
+        self.store.update_loop_metadata(loop.loop_id, metadata)
+
+    def _record_loop_failure(self, loop: Loop, run: LoopRun, error: str) -> None:
+        key = f"{SETTING_LOOP_FAILURE_RECORDED_PREFIX}{run.run_id}"
+        if self.store.get_setting(key):
+            return
+        message = _shorten(error.strip() or "unknown loop runtime failure", 500)
+        self.store.update_loop_run(
+            run.run_id,
+            status=LoopRunStatus.FAILED,
+            finished_at=utc_now(),
+            error=message,
+        )
+        failure_entry_exists = any(
+            entry.run_id == run.run_id
+            and entry.kind == "system"
+            and entry.content.startswith(f"run #{run.run_number} failed:")
+            for entry in self.store.list_loop_journal(
+                run.loop_id,
+                include_superseded=True,
+                limit=10_000,
+            )
+        )
+        if run.kind != LoopRunKind.COMPACTION and not failure_entry_exists:
+            self.store.add_loop_journal_entry(
+                LoopJournalEntry(
+                    entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                    loop_id=loop.loop_id,
+                    kind="system",
+                    content=f"run #{run.run_number} failed: {message}",
+                    created_at=utc_now(),
+                    run_id=run.run_id,
+                    thread_ts=run.thread_ts,
+                )
+            )
+        failures = self.store.record_loop_failure(loop.loop_id, message)
+        self.store.set_setting(key, utc_now().isoformat())
+        if failures < LOOP_MAX_CONSECUTIVE_FAILURES:
+            return
+        self.store.update_loop_status(loop.loop_id, LoopStatus.PAUSED, error=message)
+        pause_text = (
+            f"paused after {LOOP_MAX_CONSECUTIVE_FAILURES} consecutive failed runs: {message}"
+        )
+        self._add_loop_journal_once(
+            loop,
+            kind="system",
+            content=pause_text,
+            dedupe_content=pause_text,
+        )
+        text = (
+            f"<@{loop.owner_slack_user_id}> ⏸ Paused after "
+            f"{LOOP_MAX_CONSECUTIVE_FAILURES} consecutive failed runs. "
+            f"Last error: {message}. Reply `loop resume` to continue."
+        )
+        try:
+            if loop.channel_id:
+                self.gateway.post_message(loop.channel_id, text)
+        except Exception as exc:
+            if _slack_error_code(exc) in _PM_DEAD_THREAD_SLACK_ERRORS:
+                self._pause_loop_for_dead_channel(loop, str(_slack_error_code(exc)))
+            else:
+                LOGGER.debug("failed to post loop failure pause notice", exc_info=True)
+
+    def _add_loop_journal_once(
+        self,
+        loop: Loop,
+        *,
+        kind: str,
+        content: str,
+        dedupe_content: str,
+    ) -> None:
+        if any(
+            entry.kind == kind and entry.content == dedupe_content
+            for entry in self.store.list_loop_journal(
+                loop.loop_id,
+                include_superseded=True,
+                limit=10_000,
+            )
+        ):
+            return
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                loop_id=loop.loop_id,
+                kind=kind,
+                content=content,
+                created_at=utc_now(),
+            )
+        )
+
+    def reconcile_loop_runs(self) -> int:
+        reconciled = 0
+        for loop in self.store.list_loops(limit=1_000):
+            run = self.store.running_loop_run(loop.loop_id)
+            if run is not None and self._reconcile_loop_run(run):
+                reconciled += 1
+        return reconciled
+
+    def _reconcile_loop_run(self, run: LoopRun) -> bool:
+        current = self.store.get_loop_run(run.run_id) or run
+        if current.status != LoopRunStatus.RUNNING:
+            return False
+        if not current.task_id:
+            loop = self.store.get_loop(current.loop_id)
+            if loop is not None:
+                self._record_loop_failure(loop, current, "loop run has no managed task")
+                return True
+            return False
+        task = self.store.get_agent_task(current.task_id)
+        if task is None:
+            loop = self.store.get_loop(current.loop_id)
+            if loop is not None:
+                self._record_loop_failure(loop, current, "loop run task is missing")
+                return True
+            return False
+        if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            return False
+        self.finalize_loop_run(current, task)
         return True
 
     def _retry_loop_resolution(
@@ -3872,7 +4572,8 @@ class SlackTeamController:
         started = self.runtime.start_task(task, agent, thread) if self.runtime else True
         if started:
             self._remember_agent_authored_message(task, agent, thread, task.parent_message_ts)
-            self._refresh_existing_roster(thread.channel_id)
+            if not task.metadata.get(LOOP_ID_METADATA_KEY):
+                self._refresh_existing_roster(thread.channel_id)
         return started
 
     def _remember_roster_message(self, channel_id: str, message_ts: str) -> None:
@@ -6539,7 +7240,8 @@ class SlackTeamController:
         self.store.upsert_agent_task(updated)
         if request_message_ts:
             self._mark_message_in_progress(thread.channel_id, request_message_ts)
-        self.refresh_or_post_roster(thread.channel_id)
+        if not latest.metadata.get(LOOP_ID_METADATA_KEY):
+            self.refresh_or_post_roster(thread.channel_id)
         return True
 
     def _complete_active_thread_followup(
@@ -6573,6 +7275,19 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
     ) -> None:
+        loop_run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        if isinstance(loop_run_id, str):
+            task = self.store.get_agent_task(task.task_id) or task
+            if task.session_provider is not None and task.session_id:
+                clear_managed_session(self.store, task.session_provider, task.session_id)
+            task = self._complete_active_thread_followup(task, thread)
+            run = self.store.get_loop_run(loop_run_id)
+            finalized = self.finalize_loop_run(run, task) if run is not None else True
+            latest = self.store.get_agent_task(task.task_id) or task
+            if finalized:
+                self._clear_task_request_status_reactions(latest, thread)
+                self._remove_task_action_buttons_if_resolved(latest)
+            return
         task_is_child = _is_subtask(task) or _is_external_thread_helper_task(task)
         if task_is_child:
             task = self.store.get_agent_task(task.task_id) or task
@@ -6790,6 +7505,18 @@ class SlackTeamController:
         thread: SlackThreadRef,
         signal: str,
     ) -> bool:
+        normalized_signal = re.sub(r"\s+", " ", signal.strip()).upper()
+        if task.kind == AgentTaskKind.LOOP_RUN and task.metadata.get(LOOP_ID_METADATA_KEY):
+            if signal == AGENT_THREAD_DONE_SIGNAL:
+                return self._complete_task_thread(thread.channel_id, thread.thread_ts)
+            if normalized_signal.startswith(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX):
+                return self._handle_loop_summary_signal(task, agent, thread, signal)
+            if normalized_signal.startswith(AGENT_LOOP_COMPACT_SIGNAL_PREFIX):
+                return self._handle_loop_compact_signal(task, agent, thread, signal)
+            if normalized_signal.startswith(AGENT_LOOP_FETCH_SIGNAL_PREFIX):
+                return self._handle_loop_fetch_signal(task, agent, thread, signal)
+            if signal.strip().upper().startswith("SLACKGENTIC:"):
+                return True
         roster_summary = parse_agent_roster_status_signal(signal)
         if roster_summary is not None:
             return self._update_task_roster_summary(task, agent, thread, roster_summary)
@@ -6806,9 +7533,13 @@ class SlackTeamController:
             return self._create_deferred_work_from_agent(task, agent, thread, signal)
         if is_agent_pm_plan_signal(signal):
             return self._create_pm_initiative_from_agent(task, agent, thread, signal)
-        if re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_LOOP_FETCH_SIGNAL_PREFIX):
+        if normalized_signal.startswith(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX):
+            return self._handle_loop_summary_signal(task, agent, thread, signal)
+        if normalized_signal.startswith(AGENT_LOOP_COMPACT_SIGNAL_PREFIX):
+            return self._handle_loop_compact_signal(task, agent, thread, signal)
+        if normalized_signal.startswith(AGENT_LOOP_FETCH_SIGNAL_PREFIX):
             return self._handle_loop_fetch_signal(task, agent, thread, signal)
-        if re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_LOOP_SIGNAL_PREFIX):
+        if normalized_signal.startswith(AGENT_LOOP_SIGNAL_PREFIX):
             return self._create_loop_from_agent(task, agent, thread, signal)
         return False
 
@@ -9154,11 +9885,22 @@ class SlackTeamController:
                         )
                 else:
                     self.store.update_agent_task_status(thread_task.task_id, AgentTaskStatus.DONE)
-                self._mark_task_complete(thread_task, thread, include_thread=True)
+                completed_task = self.store.get_agent_task(thread_task.task_id) or thread_task
+                loop_run_id = completed_task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+                finalized = True
+                if isinstance(loop_run_id, str):
+                    run = self.store.get_loop_run(loop_run_id)
+                    if run is not None:
+                        finalized = self.finalize_loop_run(run, completed_task)
+                if finalized:
+                    self._mark_task_complete(completed_task, thread, include_thread=True)
                 completed += 1
                 completed_tasks.append(
                     self.store.get_agent_task(thread_task.task_id) or thread_task
                 )
+
+        if self._loop_for_channel(channel_id) is not None:
+            return completed > 0
 
         cancelled = 0
         for pending in self.store.list_pending_work_requests(channel_id=channel_id, limit=500):
@@ -9259,6 +10001,8 @@ class SlackTeamController:
                 LOOP_RUN_ID_METADATA_KEY,
                 PERMISSION_MODE_METADATA_KEY,
                 MODEL_OVERRIDE_METADATA_KEY,
+                LOOP_FETCH_COUNT_METADATA_KEY,
+                LOOP_SUMMARY_NUDGE_METADATA_KEY,
             ):
                 if key in parent_task.metadata:
                     metadata[key] = parent_task.metadata[key]
@@ -10488,6 +11232,58 @@ class SlackMessageBackfill:
                     break
 
 
+class LoopRunner:
+    def __init__(
+        self,
+        store: Store,
+        controller: SlackTeamController,
+        *,
+        poll_seconds: float = LOOP_RUNNER_POLL_FLOOR_SECONDS,
+    ):
+        self.store = store
+        self.controller = controller
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="slackgentic-loops",
+        )
+        self._thread.start()
+
+    def stop(self) -> bool:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+            return not self._thread.is_alive()
+        return True
+
+    def sync_once(self) -> int:
+        self.controller.reconcile_loop_runs()
+        fired = 0
+        for loop in self.store.list_due_loops(limit=20):
+            if self.controller.fire_due_loop(loop):
+                fired += 1
+        return fired
+
+    def _run(self) -> None:
+        backoff = LoopBackoff(base_seconds=self.poll_seconds, max_seconds=60.0)
+        while not self._stop.wait(self.poll_seconds):
+            try:
+                self.sync_once()
+                backoff.reset()
+            except Exception:
+                log_loop_failure(LOGGER, "failed to run Slackgentic loops", backoff)
+                if backoff.wait(self._stop):
+                    break
+
+
 class ScheduledTimerRunner:
     def __init__(
         self,
@@ -10771,6 +11567,7 @@ class SocketModeSlackApp:
         self.runtime.on_agent_control = self.controller.handle_runtime_agent_control
         self.runtime.agent_icon_url = self.controller._agent_icon_url
         self.controller.cancel_orphaned_active_tasks()
+        self.controller.reconcile_loop_runs()
         self.session_mirror = SessionMirror(
             self.store,
             self.gateway,
@@ -10807,6 +11604,12 @@ class SocketModeSlackApp:
             poll_seconds=max(config.poll_seconds, 1.0),
         )
         self.scheduled_work.start()
+        self.loops = LoopRunner(
+            self.store,
+            self.controller,
+            poll_seconds=max(config.poll_seconds, LOOP_RUNNER_POLL_FLOOR_SECONDS),
+        )
+        self.loops.start()
         self.deferred_work = DeferredWorkRunner(
             self.store,
             self.controller,
@@ -10854,6 +11657,7 @@ class SocketModeSlackApp:
         all_stopped = self.slack_message_backfill.stop() and all_stopped
         all_stopped = self.pm_watchdog.stop() and all_stopped
         all_stopped = self.deferred_work.stop() and all_stopped
+        all_stopped = self.loops.stop() and all_stopped
         all_stopped = self.scheduled_work.stop() and all_stopped
         all_stopped = self.scheduled_timers.stop() and all_stopped
         all_stopped = self.session_mirror.stop() and all_stopped
