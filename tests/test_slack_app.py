@@ -1012,6 +1012,48 @@ class SlackAppTests(unittest.TestCase):
         self.assertEqual(submitted, [])
         self.assertEqual(handled, [request])
 
+    def test_socket_mode_modal_action_acks_then_bypasses_worker_backlog(self):
+        events = []
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id, payload=None):
+                self.envelope_id = envelope_id
+                self.payload = payload
+
+        class FakeSocketClient:
+            def send_socket_mode_response(self, response):
+                events.append(("ack", response.envelope_id, response.payload))
+
+        request = types.SimpleNamespace(
+            type="interactive",
+            envelope_id="ENVELOPE1",
+            payload={
+                "type": "block_actions",
+                "trigger_id": "TRIGGER1",
+                "actions": [
+                    {
+                        "action_id": "loop.create.open",
+                        "value": encode_action_value("loop.create.open"),
+                    }
+                ],
+            },
+        )
+        app = object.__new__(SocketModeSlackApp)
+        app._handle_acknowledged_request = lambda handled: events.append(("inline", handled))
+        app._submit_acknowledged_request = lambda handled: events.append(("worker", handled))
+
+        response_module = types.ModuleType("slack_sdk.socket_mode.response")
+        response_module.SocketModeResponse = FakeSocketModeResponse
+        with patch.dict(
+            sys.modules,
+            {"slack_sdk.socket_mode.response": response_module},
+        ):
+            app._handle_socket_mode_envelope(FakeSocketClient(), request)
+
+        self.assertEqual(events[0], ("ack", "ENVELOPE1", None))
+        self.assertEqual(events[1], ("inline", request))
+        self.assertNotIn(("worker", request), events)
+
     def test_hire_pm_button_creates_pm_kind_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
