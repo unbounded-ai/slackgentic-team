@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import socket
 import threading
+from contextlib import suppress
 
 from slack_sdk.socket_mode import SocketModeClient
 
@@ -30,18 +32,46 @@ class SupervisedSocketModeClient(SocketModeClient):
         self.reconnect_requested.set()
 
     def close(self) -> None:
-        """Close every SDK worker before the supervisor discards this generation."""
+        """Retire this generation without waiting on stale SDK worker locks."""
 
-        try:
-            super().close()
-        finally:
-            # The built-in client leaves this runner alive after close. A fresh
-            # client per reconnect would otherwise leak one thread per generation
-            # even though its transport and other workers were closed.
-            session_runner = getattr(self, "current_session_runner", None)
-            is_alive = getattr(session_runner, "is_alive", None)
-            if callable(is_alive) and is_alive():
-                session_runner.shutdown()
+        # A socket retained across system sleep can remain non-None while its
+        # receive thread is stuck inside SSL I/O holding the SDK's receive lock.
+        # SocketModeClient.close() waits indefinitely for its monitor and session
+        # runners, which can deadlock the supervisor before it creates the
+        # replacement connection. Signal those workers, then close the raw socket
+        # without entering the SDK lock hierarchy. They are daemon threads and
+        # exit asynchronously once the socket wakes them.
+        self.closed = True
+        self.auto_reconnect_enabled = False
+        session_state = getattr(self, "current_session_state", None)
+        if session_state is not None:
+            session_state.terminated = True
+        for runner_name in (
+            "current_app_monitor",
+            "message_processor",
+            "current_session_runner",
+        ):
+            runner = getattr(self, runner_name, None)
+            event = getattr(runner, "event", None)
+            set_event = getattr(event, "set", None)
+            if callable(set_event):
+                set_event()
+        session = getattr(self, "current_session", None)
+        active_socket = getattr(session, "sock", None)
+        shutdown = getattr(active_socket, "shutdown", None)
+        if callable(shutdown):
+            with suppress(OSError):
+                shutdown(socket.SHUT_RDWR)
+        close_socket = getattr(active_socket, "close", None)
+        if callable(close_socket):
+            with suppress(OSError):
+                close_socket()
+        if session is not None:
+            session.sock = None
+        message_workers = getattr(self, "message_workers", None)
+        shutdown_workers = getattr(message_workers, "shutdown", None)
+        if callable(shutdown_workers):
+            shutdown_workers(wait=False, cancel_futures=True)
 
     def _request_reconnect_after_close(self, code: int, reason: str | None = None) -> None:
         del code, reason
