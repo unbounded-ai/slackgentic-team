@@ -41,7 +41,12 @@ from agent_harness.models import (
 )
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
-from agent_harness.slack.app import LoopRunner, SlackMessageBackfill, SlackTeamController
+from agent_harness.slack.app import (
+    SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
+    LoopRunner,
+    SlackMessageBackfill,
+    SlackTeamController,
+)
 from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent
 from tests.test_slack_app import FakeGateway, FakeRuntime
@@ -289,6 +294,24 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(guide["thread"].thread_ts, "101.000001")
         self.assertIn("loop.create.open", str(guide["blocks"]))
         self.assertIn("You do not need to create the channel", str(guide["blocks"]))
+
+    def test_backfilled_loop_create_does_not_post_button_when_socket_recovery_fails(self):
+        self.controller.handle_event(
+            {
+                "event": {
+                    "type": "message",
+                    "channel": "CMAIN",
+                    "ts": "101.000002",
+                    "user": "UOWNER",
+                    "text": "loop create",
+                    SLACK_SOCKET_DELIVERY_READY_EVENT_KEY: False,
+                }
+            }
+        )
+
+        guide = self.gateway.thread_replies[-1]
+        self.assertIn("real-time Slack connection is still recovering", guide["text"])
+        self.assertIsNone(guide["blocks"])
 
     def test_bare_loop_create_slash_command_posts_guided_create_button(self):
         self.controller.handle_slash_command(

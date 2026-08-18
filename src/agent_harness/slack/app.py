@@ -357,6 +357,9 @@ SETTING_SLACK_BACKFILL_LAST_AWAKE = "slack.backfill.last_awake_unix"
 SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN = "slack.backfill.last_thread_scan_unix"
 SETTING_SLACK_BACKFILL_THREAD_SCAN_PREFIX = "slack.backfill.thread_scan_unix."
 SETTING_SLACK_MESSAGE_PROCESSED_PREFIX = "slack.message.processed."
+SETTING_SLACK_SOCKET_LAST_ENVELOPE_AT = "slack.socket.last_envelope_at"
+SETTING_SLACK_SOCKET_LAST_ENVELOPE_TYPE = "slack.socket.last_envelope_type"
+SLACK_SOCKET_DELIVERY_READY_EVENT_KEY = "_slackgentic_socket_delivery_ready"
 SETTING_MESSAGE_STATUS_REACTION_PREFIX = "slack.message.status_reaction."
 SETTING_AGENT_AUTHORED_MESSAGE_PREFIX = "slack.agent_message."
 SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
@@ -433,6 +436,9 @@ SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
 SLACK_SOCKET_PONG_GRACE_SECONDS = 30.0
 SLACK_SOCKET_STALE_SECONDS = 30.0
 SLACK_SOCKET_STABLE_SECONDS = 30.0
+SLACK_SOCKET_SUPERVISOR_POLL_SECONDS = 1.0
+SLACK_SOCKET_WAKE_GAP_SECONDS = 5.0
+SLACK_SOCKET_RECOVERY_WAIT_SECONDS = 10.0
 SLACK_TRIGGER_BOUND_ACTIONS = frozenset(
     {
         "external.session.assign.open",
@@ -2324,6 +2330,14 @@ class SlackTeamController:
             return False
         thread = self._request_thread_anchor(event, channel_id, text)
         if not request.description:
+            if event.get(SLACK_SOCKET_DELIVERY_READY_EVENT_KEY) is False:
+                self.gateway.post_thread_reply(
+                    thread,
+                    "The real-time Slack connection is still recovering, so I did not post "
+                    "a button that cannot work. Retry `loop create`, or use "
+                    "`loop create <task and schedule>`.",
+                )
+                return True
             self.gateway.post_thread_reply(
                 thread,
                 "Create a recurring loop and its Slack channel.",
@@ -11818,6 +11832,7 @@ class SlackMessageBackfill:
         thread_poll_seconds: float = SLACK_BACKFILL_THREAD_POLL_SECONDS,
         thread_initial_lookback_seconds: float = SLACK_BACKFILL_THREAD_INITIAL_LOOKBACK_SECONDS,
         now: Callable[[], float] | None = None,
+        on_delivery_gap: Callable[[], bool] | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -11829,6 +11844,7 @@ class SlackMessageBackfill:
         self.thread_poll_seconds = thread_poll_seconds
         self.thread_initial_lookback_seconds = thread_initial_lookback_seconds
         self.now = now or time.time
+        self.on_delivery_gap = on_delivery_gap
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_awake_unix: float | None = None
@@ -11932,6 +11948,8 @@ class SlackMessageBackfill:
                 thread_history_ok=True,
             )
         recovered = 0
+        delivery_gap_reported = False
+        realtime_delivery_ready: bool | None = None
         channel_history_ok = True
         thread_history_ok = True
         for channel_id in channel_ids:
@@ -11950,10 +11968,22 @@ class SlackMessageBackfill:
                 event_channel_id, message_ts = self.controller._recoverable_user_message_ref(event)
                 if event_channel_id is None or message_ts is None:
                     continue
-                if self.controller._slack_message_processed(event_channel_id, message_ts):
+                was_processed = self.controller._slack_message_processed(
+                    event_channel_id,
+                    message_ts,
+                )
+                if was_processed:
                     if not self.controller._processed_slack_message_needs_backfill(event):
                         continue
                     self.controller._clear_slack_message_processed(event_channel_id, message_ts)
+                elif not delivery_gap_reported and self.on_delivery_gap is not None:
+                    # A user message that only the polling backfill can see proves
+                    # the real-time Socket Mode transport is not delivering. Recover
+                    # that transport before posting UI whose buttons depend on it.
+                    realtime_delivery_ready = self.on_delivery_gap()
+                    delivery_gap_reported = True
+                if realtime_delivery_ready is not None:
+                    event[SLACK_SOCKET_DELIVERY_READY_EVENT_KEY] = realtime_delivery_ready
                 try:
                     self.controller.handle_event({"event": event})
                     recovered += 1
@@ -12469,6 +12499,12 @@ class SocketModeSlackApp:
         self._request_slots = threading.BoundedSemaphore(SLACK_SOCKET_MAX_PENDING_REQUESTS)
         self._shutdown = threading.Event()
         self._socket_mode_ready = threading.Event()
+        self._socket_supervisor_started = threading.Event()
+        self._socket_reconnect_requested = threading.Event()
+        self._socket_reconnect_condition = threading.Condition()
+        self._socket_generation = 0
+        self._socket_reconnect_target = 0
+        self._active_socket_client = None
         self.store = Store(config.state_db)
         self.store.init_schema()
         self.gateway = SlackGateway(config.slack.bot_token)
@@ -12595,6 +12631,7 @@ class SocketModeSlackApp:
             self.controller,
             team_id=config.slack.team_id or "local",
             poll_seconds=max(config.poll_seconds, 5.0),
+            on_delivery_gap=self._recover_socket_mode_delivery,
         )
         self.slack_message_backfill.start()
         self.claude_permission_auto_resolver = ClaudePermissionAutoResolver(
@@ -12744,15 +12781,83 @@ class SocketModeSlackApp:
             )
         return specs
 
+    def _ensure_socket_supervision_state(self) -> None:
+        if not hasattr(self, "_socket_mode_ready"):
+            self._socket_mode_ready = threading.Event()
+        if not hasattr(self, "_socket_supervisor_started"):
+            self._socket_supervisor_started = threading.Event()
+        if not hasattr(self, "_socket_reconnect_requested"):
+            self._socket_reconnect_requested = threading.Event()
+        if not hasattr(self, "_socket_reconnect_condition"):
+            self._socket_reconnect_condition = threading.Condition()
+        if not hasattr(self, "_socket_generation"):
+            self._socket_generation = 0
+        if not hasattr(self, "_socket_reconnect_target"):
+            self._socket_reconnect_target = 0
+        if not hasattr(self, "_active_socket_client"):
+            self._active_socket_client = None
+
+    def _request_socket_reconnect(self, reason: str, *, wait: bool) -> bool:
+        self._ensure_socket_supervision_state()
+        condition = self._socket_reconnect_condition
+        with condition:
+            target = self._socket_generation + 1
+            self._socket_reconnect_target = max(self._socket_reconnect_target, target)
+            self._socket_mode_ready.clear()
+            self._socket_reconnect_requested.set()
+            condition.notify_all()
+        active_client = getattr(self, "_active_socket_client", None)
+        if active_client is not None:
+            self._active_socket_client = None
+            self._retire_socket_mode_client(active_client)
+        LOGGER.warning("reconnecting Slack Socket Mode because %s", reason)
+        if not wait or not self._socket_supervisor_started.is_set():
+            return False
+        deadline = time.monotonic() + SLACK_SOCKET_RECOVERY_WAIT_SECONDS
+        with condition:
+            while self._socket_generation < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                condition.wait(timeout=remaining)
+            return self._socket_mode_ready.is_set()
+
+    def _record_socket_connected(self) -> None:
+        self._ensure_socket_supervision_state()
+        condition = self._socket_reconnect_condition
+        with condition:
+            self._socket_generation += 1
+            if self._socket_generation >= self._socket_reconnect_target:
+                self._socket_reconnect_requested.clear()
+            self._socket_mode_ready.set()
+            condition.notify_all()
+
+    def _recover_socket_mode_delivery(self) -> bool:
+        return self._request_socket_reconnect(
+            "the message backfill recovered an event missing from the real-time connection",
+            wait=True,
+        )
+
+    def _record_socket_envelope(self, request) -> None:
+        try:
+            self.store.set_setting(SETTING_SLACK_SOCKET_LAST_ENVELOPE_AT, utc_now().isoformat())
+            request_type = getattr(request, "type", None)
+            self.store.set_setting(
+                SETTING_SLACK_SOCKET_LAST_ENVELOPE_TYPE,
+                str(request_type or "unknown"),
+            )
+        except Exception:
+            LOGGER.debug("failed to record Slack Socket Mode envelope health", exc_info=True)
+
     def run_forever(self) -> None:
         import signal
 
+        self._ensure_socket_supervision_state()
         shutdown = getattr(self, "_shutdown", threading.Event())
         self._shutdown = shutdown
         shutdown.clear()
-        socket_ready = getattr(self, "_socket_mode_ready", threading.Event())
-        self._socket_mode_ready = socket_ready
-        socket_ready.clear()
+        self._socket_mode_ready.clear()
+        self._socket_supervisor_started.set()
         client = None
         socket_connected_at: float | None = None
         socket_stable = False
@@ -12788,7 +12893,7 @@ class SocketModeSlackApp:
                     except KeyboardInterrupt:
                         raise
                     except Exception:
-                        socket_ready.clear()
+                        self._socket_mode_ready.clear()
                         self._close_socket_mode_client(client)
                         client = None
                         log_loop_failure(
@@ -12801,7 +12906,8 @@ class SocketModeSlackApp:
                         continue
                     socket_connected_at = time.monotonic()
                     socket_stable = False
-                    socket_ready.set()
+                    self._active_socket_client = client
+                    self._record_socket_connected()
                     if not update_checks_started:
                         self.update_runner.start()
                         update_checks_started = True
@@ -12827,18 +12933,25 @@ class SocketModeSlackApp:
                     and callable(getattr(reconnect_event, "is_set", None))
                     and reconnect_event.is_set()
                 )
-                if disconnected or stale or reconnect_requested:
-                    if reconnect_requested:
+                supervised_reconnect_requested = self._socket_reconnect_requested.is_set()
+                if disconnected or stale or reconnect_requested or supervised_reconnect_requested:
+                    if supervised_reconnect_requested:
+                        reason = "Slackgentic detected a real-time delivery gap"
+                    elif reconnect_requested:
                         reason = "the SDK requested a fresh endpoint"
                     elif stale and not disconnected:
                         reason = "the active transport failed its liveness check"
                     else:
                         reason = "the active transport disconnected"
-                    socket_ready.clear()
-                    self._close_socket_mode_client(client)
+                    self._socket_mode_ready.clear()
+                    LOGGER.warning("retiring Slack Socket Mode client because %s", reason)
+                    self._active_socket_client = None
+                    self._retire_socket_mode_client(client)
                     client = None
                     socket_connected_at = None
                     socket_stable = False
+                    if supervised_reconnect_requested:
+                        continue
                     delay = connect_backoff.record_failure()
                     LOGGER.warning(
                         "retired Slack Socket Mode client because %s; creating a fresh "
@@ -12850,8 +12963,23 @@ class SocketModeSlackApp:
                     if shutdown.wait(delay):
                         break
                     continue
-                if shutdown.wait(timeout=1.0):
+                wait_started_at = _socket_wall_time()
+                if shutdown.wait(timeout=SLACK_SOCKET_SUPERVISOR_POLL_SECONDS):
                     break
+                wait_elapsed = _socket_wall_time() - wait_started_at
+                if wait_elapsed > SLACK_SOCKET_WAKE_GAP_SECONDS:
+                    LOGGER.warning(
+                        "retiring Slack Socket Mode client because the host resumed after "
+                        "a %.1f-second supervisor pause",
+                        wait_elapsed,
+                    )
+                    self._socket_mode_ready.clear()
+                    self._active_socket_client = None
+                    self._retire_socket_mode_client(client)
+                    client = None
+                    socket_connected_at = None
+                    socket_stable = False
+                    continue
         except KeyboardInterrupt:
             shutdown.set()
         finally:
@@ -12860,7 +12988,9 @@ class SocketModeSlackApp:
                     signal.signal(sig, previous)
                 except (ValueError, OSError, TypeError):
                     continue
-            socket_ready.clear()
+            self._socket_supervisor_started.clear()
+            self._socket_mode_ready.clear()
+            self._active_socket_client = None
             self._close_socket_mode_client(client)
             self.close()
 
@@ -12876,14 +13006,19 @@ class SocketModeSlackApp:
             socket_client.send_socket_mode_response(
                 SocketModeResponse(envelope_id=request.envelope_id, payload=payload)
             )
+            self._record_socket_envelope(request)
             return
         socket_client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
         if _is_trigger_bound_block_action_request(request):
             # A modal trigger expires three seconds after Slack creates it. These
             # actions must not wait behind ordinary events in the shared worker
             # pool, but the envelope still needs to be acknowledged first.
-            self._handle_acknowledged_request(request)
+            try:
+                self._handle_acknowledged_request(request)
+            finally:
+                self._record_socket_envelope(request)
             return
+        self._record_socket_envelope(request)
         self._submit_acknowledged_request(request)
 
     def _create_socket_mode_client(self):
@@ -12893,6 +13028,17 @@ class SocketModeSlackApp:
             app_token=self.config.slack.app_token or "",
             web_client=self.gateway.client,
         )
+
+    @staticmethod
+    def _retire_socket_mode_client(client) -> None:
+        if client is None:
+            return
+        threading.Thread(
+            target=SocketModeSlackApp._close_socket_mode_client,
+            args=(client,),
+            name="slackgentic-socket-retire",
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _close_socket_mode_client(client) -> None:
@@ -13106,6 +13252,10 @@ def _socket_mode_connection_stale(
     # forever and dropped the interactions delivered during each handoff, so
     # rely on the SDK liveness signal plus the transport probe above in that case.
     return False
+
+
+def _socket_wall_time() -> float:
+    return time.time()
 
 
 def _socket_mode_transport_closed(session) -> bool:
