@@ -70,9 +70,11 @@ MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY = "managed_run_stall_recoveries"
 MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY = "managed_run_original_prompt"
 MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY = "managed_run_empty_text_block_api_retries"
+MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY = "managed_run_transient_provider_retries"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_STALL_RECOVERIES = 2
 MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES = 2
+MANAGED_RUN_TRANSIENT_PROVIDER_RETRY_DELAYS = (2.0, 10.0)
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
 MANAGED_RUN_PROGRESS_WARNING_TIMEOUT = timedelta(minutes=5)
@@ -127,6 +129,8 @@ class RunningTask:
     missing_resume_session: bool = False
     api_error_buffer: str = ""
     empty_text_block_api_error: bool = False
+    provider_failure_message: str | None = None
+    transient_provider_failure: bool = False
     observed_agent_messages: set[str] | None = None
     control_signals: list[str] = field(default_factory=list)
     terminal_control_signal_handled: bool = False
@@ -171,6 +175,7 @@ class ManagedTaskRuntime:
         agent_progress_timeout: timedelta | None = None,
         agent_stall_timeout: timedelta | None = None,
         max_stall_recoveries: int | None = None,
+        transient_provider_retry_delays: tuple[float, ...] | None = None,
     ):
         self.store = store
         self.gateway = gateway
@@ -221,6 +226,14 @@ class ManagedTaskRuntime:
             max_stall_recoveries
             if max_stall_recoveries is not None
             else max(0, configured_recoveries)
+        )
+        self.transient_provider_retry_delays = tuple(
+            max(0.0, delay)
+            for delay in (
+                transient_provider_retry_delays
+                if transient_provider_retry_delays is not None
+                else MANAGED_RUN_TRANSIENT_PROVIDER_RETRY_DELAYS
+            )
         )
         self._running: dict[str, RunningTask] = {}
         self._lock = threading.Lock()
@@ -600,7 +613,15 @@ class ManagedTaskRuntime:
                     running.output_buffer,
                 )
             for chunk in chunks:
-                self._post_agent_chunk(running, chunk)
+                self._post_or_capture_agent_chunk(running, chunk)
+            if running.provider_failure_message and running.process.is_alive():
+                try:
+                    running.process.terminate()
+                except Exception:
+                    LOGGER.debug(
+                        "failed to stop managed provider after terminal error",
+                        exc_info=True,
+                    )
             if running.stop_requested:
                 self._remove_running_task(task_id, running)
                 return
@@ -635,7 +656,7 @@ class ManagedTaskRuntime:
                         final=True,
                     )
                 for chunk in chunks:
-                    self._post_agent_chunk(running, chunk)
+                    self._post_or_capture_agent_chunk(running, chunk)
                 try:
                     completed_task = self.store.get_agent_task(task_id) or running.task
                 except Exception:
@@ -645,8 +666,13 @@ class ManagedTaskRuntime:
                     return
                 if self._retry_empty_text_block_api_error(running, completed_task):
                     return
+                if self._retry_transient_provider_failure(running, completed_task):
+                    return
                 if running.permission_denials:
                     self._handle_claude_permission_denial(running, completed_task)
+                    return
+                if running.provider_failure_message:
+                    self._handle_provider_failure(running, completed_task)
                     return
                 for recovered_message in self._recover_unseen_visible_messages(
                     completed_task,
@@ -673,17 +699,6 @@ class ManagedTaskRuntime:
                     self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
                     return
                 completed_task = self._clear_managed_run_started(task_id) or completed_task
-                if _running_task_exited_with_provider_failure(running):
-                    self._clear_managed_session_for_task(task_id)
-                    self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
-                    completed_task = self.store.get_agent_task(task_id) or replace(
-                        completed_task,
-                        status=AgentTaskStatus.CANCELLED,
-                        updated_at=utc_now(),
-                    )
-                    if self.on_task_done:
-                        self.on_task_done(completed_task, running.agent, running.thread)
-                    return
                 if running.terminal_control_signal_handled:
                     return
                 handled_signals = self._handle_agent_control_signals(running, completed_task)
@@ -901,6 +916,26 @@ class ManagedTaskRuntime:
             )
         except Exception:
             LOGGER.debug("failed to post managed task worker failure", exc_info=True)
+
+    def _post_or_capture_agent_chunk(self, running: RunningTask, chunk: str) -> None:
+        normalized = chunk.strip()
+        known_empty_text_block_failure = (
+            running.empty_text_block_api_error
+            and _EMPTY_TEXT_BLOCK_API_ERROR_NEEDLE in normalized.lower()
+        )
+        if (
+            not _looks_like_managed_provider_failure(normalized)
+            and not known_empty_text_block_failure
+        ):
+            self._post_agent_chunk(running, chunk)
+            return
+        if running.provider_failure_message is None or _is_retryable_managed_provider_failure(
+            normalized
+        ):
+            running.provider_failure_message = normalized
+        running.transient_provider_failure = (
+            running.transient_provider_failure or _is_retryable_managed_provider_failure(normalized)
+        )
 
     def _post_agent_chunk(self, running: RunningTask, chunk: str) -> None:
         visible_text, control_signals = _extract_agent_control_signals(chunk)
@@ -1318,6 +1353,99 @@ class ManagedTaskRuntime:
         )
         return True
 
+    def _retry_transient_provider_failure(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+    ) -> bool:
+        if not running.transient_provider_failure:
+            return False
+        current = self.store.get_agent_task(completed_task.task_id) or completed_task
+        attempts = managed_run_transient_provider_retries(current)
+        if attempts >= len(self.transient_provider_retry_delays):
+            return False
+        next_attempt = attempts + 1
+        metadata = dict(current.metadata)
+        metadata[MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY] = next_attempt
+        retry_task = replace(
+            current,
+            status=AgentTaskStatus.ACTIVE,
+            metadata=metadata,
+            updated_at=utc_now(),
+        )
+        self.store.upsert_agent_task(retry_task)
+        self.gateway.post_thread_reply(
+            running.thread,
+            (
+                "The provider is temporarily unavailable. Retrying automatically "
+                f"({next_attempt}/{len(self.transient_provider_retry_delays)})…"
+            ),
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
+        delay = self.transient_provider_retry_delays[attempts]
+        if delay > 0 and running.wake_event.wait(delay):
+            running.wake_event.clear()
+        if running.stop_requested:
+            return True
+        latest = self.store.get_agent_task(completed_task.task_id)
+        if latest is None or latest.status == AgentTaskStatus.CANCELLED:
+            return True
+        LOGGER.info(
+            "retrying transient provider failure for task %s (attempt %s/%s)",
+            completed_task.task_id,
+            next_attempt,
+            len(self.transient_provider_retry_delays),
+        )
+        if self.start_task(
+            retry_task,
+            running.agent,
+            running.thread,
+            allowed_tools=running.allowed_tools,
+        ):
+            return True
+        failed = self.store.get_agent_task(completed_task.task_id) or retry_task
+        if self.on_task_done:
+            self.on_task_done(failed, running.agent, running.thread)
+        return True
+
+    def _handle_provider_failure(
+        self,
+        running: RunningTask,
+        completed_task: AgentTask,
+    ) -> None:
+        task_id = completed_task.task_id
+        attempts = managed_run_transient_provider_retries(completed_task)
+        self._clear_managed_run_started(task_id)
+        self._clear_managed_session_for_task(task_id)
+        self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
+        self.store.delete_managed_thread_task(task_id)
+        if running.transient_provider_failure:
+            total_attempts = attempts + 1
+            message = (
+                f"{running.agent.full_name} could not reach the provider after "
+                f"{total_attempts} attempts. I stopped this run; retry in a moment."
+            )
+        else:
+            message = (
+                f"{running.agent.full_name} could not complete this run because the provider "
+                "returned an unrecoverable error. I stopped it; check the provider logs or "
+                "configuration, then retry."
+            )
+        self.gateway.post_thread_reply(
+            running.thread,
+            message,
+            persona=running.agent,
+            icon_url=self._agent_icon_url(running.agent),
+        )
+        cancelled = self.store.get_agent_task(task_id) or replace(
+            completed_task,
+            status=AgentTaskStatus.CANCELLED,
+            updated_at=utc_now(),
+        )
+        if self.on_task_done:
+            self.on_task_done(cancelled, running.agent, running.thread)
+
     def _handle_claude_permission_denial(
         self,
         running: RunningTask,
@@ -1481,12 +1609,16 @@ class ManagedTaskRuntime:
         has_text_block_retries = (
             MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY in current.metadata
         )
+        has_transient_provider_retries = (
+            MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY in current.metadata
+        )
         if (
             not has_marker
             and not has_attempts
             and not has_stall_recoveries
             and not has_original_prompt
             and not has_text_block_retries
+            and not has_transient_provider_retries
         ):
             return current
         metadata = dict(current.metadata)
@@ -1495,6 +1627,7 @@ class ManagedTaskRuntime:
         metadata.pop(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY, None)
         updated = replace(current, metadata=metadata, updated_at=utc_now())
         try:
             self.store.upsert_agent_task(updated)
@@ -2191,6 +2324,13 @@ def _claude_line_has_empty_text_block_api_error(line: str) -> bool:
 
 def managed_run_empty_text_block_api_retries(task: AgentTask) -> int:
     value = task.metadata.get(MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
+
+
+def managed_run_transient_provider_retries(task: AgentTask) -> int:
+    value = task.metadata.get(MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY)
     if isinstance(value, int) and value >= 0:
         return value
     return 0
@@ -2962,10 +3102,6 @@ def _format_claude_error(message: object) -> str:
     return f"Claude error: {_clean_terminal_output(str(message))}" if message else "Claude error."
 
 
-def _running_task_exited_with_provider_failure(running: RunningTask) -> bool:
-    return _looks_like_managed_provider_failure(running.last_visible_message)
-
-
 def _looks_like_managed_provider_failure(message: str | None) -> bool:
     if not message:
         return False
@@ -2973,6 +3109,34 @@ def _looks_like_managed_provider_failure(message: str | None) -> bool:
     if not normalized:
         return False
     return normalized.startswith(("codex error:", "claude error:"))
+
+
+_RETRYABLE_PROVIDER_STATUS_RE = re.compile(
+    r"(?:^|\D)(?:408|409|425|429|500|502|503|504|529)(?:\D|$)"
+)
+_RETRYABLE_PROVIDER_ERROR_MARKERS = (
+    "connection reset",
+    "connection timed out",
+    "rate limit",
+    "request timeout",
+    "server overloaded",
+    "service unavailable",
+    "temporarily unavailable",
+    "temporary server error",
+    "too many requests",
+    "upstream connect error",
+)
+
+
+def _is_retryable_managed_provider_failure(message: str | None) -> bool:
+    if not _looks_like_managed_provider_failure(message):
+        return False
+    normalized = " ".join(str(message).lower().split())
+    return (
+        bool(_RETRYABLE_PROVIDER_STATUS_RE.search(normalized))
+        or any(marker in normalized for marker in _RETRYABLE_PROVIDER_ERROR_MARKERS)
+        or "overloaded" in normalized
+    )
 
 
 def _line_has_ending(line: str) -> bool:

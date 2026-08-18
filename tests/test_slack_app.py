@@ -4625,7 +4625,8 @@ class SlackAppTests(unittest.TestCase):
                 assert still_waiting is not None
                 self.assertEqual(still_waiting.status, DeferredWorkStatus.WAITING_DEPS)
                 blocker_text = "\n".join(reply["text"] for reply in gateway.thread_replies)
-                self.assertIn("Codex error: unexpected status 404 Not Found", blocker_text)
+                self.assertIn("provider returned an unrecoverable error", blocker_text)
+                self.assertNotIn("example.invalid", blocker_text)
                 self.assertIn("dependency `operator` was cancelled", blocker_text)
                 self.assertIn("will not start downstream work", blocker_text)
             finally:
