@@ -36,6 +36,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
+    MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY,
     ManagedTaskRuntime,
     RunningTask,
     _allowed_session_tools_for_claude_denial,
@@ -47,6 +48,7 @@ from agent_harness.runtime.tasks import (
     _claude_permission_denials,
     _clean_terminal_output,
     _extract_agent_control_signals,
+    _is_retryable_managed_provider_failure,
     _latest_codex_transcript_message,
     _macos_tcc_protected_cwd_issue,
     _process_output_chunks,
@@ -55,6 +57,7 @@ from agent_harness.runtime.tasks import (
     build_task_prompt,
     managed_run_empty_text_block_api_retries,
     managed_run_resume_attempts,
+    managed_run_transient_provider_retries,
     parse_agent_reaction_signal,
     parse_agent_roster_status_signal,
     should_resume_managed_run,
@@ -468,6 +471,27 @@ class ClaudeEmptyTextBlockApiErrorProcess(OneShotProcess):
                         "subtype": "error_during_execution",
                         "is_error": True,
                         "session_id": "broken-session",
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
+class ClaudeOverloadedProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "result": (
+                            "API Error: 529 Overloaded. This is a server-side issue; "
+                            "backend endpoint details must remain private."
+                        ),
                     }
                 )
                 + "\n"
@@ -1878,6 +1902,33 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(managed_run_empty_text_block_api_retries(task), 2)
 
+    def test_retryable_provider_failure_classification_is_provider_neutral(self):
+        self.assertTrue(
+            _is_retryable_managed_provider_failure("Claude error: API Error: 529 Overloaded")
+        )
+        self.assertTrue(
+            _is_retryable_managed_provider_failure("Codex error: 503 Service Unavailable")
+        )
+        self.assertTrue(
+            _is_retryable_managed_provider_failure("Codex error: 429 Too Many Requests")
+        )
+        self.assertFalse(
+            _is_retryable_managed_provider_failure("Claude error: API Error: 401 Unauthorized")
+        )
+
+    def test_managed_run_transient_provider_retries_counter(self):
+        agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+        task = create_agent_task(agent, "review pr", "C1")
+
+        self.assertEqual(managed_run_transient_provider_retries(task), 0)
+
+        task = replace(
+            task,
+            metadata={MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY: 2},
+        )
+
+        self.assertEqual(managed_run_transient_provider_retries(task), 2)
+
     def test_agent_control_signal_is_stripped_from_visible_text(self):
         visible, signals = _extract_agent_control_signals(
             f"Sounds good.\n{AGENT_THREAD_DONE_SIGNAL}\n"
@@ -2596,7 +2647,9 @@ class TaskRuntimeTests(unittest.TestCase):
                         runtime.stop_all_running_tasks(status=None, join_timeout=0.02),
                         0,
                     )
-                self.assertLess(time.monotonic() - start, 0.15)
+                # Keep ample distance from the multi-second per-process read timeout
+                # while allowing for scheduler contention under the parallel CI suite.
+                self.assertLess(time.monotonic() - start, 0.3)
                 self.assertTrue(runtime.has_running_tasks())
             finally:
                 for process in BlockingReadProcess.instances:
@@ -4457,16 +4510,17 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertTrue(
                     any("empty text content block" in reply for reply in gateway.replies)
                 )
-                # The retry counter survives across the retry start so the cap
-                # is enforced; it is cleared by _clear_managed_run_started once
-                # the successful retry's worker completes its full lifecycle
-                # (covered separately by the cap test + the existing cleanup
-                # mechanism for the other counters).
+                for _ in range(100):
+                    if not runtime.is_task_running(task.task_id):
+                        break
+                    time.sleep(0.01)
+                # The counter survives across the retry so the cap is enforced,
+                # then is cleared after the successful worker fully exits.
                 persisted = store.get_agent_task(task.task_id)
                 assert persisted is not None
-                self.assertEqual(
-                    persisted.metadata.get(MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY),
-                    1,
+                self.assertNotIn(
+                    MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY,
+                    persisted.metadata,
                 )
             finally:
                 store.close()
@@ -4516,6 +4570,95 @@ class TaskRuntimeTests(unittest.TestCase):
                     time.sleep(0.01)
 
                 self.assertEqual(len(requests), 1)
+            finally:
+                store.close()
+
+    def test_runtime_retries_transient_provider_failure_without_leaking_raw_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return ClaudeOverloadedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "resolve a loop", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    transient_provider_retry_delays=(0.0, 0.0),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(200):
+                    if "Done" in gateway.replies:
+                        break
+                    time.sleep(0.01)
+
+                self.assertIn("Done", gateway.replies)
+                self.assertEqual(len(requests), 2)
+                self.assertTrue(
+                    any("Retrying automatically (1/2)" in reply for reply in gateway.replies)
+                )
+                self.assertFalse(any("529" in reply for reply in gateway.replies))
+                self.assertFalse(
+                    any("backend endpoint details" in reply for reply in gateway.replies)
+                )
+            finally:
+                store.close()
+
+    def test_runtime_caps_transient_provider_retries_and_reports_safe_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            completed = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeOverloadedProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "resolve a loop", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    on_task_done=lambda done, _agent, _thread: completed.append(done),
+                    transient_provider_retry_delays=(0.0, 0.0),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                for _ in range(300):
+                    if completed:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(len(completed), 1)
+                self.assertEqual(completed[0].status, AgentTaskStatus.CANCELLED)
+                self.assertTrue(any("after 3 attempts" in reply for reply in gateway.replies))
+                self.assertFalse(any("529" in reply for reply in gateway.replies))
+                self.assertFalse(
+                    any("backend endpoint details" in reply for reply in gateway.replies)
+                )
             finally:
                 store.close()
 

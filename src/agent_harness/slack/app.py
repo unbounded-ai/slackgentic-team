@@ -3683,6 +3683,23 @@ class SlackTeamController:
         if isinstance(request_ts, str):
             self._mark_message_complete(loop.anchor_channel_id, request_ts)
 
+    def _finalize_cancelled_loop_resolution_task(self, task: AgentTask) -> None:
+        loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
+        if not isinstance(loop_id, str):
+            return
+        loop = self.store.get_loop(loop_id)
+        if loop is None or task.metadata.get(LOOP_UPDATE_KIND_METADATA_KEY):
+            return
+        message = (
+            "The loop resolver stopped before it could produce a preview. Retry `loop create`."
+        )
+        self.store.update_loop_status(loop.loop_id, LoopStatus.CANCELLED, error=message)
+        self.store.update_loop_pending_spec(loop.loop_id, None)
+        self.store.fire_team_agent(loop.agent_id)
+        request_ts = task.metadata.get("request_message_ts")
+        if isinstance(request_ts, str):
+            self._mark_message_complete(loop.anchor_channel_id, request_ts)
+
     def _present_loop_preview(
         self,
         loop: Loop,
@@ -8255,6 +8272,11 @@ class SlackTeamController:
         agent,
         thread: SlackThreadRef,
     ) -> None:
+        if task.status == AgentTaskStatus.CANCELLED and task.metadata.get(
+            LOOP_RESOLUTION_METADATA_KEY
+        ):
+            self._finalize_cancelled_loop_resolution_task(task)
+            return
         loop_run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
         if isinstance(loop_run_id, str):
             task = self.store.get_agent_task(task.task_id) or task

@@ -1,12 +1,14 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_harness.config import AgentCommandConfig
 from agent_harness.loops import (
     AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
@@ -21,6 +23,7 @@ from agent_harness.loops import (
 from agent_harness.models import (
     LOOP_ID_METADATA_KEY,
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
+    LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
     AgentTaskKind,
     AgentTaskStatus,
@@ -39,6 +42,7 @@ from agent_harness.models import (
     WorkRequest,
     utc_now,
 )
+from agent_harness.runtime.tasks import ManagedTaskRuntime
 from agent_harness.slack import encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
@@ -592,6 +596,112 @@ class LoopCreationFlowTests(unittest.TestCase):
             self.store.get_agent_task(task.task_id).status,
             AgentTaskStatus.CANCELLED,
         )
+
+    def test_cancelled_provider_run_cleans_up_provisional_loop_without_duplicate_reply(self):
+        loop, task, agent = self._request_loop()
+        cancelled = replace(task, status=AgentTaskStatus.CANCELLED)
+        self.assertTrue(cancelled.metadata[LOOP_RESOLUTION_METADATA_KEY])
+        self.store.upsert_agent_task(cancelled)
+        replies_before = len(self.gateway.thread_replies)
+
+        self.controller.handle_runtime_task_done(
+            cancelled,
+            agent,
+            SlackThreadRef(loop.anchor_channel_id, loop.anchor_thread_ts),
+        )
+
+        cleaned = self.store.get_loop(loop.loop_id)
+        assert cleaned is not None
+        self.assertEqual(cleaned.status, LoopStatus.CANCELLED)
+        self.assertIn("Retry `loop create`", cleaned.last_error)
+        self.assertEqual(
+            self.store.get_team_agent(loop.agent_id, include_fired=True).status,
+            TeamAgentStatus.FIRED,
+        )
+        self.assertEqual(len(self.gateway.thread_replies), replies_before)
+
+    def test_loop_create_recovers_from_transient_provider_overload_and_posts_preview(self):
+        requests = []
+
+        class Process:
+            def __init__(self, request, output):
+                self.request = request
+                self.output = output
+                self.reads = 0
+
+            def start(self):
+                pass
+
+            def read_available(self, max_reads=20, timeout=0.05):
+                if self.reads:
+                    return ""
+                self.reads += 1
+                return self.output
+
+            def is_alive(self):
+                return False
+
+            def terminate(self):
+                pass
+
+        spec = {
+            "title": "Service Health Watch",
+            "bot_name": "Service Health Bot",
+            "channel_name": "loop-service-health",
+            "mission": "Inspect service health every hour and summarize material incidents.",
+            "schedule": {"frequency": "interval", "interval_seconds": 3600},
+            "icon": {"emoji": "satellite"},
+        }
+
+        def process_factory(request):
+            requests.append(request)
+            if len(requests) == 1:
+                payload = {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "result": "API Error: 529 Overloaded. Private backend details.",
+                }
+            else:
+                payload = {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": AGENT_LOOP_SIGNAL_PREFIX + json.dumps(spec),
+                }
+            return Process(request, json.dumps(payload) + "\n")
+
+        runtime = ManagedTaskRuntime(
+            self.store,
+            self.gateway,
+            AgentCommandConfig(),
+            process_factory=process_factory,
+            poll_seconds=0.01,
+            on_task_done=self.controller.handle_runtime_task_done,
+            on_agent_control=self.controller.handle_runtime_agent_control,
+            transient_provider_retry_delays=(0.0, 0.0),
+            home=Path(self.temp_dir.name),
+        )
+        self.controller.runtime = runtime
+
+        loop, _, _ = self._request_loop(
+            "loop create inspect service health every hour #private provider=claude"
+        )
+        for _ in range(300):
+            current = self.store.get_loop(loop.loop_id)
+            if current is not None and current.status == LoopStatus.AWAITING_APPROVAL:
+                break
+            time.sleep(0.01)
+
+        recovered = self.store.get_loop(loop.loop_id)
+        assert recovered is not None
+        self.assertEqual(recovered.status, LoopStatus.AWAITING_APPROVAL)
+        self.assertEqual(len(requests), 2)
+        replies = [reply["text"] for reply in self.gateway.thread_replies]
+        self.assertTrue(any("Retrying automatically (1/2)" in reply for reply in replies))
+        self.assertFalse(any("529" in reply for reply in replies))
+        self.assertFalse(any("Private backend details" in reply for reply in replies))
+        self.assertIn("loop.approve", str(self.gateway.thread_replies[-1]["blocks"]))
 
     def test_non_owner_cannot_approve_or_edit_preview(self):
         loop = self._resolve_loop()
