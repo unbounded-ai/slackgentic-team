@@ -304,6 +304,25 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("loop.create.open", str(self.gateway.posts[-1]["blocks"]))
         self.assertIn("Create a recurring loop", self.gateway.posts[-1]["text"])
 
+    def test_loop_help_posts_command_reference_without_creation_button(self):
+        self.controller.handle_event(
+            {
+                "event": {
+                    "type": "message",
+                    "channel": "CMAIN",
+                    "ts": "101.000003",
+                    "user": "UOWNER",
+                    "text": "loop help",
+                }
+            }
+        )
+
+        help_message = self.gateway.posts[-1]
+        self.assertIn("Loop commands", help_message["text"])
+        self.assertIn("Inside a loop channel", help_message["text"])
+        self.assertIsNone(help_message["blocks"])
+        self.assertNotIn("loop.create.open", str(help_message))
+
     def test_loop_create_button_opens_guided_modal(self):
         self.controller.handle_block_action(
             {
@@ -336,6 +355,35 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
         self.assertIn("loop_mission", str(modal["blocks"]))
         self.assertIn("loop_schedule", str(modal["blocks"]))
+
+    def test_loop_create_button_reports_modal_open_failure(self):
+        def fail_to_open_view(_trigger_id, _view):
+            raise RuntimeError("modal rejected")
+
+        self.gateway.open_view = fail_to_open_view
+
+        with self.assertLogs("agent_harness.slack.app", level="ERROR"):
+            self.controller.handle_block_action(
+                {
+                    "actions": [
+                        {
+                            "value": encode_action_value(
+                                "loop.create.open",
+                                anchor_thread_ts="101.000001",
+                            )
+                        }
+                    ],
+                    "channel": {"id": "CMAIN"},
+                    "message": {"ts": "101.000002"},
+                    "user": {"id": "UOWNER"},
+                    "trigger_id": "TRIGGER1",
+                }
+            )
+
+        fallback = self.gateway.thread_replies[-1]
+        self.assertEqual(fallback["thread"].thread_ts, "101.000001")
+        self.assertIn("could not open the loop form", fallback["text"])
+        self.assertIn("loop create <task and schedule>", fallback["text"])
 
     def test_loop_create_modal_validates_required_fields(self):
         response = self.controller.handle_view_submission(

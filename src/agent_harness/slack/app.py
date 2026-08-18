@@ -433,6 +433,14 @@ SLACK_SOCKET_MAX_PENDING_REQUESTS = 16
 SLACK_SOCKET_PONG_GRACE_SECONDS = 30.0
 SLACK_SOCKET_STALE_SECONDS = 30.0
 SLACK_SOCKET_STABLE_SECONDS = 30.0
+SLACK_TRIGGER_BOUND_ACTIONS = frozenset(
+    {
+        "external.session.assign.open",
+        "loop.create.open",
+        "roster.work.open",
+        "schedule.change",
+    }
+)
 CAPACITY_MESSAGE = (
     "No agents are available right now. Hire more agents and I will resume this thread "
     "automatically."
@@ -1688,7 +1696,22 @@ class SlackTeamController:
         if isinstance(command, LoopListCommand):
             self._post_loop_list(channel_id)
             return
-        self._post_loop_create_guide(channel_id)
+        self.gateway.post_message(channel_id, self._main_loop_help_text())
+
+    def _main_loop_help_text(self) -> str:
+        return (
+            "*Loop commands*\n"
+            "*In the main agent channel*\n"
+            "`loop create` — open the guided creation form\n"
+            "`loop create <task and schedule>` — generate a loop preview directly\n"
+            "`loops` · `loop list` — list loops and their controls\n\n"
+            "*Inside a loop channel*\n"
+            "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
+            "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
+            "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
+            "`loop permissions: locked|safe-auto|dangerous` · `loop compact now`\n"
+            "`loop stop` · `loop stop archive` · `loop help`"
+        )
 
     def _handle_loop_command(self, loop: Loop, command, *, event: dict | None = None) -> None:
         latest = self.store.get_loop(loop.loop_id) or loop
@@ -2416,16 +2439,29 @@ class SlackTeamController:
             self._post_loop_create_guide(channel_id)
             return
         anchor_thread_ts = payload.get("anchor_thread_ts") or message_ts
-        self.gateway.open_view(
-            trigger_id,
-            build_loop_create_modal(
-                channel_id=channel_id,
-                anchor_thread_ts=(
-                    str(anchor_thread_ts) if isinstance(anchor_thread_ts, str) else None
+        try:
+            self.gateway.open_view(
+                trigger_id,
+                build_loop_create_modal(
+                    channel_id=channel_id,
+                    anchor_thread_ts=(
+                        str(anchor_thread_ts) if isinstance(anchor_thread_ts, str) else None
+                    ),
+                    guide_message_ts=message_ts,
                 ),
-                guide_message_ts=message_ts,
-            ),
-        )
+            )
+        except Exception:
+            LOGGER.exception("failed to open the guided loop creation modal")
+            self._post_text(
+                SlackReplyTarget(
+                    channel_id=channel_id,
+                    thread_ts=(
+                        str(anchor_thread_ts) if isinstance(anchor_thread_ts, str) else None
+                    ),
+                ),
+                "I could not open the loop form. Retry *Create a loop*, or use "
+                "`loop create <task and schedule>`.",
+            )
 
     def _handle_loop_create_submission(
         self,
@@ -5179,7 +5215,7 @@ class SlackTeamController:
                 "`scheduled tasks` — pending and claimed scheduled work",
                 "`loops` / `loop list` — recurring loop bots and their controls",
                 "`loop create` — guided recurring loop and channel creation",
-                "`loop help` — loop creation help",
+                "`loop help` — loop command reference",
                 "`hire 3 agents` — add capacity; `hire 2 claude agents` picks the provider",
                 "`fire @handle` — release one agent; `fire everyone` clears the roster",
                 "`repo root ~/code` — set where agents work",
@@ -12711,24 +12747,6 @@ class SocketModeSlackApp:
     def run_forever(self) -> None:
         import signal
 
-        from slack_sdk.socket_mode.response import SocketModeResponse
-
-        def listener(socket_client, request) -> None:
-            if _is_view_submission_request(request):
-                try:
-                    payload = self.handle_request(request)
-                except Exception:
-                    LOGGER.exception("failed to handle Slack Socket Mode request")
-                    payload = None
-                socket_client.send_socket_mode_response(
-                    SocketModeResponse(envelope_id=request.envelope_id, payload=payload)
-                )
-                return
-            socket_client.send_socket_mode_response(
-                SocketModeResponse(envelope_id=request.envelope_id)
-            )
-            self._submit_acknowledged_request(request)
-
         shutdown = getattr(self, "_shutdown", threading.Event())
         self._shutdown = shutdown
         shutdown.clear()
@@ -12758,7 +12776,9 @@ class SocketModeSlackApp:
                 if client is None:
                     try:
                         client = self._create_socket_mode_client()
-                        client.socket_mode_request_listeners.append(listener)
+                        client.socket_mode_request_listeners.append(
+                            self._handle_socket_mode_envelope
+                        )
                         client.connect()
                         is_connected = getattr(client, "is_connected", None)
                         if callable(is_connected) and not is_connected():
@@ -12843,6 +12863,28 @@ class SocketModeSlackApp:
             socket_ready.clear()
             self._close_socket_mode_client(client)
             self.close()
+
+    def _handle_socket_mode_envelope(self, socket_client, request) -> None:
+        from slack_sdk.socket_mode.response import SocketModeResponse
+
+        if _is_view_submission_request(request):
+            try:
+                payload = self.handle_request(request)
+            except Exception:
+                LOGGER.exception("failed to handle Slack Socket Mode request")
+                payload = None
+            socket_client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=request.envelope_id, payload=payload)
+            )
+            return
+        socket_client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+        if _is_trigger_bound_block_action_request(request):
+            # A modal trigger expires three seconds after Slack creates it. These
+            # actions must not wait behind ordinary events in the shared worker
+            # pool, but the envelope still needs to be acknowledged first.
+            self._handle_acknowledged_request(request)
+            return
+        self._submit_acknowledged_request(request)
 
     def _create_socket_mode_client(self):
         from agent_harness.slack.socket_mode import SupervisedSocketModeClient
@@ -13012,6 +13054,29 @@ def _is_view_submission_request(request) -> bool:
         return False
     payload = getattr(request, "payload", None)
     return isinstance(payload, dict) and payload.get("type") == "view_submission"
+
+
+def _is_trigger_bound_block_action_request(request) -> bool:
+    if getattr(request, "type", None) != "interactive":
+        return False
+    payload = getattr(request, "payload", None)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "block_actions"
+        or not payload.get("trigger_id")
+    ):
+        return False
+    action = _first_action(payload)
+    if action is None:
+        return False
+    action_id = action.get("action_id")
+    if action_id in SLACK_TRIGGER_BOUND_ACTIONS:
+        return True
+    try:
+        action_name = decode_action_value(action.get("value") or "{}").get("action")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return action_name in SLACK_TRIGGER_BOUND_ACTIONS
 
 
 def _socket_mode_connection_stale(
