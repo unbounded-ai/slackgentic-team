@@ -581,7 +581,7 @@ class UpdateRunnerTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_start_posts_post_restart_ack_when_pending_matches_current_version(self):
+    def test_start_posts_post_restart_ack_after_slow_startup(self):
         from agent_harness import __version__
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -601,7 +601,7 @@ class UpdateRunnerTests(unittest.TestCase):
                     json.dumps(
                         {
                             "channel_id": "C1",
-                            "created_at": utc_now().isoformat(),
+                            "created_at": (utc_now() - timedelta(minutes=3)).isoformat(),
                             "message_ts": "999",
                             "version": __version__,
                         }
@@ -926,7 +926,7 @@ class UpdateRunnerTests(unittest.TestCase):
                     json.dumps(
                         {
                             "channel_id": "C1",
-                            "created_at": "2026-01-01T00:00:00+00:00",
+                            "created_at": (utc_now() - timedelta(minutes=5)).isoformat(),
                             "message_ts": "999",
                             "version": __version__,
                         }
@@ -955,6 +955,8 @@ class UpdateRunnerTests(unittest.TestCase):
                 try:
                     self.assertEqual(len(updates), 1)
                     self.assertIn("automatic service restart did not confirm", updates[0][2])
+                    self.assertIn("within 5 minutes", updates[0][2])
+                    self.assertNotIn("after a later start", updates[0][2])
                     self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
                     self.assertEqual(
                         store.get_setting(SETTING_UPDATE_INSTALLED_VERSION),
@@ -1047,24 +1049,25 @@ class UpdateHelperConfirmTests(unittest.TestCase):
                     helper_phase="succeeded",
                     update_message=lambda *args: posts.append(args),
                     status_blocks=lambda candidate, status, actions: [{"type": "section"}],
-                    timeout_seconds=20,
                     poll_seconds=5,
                     sleep=clock.sleep,
                     now=clock.now,
                 )
 
                 self.assertEqual(outcome, "notified")
+                self.assertEqual(sum(clock.slept), 6 * 60)
                 self.assertEqual(len(posts), 1)
                 channel_id, message_ts, text, blocks = posts[0]
                 self.assertEqual((channel_id, message_ts), ("C1", "171"))
                 self.assertIn("did not confirm", text)
+                self.assertIn("within 5 minutes", text)
                 self.assertEqual(blocks, [{"type": "section"}])
                 self.assertIsNone(store.get_setting(SETTING_UPDATE_RESTART_PENDING))
                 self.assertEqual(store.get_setting(SETTING_UPDATE_INSTALLED_VERSION), "0.2.0")
             finally:
                 store.close()
 
-    def test_finalize_skips_when_daemon_confirms(self):
+    def test_finalize_waits_for_slow_daemon_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
             try:
@@ -1073,10 +1076,10 @@ class UpdateHelperConfirmTests(unittest.TestCase):
                 posts: list[tuple] = []
 
                 def clearing_sleep(seconds: float) -> None:
-                    # Simulate the restarted daemon posting the ack and clearing
-                    # the marker between poll iterations.
-                    store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
                     clock.sleep(seconds)
+                    # Startup reconciliation can outlast the old helper timeout.
+                    if sum(clock.slept) >= 4 * 60:
+                        store.delete_setting(SETTING_UPDATE_RESTART_PENDING)
 
                 outcome = finalize_restart_pending(
                     store,
@@ -1084,13 +1087,13 @@ class UpdateHelperConfirmTests(unittest.TestCase):
                     helper_phase="succeeded",
                     update_message=lambda *args: posts.append(args),
                     status_blocks=lambda *args: [],
-                    timeout_seconds=20,
                     poll_seconds=5,
                     sleep=clearing_sleep,
                     now=clock.now,
                 )
 
                 self.assertEqual(outcome, "confirmed")
+                self.assertEqual(sum(clock.slept), 4 * 60)
                 self.assertEqual(posts, [])
             finally:
                 store.close()
