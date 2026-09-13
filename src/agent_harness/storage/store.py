@@ -1215,23 +1215,31 @@ class Store:
         *,
         team_id: str | None = None,
         channel_id: str | None = None,
+        preserve_history: bool = False,
     ) -> bool:
         changed = False
-        for prefix in (
+        prefixes = (
             "external_session_agent.",
             "external_session_pending.",
             "external_session_live_target.",
             "external_session_missing_target.",
-            "external_session_summary.",
             "external_session_terminal_mirror.",
-            "session_channel_notice.",
-            "codex_response_item_recovery.v1.",
-        ):
+        )
+        if not preserve_history:
+            prefixes += (
+                "external_session_summary.",
+                "session_channel_notice.",
+                "codex_response_item_recovery.v1.",
+            )
+        for prefix in prefixes:
             cursor = self.conn.execute(
                 "DELETE FROM settings WHERE key = ?",
                 (f"{prefix}{provider.value}.{session_id}",),
             )
             changed = changed or cursor.rowcount > 0
+        if preserve_history:
+            self.conn.commit()
+            return changed
         thread_where = "provider = ? AND session_id = ?"
         thread_params: list[object] = [provider.value, session_id]
         if team_id is not None:

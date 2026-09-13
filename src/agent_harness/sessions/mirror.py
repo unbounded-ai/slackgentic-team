@@ -189,6 +189,7 @@ class SessionMirror:
         for provider in self.providers:
             for session in provider.discover():
                 revived_ignored_session = self._revive_ignored_session_if_new_activity(
+                    provider,
                     session,
                     channel_id,
                 )
@@ -900,6 +901,7 @@ class SessionMirror:
 
     def _revive_ignored_session_if_new_activity(
         self,
+        provider: AgentProvider,
         session: AgentSession,
         channel_id: str,
     ) -> bool | None:
@@ -907,8 +909,39 @@ class SessionMirror:
         ignored_at_text = self.store.get_setting(setting_key)
         if not ignored_at_text:
             return None
-        if not _ignored_external_session_has_new_activity(session, ignored_at_text):
+        if not _ignored_external_session_may_have_new_activity(session, ignored_at_text):
             return False
+        # Transcript mtimes also advance for background bookkeeping. Require a
+        # visible message after retirement before reclaiming a seat or posting.
+        ignored_at = parse_timestamp(ignored_at_text)
+        cursor = self.store.get_session_mirror_cursor(session.provider, session.session_id)
+        iter_events_after = getattr(provider, "iter_events_after", None)
+        try:
+            events = (
+                iter_events_after(session.transcript_path, cursor)
+                if callable(iter_events_after)
+                else provider.iter_events(session.transcript_path)
+            )
+            first_new_message = next(
+                (
+                    event
+                    for event in events
+                    if (event.line_number or 0) > cursor
+                    and event.timestamp is not None
+                    and ignored_at is not None
+                    and event.timestamp > ignored_at
+                    and render_session_event_chunk(event) is not None
+                ),
+                None,
+            )
+        except OSError:
+            LOGGER.debug("failed to check retired session activity", exc_info=True)
+            return False
+        if first_new_message is None:
+            return False
+        # Older versions erased retired cursors. Even without saved history,
+        # resumption must start with new output, not replay the whole transcript.
+        self._update_cursor_if_needed(session, first_new_message.line_number - 1)
         self.store.delete_setting(setting_key)
         self._mark_session_pending(session)
         self._notify_external_session_occupancy_changed(channel_id)
@@ -924,21 +957,29 @@ class SessionMirror:
         if not _cwd_matches_ignored_patterns(session.cwd, self.ignored_cwd_patterns):
             return False
         self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
-        self._record_ignored_session(session, channel_id)
+        self._record_ignored_session(session, channel_id, preserve_history=False)
         return True
 
     def _skip_disallowed_cwd_session(self, session: AgentSession, channel_id: str) -> bool:
         if _cwd_matches_allowed_prefixes(session.cwd, self.allowed_cwd_prefixes):
             return False
         self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
-        self._record_ignored_session(session, channel_id)
+        self._record_ignored_session(session, channel_id, preserve_history=False)
         return True
 
-    def _record_ignored_session(self, session: AgentSession, channel_id: str) -> None:
+    def _record_ignored_session(
+        self,
+        session: AgentSession,
+        channel_id: str,
+        *,
+        preserve_history: bool = True,
+    ) -> None:
         if session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             session = replace(session, status=SessionStatus.DONE)
         self.store.upsert_session(session)
-        self._clear_external_tracking(session, channel_id)
+        # Retirement releases occupancy, but the conversation and delivery cursor
+        # must survive so a resumed session continues in its original thread.
+        self._clear_external_tracking(session, channel_id, preserve_history=preserve_history)
 
     def _skip_internal_session(self, session: AgentSession, channel_id: str) -> bool:
         if not _is_codex_subagent_session(session):
@@ -967,12 +1008,19 @@ class SessionMirror:
         self._clear_external_tracking(session, channel_id)
         return True
 
-    def _clear_external_tracking(self, session: AgentSession, channel_id: str) -> None:
+    def _clear_external_tracking(
+        self,
+        session: AgentSession,
+        channel_id: str,
+        *,
+        preserve_history: bool = False,
+    ) -> None:
         changed = self.store.clear_external_session_tracking(
             session.provider,
             session.session_id,
             team_id=self.team_id,
             channel_id=channel_id,
+            preserve_history=preserve_history,
         )
         if changed:
             self._notify_external_session_occupancy_changed(channel_id)
@@ -1191,7 +1239,7 @@ def _provider_session_from_external_key(value: str) -> tuple[Provider, str] | No
     return provider, session_id
 
 
-def _ignored_external_session_has_new_activity(
+def _ignored_external_session_may_have_new_activity(
     session: AgentSession,
     ignored_at_text: str,
 ) -> bool:

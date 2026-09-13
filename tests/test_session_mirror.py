@@ -1,9 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from itertools import product
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.models import (
     AgentEvent,
@@ -14,6 +17,7 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgentKind,
 )
+from agent_harness.providers.claude import ClaudeProvider
 from agent_harness.providers.codex import CodexProvider
 from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.mirror import (
@@ -38,6 +42,35 @@ def _task_notification_text() -> str:
         "<summary>Background command completed</summary>\n"
         "</task-notification>"
     )
+
+
+def _external_transcript(home, provider_kind, timestamp):
+    if provider_kind == Provider.CLAUDE:
+        provider = ClaudeProvider(home=home)
+        path = provider.projects_root / "example-project" / "s1.jsonl"
+        records = []
+    else:
+        provider = CodexProvider(home=home)
+        path = provider.sessions_root / "rollout-s1.jsonl"
+        records = [{"type": "session_meta", "payload": {"id": "s1"}}]
+    records.append(_external_message_record(provider_kind, timestamp, "Previous answer"))
+    path.parent.mkdir(parents=True)
+    _write_external_records(path, records, timestamp)
+    return provider, path, records
+
+
+def _external_message_record(provider_kind, timestamp, text):
+    record = {"timestamp": timestamp.isoformat()}
+    if provider_kind == Provider.CLAUDE:
+        record.update(type="assistant", message={"content": text})
+    else:
+        record.update(type="event_msg", payload={"type": "agent_message", "message": text})
+    return record
+
+
+def _write_external_records(path, records, timestamp):
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    os.utime(path, (timestamp.timestamp(), timestamp.timestamp()))
 
 
 class FakeGateway:
@@ -666,6 +699,139 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_ignored_session_metadata_write_does_not_reannounce_history(self):
+        for provider_kind in Provider:
+            with self.subTest(provider=provider_kind), tempfile.TemporaryDirectory() as tmp:
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(minutes=2)
+                    )
+                    ignored_key = f"external_session_ignored.{provider_kind.value}.s1"
+                    ignored_at = now - timedelta(minutes=1)
+                    store.set_setting(ignored_key, ignored_at.isoformat())
+                    # Background bookkeeping changes mtime without a new message.
+                    records.append(
+                        {
+                            "type": "system",
+                            "subtype": "away_summary",
+                            "timestamp": now.isoformat(),
+                        }
+                    )
+                    _write_external_records(path, records, now)
+                    gateway = FakeGateway()
+                    mirror = SessionMirror(
+                        store,
+                        gateway,
+                        [provider],
+                        team_id="T1",
+                        channel_id="C1",
+                        terminal_notifier=FakeTerminalNotifier(),
+                        home=Path(tmp),
+                    )
+
+                    mirror.sync_once()
+                    mirror.sync_once()
+
+                    self.assertEqual(gateway.parents, [])
+                    self.assertEqual(gateway.replies, [])
+                    self.assertEqual(store.get_setting(ignored_key), ignored_at.isoformat())
+                    self.assertIsNone(
+                        store.get_setting(f"external_session_agent.{provider_kind.value}.s1")
+                    )
+                    # Older versions already erased the thread and cursor. A
+                    # real resumption may need a parent, but must not replay
+                    # messages from before the session was ignored.
+                    resumed_at = now + timedelta(seconds=1)
+                    records.append(
+                        _external_message_record(provider_kind, resumed_at, "New answer")
+                    )
+                    _write_external_records(path, records, resumed_at)
+                    mirror.sync_once()
+                    mirror.sync_once()
+
+                    self.assertEqual(len(gateway.parents), 1)
+                    self.assertEqual([reply[1] for reply in gateway.replies], ["New answer"])
+                finally:
+                    store.close()
+
+    def test_retired_session_resumes_original_thread_without_replaying_history(self):
+        for provider_kind, restart in product(Provider, (False, True)):
+            with (
+                self.subTest(provider=provider_kind, restart=restart),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                state_path = Path(tmp) / "state.sqlite"
+                store = Store(state_path)
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(minutes=2)
+                    )
+                    gateway = FakeGateway()
+
+                    mirror_options = {
+                        "team_id": "T1",
+                        "channel_id": "C1",
+                        "terminal_notifier": FakeTerminalNotifier(),
+                        "home": Path(tmp),
+                    }
+                    mirror = SessionMirror(
+                        store, gateway, [provider], missing_target_grace_seconds=0, **mirror_options
+                    )
+                    mirror.sync_once()
+                    thread = store.get_slack_thread_for_session(provider_kind, "s1", "T1", "C1")
+                    self.assertIsNotNone(thread)
+                    self.assertEqual(len(gateway.parents), 1)
+
+                    provider.active_within_seconds = 30
+                    self.assertEqual(provider.discover()[0].status, SessionStatus.IDLE)
+
+                    with patch(
+                        "agent_harness.sessions.mirror.utc_now",
+                        return_value=now - timedelta(minutes=1),
+                    ):
+                        # Missing process, retirement, then ignored-session cleanup.
+                        for _ in range(3):
+                            mirror.sync_once()
+                    self.assertIsNone(
+                        store.get_setting(f"external_session_agent.{provider_kind.value}.s1")
+                    )
+
+                    # Resumption must work both within a process and after restart.
+                    if restart:
+                        store.close()
+                        store = Store(state_path)
+                        store.init_schema()
+                    records.append(_external_message_record(provider_kind, now, "New answer"))
+                    _write_external_records(path, records, now)
+                    if restart:
+                        mirror = SessionMirror(store, gateway, [provider], **mirror_options)
+                    mirror.missing_target_grace_seconds = 300
+                    mirror.sync_once(backfill_new_sessions=not restart)
+                    mirror.sync_once()
+
+                    self.assertEqual(len(gateway.parents), 1)
+                    self.assertEqual(
+                        store.get_slack_thread_for_session(provider_kind, "s1", "T1", "C1"),
+                        thread,
+                    )
+                    self.assertEqual(
+                        [reply[1] for reply in gateway.replies],
+                        ["Previous answer", "Session ended; freed up this agent.", "New answer"],
+                    )
+                    self.assertTrue(all(reply[0] == thread for reply in gateway.replies))
+                    self.assertEqual(
+                        store.get_session_mirror_cursor(provider_kind, "s1"), len(records)
+                    )
+                finally:
+                    store.close()
+
     def test_ignored_external_session_with_new_activity_is_pending_again(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -685,10 +851,18 @@ class SessionMirrorTests(unittest.TestCase):
                     "external_session_ignored.claude.s1",
                     ignored_at.isoformat(),
                 )
+                event = AgentEvent(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    timestamp=session.last_seen_at,
+                    event_type="user",
+                    line_number=1,
+                    metadata={"message": {"content": "Continue the task"}},
+                )
                 mirror = SessionMirror(
                     store,
                     FakeGateway(),
-                    [FakeProvider(session, [])],
+                    [FakeProvider(session, [event])],
                     team_id="T1",
                     channel_id="C1",
                 )
