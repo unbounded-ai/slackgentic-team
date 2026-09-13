@@ -195,52 +195,52 @@ class PropertyTests(unittest.TestCase):
     @settings(max_examples=PROPERTY_MAX_EXAMPLES, deadline=None)
     @given(task_scope_cases())
     def test_task_free_up_only_finishes_same_agent_thread_scope(self, specs):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.sqlite")
-            try:
-                store.init_schema()
-                agents = build_initial_model_team(2, 1)
-                for agent in agents:
-                    store.upsert_team_agent(agent)
-                created_at = datetime(2026, 1, 1, tzinfo=UTC)
-                for index, (agent_index, thread_ts, status) in enumerate(specs):
-                    task = AgentTask(
-                        task_id=f"task_{index}",
-                        agent_id=agents[agent_index].agent_id,
-                        prompt=f"task {index}",
-                        channel_id="C1",
-                        kind=AgentTaskKind.WORK,
-                        status=status,
-                        created_at=created_at + timedelta(seconds=index),
-                        updated_at=created_at + timedelta(seconds=index),
-                        thread_ts=thread_ts,
-                        parent_message_ts=thread_ts,
-                    )
-                    store.upsert_agent_task(task)
-                controller = SlackTeamController(store, FakeGateway(), default_channel_id="C1")
-
-                controller.handle_block_action(
-                    {
-                        "type": "block_actions",
-                        "channel": {"id": "C1"},
-                        "message": {"ts": specs[0][1]},
-                        "actions": [{"value": encode_action_value("task.done", task_id="task_0")}],
-                    }
+        # Each generated case needs isolated state without durable disk writes.
+        store = Store(Path(":memory:"))
+        try:
+            store.init_schema()
+            agents = build_initial_model_team(2, 1)
+            for agent in agents:
+                store.upsert_team_agent(agent)
+            created_at = datetime(2026, 1, 1, tzinfo=UTC)
+            for index, (agent_index, thread_ts, status) in enumerate(specs):
+                task = AgentTask(
+                    task_id=f"task_{index}",
+                    agent_id=agents[agent_index].agent_id,
+                    prompt=f"task {index}",
+                    channel_id="C1",
+                    kind=AgentTaskKind.WORK,
+                    status=status,
+                    created_at=created_at + timedelta(seconds=index),
+                    updated_at=created_at + timedelta(seconds=index),
+                    thread_ts=thread_ts,
+                    parent_message_ts=thread_ts,
                 )
+                store.upsert_agent_task(task)
+            controller = SlackTeamController(store, FakeGateway(), default_channel_id="C1")
 
-                target_agent_id = agents[specs[0][0]].agent_id
-                target_thread = specs[0][1]
-                for index, (agent_index, thread_ts, original_status) in enumerate(specs):
-                    stored = store.get_agent_task(f"task_{index}")
-                    should_finish = (
-                        agents[agent_index].agent_id == target_agent_id
-                        and thread_ts == target_thread
-                        and original_status in ACTIVE_TASK_STATUSES
-                    )
-                    expected = AgentTaskStatus.DONE if should_finish else original_status
-                    self.assertEqual(stored.status, expected)
-            finally:
-                store.close()
+            controller.handle_block_action(
+                {
+                    "type": "block_actions",
+                    "channel": {"id": "C1"},
+                    "message": {"ts": specs[0][1]},
+                    "actions": [{"value": encode_action_value("task.done", task_id="task_0")}],
+                }
+            )
+
+            target_agent_id = agents[specs[0][0]].agent_id
+            target_thread = specs[0][1]
+            for index, (agent_index, thread_ts, original_status) in enumerate(specs):
+                stored = store.get_agent_task(f"task_{index}")
+                should_finish = (
+                    agents[agent_index].agent_id == target_agent_id
+                    and thread_ts == target_thread
+                    and original_status in ACTIVE_TASK_STATUSES
+                )
+                expected = AgentTaskStatus.DONE if should_finish else original_status
+                self.assertEqual(stored.status, expected)
+        finally:
+            store.close()
 
     @settings(max_examples=PROPERTY_MAX_EXAMPLES, deadline=None)
     @given(codex_stream_cases())
