@@ -29,7 +29,9 @@ DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_UPGRADE_COMMAND_ATTEMPTS = 2
 DEFAULT_UPGRADE_RETRY_DELAY_SECONDS = 2.0
-DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 2 * 60
+# Startup reconciles saved sessions and Slack history before confirming readiness.
+# Allow slow network-bound recovery to finish before reporting a restart timeout.
+DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 5 * 60
 # The update-helper waits this long for the restarted daemon to acknowledge the
 # upgrade before posting the terminal status itself. It is intentionally longer
 # than DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS so a slow-but-healthy daemon wins
@@ -553,8 +555,9 @@ class SlackgenticUpdateRunner:
         elif stale:
             text = (
                 f":warning: Installed Slackgentic {tag_name}, but automatic service restart "
-                "did not confirm within 2 minutes. This daemon is now running the installed "
-                "version after a later start; run `slackgentic service status` to verify the "
+                f"did not confirm within {DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS // 60} minutes. "
+                "This daemon is now running the installed version, but startup confirmation "
+                "arrived late; run `slackgentic service status` to verify the "
                 "service is healthy."
             )
             self.store.set_setting(
@@ -948,7 +951,7 @@ def restart_pending_failure_text(version: str, *, current_version: str | None = 
     current = f" Current daemon version: `{current_version}`." if current_version else ""
     return (
         f":warning: Slackgentic {version} was installed, but automatic service restart "
-        "did not confirm within 2 minutes."
+        f"did not confirm within {DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS // 60} minutes."
         f"{current} Recovery: run `slackgentic service install && "
         "slackgentic service status`."
     )
