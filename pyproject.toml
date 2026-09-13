@@ -60,8 +60,3 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["B", "C4", "E", "F", "I", "PIE", "RUF", "SIM", "UP"]
 ignore = ["E501"]
-
-[tool.pytest.ini_options]
-addopts = "-vv --max-worker-restart=0"
-faulthandler_timeout = 60
-faulthandler_exit_on_timeout = true

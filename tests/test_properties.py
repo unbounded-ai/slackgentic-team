@@ -321,7 +321,9 @@ class PropertyTests(unittest.TestCase):
     def test_external_session_assignment_never_overfills_matching_provider_capacity(self, case):
         codex_count, claude_count, providers = case
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "state.sqlite")
+            # This property checks assignment, not persistence. Avoid thousands
+            # of durable schema writes across the generated cases.
+            store = Store(Path(":memory:"))
             try:
                 store.init_schema()
                 if codex_count + claude_count:
