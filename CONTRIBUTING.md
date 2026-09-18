@@ -27,6 +27,20 @@ The test suite is written with `unittest` and run through `pytest` in CI so
 `pytest-xdist` can split tests across workers. It should not require network
 access.
 
+CI runners are slow and stall unpredictably, so tests that observe background
+threads must not depend on timing:
+
+- Wait with the helpers in `tests/polling.py` (`wait_until`, `poll_attempts`,
+  `POLL_TIMEOUT_SECONDS`) instead of attempt-counted loops or short timeouts.
+  They return as soon as the condition holds, so a generous deadline is free.
+- Wait for the state the test asserts on, not for an earlier step that leads
+  to it.
+- Call `shut_down_runtime(runtime)` before `store.close()` in any test that
+  starts a `ManagedTaskRuntime` task. Closing the store while a worker thread
+  is still using it can crash the interpreter instead of failing the test.
+- Do not assert on elapsed wall-clock time when the behavior can be observed
+  directly.
+
 ## Public Change Metadata
 
 Do not add automated assistant, agent, model, bot, or tool attribution anywhere

@@ -24,8 +24,9 @@ from agent_harness.sessions.bridge import (
 )
 from agent_harness.sessions.terminal import TerminalTarget
 from agent_harness.storage.store import Store
+from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts
 
-BRIDGE_THREAD_TIMEOUT_SECONDS = 5.0
+BRIDGE_THREAD_TIMEOUT_SECONDS = POLL_TIMEOUT_SECONDS
 
 
 class FakeGateway:
@@ -591,7 +592,7 @@ class SessionBridgeTests(unittest.TestCase):
                 return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
             def deliver_channel_message():
-                for _ in range(50):
+                for _ in poll_attempts():
                     rows = store.pending_claude_channel_messages(123)
                     if rows:
                         store.mark_claude_channel_message_delivered(int(rows[0]["id"]))
@@ -625,7 +626,7 @@ class SessionBridgeTests(unittest.TestCase):
 
                 handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
 
-                thread.join(timeout=1)
+                thread.join(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS)
                 self.assertTrue(handled)
                 self.assertTrue(delivered.is_set())
                 self.assertEqual(calls, [])
@@ -657,7 +658,7 @@ class SessionBridgeTests(unittest.TestCase):
                 return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
             def deliver_channel_message():
-                for _ in range(50):
+                for _ in poll_attempts():
                     rows = store.pending_claude_channel_messages(123)
                     if rows:
                         store.mark_claude_channel_message_delivered(int(rows[0]["id"]))
@@ -691,7 +692,7 @@ class SessionBridgeTests(unittest.TestCase):
 
                 handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
 
-                thread.join(timeout=1)
+                thread.join(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS)
                 self.assertTrue(handled)
                 self.assertTrue(delivered.is_set())
                 self.assertEqual(calls, [])

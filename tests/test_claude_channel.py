@@ -40,6 +40,7 @@ from agent_harness.slack import decode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
+from tests.polling import POLL_TIMEOUT_SECONDS, wait_until
 
 
 class FakeGateway:
@@ -857,7 +858,7 @@ class ClaudeChannelTests(unittest.TestCase):
                 store.init_schema()
                 handler = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                     poll_seconds=0.01,
@@ -878,7 +879,7 @@ class ClaudeChannelTests(unittest.TestCase):
                             },
                         }
                     )
-                    self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                    self.assertTrue(wait_until(lambda: bool(gateway.replies)))
                     actions = next(
                         block
                         for block in gateway.replies[0]["blocks"]
@@ -893,7 +894,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         )
                     )
                     self.assertTrue(
-                        _wait_for(
+                        wait_until(
                             lambda: "notifications/claude/channel/permission" in output.getvalue()
                         )
                     )
@@ -918,7 +919,7 @@ class ClaudeChannelTests(unittest.TestCase):
                 store.init_schema()
                 handler = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                     poll_seconds=0.01,
@@ -941,7 +942,7 @@ class ClaudeChannelTests(unittest.TestCase):
                             }
                         )
                         self.assertTrue(
-                            _wait_for(
+                            wait_until(
                                 lambda: (
                                     output.getvalue().count(
                                         "notifications/claude/channel/permission"
@@ -976,7 +977,7 @@ class ClaudeChannelTests(unittest.TestCase):
                 store.init_schema()
                 handler = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                     poll_seconds=0.01,
@@ -1003,7 +1004,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         }
                     )
                     self.assertTrue(
-                        _wait_for(
+                        wait_until(
                             lambda: "notifications/claude/channel/permission" in output.getvalue()
                         )
                     )
@@ -1030,7 +1031,7 @@ class ClaudeChannelTests(unittest.TestCase):
                 store.init_schema()
                 handler = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                     poll_seconds=0.01,
@@ -1148,7 +1149,7 @@ class ClaudeChannelTests(unittest.TestCase):
                             }
                         )
                     self.assertTrue(
-                        _wait_for(
+                        wait_until(
                             lambda: (
                                 output.getvalue().count("notifications/claude/channel/permission")
                                 == len(requests)
@@ -1708,7 +1709,7 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 worker = threading.Thread(target=run_hook)
                 worker.start()
-                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
                 rows = store.list_pending_slack_agent_requests("item/tool/requestUserInput")
                 self.assertEqual(len(rows), 1)
                 store.resolve_slack_agent_request(
@@ -1720,7 +1721,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         }
                     },
                 )
-                worker.join(timeout=1)
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertFalse(worker.is_alive())
                 hook_result = result["value"]
@@ -1812,11 +1813,11 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 worker = threading.Thread(target=run_hook)
                 worker.start()
-                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
 
                 responder = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -1828,7 +1829,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         element_index=1,
                     )
                 )
-                self.assertTrue(_wait_for(lambda: bool(gateway.updates)))
+                self.assertTrue(wait_until(lambda: bool(gateway.updates)))
                 self.assertTrue(
                     _click_request_button(
                         responder,
@@ -1837,7 +1838,7 @@ class ClaudeChannelTests(unittest.TestCase):
                         element_index=1,
                     )
                 )
-                worker.join(timeout=1)
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertFalse(worker.is_alive())
                 hook_result = result["value"]
@@ -1907,11 +1908,11 @@ class ClaudeChannelTests(unittest.TestCase):
 
                 worker = threading.Thread(target=run_hook)
                 worker.start()
-                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
                 rows = store.list_pending_slack_agent_requests("item/tool/requestUserInput")
                 self.assertEqual(len(rows), 1)
                 store.resolve_slack_agent_request(rows[0]["token"], {"answers": {}})
-                worker.join(timeout=1)
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertFalse(worker.is_alive())
                 hook_result = result["value"]
@@ -1926,15 +1927,6 @@ class ClaudeChannelTests(unittest.TestCase):
                 )
             finally:
                 store.close()
-
-
-def _wait_for(predicate, attempts=100):
-    event = threading.Event()
-    for _ in range(attempts):
-        if predicate():
-            return True
-        event.wait(0.01)
-    return False
 
 
 def _click_request_button(

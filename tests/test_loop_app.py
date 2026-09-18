@@ -53,6 +53,7 @@ from agent_harness.slack.app import (
 )
 from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent
+from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, shut_down_runtime
 from tests.test_slack_app import FakeGateway, FakeRuntime
 
 
@@ -75,6 +76,8 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        if isinstance(self.controller.runtime, ManagedTaskRuntime):
+            shut_down_runtime(self.controller.runtime)
         self.store.close()
         self.temp_dir.cleanup()
 
@@ -687,11 +690,14 @@ class LoopCreationFlowTests(unittest.TestCase):
         loop, _, _ = self._request_loop(
             "loop create inspect service health every hour #private provider=claude"
         )
-        for _ in range(300):
+        for _ in poll_attempts():
             current = self.store.get_loop(loop.loop_id)
             if current is not None and current.status == LoopStatus.AWAITING_APPROVAL:
                 break
             time.sleep(0.01)
+        # The worker parks the loop before it posts the approval preview, so
+        # let it finish before looking at the replies.
+        self.assertTrue(runtime.join_workers(POLL_TIMEOUT_SECONDS))
 
         recovered = self.store.get_loop(loop.loop_id)
         assert recovered is not None
@@ -1330,7 +1336,7 @@ class LoopCreationFlowTests(unittest.TestCase):
             worker.start()
         barrier.wait()
         for worker in workers:
-            worker.join(timeout=2)
+            worker.join(timeout=POLL_TIMEOUT_SECONDS)
 
         self.assertFalse(any(worker.is_alive() for worker in workers))
         self.assertEqual(results, [True, True])
