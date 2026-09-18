@@ -68,6 +68,7 @@ from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX, parse_agent_timer_signal
+from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, shut_down_runtime
 
 
 def _task_notification_text(*, escaped: bool = False) -> str:
@@ -953,6 +954,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].model, "example-model")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_refuses_macos_tcc_protected_working_directory(self):
@@ -989,6 +991,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
                 self.assertIn("macOS-protected Documents", runtime.gateway.replies[-1])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_can_opt_into_macos_tcc_protected_working_directory(self):
@@ -1026,6 +1029,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(launched), 1)
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_passes_configured_repo_root_to_codex_safe_auto(self):
@@ -1061,6 +1065,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].safe_auto_extra_roots, (root.resolve(),))
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_passes_configured_repo_root_to_claude_safe_auto(self):
@@ -1096,6 +1101,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].safe_auto_extra_roots, (root.resolve(),))
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_passes_claude_effort_from_user_settings(self):
@@ -1133,6 +1139,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].claude_effort, "xhigh")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_prefers_project_claude_effort_settings(self):
@@ -1170,6 +1177,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].claude_effort, "xhigh")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_defaults_claude_effort_when_settings_missing(self):
@@ -1204,6 +1212,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].claude_effort, "xhigh")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_defaults_claude_effort_when_settings_invalid(self):
@@ -1240,6 +1249,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].claude_effort, "xhigh")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_forces_pm_claude_agent_to_max_effort(self):
@@ -1290,6 +1300,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(launched[0].claude_effort, "max")
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_forces_pm_codex_agent_to_high_reasoning_effort(self):
@@ -1343,6 +1354,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIsNone(launched[-1].codex_reasoning_effort)
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_requested_repo_cwd_uses_named_sibling_repo(self):
@@ -2167,7 +2179,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen:
                         break
                     time.sleep(0.01)
@@ -2178,6 +2190,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(seen, ["somebody review this handoff"])
                 self.assertEqual(gateway.replies, seen)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_does_not_post_process_lifecycle_message_on_completion(self):
@@ -2199,7 +2212,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if gateway.replies:
                         break
                     time.sleep(0.01)
@@ -2209,7 +2222,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).status,
                     AgentTaskStatus.ACTIVE,
                 )
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and MANAGED_RUN_STARTED_METADATA_KEY not in current.metadata:
                         break
@@ -2219,6 +2232,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_agent_task(task.task_id).metadata,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_should_resume_managed_run_requires_marker(self):
@@ -2304,6 +2318,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 assert cleared is not None
                 self.assertEqual(managed_run_resume_attempts(cleared), 0)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_all_running_tasks_clears_markers(self):
@@ -2340,6 +2355,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
                     self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_all_running_tasks_can_preserve_restart_markers(self):
@@ -2368,6 +2384,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
                 self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_post_agent_chunk_drops_output_after_stop_requested(self):
@@ -2414,6 +2431,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     ["before release", "release cleared — posts again"],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_task_escalates_to_kill_when_terminate_does_not_exit(self):
@@ -2468,14 +2486,14 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
 
-                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+                self.assertTrue(processes[0].reading.wait(timeout=POLL_TIMEOUT_SECONDS))
                 with self.assertLogs("agent_harness.runtime.tasks", level="WARNING") as logs:
                     self.assertTrue(
                         runtime.stop_task(
                             task.task_id,
                             status=None,
                             join_timeout=0.05,
-                            kill_join_timeout=1.0,
+                            kill_join_timeout=POLL_TIMEOUT_SECONDS,
                         )
                     )
                 self.assertTrue(processes[0].terminate_called)
@@ -2488,6 +2506,7 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 for process in processes:
                     process.release.set()
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_task_keeps_unjoined_worker_visible_until_exit(self):
@@ -2533,7 +2552,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
 
-                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+                self.assertTrue(processes[0].reading.wait(timeout=POLL_TIMEOUT_SECONDS))
                 with self.assertLogs("agent_harness.runtime.tasks", level="WARNING") as logs:
                     self.assertFalse(
                         runtime.stop_task(task.task_id, status=None, join_timeout=0.01)
@@ -2549,13 +2568,14 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
 
                 processes[0].release.set()
-                deadline = time.monotonic() + 1.0
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while runtime.has_running_tasks() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertFalse(runtime.has_running_tasks())
             finally:
                 for process in processes:
                     process.release.set()
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_keeps_completed_worker_visible_until_done_callback_finishes(self):
@@ -2572,7 +2592,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 def on_task_done(task, agent, thread):
                     callback_started.set()
-                    release_callback.wait(timeout=1.0)
+                    release_callback.wait(timeout=POLL_TIMEOUT_SECONDS)
 
                 runtime = ManagedTaskRuntime(
                     store,
@@ -2584,16 +2604,17 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                self.assertTrue(callback_started.wait(timeout=1.0))
+                self.assertTrue(callback_started.wait(timeout=POLL_TIMEOUT_SECONDS))
                 self.assertTrue(runtime.has_running_tasks())
 
                 release_callback.set()
-                deadline = time.monotonic() + 1.0
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while runtime.has_running_tasks() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertFalse(runtime.has_running_tasks())
             finally:
                 release_callback.set()
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_all_uses_shared_join_budget(self):
@@ -2639,28 +2660,34 @@ class TaskRuntimeTests(unittest.TestCase):
                     runtime.start_task(task, agent, SlackThreadRef("C1", f"171.00000{index}"))
 
                 for process in BlockingReadProcess.instances:
-                    self.assertTrue(process.reading.wait(timeout=1.0))
+                    self.assertTrue(process.reading.wait(timeout=POLL_TIMEOUT_SECONDS))
 
-                start = time.monotonic()
+                join_timeouts: list[float] = []
+                for running in runtime.running_tasks():
+
+                    def record_join(timeout=None, _join=running.worker.join):
+                        join_timeouts.append(timeout)
+                        return _join(timeout)
+
+                    running.worker.join = record_join
+
                 with self.assertLogs("agent_harness.runtime.tasks", level="WARNING"):
                     self.assertEqual(
                         runtime.stop_all_running_tasks(status=None, join_timeout=0.02),
                         0,
                     )
-                # Keep ample distance from the multi-second per-process read timeout
-                # while allowing for scheduler contention under the parallel CI suite.
-                self.assertLess(time.monotonic() - start, 0.3)
+                # Both workers stay blocked in their reads, so the first join spends
+                # the budget and the second only gets what is left. Checking the
+                # budget handed to each join, rather than elapsed time, keeps a
+                # stalled CI runner from failing this.
+                self.assertEqual(len(join_timeouts), 2)
+                self.assertLess(sum(join_timeouts), 0.03)
                 self.assertTrue(runtime.has_running_tasks())
             finally:
                 for process in BlockingReadProcess.instances:
                     process.release.set()
-                deadline = time.monotonic() + 1.0
-                while (
-                    "runtime" in locals()
-                    and runtime.has_running_tasks()
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.01)
+                if "runtime" in locals():
+                    shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_cancels_codex_run_that_never_starts_thread(self):
@@ -2704,6 +2731,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIsNone(store.get_managed_thread_task("C1", "171.000001"))
                 self.assertIn("did not finish starting Codex", gateway.replies[-1])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_cancels_claude_run_that_never_starts_session(self):
@@ -2726,7 +2754,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.CANCELLED and gateway.replies:
                         break
@@ -2737,6 +2765,53 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(persisted.status, AgentTaskStatus.CANCELLED)
                 self.assertIn("did not finish starting Claude", gateway.replies[-1])
             finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_join_workers_waits_for_worker_that_left_running_set(self):
+        # The start-timeout path drops the task from the running set and only
+        # then reports to Slack, so the worker outlives has_running_tasks().
+        class BlockingGateway(FakeGateway):
+            def __init__(self):
+                super().__init__()
+                self.posting = threading.Event()
+                self.release = threading.Event()
+
+            def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
+                self.posting.set()
+                self.release.wait(timeout=POLL_TIMEOUT_SECONDS)
+                return super().post_thread_reply(thread, text, persona, icon_url, blocks)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = BlockingGateway()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "review a design", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                    poll_seconds=0.01,
+                    agent_start_timeout=timedelta(seconds=0),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                self.assertTrue(gateway.posting.wait(timeout=POLL_TIMEOUT_SECONDS))
+
+                self.assertFalse(runtime.has_running_tasks())
+                self.assertFalse(runtime.join_workers(0.01))
+
+                gateway.release.set()
+                self.assertTrue(runtime.join_workers(POLL_TIMEOUT_SECONDS))
+                self.assertIn("did not finish starting Claude", gateway.replies[-1])
+            finally:
+                gateway.release.set()
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_warns_without_interrupting_on_missing_visible_progress(self):
@@ -2768,7 +2843,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if any("leaving the run active" in reply for reply in gateway.replies):
                         break
                     time.sleep(0.01)
@@ -2782,7 +2857,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(current.status, AgentTaskStatus.ACTIVE)
             finally:
                 if "runtime" in locals():
-                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                    shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_skips_progress_warning_when_activity_is_recent(self):
@@ -2826,6 +2901,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 running.last_activity_monotonic = stale
                 self.assertTrue(runtime._managed_task_progress_warning_due(running))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_restarts_stalled_session_with_status_prompt(self):
@@ -2863,7 +2939,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if len(requests) >= 2 and gateway.replies and gateway.replies[-1] == "Done":
                         break
                     time.sleep(0.01)
@@ -2882,7 +2958,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
             finally:
                 if "runtime" in locals():
-                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                    shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_treats_transcript_updates_as_activity_for_stall_timeout(self):
@@ -2937,6 +3013,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 self.assertFalse(runtime._managed_task_stall_timed_out(running))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_cancels_stalled_session_after_recovery_limit(self):
@@ -2966,7 +3043,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.CANCELLED:
                         break
@@ -2978,6 +3055,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn("repeatedly had no observed activity", gateway.replies[-1])
                 self.assertNotIn(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY, persisted.metadata)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def _claude_idle_running_task(self, agent, *, stale_seconds: float = 60.0):
@@ -3024,6 +3102,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 running.turn_complete = True
                 self.assertFalse(runtime._managed_task_progress_warning_due(running))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_suppresses_stall_restart_after_completed_turn(self):
@@ -3049,6 +3128,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 running.turn_complete = True
                 self.assertFalse(runtime._managed_task_stall_timed_out(running))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_capture_turn_completion_marks_idle_after_result(self):
@@ -3101,6 +3181,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertFalse(codex_running.turn_complete)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_send_to_task_rearms_watchdog_after_completed_turn(self):
@@ -3144,6 +3225,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(running.turn_buffer, "")
                 self.assertFalse(runtime._managed_task_stall_timed_out(running))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_marks_managed_run_while_process_is_alive(self):
@@ -3178,6 +3260,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 assert current is not None
                 self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, current.metadata)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_send_to_task_delivers_live_to_managed_claude(self):
@@ -3213,6 +3296,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.stop_task(task.task_id)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_send_to_task_still_rejects_managed_codex_followup(self):
@@ -3248,6 +3332,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.stop_task(task.task_id)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_interrupt_sends_escape_but_keeps_task_running(self):
@@ -3281,6 +3366,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.stop_task(task.task_id)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_worker_failure_terminates_orphan_child_process(self):
@@ -3310,7 +3396,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 logging.disable(logging.CRITICAL)
                 try:
                     runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                    for _ in range(50):
+                    for _ in poll_attempts():
                         current = store.get_agent_task(task.task_id)
                         if current and current.status == AgentTaskStatus.CANCELLED:
                             break
@@ -3325,6 +3411,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertFalse(created[0].is_alive())
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_worker_failure_cancels_task_instead_of_leaving_it_active(self):
@@ -3347,7 +3434,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 logging.disable(logging.CRITICAL)
                 try:
                     runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                    for _ in range(50):
+                    for _ in poll_attempts():
                         current = store.get_agent_task(task.task_id)
                         if current and current.status == AgentTaskStatus.CANCELLED:
                             break
@@ -3361,6 +3448,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(current.status, AgentTaskStatus.CANCELLED)
                 self.assertIsNone(store.get_managed_thread_task("C1", "171.000001", agent.agent_id))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_posts_visible_chunks_with_agent_avatar_url(self):
@@ -3383,7 +3471,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if gateway.replies:
                         break
                     time.sleep(0.01)
@@ -3391,6 +3479,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(gateway.replies, ["Done"])
                 self.assertEqual(gateway.icon_urls, [f"https://example.com/{agent.handle}.png"])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_cancels_silent_process_completion(self):
@@ -3412,7 +3501,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.CANCELLED:
                         break
@@ -3424,6 +3513,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentTaskStatus.CANCELLED,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_captures_codex_session_id(self):
@@ -3445,7 +3535,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and current.session_id == "codex-thread-1":
                         break
@@ -3456,16 +3546,17 @@ class TaskRuntimeTests(unittest.TestCase):
                 assert current is not None
                 self.assertEqual(current.session_provider, Provider.CODEX)
                 self.assertEqual(current.session_id, "codex-thread-1")
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.ACTIVE:
                         break
                     time.sleep(0.01)
-                for _ in range(50):
+                for _ in poll_attempts():
                     if gateway.replies:
                         break
                     time.sleep(0.01)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_resumes_task_session(self):
@@ -3500,16 +3591,17 @@ class TaskRuntimeTests(unittest.TestCase):
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
 
                 self.assertEqual(requests[0].resume_session_id, "codex-thread-1")
-                for _ in range(50):
+                for _ in poll_attempts():
                     current = store.get_agent_task(task.task_id)
                     if current and current.status == AgentTaskStatus.ACTIVE:
                         break
                     time.sleep(0.01)
-                for _ in range(50):
+                for _ in poll_attempts():
                     if gateway.replies:
                         break
                     time.sleep(0.01)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_uses_task_dangerous_mode_metadata(self):
@@ -3540,11 +3632,12 @@ class TaskRuntimeTests(unittest.TestCase):
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
 
                 self.assertTrue(requests[0].dangerous)
-                for _ in range(50):
+                for _ in poll_attempts():
                     if gateway.replies:
                         break
                     time.sleep(0.01)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_records_managed_session_on_capture(self):
@@ -3571,7 +3664,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if store.get_setting(
                         managed_session_agent_key(Provider.CODEX, "codex-thread-1")
                     ) and store.get_setting(
@@ -3591,6 +3684,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     "1",
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_task_clears_managed_session_setting(self):
@@ -3633,6 +3727,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     store.get_setting(managed_session_agent_key(Provider.CODEX, "codex-stop"))
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stop_all_clears_managed_session_settings(self):
@@ -3694,7 +3789,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     poll_seconds=0.01,
                 )
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                self.assertTrue(processes[0].reading.wait(timeout=1.0))
+                self.assertTrue(processes[0].reading.wait(timeout=POLL_TIMEOUT_SECONDS))
 
                 runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED, join_timeout=1.0)
 
@@ -3704,6 +3799,7 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 for process in processes:
                     process.release.set()
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_ignores_claude_permission_denials_in_dangerous_mode(self):
@@ -3732,7 +3828,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done after dangerous-mode bypass." in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -3744,6 +3840,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_loads_claude_channel_for_slack_thread_when_configured(self):
@@ -3783,11 +3880,12 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(requests[0].slack_thread_ts, "171.000001")
                 for allowed_tool in SLACKGENTIC_MCP_PERMISSION_ALLOW:
                     self.assertIn(allowed_tool, requests[0].allowed_tools)
-                for _ in range(50):
+                for _ in poll_attempts():
                     if gateway.replies:
                         break
                     time.sleep(0.01)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_internal_slackgentic_mcp_permission_without_slack_approval(self):
@@ -3817,7 +3915,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -3833,6 +3931,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_safe_auto_claude_read_only_denial_without_slack_approval(self):
@@ -3862,7 +3961,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -3876,6 +3975,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_safe_auto_piped_read_only_denial_without_slack_approval(self):
@@ -3905,7 +4005,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -3925,6 +4025,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_safe_auto_sequenced_read_only_denial_without_slack_approval(self):
@@ -3954,7 +4055,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -3975,6 +4076,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_safe_auto_git_branch_remote_denials_without_slack_approval(self):
@@ -4020,7 +4122,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     )
 
                     runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                    for _ in range(100):
+                    for _ in poll_attempts():
                         if "Done" in gateway.replies:
                             break
                         time.sleep(0.01)
@@ -4034,6 +4136,7 @@ class TaskRuntimeTests(unittest.TestCase):
                         [],
                     )
                 finally:
+                    shut_down_runtime(runtime)
                     store.close()
 
     def test_runtime_retries_managed_claude_after_slack_approval(self):
@@ -4049,7 +4152,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 return ClaudeOneShotProcess(request)
 
             def approve_request():
-                for _ in range(100):
+                for _ in poll_attempts():
                     rows = store.list_pending_slack_agent_requests("claude/channel/permission")
                     if rows:
                         params = json.loads(rows[0]["params_json"])
@@ -4079,11 +4182,11 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.start()
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
-                approver.join(timeout=1)
+                approver.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertTrue(approved.is_set())
                 self.assertIn(
@@ -4100,6 +4203,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     ("Bash(gh pr view:*)", "Bash(gh pr view *)"),
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_broadens_claude_bash_allowlist_for_session_approval(self):
@@ -4115,7 +4219,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 return ClaudeOneShotProcess(request)
 
             def approve_request():
-                for _ in range(100):
+                for _ in poll_attempts():
                     rows = store.list_pending_slack_agent_requests("claude/channel/permission")
                     if rows:
                         store.resolve_slack_agent_request(
@@ -4145,11 +4249,11 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.start()
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
-                approver.join(timeout=1)
+                approver.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertTrue(approved.is_set())
                 self.assertEqual(len(requests), 2)
@@ -4157,6 +4261,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn("Bash(gh:*)", requests[1].allowed_tools)
                 self.assertIn("Bash(gh *)", requests[1].allowed_tools)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_posts_streamed_claude_permission_denial_without_waiting_for_result(self):
@@ -4172,7 +4277,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 return ClaudeOneShotProcess(request)
 
             def approve_request():
-                for _ in range(100):
+                for _ in poll_attempts():
                     rows = store.list_pending_slack_agent_requests("claude/channel/permission")
                     if rows:
                         params = json.loads(rows[0]["params_json"])
@@ -4202,11 +4307,11 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.start()
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
-                approver.join(timeout=1)
+                approver.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertTrue(approved.is_set())
                 self.assertIn(
@@ -4226,6 +4331,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_safe_auto_multiline_commit_without_slack_approval(self):
@@ -4255,7 +4361,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -4276,6 +4382,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_stops_live_claude_after_streamed_permission_denial(self):
@@ -4294,7 +4401,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 return ClaudeOneShotProcess(request)
 
             def approve_request():
-                for _ in range(100):
+                for _ in poll_attempts():
                     rows = store.list_pending_slack_agent_requests("claude/channel/permission")
                     if rows:
                         store.resolve_slack_agent_request(rows[0]["token"], {"behavior": "allow"})
@@ -4321,11 +4428,11 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.start()
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
-                approver.join(timeout=1)
+                approver.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertTrue(approved.is_set())
                 self.assertTrue(denied_processes[0].terminated)
@@ -4342,6 +4449,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertIn("Bash(git log:*)", requests[1].allowed_tools)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_accumulates_claude_allowed_tools_across_approvals(self):
@@ -4359,7 +4467,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 return ClaudeOneShotProcess(request)
 
             def approve_requests():
-                for _ in range(200):
+                for _ in poll_attempts():
                     rows = store.list_pending_slack_agent_requests("claude/channel/permission")
                     for row in rows:
                         if row["token"] in approved_tokens:
@@ -4389,11 +4497,11 @@ class TaskRuntimeTests(unittest.TestCase):
                 approver.start()
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(200):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
-                approver.join(timeout=1)
+                approver.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertEqual(len(approved_tokens), 2)
                 self.assertIn("Done", gateway.replies)
@@ -4412,6 +4520,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     ),
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_restarts_managed_claude_when_resume_session_is_missing(self):
@@ -4446,7 +4555,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -4457,6 +4566,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(requests[0].resume_session_id, "missing-session")
                 self.assertIsNone(requests[1].resume_session_id)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_restarts_managed_claude_on_empty_text_block_api_error(self):
@@ -4496,7 +4606,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(200):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -4510,7 +4620,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertTrue(
                     any("empty text content block" in reply for reply in gateway.replies)
                 )
-                for _ in range(100):
+                for _ in poll_attempts():
                     if not runtime.is_task_running(task.task_id):
                         break
                     time.sleep(0.01)
@@ -4523,6 +4633,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     persisted.metadata,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_gives_up_on_empty_text_block_api_error_after_retry_cap(self):
@@ -4563,14 +4674,13 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                # Give the loop ample time to attempt a retry that should not happen.
-                for _ in range(80):
-                    if len(requests) > 1:
-                        break
-                    time.sleep(0.01)
+                # A retry is started by the exiting worker, so once every worker is
+                # gone the retry that should not happen can no longer happen.
+                self.assertTrue(runtime.join_workers(POLL_TIMEOUT_SECONDS))
 
                 self.assertEqual(len(requests), 1)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_retries_transient_provider_failure_without_leaking_raw_error(self):
@@ -4601,7 +4711,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(200):
+                for _ in poll_attempts():
                     if "Done" in gateway.replies:
                         break
                     time.sleep(0.01)
@@ -4616,6 +4726,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     any("backend endpoint details" in reply for reply in gateway.replies)
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_caps_transient_provider_retries_and_reports_safe_failure(self):
@@ -4646,7 +4757,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(300):
+                for _ in poll_attempts():
                     if completed:
                         break
                     time.sleep(0.01)
@@ -4660,6 +4771,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     any("backend endpoint details" in reply for reply in gateway.replies)
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_notifies_agent_message_callback_once_per_visible_chunk(self):
@@ -4688,7 +4800,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen:
                         break
                     time.sleep(0.01)
@@ -4700,6 +4812,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentTaskStatus.ACTIVE,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_done_callback_can_restart_same_task(self):
@@ -4739,7 +4852,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 runtime.on_task_done = on_task_done
 
                 self.assertTrue(runtime.start_task(task, agent, SlackThreadRef("C1", "171.thread")))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if done_event.is_set():
                         break
                     time.sleep(0.01)
@@ -4747,6 +4860,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(restart_results, [True])
                 self.assertEqual(callbacks, ["initial", "queued follow-up"])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_posts_duplicate_codex_final_once(self):
@@ -4772,7 +4886,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if gateway.replies and not runtime.has_running_tasks():
                         break
                     time.sleep(0.01)
@@ -4780,6 +4894,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(gateway.replies, ["Final answer"])
                 self.assertEqual(seen, ["Final answer"])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_hides_agent_control_signal_and_notifies_callback(self):
@@ -4810,7 +4925,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen_controls:
                         break
                     time.sleep(0.01)
@@ -4822,6 +4937,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(done_callbacks, [])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_posts_visible_thread_done_text_before_control_callback(self):
@@ -4850,7 +4966,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if control_order:
                         break
                     time.sleep(0.01)
@@ -4858,6 +4974,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(gateway.replies, ["Sounds good."])
                 self.assertEqual(control_order, [(AGENT_THREAD_DONE_SIGNAL, ["Sounds good."])])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_handles_thread_done_signal_before_live_process_exits(self):
@@ -4892,7 +5009,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if seen_controls and not runtime.has_running_tasks():
                         break
                     time.sleep(0.01)
@@ -4907,7 +5024,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertTrue(LiveThreadDoneSignalProcess.instances[0].terminated)
             finally:
                 if runtime is not None:
-                    runtime.stop_all_running_tasks()
+                    shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_hides_agent_timer_signal_and_notifies_callback(self):
@@ -4933,7 +5050,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen_controls:
                         break
                     time.sleep(0.01)
@@ -4944,6 +5061,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     [f"{AGENT_TIMER_SIGNAL_PREFIX}2s | Re-check the PR feedback."],
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_timer_signal_does_not_suppress_task_done_callback(self):
@@ -4971,7 +5089,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen_controls and done_callbacks:
                         break
                     time.sleep(0.01)
@@ -4982,6 +5100,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(done_callbacks, [task.task_id])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_hides_schedule_success_text_and_notifies_callback(self):
@@ -5007,7 +5126,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen_controls:
                         break
                     time.sleep(0.01)
@@ -5016,6 +5135,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(seen_controls), 1)
                 self.assertTrue(seen_controls[0].startswith(AGENT_SCHEDULE_SIGNAL_PREFIX))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_hides_loop_resolution_text_and_dispatches_immediately(self):
@@ -5041,7 +5161,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(50):
+                for _ in poll_attempts():
                     if seen_controls:
                         break
                     time.sleep(0.01)
@@ -5050,6 +5170,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(seen_controls), 1)
                 self.assertTrue(seen_controls[0].startswith(AGENT_LOOP_SIGNAL_PREFIX))
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_handles_roster_status_signal_immediately_without_deferring_done(self):
@@ -5077,7 +5198,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in range(100):
+                for _ in poll_attempts():
                     if done_callbacks:
                         break
                     time.sleep(0.01)
@@ -5091,6 +5212,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(done_callbacks, [task.task_id])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_recovers_visible_message_from_codex_transcript(self):
@@ -5130,7 +5252,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while (not gateway.replies or not done_callbacks) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
@@ -5141,6 +5263,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentTaskStatus.ACTIVE,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_recovers_unseen_final_message_after_progress_chunk(self):
@@ -5186,7 +5309,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while (
                     len(gateway.replies) < 2 or not done_callbacks
                 ) and time.monotonic() < deadline:
@@ -5196,6 +5319,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(seen, ["Working", "Recovered final"])
                 self.assertEqual(done_callbacks, [task.task_id])
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_does_not_repost_transcript_history_when_resuming_session(self):
@@ -5260,11 +5384,12 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
                 gateway = runtime.gateway
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while not gateway.replies and time.monotonic() < deadline:
                     time.sleep(0.01)
-                # Wait for the recovery branch to also fire.
-                time.sleep(0.2)
+                # The recovery branch runs as the worker exits, so it has fired
+                # once the worker is gone.
+                self.assertTrue(runtime.join_workers(POLL_TIMEOUT_SECONDS))
 
                 self.assertEqual(
                     gateway.replies,
@@ -5272,6 +5397,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 self.assertNotIn(historical, gateway.replies)
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_recovers_visible_message_from_claude_transcript(self):
@@ -5319,7 +5445,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while (not gateway.replies or not done_callbacks) and time.monotonic() < deadline:
                     time.sleep(0.01)
 
@@ -5333,6 +5459,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentTaskStatus.CANCELLED,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_posts_claude_assistant_text_without_result(self):
@@ -5393,7 +5520,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000002"))
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
                 while (
                     len(gateway.replies) < 2 or not done_callbacks
                 ) and time.monotonic() < deadline:
@@ -5409,6 +5536,7 @@ class TaskRuntimeTests(unittest.TestCase):
                     AgentTaskStatus.CANCELLED,
                 )
             finally:
+                shut_down_runtime(runtime)
                 store.close()
 
 

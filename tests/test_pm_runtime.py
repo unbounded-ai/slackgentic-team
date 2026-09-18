@@ -45,6 +45,7 @@ from agent_harness.slack.app import (
 )
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task, hire_team_agents
+from tests.polling import poll_attempts, shut_down_runtime
 from tests.test_slack_app import FakeGateway, FakeRuntime
 
 
@@ -894,7 +895,7 @@ class PmStallRecoveryTests(unittest.TestCase):
                 controller.runtime = runtime
 
                 runtime.start_task(pm_task, pm_agent, thread_ref)
-                for _ in range(200):
+                for _ in poll_attempts():
                     parked = store.get_pm_initiative(initiative.initiative_id)
                     current_task = store.get_agent_task(pm_task.task_id)
                     if (
@@ -926,7 +927,7 @@ class PmStallRecoveryTests(unittest.TestCase):
                 )
             finally:
                 if "runtime" in locals():
-                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                    shut_down_runtime(runtime)
                 store.close()
 
 

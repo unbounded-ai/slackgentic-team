@@ -30,6 +30,7 @@ from agent_harness.updates import (
     is_newer_version,
     run_update_helper,
 )
+from tests.polling import POLL_TIMEOUT_SECONDS
 
 
 class UpdateVersionTests(unittest.TestCase):
@@ -454,7 +455,7 @@ class UpdateRunnerTests(unittest.TestCase):
 
                 thread = runner.start_upgrade("0.2.0", "C1", "171")
                 assert thread is not None
-                thread.join(timeout=2)
+                thread.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(restarts, [True])
@@ -571,7 +572,7 @@ class UpdateRunnerTests(unittest.TestCase):
 
                 thread = runner.start_upgrade("0.2.0", "C1", "171")
                 assert thread is not None
-                thread.join(timeout=2)
+                thread.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(updates[-1], "install failed")

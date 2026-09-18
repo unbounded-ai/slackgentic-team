@@ -9,6 +9,7 @@ from agent_harness.slack import decode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
+from tests.polling import POLL_TIMEOUT_SECONDS, wait_until
 
 
 class FakeGateway:
@@ -58,13 +59,13 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
                 responder = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -88,7 +89,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
 
                 worker = threading.Thread(target=run_request)
                 worker.start()
-                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
 
                 value = gateway.replies[0]["blocks"][2]["elements"][1]["value"]
                 handled = responder.handle_block_action(
@@ -97,7 +98,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                     gateway.replies[0]["ts"],
                 )
 
-                worker.join(timeout=1)
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
                 self.assertTrue(handled)
                 self.assertEqual(
                     result["value"],
@@ -116,13 +117,13 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
                 responder = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -137,7 +138,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
 
                 worker = threading.Thread(target=run_request)
                 worker.start()
-                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
 
                 value = _first_actions_block(gateway.replies[0]["blocks"])["elements"][0]["value"]
                 handled = responder.handle_block_action(
@@ -146,7 +147,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                     gateway.replies[0]["ts"],
                 )
 
-                worker.join(timeout=1)
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
                 self.assertTrue(handled)
                 self.assertEqual(result["value"], {"decision": "accept"})
                 self.assertEqual(gateway.updates[-1]["text"], "Approved Claude request.")
@@ -162,13 +163,13 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
                 responder = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -188,7 +189,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
 
                 worker = threading.Thread(target=run_request)
                 worker.start()
-                self.assertTrue(_wait_for(lambda: bool(gateway.replies)))
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
 
                 value = _first_actions_block(gateway.replies[0]["blocks"])["elements"][0]["value"]
                 handled = responder.handle_block_action(
@@ -197,7 +198,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                     gateway.replies[0]["ts"],
                 )
 
-                worker.join(timeout=1)
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
                 self.assertTrue(handled)
                 self.assertEqual(result["value"], {"behavior": "allow"})
                 self.assertIn("Claude requests tool approval", gateway.replies[0]["text"])
@@ -215,7 +216,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -258,7 +259,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -279,7 +280,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                         results.append(
                             requester.wait_for_persistent_request(
                                 pending.token,
-                                timeout_seconds=2,
+                                timeout_seconds=POLL_TIMEOUT_SECONDS,
                             )
                         )
                     except Exception as exc:  # pragma: no cover - asserted through errors
@@ -291,7 +292,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 start.set()
                 store.resolve_slack_agent_request(pending.token, {"behavior": "allow"})
                 for worker in workers:
-                    worker.join(timeout=2)
+                    worker.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertEqual(errors, [])
                 self.assertEqual(results, [{"behavior": "allow"}] * 8)
@@ -306,7 +307,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -354,7 +355,7 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 store.init_schema()
                 requester = SlackAgentRequestHandler(
                     gateway,
-                    timeout_seconds=2,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
                     store=store,
                     provider_label="Claude",
                 )
@@ -570,15 +571,6 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                 self.assertNotIn("Input preview", gateway.replies[0]["blocks"][1]["text"]["text"])
             finally:
                 store.close()
-
-
-def _wait_for(predicate, attempts=50):
-    event = threading.Event()
-    for _ in range(attempts):
-        if predicate():
-            return True
-        event.wait(0.01)
-    return False
 
 
 def _first_actions_block(blocks):

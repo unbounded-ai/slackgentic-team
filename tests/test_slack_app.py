@@ -3,7 +3,6 @@ import socket
 import sys
 import tempfile
 import threading
-import time
 import types
 import unittest
 from dataclasses import replace
@@ -101,6 +100,7 @@ from agent_harness.team.commands import (
     UnassignedExternalSessionsCommand,
 )
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
+from tests.polling import POLL_TIMEOUT_SECONDS, shut_down_runtime, wait_until
 
 
 def _task_notification_text(*, escaped: bool = False) -> str:
@@ -865,13 +865,13 @@ class SlackAppTests(unittest.TestCase):
         )
         recovery.start()
 
-        self.assertTrue(app._socket_reconnect_requested.wait(timeout=1))
-        self.assertTrue(closed.wait(timeout=1))
+        self.assertTrue(app._socket_reconnect_requested.wait(timeout=POLL_TIMEOUT_SECONDS))
+        self.assertTrue(closed.wait(timeout=POLL_TIMEOUT_SECONDS))
         self.assertFalse(app._socket_mode_ready.is_set())
         self.assertIsNone(app._active_socket_client)
 
         app._record_socket_connected()
-        recovery.join(timeout=1)
+        recovery.join(timeout=POLL_TIMEOUT_SECONDS)
 
         self.assertEqual(result, [True])
         self.assertEqual(app._socket_generation, 2)
@@ -4351,24 +4351,19 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def _drive_runtime_to_idle(self, runtime, gateway, *, timeout: float = 2.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if runtime.has_running_tasks():
-                time.sleep(0.01)
-                continue
-            if self._find_idle_release_prompt(gateway) is not None:
-                return True
-            time.sleep(0.01)
-        return self._find_idle_release_prompt(gateway) is not None
+    def _drive_runtime_to_idle(self, runtime, gateway, *, timeout: float = POLL_TIMEOUT_SECONDS):
+        return wait_until(
+            lambda: (
+                not runtime.has_running_tasks()
+                and self._find_idle_release_prompt(gateway) is not None
+            ),
+            timeout,
+        )
 
-    def _drive_runtime_to_stop(self, runtime, *, timeout: float = 2.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not runtime.has_running_tasks():
-                return True
-            time.sleep(0.01)
-        return not runtime.has_running_tasks()
+    def _drive_runtime_to_stop(self, runtime, *, timeout: float = POLL_TIMEOUT_SECONDS):
+        # Wait for the workers themselves: a task leaves the running set before
+        # its worker has finished writing the outcome.
+        return runtime.join_workers(timeout)
 
     def test_runtime_to_controller_e2e_posts_idle_prompt_for_codex(self):
         class CodexFinalProcess:
@@ -4435,7 +4430,7 @@ class SlackAppTests(unittest.TestCase):
                     )
                 )
             finally:
-                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_to_controller_e2e_posts_idle_prompt_for_claude(self):
@@ -4503,7 +4498,7 @@ class SlackAppTests(unittest.TestCase):
                     )
                 )
             finally:
-                runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_provider_error_cancels_pm_subtask_and_blocks_dependents(self):
@@ -4631,7 +4626,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("will not start downstream work", blocker_text)
             finally:
                 if runtime is not None:
-                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                    shut_down_runtime(runtime)
                 store.close()
 
     def test_agent_final_handle_line_routes_callback_without_action_button(self):

@@ -236,6 +236,11 @@ class ManagedTaskRuntime:
             )
         )
         self._running: dict[str, RunningTask] = {}
+        # Every worker that has been started and has not exited yet. A worker can
+        # drop out of _running (timeout, failure, or retry handoff) while it is
+        # still writing to the store, so _running alone cannot say when the
+        # store is no longer in use.
+        self._workers: set[threading.Thread] = set()
         self._lock = threading.Lock()
 
     def start_task(
@@ -389,6 +394,7 @@ class ManagedTaskRuntime:
                 }
         with self._lock:
             self._running[task.task_id] = running
+            self._workers.add(worker)
         worker.start()
         return True
 
@@ -536,6 +542,30 @@ class ManagedTaskRuntime:
             stopped += 1
         return stopped
 
+    def join_workers(self, timeout: float) -> bool:
+        """Wait for every started worker thread to exit.
+
+        Returns True once none remain, which is when the store is no longer in
+        use by this runtime and can be closed.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                workers = [
+                    worker for worker in self._workers if worker is not threading.current_thread()
+                ]
+            if not workers:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            for worker in workers:
+                # A worker registered by start_task may not have been started yet.
+                if worker.ident is None:
+                    time.sleep(min(remaining, 0.01))
+                else:
+                    worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
     def running_task_for_thread(self, channel_id: str, thread_ts: str) -> RunningTask | None:
         with self._lock:
             for running in self._running.values():
@@ -577,6 +607,8 @@ class ManagedTaskRuntime:
             running = self._get_running(task_id)
             if running is not None and running.worker is threading.current_thread():
                 self._remove_running_task(task_id, running)
+            with self._lock:
+                self._workers.discard(threading.current_thread())
 
     def _stream_task_loop(self, task_id: str) -> None:
         sleep_seconds = _fast_stream_poll_seconds(self.poll_seconds)

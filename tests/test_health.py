@@ -27,7 +27,8 @@ class HealthTests(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(backoff.wait(stop))
 
-        self.assertLess(time.monotonic() - start, 0.5)
+        # Well under the 10s backoff, with room for a stalled CI runner.
+        self.assertLess(time.monotonic() - start, 5.0)
 
     def test_cpu_watchdog_triggers_after_consecutive_hot_samples(self):
         process_values = iter([0.0, 1.0, 2.0, 3.0])
