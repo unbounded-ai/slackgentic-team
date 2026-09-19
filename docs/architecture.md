@@ -117,6 +117,26 @@ whole idle pool.
 External sessions are discoverable from provider transcript files and mirrored
 into Slack.
 
+A transcript's `user` role is not authorship. It is the carrier for everything
+that is not model output: tool results, injected context, hook prompts,
+notifications, compaction summaries, and prompts replayed after compaction. The
+mirror therefore posts a message under the person's name only when the provider
+adapter sets `AgentEvent.human_authored`, and adapters set it only from the
+CLI's own record that someone submitted input:
+
+- Claude Code labels each prompt with `origin.kind`; only `human` counts, plus
+  the launcher-supplied prompt of a headless run (`promptSource: sdk`). Records
+  the CLI writes for itself carry no label and are dropped.
+- Codex records a submission event (`user_message`, or an `item_completed`
+  event with a `UserMessage` item) for each prompt; role `user` response items
+  are model input and are never attributed to the person.
+
+The field defaults to false, so a record type a CLI adds later is left out of
+Slack until an adapter has positive evidence for it. Do not add text patterns
+for new internal record types; they are already excluded. Transcripts from CLI
+releases older than the ones verified to write these labels keep the earlier
+text heuristics, which are frozen along with those releases.
+
 Codex live delivery uses the local Codex app-server. Slackgentic sends
 `thread/resume` and `turn/start` JSON-RPC calls to the app-server and listens
 for input or approval requests from the server.

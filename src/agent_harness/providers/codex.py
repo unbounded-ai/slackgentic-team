@@ -24,6 +24,18 @@ from agent_harness.providers.path_index import (
 )
 from agent_harness.storage.jsonl import first_jsonl_record, iter_jsonl, last_jsonl_line_number
 
+# Codex writes an explicit event whenever a person (or the launcher of a headless
+# run) submits input: `user_message`, or on newer releases an `item_completed`
+# event carrying a `UserMessage` item. Response items with role "user" are the
+# model's input instead. They also hold injected context (AGENTS.md, environment,
+# hook prompts, shell commands) and the prompts Codex replays after compaction,
+# so they say nothing about who wrote them. Authorship comes from the submission
+# events alone, which drops any new kind of injected item by default.
+CODEX_USER_MESSAGE_ITEM_TYPE = "UserMessage"
+# Oldest release verified to record a submission event for every prompt. Older
+# or unidentified rollouts keep the response-item heuristics they always had.
+CODEX_SUBMISSION_EVENTS_MIN_VERSION = (0, 136)
+
 
 class CodexProvider:
     provider = Provider.CODEX
@@ -41,6 +53,7 @@ class CodexProvider:
         self.active_within_seconds = active_within_seconds
         self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
         self._response_item_message_format: dict[Path, bool] = {}
+        self._records_submission_events: dict[Path, bool] = {}
         self._hot_path_retention_seconds = (
             hot_path_retention_seconds
             if hot_path_retention_seconds is not None
@@ -113,6 +126,9 @@ class CodexProvider:
         for path in list(self._session_cache):
             if path not in seen_paths:
                 self._session_cache.pop(path, None)
+        for path in list(self._records_submission_events):
+            if path not in seen_paths:
+                self._records_submission_events.pop(path, None)
 
     def _session_from_path(
         self,
@@ -162,6 +178,8 @@ class CodexProvider:
     ) -> Iterator[AgentEvent]:
         session_id = _session_id_from_filename(transcript_path) or "unknown"
         prefer_response_items = self._prefers_response_item_messages(transcript_path)
+        submission_events = self._rollout_records_submission_events(transcript_path)
+        last_submission: tuple[int, str] | None = None
         for event_line_number, record in iter_jsonl(transcript_path, after_line=line_number):
             timestamp = parse_timestamp(record.get("timestamp"))
             record_type = str(record.get("type", "unknown"))
@@ -181,10 +199,13 @@ class CodexProvider:
                 continue
             payload = record.get("payload")
             metadata = record
+            duplicate_types = (
+                {"agent_message"} if submission_events else {"agent_message", "user_message"}
+            )
             if (
                 prefer_response_items
                 and isinstance(payload, dict)
-                and payload.get("type") in {"agent_message", "user_message"}
+                and payload.get("type") in duplicate_types
             ):
                 metadata = {**record, "_slackgentic_duplicate_message": True}
             if isinstance(payload, dict) and payload.get("type") == "token_count":
@@ -200,6 +221,17 @@ class CodexProvider:
                 )
                 continue
             text = _event_text(record)
+            if submission_events:
+                submitted = codex_user_submission_text(payload)
+                human_authored = submitted is not None
+                # Codex can record one submission twice, on consecutive lines.
+                # Two real submissions always have a turn between them.
+                if human_authored and last_submission == (event_line_number - 1, submitted):
+                    human_authored = False
+                if human_authored:
+                    last_submission = (event_line_number, submitted)
+            else:
+                human_authored = _is_legacy_codex_user_message(metadata)
             yield AgentEvent(
                 provider=self.provider,
                 session_id=session_id,
@@ -209,7 +241,22 @@ class CodexProvider:
                 source_path=transcript_path,
                 line_number=event_line_number,
                 metadata=metadata,
+                human_authored=human_authored,
             )
+
+    def _rollout_records_submission_events(self, transcript_path: Path) -> bool:
+        cached = self._records_submission_events.get(transcript_path)
+        if cached is not None:
+            return cached
+        first = first_jsonl_record(transcript_path)
+        if first is None:
+            # Nothing written yet; decide once the session header exists.
+            return False
+        payload = first[1].get("payload")
+        version = payload.get("cli_version") if isinstance(payload, dict) else None
+        records = _codex_cli_version(version) >= CODEX_SUBMISSION_EVENTS_MIN_VERSION
+        self._records_submission_events[transcript_path] = records
+        return records
 
     def response_item_recovery_cursor(
         self,
@@ -358,6 +405,78 @@ def _event_text(record: dict[str, Any]) -> str | None:
         if payload.get("type") == "function_call_output":
             return "tool result"
     return None
+
+
+def codex_user_submission_text(payload: Any) -> str | None:
+    """The text of an event recording that someone submitted input, else None."""
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") == "user_message":
+        message = payload.get("message") or payload.get("text")
+        return str(message) if message else None
+    if payload.get("type") != "item_completed":
+        return None
+    item = payload.get("item")
+    if not isinstance(item, dict) or item.get("type") != CODEX_USER_MESSAGE_ITEM_TYPE:
+        return None
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        part["text"]
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    ]
+    return "\n\n".join(parts) if parts else None
+
+
+def is_codex_context_message(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped.startswith("# AGENTS.md instructions for ")
+        and "<INSTRUCTIONS>" in stripped
+        and "<environment_context>" in stripped
+    ) or (
+        stripped.startswith("<environment_context>") and stripped.endswith("</environment_context>")
+    )
+
+
+def _is_legacy_codex_user_message(record: dict[str, Any]) -> bool:
+    # Rollouts that predate verified submission events: keep what was mirrored
+    # for them before, a `user_message` or a role "user" response item that is
+    # not one of the known context injections.
+    if record.get("_slackgentic_duplicate_message") is True:
+        return False
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("type") == "user_message":
+        return True
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return False
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    text = "\n\n".join(
+        item["text"].strip()
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") in {"input_text", "output_text", "text"}
+        and isinstance(item.get("text"), str)
+        and item["text"].strip()
+    )
+    return bool(text) and not is_codex_context_message(text)
+
+
+def _codex_cli_version(value: Any) -> tuple[int, ...]:
+    parts: list[int] = []
+    for part in str(value or "").split("."):
+        if not part.isdigit():
+            break
+        parts.append(int(part))
+    return tuple(parts)
 
 
 def _is_visible_response_item_message(payload: dict[str, Any]) -> bool:

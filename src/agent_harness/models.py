@@ -187,6 +187,12 @@ class AgentEvent:
     source_path: Path | None = None
     line_number: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # True only when the provider's transcript itself identifies this event as
+    # input a person submitted. A transcript's "user" role is just the carrier
+    # for everything that is not model output (tool results, injected context,
+    # compaction summaries, notifications), so it never implies authorship.
+    # Providers must set this from positive evidence; the default fails closed.
+    human_authored: bool = False
 
 
 @dataclass(frozen=True)

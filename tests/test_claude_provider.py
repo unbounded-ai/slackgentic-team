@@ -421,5 +421,234 @@ class IsSyntheticClaudeAssistantRecordTests(unittest.TestCase):
         self.assertFalse(is_synthetic_claude_assistant_record(record))
 
 
+def _prompt(text, **fields):
+    return {"type": "user", "message": {"role": "user", "content": text}, **fields}
+
+
+class ClaudeUserRecordAuthorshipTests(unittest.TestCase):
+    MODERN = "2.1.228"
+    LEGACY = "1.0.35"
+
+    def test_only_a_human_origin_is_attributed_to_a_person(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        for source in ("typed", "queued", "suggestion_accepted"):
+            record = _prompt("ship it", origin={"kind": "human"}, promptSource=source)
+            with self.subTest(source=source):
+                self.assertTrue(is_human_claude_user_record(record, provenance_labelled=True))
+
+        for kind in ("task-notification", "coordinator", "peer", "some-future-kind"):
+            record = _prompt("ship it", origin={"kind": kind}, promptSource="system")
+            with self.subTest(kind=kind):
+                self.assertFalse(is_human_claude_user_record(record, provenance_labelled=True))
+
+    def test_headless_launcher_prompt_counts_but_system_prompts_do_not(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        launched = _prompt("review the diff", promptSource="sdk", version=self.MODERN)
+        injected = _prompt("scheduled wake-up", promptSource="system", version=self.MODERN)
+
+        self.assertTrue(is_human_claude_user_record(launched, provenance_labelled=True))
+        self.assertFalse(is_human_claude_user_record(injected, provenance_labelled=True))
+
+    def test_cli_written_flags_win_over_any_origin(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        for flag in ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly", "isSidechain"):
+            record = _prompt("internal state", origin={"kind": "human"}, **{flag: True})
+            with self.subTest(flag=flag):
+                self.assertFalse(is_human_claude_user_record(record, provenance_labelled=False))
+
+    def test_unlabelled_record_from_a_labelling_cli_is_never_a_person(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        # Shaped like any record type the CLI might add later: plain text, no
+        # flags, nothing to pattern-match on.
+        future = _prompt("An internal note nobody has thought of yet.", version=self.MODERN)
+        newer = _prompt("An internal note nobody has thought of yet.", version="3.0.0")
+
+        self.assertFalse(is_human_claude_user_record(future, provenance_labelled=False))
+        self.assertFalse(is_human_claude_user_record(newer, provenance_labelled=False))
+
+    def test_unlabelled_record_in_a_transcript_seen_labelling_is_not_a_person(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        record = _prompt("An internal note.", version=self.LEGACY)
+
+        self.assertFalse(is_human_claude_user_record(record, provenance_labelled=True))
+
+    def test_legacy_transcript_keeps_typed_prompts_and_drops_cli_plumbing(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        typed = _prompt("ship it", version=self.LEGACY)
+        unversioned = _prompt("ship it")
+        parts = {
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": "ship it"}]},
+        }
+        self.assertTrue(is_human_claude_user_record(typed, provenance_labelled=False))
+        self.assertTrue(is_human_claude_user_record(unversioned, provenance_labelled=False))
+        self.assertTrue(is_human_claude_user_record(parts, provenance_labelled=False))
+
+        tool_result = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+            },
+        }
+        self.assertFalse(is_human_claude_user_record(tool_result, provenance_labelled=False))
+        for text in (
+            "<command-name>/model</command-name>",
+            "<local-command-stdout>done</local-command-stdout>",
+            "<bash-input>ls</bash-input>",
+            "<bash-stdout>README.md</bash-stdout>",
+            "<task-notification><summary>finished</summary></task-notification>",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    is_human_claude_user_record(_prompt(text), provenance_labelled=False)
+                )
+
+    def test_malformed_origin_fails_closed(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        for origin in ({}, {"kind": None}, {"kind": ["human"]}, ["human"], 7, ""):
+            with self.subTest(origin=origin):
+                record = _prompt("ship it", origin=origin)
+                self.assertFalse(is_human_claude_user_record(record, provenance_labelled=False))
+
+        self.assertTrue(
+            is_human_claude_user_record(
+                _prompt("ship it", origin="human"), provenance_labelled=True
+            )
+        )
+
+    def test_non_user_records_are_never_a_person(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        record = {"type": "assistant", "origin": {"kind": "human"}, "message": {"content": "hi"}}
+
+        self.assertFalse(is_human_claude_user_record(record, provenance_labelled=True))
+
+
+class ClaudeEventAuthorshipTests(unittest.TestCase):
+    def _events(self, records, *, after=0, provider=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+            provider = provider or ClaudeProvider(home=Path(tmp))
+            return list(provider.iter_events_after(path, after))
+
+    def test_compaction_summary_and_notifications_are_not_human_authored(self):
+        version = "2.1.277"
+        records = [
+            _prompt(
+                "take over the rollout",
+                origin={"kind": "human"},
+                promptSource="typed",
+                version=version,
+            ),
+            {"type": "assistant", "version": version, "message": {"content": "On it."}},
+            _prompt(
+                "This session is being continued from a previous conversation.\n\n"
+                "## 6. All user messages\n1. take over the rollout",
+                isCompactSummary=True,
+                isVisibleInTranscriptOnly=True,
+                version=version,
+            ),
+            _prompt(
+                "<task-notification><task-id>t1</task-id><summary>done</summary>"
+                "</task-notification>",
+                origin={"kind": "task-notification"},
+                promptSource="system",
+                version=version,
+            ),
+            _prompt("[Request interrupted by user]", version=version),
+            _prompt("<bash-input>git status</bash-input>", version=version),
+            _prompt("keep going", origin={"kind": "human"}, promptSource="queued", version=version),
+        ]
+
+        events = self._events(records)
+
+        self.assertEqual(
+            [event.metadata["message"]["content"] for event in events if event.human_authored],
+            ["take over the rollout", "keep going"],
+        )
+
+    def test_resumed_transcript_that_opens_with_a_summary_is_not_human_authored(self):
+        records = [
+            _prompt(
+                "This session is being continued from a previous conversation.",
+                isCompactSummary=True,
+                version="2.1.277",
+            ),
+            _prompt("carry on", origin={"kind": "human"}, promptSource="typed", version="2.1.277"),
+        ]
+
+        events = self._events(records)
+
+        self.assertEqual([event.human_authored for event in events], [False, True])
+
+    def test_older_cli_is_calibrated_by_what_its_transcript_labels(self):
+        # A release below the verified floor that nevertheless labels prompts:
+        # once that is seen, its unlabelled records are CLI state as well.
+        old = "2.0.10"
+        records = [
+            _prompt("first ask", origin={"kind": "human"}, promptSource="typed", version=old),
+            {"type": "assistant", "version": old, "message": {"content": "Done."}},
+            _prompt("An internal note with nothing to pattern-match on.", version=old),
+        ]
+
+        events = self._events(records)
+        self.assertEqual([event.human_authored for event in events], [True, False, False])
+
+        # Reading only the tail, as the mirror does from its cursor, must reach
+        # the same verdict even though the labelled record is not re-read.
+        tail = self._events(records, after=2)
+        self.assertEqual([event.human_authored for event in tail], [False])
+
+    def test_transcript_that_never_labels_keeps_mirroring_typed_prompts(self):
+        records = [
+            _prompt("first ask", version="1.0.35"),
+            {"type": "assistant", "version": "1.0.35", "message": {"content": "Done."}},
+            _prompt("<command-name>/clear</command-name>", version="1.0.35"),
+            _prompt("second ask", version="1.0.35"),
+        ]
+
+        events = self._events(records)
+
+        self.assertEqual([event.human_authored for event in events], [True, False, False, True])
+
+    def test_compaction_summary_after_exit_does_not_revive_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / ".claude" / "projects" / "-tmp-repo"
+            project.mkdir(parents=True)
+            path = project / "session-1.jsonl"
+            base = {"cwd": str(project), "sessionId": "session-1", "version": "2.1.277"}
+            records = [
+                _prompt("hello", origin={"kind": "human"}, promptSource="typed", **base),
+                _prompt("<command-name>/exit</command-name>", **base),
+                _prompt("This session is being continued.", isCompactSummary=True, **base),
+            ]
+            path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+            now = datetime.now(UTC).timestamp()
+            os.utime(path, (now, now))
+            provider = ClaudeProvider(
+                home=home, active_within_seconds=3600, stale_after_seconds=None
+            )
+
+            self.assertEqual(provider.discover()[0].status, SessionStatus.DONE)
+
+            records.append(
+                _prompt("back again", origin={"kind": "human"}, promptSource="typed", **base)
+            )
+            path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+            os.utime(path, (now + 5, now + 5))
+
+            self.assertNotEqual(provider.discover()[0].status, SessionStatus.DONE)
+
+
 if __name__ == "__main__":
     unittest.main()

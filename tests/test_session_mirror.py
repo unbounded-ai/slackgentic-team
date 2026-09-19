@@ -858,6 +858,7 @@ class SessionMirrorTests(unittest.TestCase):
                     event_type="user",
                     line_number=1,
                     metadata={"message": {"content": "Continue the task"}},
+                    human_authored=True,
                 )
                 mirror = SessionMirror(
                     store,
@@ -1443,6 +1444,7 @@ class SessionMirrorTests(unittest.TestCase):
                         event_type="user",
                         line_number=1,
                         metadata={"message": {"content": _task_notification_text()}},
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CLAUDE,
@@ -1496,6 +1498,7 @@ class SessionMirrorTests(unittest.TestCase):
                                 "message": "make the README punchier",
                             }
                         },
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CODEX,
@@ -1619,6 +1622,7 @@ class SessionMirrorTests(unittest.TestCase):
                                 ]
                             },
                         },
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CLAUDE,
@@ -2960,6 +2964,7 @@ class SessionMirrorTests(unittest.TestCase):
                         event_type="user",
                         line_number=1,
                         metadata={"message": {"content": prompt}},
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CLAUDE,
@@ -3031,6 +3036,7 @@ class SessionMirrorTests(unittest.TestCase):
                                 "message": "private Slack task context",
                             }
                         },
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CODEX,
@@ -3228,6 +3234,7 @@ class SessionMirrorTests(unittest.TestCase):
                         event_type="event_msg",
                         line_number=1,
                         metadata={"payload": {"type": "user_message", "message": "hello"}},
+                        human_authored=True,
                     )
                 ]
                 gateway = FakeGateway()
@@ -3271,6 +3278,7 @@ class SessionMirrorTests(unittest.TestCase):
                         event_type="event_msg",
                         line_number=1,
                         metadata={"payload": {"type": "user_message", "message": "from slack"}},
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CODEX,
@@ -3377,6 +3385,7 @@ class SessionMirrorTests(unittest.TestCase):
                         event_type="event_msg",
                         line_number=1,
                         metadata={"payload": {"type": "user_message", "message": "from slack"}},
+                        human_authored=True,
                     ),
                     AgentEvent(
                         provider=Provider.CODEX,
@@ -3437,6 +3446,7 @@ class SessionMirrorTests(unittest.TestCase):
                         event_type="event_msg",
                         line_number=1,
                         metadata={"payload": {"type": "user_message", "message": "hello"}},
+                        human_authored=True,
                     )
                 ]
                 gateway = FakeGateway()
@@ -3720,6 +3730,7 @@ class SessionMirrorTests(unittest.TestCase):
                     "content": [{"type": "input_text", "text": "ship it"}],
                 }
             },
+            human_authored=True,
         )
         context = AgentEvent(
             provider=Provider.CODEX,
@@ -3783,6 +3794,7 @@ class SessionMirrorTests(unittest.TestCase):
                     )
                 }
             },
+            human_authored=True,
         )
 
         self.assertIsNone(render_session_event(event))
@@ -3797,6 +3809,7 @@ class SessionMirrorTests(unittest.TestCase):
                 "isMeta": True,
                 "message": {"content": [{"type": "text", "text": "# Schedule Remote Agents"}]},
             },
+            human_authored=True,
         )
 
         self.assertIsNone(render_session_event(event))
@@ -3813,6 +3826,7 @@ class SessionMirrorTests(unittest.TestCase):
                 timestamp=None,
                 event_type="user",
                 metadata={"message": {"content": text}},
+                human_authored=True,
             )
 
             self.assertIsNone(render_session_event(event))
@@ -4775,6 +4789,125 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertIsNotNone(store.get_setting("external_session_missing_target.codex.s1"))
             finally:
                 store.close()
+
+
+COMPACTION_SUMMARY = (
+    "This session is being continued from a previous conversation that ran out of context.\n\n"
+    "## 6. All user messages\n1. take over the rollout\n\n"
+    "## 7. Pending Tasks\n- internal notes about /workspace/repos/example-project"
+)
+
+
+def _claude_transcript_with_cli_state(timestamp):
+    base = {"timestamp": timestamp.isoformat(), "sessionId": "s1", "version": "2.1.277"}
+
+    def user(text, **fields):
+        return {**base, "type": "user", "message": {"role": "user", "content": text}, **fields}
+
+    def assistant(text):
+        return {**base, "type": "assistant", "message": {"content": text}}
+
+    return [
+        user("take over the rollout", origin={"kind": "human"}, promptSource="typed"),
+        assistant("On it."),
+        user(COMPACTION_SUMMARY, isCompactSummary=True, isVisibleInTranscriptOnly=True),
+        # A notification variant without the tags the text filter insists on.
+        user(
+            "<task-notification><task-id>t1</task-id><summary>worker finished</summary>"
+            "</task-notification>",
+            origin={"kind": "task-notification"},
+            promptSource="system",
+        ),
+        user("[Request interrupted by user]"),
+        user("<bash-input>git status</bash-input>"),
+        user("An internal note nobody has thought of yet."),
+        assistant("Picking the work back up."),
+    ]
+
+
+def _codex_transcript_with_cli_state(timestamp):
+    stamp = {"timestamp": timestamp.isoformat()}
+
+    def item(text, role="user"):
+        kind = "input_text" if role == "user" else "output_text"
+        payload = {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+        return {**stamp, "type": "response_item", "payload": payload}
+
+    submitted = {
+        **stamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "item": {
+                "type": "UserMessage",
+                "content": [{"type": "text", "text": "take over the rollout"}],
+            },
+        },
+    }
+    return [
+        {"type": "session_meta", "payload": {"id": "s1", "cli_version": "0.154.0"}},
+        item("<environment_context><cwd>/workspace</cwd></environment_context>"),
+        item("take over the rollout"),
+        submitted,
+        item("On it.", role="assistant"),
+        {**stamp, "type": "compacted", "payload": {"message": COMPACTION_SUMMARY}},
+        # Codex rewrites earlier prompts into the history after compacting.
+        item("take over the rollout"),
+        item("<hook_prompt>stop hook feedback</hook_prompt>"),
+        item("<user_shell_command>git status</user_shell_command>"),
+        item("An internal note nobody has thought of yet."),
+        item("Picking the work back up.", role="assistant"),
+    ]
+
+
+class CliStateIsNotMirroredAsThePersonTests(unittest.TestCase):
+    """What an agent CLI writes under the "user" role for itself stays out of Slack."""
+
+    def test_only_what_the_person_submitted_is_posted_under_their_name(self):
+        builders = {
+            Provider.CLAUDE: _claude_transcript_with_cli_state,
+            Provider.CODEX: _codex_transcript_with_cli_state,
+        }
+        for provider_kind, build in builders.items():
+            with self.subTest(provider=provider_kind), tempfile.TemporaryDirectory() as tmp:
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    for agent in build_initial_model_team():
+                        store.upsert_team_agent(agent)
+                    now = datetime.now(UTC)
+                    provider, path, _ = _external_transcript(Path(tmp), provider_kind, now)
+                    _write_external_records(path, build(now), now)
+                    gateway = FakeGateway()
+                    mirror = SessionMirror(
+                        store,
+                        gateway,
+                        [provider],
+                        team_id="T1",
+                        channel_id="C1",
+                        terminal_notifier=FakeTerminalNotifier(),
+                        home=Path(tmp),
+                    )
+
+                    mirror.sync_once()
+
+                    posted = [(reply[1], reply[3] is not None) for reply in gateway.replies]
+                    self.assertEqual(
+                        posted,
+                        [
+                            ("take over the rollout", True),
+                            ("On it.", False),
+                            ("Picking the work back up.", False),
+                        ],
+                    )
+                    # The thread's task title comes from the first thing the
+                    # person said, never from CLI state that precedes it.
+                    self.assertEqual(
+                        store.get_setting(f"external_session_summary.{provider_kind.value}.s1"),
+                        "take over the rollout",
+                    )
+                finally:
+                    store.close()
 
 
 if __name__ == "__main__":
