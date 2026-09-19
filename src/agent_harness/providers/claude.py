@@ -27,6 +27,49 @@ CLAUDE_LOCAL_EXIT_MARKERS = (
     "<command-name>/exit</command-name>",
     "<local-command-stdout>Bye!</local-command-stdout>",
 )
+CLAUDE_LOCAL_COMMAND_MARKERS = (
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+)
+
+# Claude Code labels where each prompt came from: `origin.kind` is "human" for
+# what a person typed, queued, or accepted, and something else ("task-notification",
+# "coordinator", ...) for what the CLI or another agent injected. Records the CLI
+# generates itself (compaction summaries, interrupts, shell-mode plumbing) carry
+# no label at all. Authorship is decided from that label, never from the
+# transcript's "user" role, so a new kind of injected record is dropped by
+# default instead of being posted under the person's name.
+CLAUDE_HUMAN_ORIGIN_KINDS = frozenset({"human"})
+# A headless run (`claude -p`, the SDK) records the prompt its launcher supplied
+# with this source and no origin. It is the operator's input, not CLI state.
+CLAUDE_OPERATOR_PROMPT_SOURCES = frozenset({"sdk"})
+# The CLI sets these on records it writes for itself. They hold for every
+# release, so they are honoured before any provenance label is consulted.
+CLAUDE_SYNTHETIC_RECORD_FLAGS = (
+    "isMeta",
+    "isCompactSummary",
+    "isVisibleInTranscriptOnly",
+    "isSidechain",
+)
+# Oldest release verified to label every prompt. An unlabelled user record from
+# it or anything newer was written by the CLI. Older transcripts are calibrated
+# per file instead: once one record carries a label, unlabelled ones are CLI
+# state too. Only transcripts that never label anything fall back to text checks.
+CLAUDE_PROVENANCE_MIN_VERSION = (2, 1, 228)
+_PROVENANCE_SCAN_RECORDS = 200
+# Plumbing an unlabelled legacy transcript writes under the "user" role.
+_CLAUDE_LEGACY_CLI_TEXT_MARKERS = (
+    *CLAUDE_LOCAL_COMMAND_MARKERS,
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<task-notification>",
+    "<system-reminder>",
+)
 
 
 class ClaudeProvider:
@@ -44,6 +87,7 @@ class ClaudeProvider:
         self.home = home or Path.home()
         self.active_within_seconds = active_within_seconds
         self._session_cache: dict[Path, tuple[tuple[int, int], AgentSession | None]] = {}
+        self._labels_provenance: dict[Path, bool] = {}
         self._project_dir_signatures: dict[Path, tuple[int, int]] = {}
         self._hot_path_retention_seconds = (
             hot_path_retention_seconds
@@ -148,6 +192,9 @@ class ClaudeProvider:
         for path in list(self._session_cache):
             if path not in seen_paths:
                 self._session_cache.pop(path, None)
+        for path in list(self._labels_provenance):
+            if path not in seen_paths:
+                self._labels_provenance.pop(path, None)
 
     def _session_from_path(
         self,
@@ -213,11 +260,15 @@ class ClaudeProvider:
         line_number: int,
     ) -> Iterator[AgentEvent]:
         session_id = transcript_path.stem
+        labelled = self._transcript_labels_provenance(transcript_path)
         for event_line_number, record in iter_jsonl(transcript_path, after_line=line_number):
             session_id = str(record.get("sessionId") or session_id)
             timestamp = parse_timestamp(record.get("timestamp"))
             record_type = str(record.get("type", "unknown"))
             text = _record_text(record)
+            if not labelled and claude_record_labels_provenance(record):
+                labelled = True
+                self._labels_provenance[transcript_path] = True
             yield AgentEvent(
                 provider=self.provider,
                 session_id=session_id,
@@ -227,7 +278,25 @@ class ClaudeProvider:
                 source_path=transcript_path,
                 line_number=event_line_number,
                 metadata=record,
+                human_authored=is_human_claude_user_record(
+                    record,
+                    provenance_labelled=labelled,
+                ),
             )
+
+    def _transcript_labels_provenance(self, transcript_path: Path) -> bool:
+        cached = self._labels_provenance.get(transcript_path)
+        if cached is not None:
+            return cached
+        labelled = False
+        for index, (_, record) in enumerate(iter_jsonl(transcript_path), start=1):
+            if claude_record_labels_provenance(record):
+                labelled = True
+                break
+            if index >= _PROVENANCE_SCAN_RECORDS:
+                break
+        self._labels_provenance[transcript_path] = labelled
+        return labelled
 
     def last_event_line_number(self, transcript_path: Path) -> int:
         return last_jsonl_line_number(transcript_path)
@@ -341,26 +410,86 @@ def _record_text(record: dict[str, Any]) -> str | None:
 
 
 def _session_ended_by_exit(records: Iterable[dict[str, Any]]) -> bool:
+    records = list(records)
+    labelled = any(claude_record_labels_provenance(record) for record in records)
     exited = False
     for record in records:
         text = _record_text(record) or ""
         if any(marker in text for marker in CLAUDE_LOCAL_EXIT_MARKERS) or text.strip() == "/exit":
             exited = True
             continue
-        if exited and _is_normal_conversation_record_after_exit(record, text):
+        if exited and _is_normal_conversation_record_after_exit(record, labelled):
             exited = False
     return exited
 
 
-def _is_normal_conversation_record_after_exit(record: dict[str, Any], text: str) -> bool:
-    record_type = record.get("type")
-    if record_type == "assistant":
+def _is_normal_conversation_record_after_exit(
+    record: dict[str, Any],
+    provenance_labelled: bool,
+) -> bool:
+    if record.get("type") == "assistant":
         return not is_synthetic_claude_assistant_record(record)
-    if record_type != "user":
+    return is_human_claude_user_record(record, provenance_labelled=provenance_labelled)
+
+
+def claude_record_labels_provenance(record: dict[str, Any]) -> bool:
+    return record.get("origin") is not None or isinstance(record.get("promptSource"), str)
+
+
+def is_human_claude_user_record(
+    record: dict[str, Any],
+    *,
+    provenance_labelled: bool,
+) -> bool:
+    """Whether a transcript record is input a person (or the run's launcher) submitted.
+
+    ``provenance_labelled`` says the transcript has been seen labelling its
+    prompts, which makes an unlabelled user record CLI state rather than input.
+    """
+    if record.get("type") != "user":
         return False
-    if record.get("isMeta") is True:
+    if any(record.get(flag) is True for flag in CLAUDE_SYNTHETIC_RECORD_FLAGS):
         return False
-    return not _is_local_command_text(text)
+    origin = record.get("origin")
+    if origin is not None:
+        kind = origin.get("kind") if isinstance(origin, dict) else origin
+        return isinstance(kind, str) and kind in CLAUDE_HUMAN_ORIGIN_KINDS
+    prompt_source = record.get("promptSource")
+    if isinstance(prompt_source, str):
+        return prompt_source in CLAUDE_OPERATOR_PROMPT_SOURCES
+    if provenance_labelled or _claude_cli_labels_provenance(record):
+        return False
+    text = _claude_prompt_text(record)
+    return bool(text) and not any(marker in text for marker in _CLAUDE_LEGACY_CLI_TEXT_MARKERS)
+
+
+def _claude_cli_labels_provenance(record: dict[str, Any]) -> bool:
+    version = record.get("version")
+    if not isinstance(version, str):
+        return False
+    parts: list[int] = []
+    for part in version.split("."):
+        if not part.isdigit():
+            break
+        parts.append(int(part))
+    return bool(parts) and tuple(parts) >= CLAUDE_PROVENANCE_MIN_VERSION
+
+
+def _claude_prompt_text(record: dict[str, Any]) -> str:
+    # Only typed text counts: tool results and tool calls also travel as "user".
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        item["text"]
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+    ).strip()
 
 
 def is_synthetic_claude_assistant_record(record: dict[str, Any]) -> bool:
@@ -380,20 +509,6 @@ def is_synthetic_claude_assistant_record(record: dict[str, Any]) -> bool:
         and item.get("type") == "text"
         and str(item.get("text") or "").strip() == "No response requested."
         for item in content
-    )
-
-
-def _is_local_command_text(text: str) -> bool:
-    return any(
-        marker in text
-        for marker in (
-            "<local-command-caveat>",
-            "<command-name>",
-            "<command-message>",
-            "<command-args>",
-            "<local-command-stdout>",
-            "<local-command-stderr>",
-        )
     )
 
 

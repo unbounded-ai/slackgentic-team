@@ -29,7 +29,11 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.providers.base import AgentProvider
-from agent_harness.providers.claude import is_synthetic_claude_assistant_record
+from agent_harness.providers.claude import (
+    CLAUDE_LOCAL_COMMAND_MARKERS,
+    is_synthetic_claude_assistant_record,
+)
+from agent_harness.providers.codex import codex_user_submission_text, is_codex_context_message
 from agent_harness.runtime.codex_app_server import DEFAULT_CODEX_APP_SERVER_URL
 from agent_harness.runtime.health import LoopBackoff, log_loop_failure
 from agent_harness.runtime.tasks import build_task_prompt
@@ -1363,7 +1367,7 @@ def _managed_prompt_from_record(provider: Provider, record: dict[str, object]) -
             return message if isinstance(message, str) else None
         if payload.get("type") == "message" and payload.get("role") == "user":
             message = _codex_response_item_message_text(payload)
-            return None if _is_codex_context_message(message) else message or None
+            return None if is_codex_context_message(message) else message or None
     return None
 
 
@@ -1441,16 +1445,20 @@ def _render_codex_event(event: AgentEvent) -> RenderedSessionEvent | None:
         if text and is_internal_task_notification_text(text):
             return None
         return RenderedSessionEvent(text, "assistant") if text else None
-    if event_type == "user_message":
-        message = payload.get("message") or payload.get("text")
-        text = _clean_text(str(message)) if message else ""
+    if event_type in {"user_message", "item_completed"}:
+        # Only an event the provider identified as submitted input is posted
+        # under the person's name.
+        submitted = codex_user_submission_text(payload) if event.human_authored else None
+        text = _clean_text(submitted) if submitted else ""
         if text and is_internal_task_notification_text(text):
             return None
         return RenderedSessionEvent(text, "user") if text else None
     if event_type == "message" and payload.get("role") in {"assistant", "user"}:
-        text = _codex_response_item_message_text(payload)
-        if payload.get("role") == "user" and _is_codex_context_message(text):
+        # A role "user" response item is model input: injected context and
+        # compaction replays travel the same way as a typed prompt.
+        if payload.get("role") == "user" and not event.human_authored:
             return None
+        text = _codex_response_item_message_text(payload)
         if text and is_internal_task_notification_text(text):
             return None
         author = "assistant" if payload.get("role") == "assistant" else "user"
@@ -1480,21 +1488,15 @@ def _codex_response_item_message_text(payload: dict) -> str:
     return "\n\n".join(parts)
 
 
-def _is_codex_context_message(text: str) -> bool:
-    stripped = text.strip()
-    return (
-        stripped.startswith("# AGENTS.md instructions for ")
-        and "<INSTRUCTIONS>" in stripped
-        and "<environment_context>" in stripped
-    ) or (
-        stripped.startswith("<environment_context>") and stripped.endswith("</environment_context>")
-    )
-
-
 def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
     if event.event_type not in {"assistant", "user"}:
         return None
     if event.metadata.get("isMeta") is True:
+        return None
+    # The "user" role also carries tool results, compaction summaries, and
+    # whatever else the CLI injects. Only what the provider identified as a
+    # person's input is posted under their name.
+    if event.event_type == "user" and not event.human_authored:
         return None
     if event.event_type == "assistant" and is_synthetic_claude_assistant_record(event.metadata):
         return None
@@ -1710,17 +1712,7 @@ def _remove_slackgentic_channel_blocks(text: str) -> str:
 
 
 def _has_claude_local_command_block(text: str) -> bool:
-    return any(
-        marker in text
-        for marker in (
-            "<local-command-caveat>",
-            "<command-name>",
-            "<command-message>",
-            "<command-args>",
-            "<local-command-stdout>",
-            "<local-command-stderr>",
-        )
-    )
+    return any(marker in text for marker in CLAUDE_LOCAL_COMMAND_MARKERS)
 
 
 def _short_path(path: Path) -> str:
