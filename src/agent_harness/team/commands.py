@@ -49,6 +49,18 @@ class RepoRootCommand:
     path: Path | None = None
 
 
+SETTING_AUTO_UPDATE = "auto_update"
+SETTING_UPDATE_CHECKS = "update_checks"
+
+
+@dataclass(frozen=True)
+class SettingsCommand:
+    """Show the settings card, or switch one setting when ``setting`` is given."""
+
+    setting: str | None = None
+    enabled: bool | None = None
+
+
 TeamCommand = (
     HireCommand
     | FireCommand
@@ -58,6 +70,7 @@ TeamCommand = (
     | UnassignedExternalSessionsCommand
     | HelpCommand
     | RepoRootCommand
+    | SettingsCommand
 )
 
 
@@ -73,6 +86,7 @@ def parse_team_command(text: str) -> TeamCommand | None:
         or _parse_scheduled_tasks(cleaned)
         or _parse_roster(cleaned)
         or _parse_repo_root(cleaned)
+        or _parse_settings(cleaned)
     )
 
 
@@ -167,6 +181,40 @@ def _parse_repo_root(text: str) -> RepoRootCommand | None:
     )
     if match:
         return RepoRootCommand(Path(_strip_quotes(match.group(1))).expanduser())
+    return None
+
+
+_ON_OFF = r"(?P<state>on|off|enable|enabled|disable|disabled|true|false|yes|no)"
+_SETTING_NAMES = {
+    SETTING_AUTO_UPDATE: r"auto[\s-]?updates?|auto[\s-]?upgrades?",
+    SETTING_UPDATE_CHECKS: r"update\s+checks?|release\s+checks?",
+}
+
+
+def _parse_settings(text: str) -> SettingsCommand | None:
+    if re.match(
+        r"^(?:(?:show|open|list)\s+)?(?:settings|preferences|prefs)\s*$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return SettingsCommand()
+    for setting, name in _SETTING_NAMES.items():
+        if re.match(rf"^(?:{name})\s*$", text, flags=re.IGNORECASE):
+            return SettingsCommand()
+        match = re.match(
+            rf"^(?:(?:settings?|set)\s+)?(?:{name})\s*(?:[:=]\s*|to\s+)?{_ON_OFF}\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            match = re.match(
+                rf"^{_ON_OFF}\s+(?:{name})\s*$",
+                text,
+                flags=re.IGNORECASE,
+            )
+        if match is not None:
+            state = match.group("state").lower()
+            return SettingsCommand(setting, state in {"on", "enable", "enabled", "true", "yes"})
     return None
 
 

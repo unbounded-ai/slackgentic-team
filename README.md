@@ -102,15 +102,21 @@ Useful commands:
 /slackgentic-<you> hire 1 claude agent
 /slackgentic-<you> fire @riley
 /slackgentic-<you> fire everyone
+/slackgentic-<you> settings
 status
 show roster
 hire 3 agents
+settings
+auto-update off
 ```
+
+A message that is not a command or a task request gets a threaded reply
+listing the commands, so a typo never goes unanswered.
 
 Start work by typing in the agent channel:
 
 ```text
-Inspect the repo and summarize the test command
+Somebody inspect the repo and summarize the test command
 @riley update the README with install steps
 Somebody review @riley's PR https://github.com/org/repo/pull/42
 #dangerous-mode @riley repair the local service installer
@@ -125,8 +131,8 @@ Slack form for a task, work/review kind, timing, dangerous mode, repeat cadence,
 and an optional dependency on a currently busy agent finishing its active task or
 external session.
 
-In the main channel, write anything to hand it to an available agent. Use
-`@agentname ...` when you want a specific agent. Inside a task thread, reply
+In the main channel, write `somebody ...` to hand work to an available agent.
+Use `@agentname ...` when you want a specific agent. Inside a task thread, reply
 with `somebody ...` to bring in another agent for a subtask; the original agent
 then picks the thread back up with that new context.
 
@@ -462,7 +468,15 @@ does not make Slack a reliable way to wake a closed-lid or deep-sleeping laptop.
 You do not need to `git pull` or rerun `pip install` to update Slackgentic.
 The running daemon checks GitHub Releases of `unbounded-ai/slackgentic-team`
 every five minutes. When a newer published version appears it posts one
-prompt in the agent channel:
+card in the agent channel. Auto-update is on by default: the daemon installs
+the release itself once no agent task is running, so a restart never cuts one
+off, and edits the card as it goes. Each release is tried once automatically;
+if that attempt fails, the card keeps its buttons for a manual retry.
+
+Type `settings` in the agent channel to switch auto-update or release checks
+off and on, change the repo root, or check for a release right away.
+`auto-update off` and `auto-update on` work as direct commands too. With
+auto-update off, the card waits for you:
 
 > *Slackgentic update available*
 > Current: `0.1.0`  Latest: `0.1.1`
@@ -521,7 +535,8 @@ variables override stored values.
 | `SLACKGENTIC_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS` | Seconds a session started outside Slack may go without messages or tool calls before it frees its agent, default `7200`. A session still open in a terminal keeps its agent however long it sits idle; when one terminal has run several sessions, only the newest counts. The Slack thread is kept, and the session claims an agent again when it has new activity. `0` disables this. |
 | `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS avatar directory, or `off`. |
 | `SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS` | Allow managed tasks to start in macOS privacy-protected locations after you have granted OS access. |
-| `SLACKGENTIC_UPDATE_CHECK_ENABLED` | Enable or disable release checks, default `true`. |
+| `SLACKGENTIC_UPDATE_CHECK_ENABLED` | Enable or disable release checks, default `true`. The `settings` card overrides it. |
+| `SLACKGENTIC_UPDATE_AUTO_INSTALL` | Install new releases automatically, default `true`. The `settings` card overrides it. |
 | `SLACKGENTIC_UPDATE_CHECK_INTERVAL_SECONDS` | Seconds between release checks, default `300`. |
 | `SLACKGENTIC_UPDATE_REPOSITORY` | GitHub repository used for update checks, default `unbounded-ai/slackgentic-team`. |
 

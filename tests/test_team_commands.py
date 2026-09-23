@@ -3,6 +3,8 @@ from pathlib import Path
 
 from agent_harness.models import Provider
 from agent_harness.team.commands import (
+    SETTING_AUTO_UPDATE,
+    SETTING_UPDATE_CHECKS,
     FireCommand,
     FireEveryoneCommand,
     HelpCommand,
@@ -10,6 +12,7 @@ from agent_harness.team.commands import (
     RepoRootCommand,
     RosterCommand,
     ScheduledTasksCommand,
+    SettingsCommand,
     UnassignedExternalSessionsCommand,
     parse_team_command,
 )
@@ -88,8 +91,34 @@ class HelpAndSessionPhrasingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsInstance(parse_team_command(text), UnassignedExternalSessionsCommand)
 
+    def test_parse_settings(self):
+        for text in ("settings", "show settings", "Preferences", "auto-update", "<@UBOT> settings"):
+            with self.subTest(text=text):
+                self.assertEqual(parse_team_command(text), SettingsCommand())
+
+    def test_parse_setting_switches(self):
+        cases = {
+            "auto-update on": SettingsCommand(SETTING_AUTO_UPDATE, True),
+            "auto update off": SettingsCommand(SETTING_AUTO_UPDATE, False),
+            "settings autoupdate: off": SettingsCommand(SETTING_AUTO_UPDATE, False),
+            "set auto-update to on": SettingsCommand(SETTING_AUTO_UPDATE, True),
+            "disable auto-updates": SettingsCommand(SETTING_AUTO_UPDATE, False),
+            "enable update checks": SettingsCommand(SETTING_UPDATE_CHECKS, True),
+            "release checks off": SettingsCommand(SETTING_UPDATE_CHECKS, False),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(parse_team_command(text), expected)
+
     def test_near_misses_are_not_commands(self):
-        for text in ("helpful stuff", "session notes", "help me fix this", "sessions are slow"):
+        for text in (
+            "helpful stuff",
+            "session notes",
+            "help me fix this",
+            "sessions are slow",
+            "settings are confusing",
+            "auto-update broke again",
+        ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_team_command(text))
 

@@ -1680,7 +1680,7 @@ def build_channel_overview_blocks(
     claude_command: str,
 ) -> list[dict[str, Any]]:
     """The welcome card posted when the agent channel is set up."""
-    guide = f"""**Start work** — write anything here, or `@agentname ...` for someone specific. The agent replies in your thread and keeps the thread's context.
+    guide = f"""**Start work** — write `somebody ...` for any free agent, or `@agentname ...` for someone specific. The agent replies in your thread and keeps the thread's context.
 
 **Thread subtasks** — reply `somebody ...` in a task thread to pull in another agent; the original agent picks the thread back up with the added context.
 
@@ -1694,6 +1694,7 @@ def build_channel_overview_blocks(
 - `external sessions` unassigned outside-Slack sessions
 - `scheduled tasks` active schedules
 - `hire 3 agents` · `fire everyone`
+- `settings` auto-update, release checks and repo root
 
 **Sessions started outside Slack** — Codex: `{codex_command}`. Claude: run `slackgentic claude-channel --install` once, then `{claude_command}`. Each session gets a tracked thread here; Slack replies and tool approvals relay through it. Restart already-open Claude sessions after installing the channel."""
     return [
@@ -1704,11 +1705,154 @@ def build_channel_overview_blocks(
             "subtitle": {"type": "mrkdwn", "text": "Your agent team works right here"},
             "body": {
                 "type": "mrkdwn",
-                "text": "Write anything in this channel to start a task. Agents reply in threads.",
+                "text": "Write `somebody ...` in this channel to start a task. Agents reply in threads.",
             },
         },
         {"type": "markdown", "text": guide},
     ]
+
+
+SETTINGS_BLOCK_ID = "slackgentic.settings"
+
+
+@dataclass(frozen=True)
+class SettingsSnapshot:
+    version: str
+    auto_update: bool
+    update_checks: bool
+    repo_root: str
+    last_checked_at: datetime | None = None
+    update_available: str | None = None
+    available: bool = True
+
+
+def build_settings_blocks(settings: SettingsSnapshot) -> list[dict[str, Any]]:
+    """The `settings` card: each row shows its current value and one control."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "block_id": SETTINGS_BLOCK_ID,
+            "text": {"type": "mrkdwn", "text": "*⚙️ Slackgentic settings*"},
+        }
+    ]
+    if settings.available:
+        blocks.append(
+            _settings_toggle_row(
+                "auto_update",
+                "Auto-update",
+                settings.auto_update,
+                "Installs new releases and restarts the service on its own, "
+                "once no agent task is running.",
+            )
+        )
+        blocks.append(
+            _settings_toggle_row(
+                "update_checks",
+                "Release checks",
+                settings.update_checks,
+                "Looks for new releases and posts an update card here. Auto-update needs this on.",
+            )
+        )
+    blocks.append(
+        {
+            "type": "section",
+            "block_id": f"{SETTINGS_BLOCK_ID}.repo_root",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Repo root*  `{settings.repo_root}`\nWhere agents start work by default.",
+            },
+            "accessory": _button(
+                "Change",
+                "slackgentic.settings.repo_root",
+                encode_action_value("settings.repo_root.open"),
+            ),
+        }
+    )
+    version_parts = [f"Running Slackgentic {settings.version}"]
+    if settings.update_available:
+        version_parts.append(f"{settings.update_available} is available")
+    if settings.last_checked_at is not None:
+        version_parts.append(
+            f"checked {_slack_time(settings.last_checked_at, '{date_short_pretty} at {time}')}"
+        )
+    blocks.append(
+        {
+            "type": "context",
+            "block_id": f"{SETTINGS_BLOCK_ID}.version",
+            "elements": [{"type": "mrkdwn", "text": "  ·  ".join(version_parts)}],
+        }
+    )
+    if settings.available and settings.update_checks:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"{SETTINGS_BLOCK_ID}.actions",
+                "elements": [
+                    _button(
+                        "Check for updates",
+                        "slackgentic.settings.check_updates",
+                        encode_action_value("settings.check_updates"),
+                    )
+                ],
+            }
+        )
+    return blocks
+
+
+def _settings_toggle_row(
+    setting: str,
+    label: str,
+    enabled: bool,
+    description: str,
+) -> dict[str, Any]:
+    state = "*On*" if enabled else "*Off*"
+    return {
+        "type": "section",
+        "block_id": f"{SETTINGS_BLOCK_ID}.{setting}",
+        "text": {"type": "mrkdwn", "text": f"*{label}*  {state}\n{description}"},
+        "accessory": _button(
+            "Turn off" if enabled else "Turn on",
+            f"slackgentic.settings.{setting}",
+            encode_action_value("settings.toggle", setting=setting, enabled=not enabled),
+            None if enabled else "primary",
+        ),
+    }
+
+
+def build_repo_root_modal(
+    repo_root: str,
+    *,
+    channel_id: str,
+    message_ts: str | None,
+) -> dict[str, Any]:
+    return {
+        "type": "modal",
+        "callback_id": "settings.repo_root",
+        "private_metadata": json.dumps(
+            {"channel_id": channel_id, "message_ts": message_ts},
+            separators=(",", ":"),
+        ),
+        "title": {"type": "plain_text", "text": "Repo root"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "repo_root",
+                "label": {"type": "plain_text", "text": "Repos root"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": repo_root,
+                    "placeholder": {"type": "plain_text", "text": "~/code"},
+                },
+                "hint": {
+                    "type": "plain_text",
+                    "text": "Agents launch here by default. Named sibling repos can be selected from this root.",
+                },
+            }
+        ],
+    }
 
 
 def build_update_prompt_blocks(

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent_harness import __version__
@@ -275,6 +275,7 @@ from agent_harness.slack import (
     LoopRunCardChart,
     LoopRunCardMetric,
     LoopRunChip,
+    SettingsSnapshot,
     UnassignedExternalSessionListItem,
     build_channel_overview_blocks,
     build_external_session_capacity_blocks,
@@ -293,6 +294,8 @@ from agent_harness.slack import (
     build_loop_run_report_blocks,
     build_loop_run_running_blocks,
     build_loop_stop_confirmation_blocks,
+    build_repo_root_modal,
+    build_settings_blocks,
     build_setup_modal,
     build_status_blocks,
     build_task_thread_blocks,
@@ -333,6 +336,8 @@ from agent_harness.team import (
 )
 from agent_harness.team.assignment import assign_work_request
 from agent_harness.team.commands import (
+    SETTING_AUTO_UPDATE,
+    SETTING_UPDATE_CHECKS,
     FireCommand,
     FireEveryoneCommand,
     HelpCommand,
@@ -340,6 +345,7 @@ from agent_harness.team.commands import (
     RepoRootCommand,
     RosterCommand,
     ScheduledTasksCommand,
+    SettingsCommand,
     UnassignedExternalSessionsCommand,
     parse_team_command,
 )
@@ -351,12 +357,18 @@ from agent_harness.team.routing import (
 )
 from agent_harness.timers import is_agent_timer_signal, parse_agent_timer_signal
 from agent_harness.updates import (
+    SETTING_UPDATE_AUTO_INSTALL,
+    SETTING_UPDATE_CHECKS_ENABLED,
+    SETTING_UPDATE_LAST_CHECK_AT,
+    SETTING_UPDATE_PROMPTED_VERSION,
     GitHubReleaseSource,
     SelfUpdater,
     SlackgenticUpdateRunner,
     UpdateCandidate,
     UpdateChecker,
     detect_source_root,
+    is_newer_version,
+    setting_flag,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -660,6 +672,8 @@ class SlackTeamController:
             self.publish_usage(channel_id, show_loading=False)
         elif action_name.startswith("update."):
             self._update_from_action(decoded, channel_id, message_ts)
+        elif action_name.startswith("settings."):
+            self._settings_from_action(decoded, channel_id, message_ts, payload.get("trigger_id"))
         elif action_name.startswith("pm_initiative."):
             self._pm_initiative_from_action(decoded, payload, channel_id, message_ts)
         elif action_name == "loop.create.open":
@@ -698,6 +712,8 @@ class SlackTeamController:
             return self._handle_loop_create_submission(payload, async_success=async_success)
         if callback_id == "loop.edit":
             return self._handle_loop_edit_submission(payload, async_success=async_success)
+        if callback_id == "settings.repo_root":
+            return self._handle_repo_root_settings_submission(payload)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -813,6 +829,10 @@ class SlackTeamController:
                 SlackReplyTarget(channel_id=channel_id),
                 requested_by_slack_user=payload.get("user_id"),
             )
+            return
+        user_id = payload.get("user_id")
+        if text and isinstance(user_id, str) and user_id:
+            self.gateway.post_ephemeral(channel_id, user_id, self.unrecognized_command_text(text))
             return
         self.refresh_or_post_roster(channel_id)
 
@@ -1080,6 +1100,7 @@ class SlackTeamController:
             return
         request = _channel_work_request(text, active_agents)
         if request is None:
+            self._reply_to_unrecognized_command(event, channel_id, text)
             return
         pm_target = self._pm_agent_for_request_target(request)
         if pm_target is not None:
@@ -1167,6 +1188,7 @@ class SlackTeamController:
             | ScheduledTasksCommand
             | UnassignedExternalSessionsCommand
             | HelpCommand
+            | SettingsCommand
         ),
         target: SlackReplyTarget,
         *,
@@ -1257,6 +1279,9 @@ class SlackTeamController:
             return
         if isinstance(command, HelpCommand):
             self._post_text(target, self.help_text())
+            return
+        if isinstance(command, SettingsCommand):
+            self._handle_settings_command(command, target)
             return
         self.post_roster(
             target.channel_id,
@@ -5846,16 +5871,36 @@ class SlackTeamController:
                 "`hire 3 agents` — add capacity; `hire 2 claude agents` picks the provider",
                 "`fire @handle` — release one agent; `fire everyone` clears the roster",
                 "`repo root ~/code` — set where agents work",
+                "`settings` — auto-update, release checks and repo root; "
+                "`auto-update on` / `auto-update off` switches auto-update directly",
                 "`help` — this list",
                 "",
-                "Write anything else to start a task, or `@agentname ...` to ask a specific "
-                "agent. In a task thread, `somebody ...` brings in another agent for a "
-                "subtask. Add `#dangerous-mode` to launch with Codex no-sandbox/no-approval "
-                "or Claude skip-permissions.",
+                "Start a task with `somebody ...` for any free agent, or `@agentname ...` "
+                "to ask a specific agent. In a task thread, `somebody ...` brings in another "
+                "agent for a subtask. Add `#dangerous-mode` to launch with Codex "
+                "no-sandbox/no-approval or Claude skip-permissions.",
                 f"Outside Slack: `{codex_command}` for Codex, or `{CLAUDE_EXTERNAL_COMMAND}` "
                 "for Claude (after `slackgentic claude-channel --install`), each of which "
                 "creates a tracking thread here.",
             ]
+        )
+
+    def unrecognized_command_text(self, text: str) -> str:
+        shown = _shorten(re.sub(r"\s+", " ", _strip_leading_bot_mention(text)).strip(), 80)
+        quoted = shown.replace("`", "'")
+        heard = f"`{quoted}`" if shown else "that"
+        return f"I didn't recognize {heard} as a command.\n\n{self.help_text()}"
+
+    def _reply_to_unrecognized_command(self, event: dict, channel_id: str, text: str) -> None:
+        # Only top-level channel messages read as commands. Thread replies are
+        # conversation, and answering each one would be noise.
+        message_ts = event.get("ts")
+        thread_ts = event.get("thread_ts")
+        if not message_ts or (thread_ts and thread_ts != message_ts):
+            return
+        self.gateway.post_thread_reply(
+            SlackThreadRef(channel_id, message_ts),
+            self.unrecognized_command_text(text),
         )
 
     def post_channel_overview(self, channel_id: str) -> str:
@@ -5864,7 +5909,7 @@ class SlackTeamController:
         text = "\n".join(
             [
                 (
-                    "Slackgentic is ready. Write anything here to start a task, "
+                    "Slackgentic is ready. Write `somebody ...` here to start a task, "
                     "or use `@agentname ...` to ask a specific agent."
                 ),
                 (
@@ -6389,6 +6434,144 @@ class SlackTeamController:
             )
             if updated != agent:
                 self.store.upsert_team_agent(updated)
+
+    def settings_snapshot(self) -> SettingsSnapshot:
+        repo_root = self._configured_repo_root() or _suggested_repo_root(self.default_cwd)
+        runner = self.update_runner
+        last_checked_at = None
+        raw_last_check = self.store.get_setting(SETTING_UPDATE_LAST_CHECK_AT)
+        if raw_last_check:
+            try:
+                last_checked_at = datetime.fromisoformat(raw_last_check)
+            except ValueError:
+                last_checked_at = None
+        prompted = self.store.get_setting(SETTING_UPDATE_PROMPTED_VERSION)
+        update_available = (
+            prompted if prompted and is_newer_version(prompted, __version__) else None
+        )
+        return SettingsSnapshot(
+            version=__version__,
+            auto_update=(
+                runner.auto_install_enabled()
+                if runner is not None
+                else setting_flag(self.store, SETTING_UPDATE_AUTO_INSTALL, True)
+            ),
+            update_checks=(
+                runner.checks_enabled()
+                if runner is not None
+                else setting_flag(self.store, SETTING_UPDATE_CHECKS_ENABLED, True)
+            ),
+            repo_root=str(repo_root),
+            last_checked_at=last_checked_at,
+            update_available=update_available,
+            available=runner is not None,
+        )
+
+    def post_settings(self, target: SlackReplyTarget) -> str:
+        blocks = build_settings_blocks(self.settings_snapshot())
+        posted = self.gateway.post_message(
+            target.channel_id,
+            "Slackgentic settings",
+            thread_ts=target.thread_ts,
+            blocks=blocks,
+        )
+        return posted.ts
+
+    def _refresh_settings_message(self, channel_id: str, message_ts: str | None) -> None:
+        if not message_ts:
+            return
+        try:
+            self.gateway.update_message(
+                channel_id,
+                message_ts,
+                "Slackgentic settings",
+                build_settings_blocks(self.settings_snapshot()),
+            )
+        except Exception:
+            LOGGER.debug("failed to refresh the settings card", exc_info=True)
+
+    def _handle_settings_command(self, command: SettingsCommand, target: SlackReplyTarget) -> None:
+        if command.setting is None or command.enabled is None:
+            self.post_settings(target)
+            return
+        error = self._apply_setting(command.setting, command.enabled)
+        if error is not None:
+            self._post_text(target, error)
+            return
+        self._post_text(target, _setting_changed_text(command.setting, command.enabled))
+
+    def _apply_setting(self, setting: str, enabled: bool) -> str | None:
+        runner = self.update_runner
+        if runner is None:
+            return "Update settings are not available in this process."
+        if setting == SETTING_AUTO_UPDATE:
+            runner.set_auto_install_enabled(enabled)
+        elif setting == SETTING_UPDATE_CHECKS:
+            runner.set_checks_enabled(enabled)
+        else:
+            return f"Unknown setting `{setting}`."
+        return None
+
+    def _settings_from_action(
+        self,
+        payload: dict,
+        channel_id: str,
+        message_ts: str | None,
+        trigger_id: str | None,
+    ) -> None:
+        action = payload.get("action")
+        target = SlackReplyTarget(channel_id=channel_id, thread_ts=message_ts)
+        if action == "settings.toggle":
+            setting = payload.get("setting")
+            enabled = payload.get("enabled")
+            if not isinstance(setting, str) or not isinstance(enabled, bool):
+                return
+            error = self._apply_setting(setting, enabled)
+            if error is not None:
+                self._post_text(target, error)
+            self._refresh_settings_message(channel_id, message_ts)
+            return
+        if action == "settings.check_updates":
+            runner = self.update_runner
+            if runner is None:
+                self._post_text(target, "Update checks are not available in this process.")
+                return
+            runner.check_soon()
+            self._post_text(
+                target,
+                "Checking for a new release. An update card appears in the channel if one is out.",
+            )
+            return
+        if action == "settings.repo_root.open":
+            if not trigger_id:
+                self._post_text(target, "Use `repo root <path>` to change the repo root.")
+                return
+            repo_root = self._configured_repo_root() or _suggested_repo_root(self.default_cwd)
+            self.gateway.open_view(
+                trigger_id,
+                build_repo_root_modal(
+                    str(repo_root),
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                ),
+            )
+
+    def _handle_repo_root_settings_submission(self, payload: dict) -> dict | None:
+        view = payload.get("view") or {}
+        values = view.get("state", {}).get("values", {})
+        repo_root = _validated_repo_root(_view_plain_value(values, "repo_root", "value") or "")
+        if repo_root is None:
+            return _view_errors("repo_root", "Use an existing local folder path.")
+        self.store.set_setting(SETTING_REPO_ROOT, str(repo_root))
+        try:
+            metadata = json.loads(view.get("private_metadata") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        channel_id = metadata.get("channel_id") if isinstance(metadata, dict) else None
+        message_ts = metadata.get("message_ts") if isinstance(metadata, dict) else None
+        if isinstance(channel_id, str) and isinstance(message_ts, str):
+            self._refresh_settings_message(channel_id, message_ts)
+        return None
 
     def update_channel_id(self) -> str | None:
         return self.default_channel_id or self.store.get_setting(SETTING_CHANNEL_ID)
@@ -13455,6 +13638,8 @@ class SocketModeSlackApp:
             ),
             restart=self._restart_after_update,
             enabled=config.updates.enabled,
+            auto_install=config.updates.auto_install,
+            is_busy=self.runtime.has_running_tasks,
             poll_seconds=config.updates.check_interval_seconds,
         )
         self.controller.set_update_runner(self.update_runner)
@@ -15979,6 +16164,23 @@ def _channel_work_request(text: str, agents) -> WorkRequest | None:
     canonical_text = canonicalize_agent_mentions(text, agents)
     known_handles = [agent.handle for agent in agents]
     return parse_work_request(canonical_text, known_handles)
+
+
+def _setting_changed_text(setting: str, enabled: bool) -> str:
+    if setting == SETTING_AUTO_UPDATE:
+        if enabled:
+            return (
+                "Auto-update is on. New releases install on their own once no agent "
+                "task is running."
+            )
+        return "Auto-update is off. New releases still post an update card to install by hand."
+    if enabled:
+        return "Release checks are on."
+    return "Release checks are off. No update cards will be posted and auto-update pauses."
+
+
+def _strip_leading_bot_mention(text: str) -> str:
+    return re.sub(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", "", text)
 
 
 def _usage_request_kind(text: str) -> str | None:
