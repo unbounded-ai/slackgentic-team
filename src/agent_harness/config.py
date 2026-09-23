@@ -19,6 +19,9 @@ class SlackConfig(BaseModel):
 
     bot_token: str | None = Field(default=None, validation_alias="SLACK_BOT_TOKEN")
     app_token: str | None = Field(default=None, validation_alias="SLACK_APP_TOKEN")
+    # Optional token that acts as the owner (User Token Scope chat:write). Used only
+    # to delete the owner's own replies when a quiet loop's run log is cleared.
+    user_token: str | None = Field(default=None, validation_alias="SLACK_USER_TOKEN")
     team_id: str | None = Field(default=None, validation_alias="SLACK_TEAM_ID")
     channel_id: str | None = Field(default=None, validation_alias="SLACK_CHANNEL_ID")
     app_id: str | None = Field(default=None, validation_alias="SLACK_APP_ID")

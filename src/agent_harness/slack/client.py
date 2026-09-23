@@ -35,10 +35,12 @@ class SlackUserProfile:
 
 
 class SlackGateway:
-    def __init__(self, bot_token: str):
+    def __init__(self, bot_token: str, user_token: str | None = None):
         from slack_sdk import WebClient
 
         self.client = WebClient(token=bot_token)
+        # Acts as the owner; only ever used to delete the owner's own messages.
+        self.user_client = WebClient(token=user_token) if user_token else None
         # Permalinks are deterministic once the workspace URL is known, so they
         # are built locally instead of costing one chat.getPermalink per message
         # (the roster alone used to make one call per occupied agent).
@@ -191,6 +193,12 @@ class SlackGateway:
     def open_view(self, trigger_id: str, view: dict[str, Any]) -> None:
         self.client.views_open(trigger_id=trigger_id, view=view)
 
+    def update_view(self, view_id: str, view: dict[str, Any], view_hash: str | None = None) -> None:
+        kwargs: dict[str, Any] = {"view_id": view_id, "view": view}
+        if view_hash:
+            kwargs["hash"] = view_hash
+        self.client.views_update(**kwargs)
+
     def auth_test(self) -> dict[str, Any]:
         response = self.client.auth_test()
         data = getattr(response, "data", response)
@@ -260,15 +268,42 @@ class SlackGateway:
                 self._workspace_url = url if url.endswith("/") else f"{url}/"
         return getattr(self, "_workspace_url", None)
 
-    def delete_message(self, channel_id: str, message_ts: str) -> bool:
+    def delete_message(
+        self,
+        channel_id: str,
+        message_ts: str,
+        *,
+        as_owner: bool = False,
+    ) -> bool:
+        """Delete a message. ``as_owner`` deletes one the owner wrote, which the bot
+        cannot, through the optional owner token; without that token it fails."""
         from slack_sdk.errors import SlackApiError
 
+        client = self.client
+        if as_owner:
+            if self.user_client is None:
+                return False
+            client = self.user_client
         try:
-            self.client.chat_delete(channel=channel_id, ts=message_ts)
+            client.chat_delete(channel=channel_id, ts=message_ts)
         except SlackApiError:
             LOGGER.debug("failed to delete Slack message %s", message_ts, exc_info=True)
             return False
         return True
+
+    @property
+    def can_delete_as_owner(self) -> bool:
+        return self.user_client is not None
+
+    def unpin_message(self, channel_id: str, message_ts: str) -> None:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self.client.pins_remove(channel=channel_id, timestamp=message_ts)
+        except SlackApiError as exc:
+            if exc.response.get("error") in {"no_pin", "message_not_found"}:
+                return
+            raise
 
     def pin_message(self, channel_id: str, message_ts: str) -> None:
         from slack_sdk.errors import SlackApiError

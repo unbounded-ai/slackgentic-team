@@ -17,6 +17,7 @@ from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.loops import AGENT_LOOP_SIGNAL_PREFIX, LOOP_SIGNAL_PREFIXES_LONGEST_FIRST
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
+    LOOP_SILENT_OUTPUT_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
     PR_URLS_METADATA_KEY,
@@ -2493,6 +2494,49 @@ class TaskRuntimeTests(unittest.TestCase):
                     gateway.replies,
                     ["before release", "release cleared — posts again"],
                 )
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_post_agent_chunk_drops_output_of_silent_loop_runs(self):
+        # Memory compaction runs against the pinned loop panel's thread; their
+        # narration must never land there, but control signals still dispatch.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "compact memory", "C1")
+                task = replace(task, metadata={LOOP_SILENT_OUTPUT_METADATA_KEY: True})
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                signals = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda *args: signals.append(args[3]) or True,
+                )
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=OneShotProcess(None),
+                    thread=SlackThreadRef("C1", "171.panel"),
+                    worker=threading.Thread(),
+                )
+
+                runtime._post_agent_chunk(
+                    running,
+                    'Compacting now.\nSLACKGENTIC: LOOP_COMPACT {"snapshot": "memory"}',
+                )
+
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(len(signals), 1)
+                self.assertIn("LOOP_COMPACT", signals[0])
+                self.assertFalse(runtime._managed_task_progress_warning_due(running))
             finally:
                 shut_down_runtime(runtime)
                 store.close()

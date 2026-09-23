@@ -402,7 +402,17 @@ follow-up before the harness writes a fallback entry. `LOOP_FETCH` can retrieve
 at most five earlier run threads per occurrence, from the same loop channel
 only. `LOOP_COMPACT` replaces redundant run/system memory while owner notes are
 never superseded. Compaction is also queued automatically when un-superseded
-memory crosses the configured threshold. Three consecutive runtime failures
+memory crosses the configured threshold. Compaction runs post nothing: they run
+against the pinned panel's thread with their visible output dropped. A rejected
+`LOOP_SUMMARY` or `LOOP_COMPACT` line is sent back to the running agent with the
+reason so it can re-emit, rather than being posted to Slack. Quiet loops count
+the runs that share the panel's thread; at the configured threshold (default 120)
+the next compaction also asks for a short `thread_summary`, then the harness
+posts one archive message with dates and counts, pins a fresh panel, and deletes
+the old thread replies-first (Slack has no thread delete; removing only the
+parent leaves a placeholder with the replies still reachable). The bot token
+deletes its own messages; the optional owner token (`SLACK_USER_TOKEN`, user
+scope `chat:write`) deletes the owner's replies and is used for nothing else. Three consecutive runtime failures
 pause the loop and notify its owner; a mission result whose summary status is
 `failed` still counts as a successfully completed harness run.
 

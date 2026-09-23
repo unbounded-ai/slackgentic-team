@@ -186,6 +186,8 @@ class FakeGateway:
         self.reactions = []
         self.removed_reactions = []
         self.pins = []
+        self.unpins = []
+        self.view_updates = []
         self.history_messages = []
         self.thread_history_messages = {}
         self.channel_message_calls = []
@@ -293,6 +295,12 @@ class FakeGateway:
 
     def pin_message(self, channel_id, message_ts):
         self.pins.append((channel_id, message_ts))
+
+    def unpin_message(self, channel_id, message_ts):
+        self.unpins.append((channel_id, message_ts))
+
+    def update_view(self, view_id, view, view_hash=None):
+        self.view_updates.append((view_id, view, view_hash))
 
     def post_thread_reply(
         self,
