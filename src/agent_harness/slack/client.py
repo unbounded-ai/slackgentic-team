@@ -225,6 +225,11 @@ class SlackGateway:
         response = self.client.chat_getPermalink(channel=channel_id, message_ts=message_ts)
         return response.get("permalink")
 
+    def channel_url(self, channel_id: str) -> str | None:
+        # A workspace link opens in the Slack client; app_redirect detours through the browser.
+        base = self._workspace_base_url()
+        return f"{base}archives/{channel_id}" if base and channel_id else None
+
     def _workspace_base_url(self) -> str | None:
         if not getattr(self, "_workspace_url_checked", False):
             self._workspace_url_checked = True

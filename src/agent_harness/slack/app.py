@@ -64,6 +64,7 @@ from agent_harness.loops import (
     LoopSpec,
     LoopStatusCommand,
     LoopStopCommand,
+    LoopSummary,
     LoopTaskCommand,
     build_loop_compaction_prompt,
     build_loop_fetch_result,
@@ -2038,6 +2039,7 @@ class SlackTeamController:
                     "loop": loop,
                     "icon_emoji": agent.icon_emoji if agent is not None else None,
                     "channel_id": loop.channel_id,
+                    "channel_url": self._channel_url(loop.channel_id),
                     "channel_text": (
                         f"<#{loop.channel_id}>"
                         if loop.channel_id
@@ -3347,6 +3349,7 @@ class SlackTeamController:
             started_at=now,
         )
         header_blocks: list[dict] | None = None
+        previous: LoopSummary | None = None
         quiet_run = (
             _loop_is_quiet(loop)
             and kind != LoopRunKind.COMPACTION
@@ -3432,6 +3435,9 @@ class SlackTeamController:
                 scratch_dir=str(guard_paths[0]) if guard_paths else None,
                 reference_dir=str(guard_paths[2]) if guard_paths and guard_paths[2] else None,
                 quiet=quiet_run,
+                previous_headline_overflow_chars=(
+                    previous.headline_overflow_chars if previous is not None else None
+                ),
             )
         )
         task = create_agent_task(
@@ -5192,6 +5198,16 @@ class SlackTeamController:
         if thread is not None:
             return thread
         return self.store.find_slack_thread_for_session_channel(provider, session_id, channel_id)
+
+    def _channel_url(self, channel_id: str | None) -> str | None:
+        channel_url = getattr(self.gateway, "channel_url", None)
+        if not channel_id or not callable(channel_url):
+            return None
+        try:
+            return channel_url(channel_id)
+        except Exception:
+            LOGGER.debug("failed to build Slack channel URL for %s", channel_id)
+            return None
 
     def _thread_permalink(self, channel_id: str, thread_ts: str | None) -> str | None:
         if not thread_ts:

@@ -266,7 +266,8 @@ review the preview and click Create. Agent-requested loops always start
 read-only. `slackgentic loop list` shows loops from a terminal.
 
 Use `loops` or `loop list` in the main agent channel to see every loop in one
-message, with its latest result and a menu to run, pause, resume, or stop it. Loops intentionally cannot delegate to roster
+message, with its latest result and buttons to open its channel, edit it, and
+pause or resume it. Loops intentionally cannot delegate to roster
 agents, start PM initiatives, or read Slack file and attachment contents.
 
 Loop badge uploads use the optional `files:write` scope. Existing installations

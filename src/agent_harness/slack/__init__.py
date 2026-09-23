@@ -648,6 +648,8 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
             "text": _shorten_text(" ".join(body_parts) or row["schedule_text"], 200),
         },
     }
+    # Cards hold at most three buttons: Open, Edit, and the pause toggle. Run now
+    # lives on the channel's pinned panel.
     actions: list[dict[str, Any]] = []
     channel_id = row.get("channel_id")
     if channel_id:
@@ -656,17 +658,17 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
                 "Open",
                 "loop.open",
                 encode_action_value("loop.open", loop_id=loop.loop_id),
-                url=f"https://slack.com/app_redirect?channel={channel_id}",
+                url=row.get("channel_url")
+                or f"https://slack.com/app_redirect?channel={channel_id}",
             )
         )
-    if loop.status == LoopStatus.ACTIVE and not row.get("running"):
-        actions.append(
-            _button(
-                "▶ Run now",
-                "loop.run_now",
-                encode_action_value("loop.run_now", loop_id=loop.loop_id),
-            )
+    actions.append(
+        _button(
+            "✏️ Edit",
+            "loop.edit.open",
+            encode_action_value("loop.edit.open", loop_id=loop.loop_id),
         )
+    )
     if loop.status == LoopStatus.ACTIVE:
         actions.append(
             _button(

@@ -133,7 +133,8 @@ exact text to send, in the **loop's channel**:
 
 The pinned panel also has Run now, Pause/Resume, and **Edit** (mission,
 schedule, permissions, reference directory, quiet) buttons. In the main agent
-channel, `loops` (or `loop list`) shows every loop as a card.
+channel, `loops` (or `loop list`) shows every loop as a card with Open (jumps to
+the loop channel), Edit, and Pause/Resume.
 
 ## If you are a loop run
 

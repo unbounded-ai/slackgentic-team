@@ -55,6 +55,7 @@ LOOP_FETCH_MAX_PER_RUN = 5
 LOOP_FETCH_PAYLOAD_MAX_CHARS = 8_000
 LOOP_SUMMARY_MAX_CHARS = 2_000
 LOOP_HEADLINE_MAX_CHARS = 150
+LOOP_HEADLINE_TRUNCATED_MARKER = "… (truncated)"
 LOOP_REPORT_MAX_CHARS = 6_000
 LOOP_METRICS_MAX_ITEMS = 8
 LOOP_METRIC_FIELD_MAX_CHARS = 60
@@ -94,7 +95,7 @@ LOOP_CHART_SIGNAL_EXAMPLE = json.dumps(
 LOOP_SUMMARY_SIGNAL_EXAMPLE = json.dumps(
     {
         "status": "ok|found_issue|action_taken|failed",
-        "headline": "<the answer in one line>",
+        "headline": f"<the answer in one line, at most {LOOP_HEADLINE_MAX_CHARS} characters>",
         "metrics": [{"label": "<name>", "value": "<value>", "delta": "<change vs baseline>"}],
         "report": "<markdown report>",
         "chart": "<optional chart object>",
@@ -172,6 +173,8 @@ class LoopSummary:
     report: str | None = None
     metrics: tuple[LoopMetric, ...] = ()
     chart: LoopChart | None = None
+    # Length of the agent's headline when it ran over the limit and was cut.
+    headline_overflow_chars: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -181,6 +184,8 @@ class LoopSummary:
         }
         if self.headline:
             payload["headline"] = self.headline
+        if self.headline_overflow_chars:
+            payload["headline_overflow_chars"] = self.headline_overflow_chars
         if self.report:
             payload["report"] = self.report
         if self.metrics:
@@ -665,9 +670,16 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
         return LoopSummaryParseResult(error="loop summary carry must be an object")
     if carry is not None and len(json.dumps(carry, sort_keys=True)) > 4_000:
         return LoopSummaryParseResult(error="loop summary carry must be at most 4000 characters")
-    headline = _optional_text(payload.get("headline"), LOOP_HEADLINE_MAX_CHARS, "headline")
+    # An over-long headline is cut rather than rejected: dropping it would throw away
+    # the whole run summary, report and carry with it.
+    headline = _optional_text(payload.get("headline"), None, "headline")
     if isinstance(headline, _FieldError):
         return LoopSummaryParseResult(error=headline.message)
+    headline = " ".join(headline.split()) if headline else None
+    headline_overflow_chars = None
+    if headline and len(headline) > LOOP_HEADLINE_MAX_CHARS:
+        headline_overflow_chars = len(headline)
+        headline = truncate_loop_headline(headline)
     report = _optional_text(payload.get("report"), LOOP_REPORT_MAX_CHARS, "report")
     if isinstance(report, _FieldError):
         return LoopSummaryParseResult(error=report.message)
@@ -682,12 +694,18 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
             summary,
             str(status),
             carry,
-            headline=" ".join(headline.split()) if headline else None,
+            headline=headline,
             report=report,
             metrics=metrics,
             chart=chart,
+            headline_overflow_chars=headline_overflow_chars,
         )
     )
+
+
+def truncate_loop_headline(headline: str) -> str:
+    keep = LOOP_HEADLINE_MAX_CHARS - len(LOOP_HEADLINE_TRUNCATED_MARKER)
+    return headline[:keep].rstrip() + LOOP_HEADLINE_TRUNCATED_MARKER
 
 
 def loop_summary_from_json(value: str | None) -> LoopSummary | None:
@@ -709,6 +727,7 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
     report = payload.get("report")
     metrics = _parse_loop_metrics(payload.get("metrics"))
     chart = parse_loop_chart(payload.get("chart"))
+    overflow = payload.get("headline_overflow_chars")
     return LoopSummary(
         summary=summary.strip(),
         status=status if status in LOOP_SUMMARY_STATUSES else "ok",
@@ -717,6 +736,9 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
         report=report.strip() if isinstance(report, str) and report.strip() else None,
         metrics=metrics if isinstance(metrics, tuple) else (),
         chart=chart if isinstance(chart, LoopChart) else None,
+        headline_overflow_chars=(
+            overflow if isinstance(overflow, int) and not isinstance(overflow, bool) else None
+        ),
     )
 
 
@@ -775,13 +797,13 @@ class _FieldError:
     message: str
 
 
-def _optional_text(value: object, limit: int, label: str) -> str | _FieldError | None:
+def _optional_text(value: object, limit: int | None, label: str) -> str | _FieldError | None:
     if value is None:
         return None
     if not isinstance(value, str):
         return _FieldError(f"loop summary {label} must be a string")
     cleaned = value.strip()
-    if len(cleaned) > limit:
+    if limit is not None and len(cleaned) > limit:
         return _FieldError(f"loop summary {label} must be at most {limit} characters")
     return cleaned or None
 
@@ -940,6 +962,7 @@ def build_loop_run_prompt(
     scratch_dir: str | None = None,
     reference_dir: str | None = None,
     quiet: bool = False,
+    previous_headline_overflow_chars: int | None = None,
 ) -> str:
     del now
     identity = bot_name or str(loop.metadata.get("bot_name") or loop.title)
@@ -1015,7 +1038,19 @@ def build_loop_run_prompt(
             "- status: ok (nothing notable), found_issue (anomaly or problem the owner should "
             "see), action_taken (you changed something), failed (you could not do the mission).",
             f"- headline: one line, at most {LOOP_HEADLINE_MAX_CHARS} characters, that states "
-            "the answer itself (numbers and verdict), not a description of the work.",
+            "the answer itself (numbers and verdict), not a description of the work. This is a "
+            "hard limit: count the characters before you emit, and if it is over, cut it down "
+            "to the verdict and move the detail into report. The harness cuts anything longer "
+            "and marks it truncated.",
+            *(
+                [
+                    f"- Your previous run's headline was {previous_headline_overflow_chars} "
+                    f"characters, so it was cut at {LOOP_HEADLINE_MAX_CHARS}. Keep this one "
+                    "shorter."
+                ]
+                if previous_headline_overflow_chars
+                else []
+            ),
             f"- metrics: up to {LOOP_METRICS_MAX_ITEMS} key numbers shown as tiles; delta "
             "compares with the baseline (for example +12% vs 7d avg).",
             f"- report: the full report in GitHub-flavored markdown (## headings, **bold**, "

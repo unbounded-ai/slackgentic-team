@@ -1763,6 +1763,13 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn(f"<#{loop.channel_id}>", rendered)
         self.assertIn("carousel", rendered)
         card = posts[0]["blocks"][2]["elements"][0]
+        self.assertEqual(
+            [item["action_id"] for item in card["actions"]],
+            ["loop.open", "loop.edit.open", "loop.pause"],
+        )
+        self.assertEqual(
+            card["actions"][0]["url"], f"https://example.slack.com/archives/{loop.channel_id}"
+        )
         pause = next(item for item in card["actions"] if item["action_id"] == "loop.pause")
         self.controller.handle_block_action(
             {
