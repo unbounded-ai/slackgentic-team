@@ -6,6 +6,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
     PR_URL_METADATA_KEY,
@@ -113,6 +114,8 @@ def assign_work_request(
         metadata[PERMISSION_MODE_METADATA_KEY] = request.permission_mode.value
     if request.dangerous_mode:
         metadata[DANGEROUS_MODE_METADATA_KEY] = True
+    if request.model:
+        metadata[MODEL_OVERRIDE_METADATA_KEY] = request.model
     if metadata:
         task = replace(task, metadata=metadata)
 

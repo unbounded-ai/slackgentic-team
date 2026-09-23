@@ -300,6 +300,9 @@ class WorkRequest:
     author_handle: str | None = None
     pr_url: str | None = None
     permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
+    # Explicit ``model=<name>`` from the requester. None launches the
+    # provider with its own default model.
+    model: str | None = None
 
     @property
     def dangerous_mode(self) -> bool:

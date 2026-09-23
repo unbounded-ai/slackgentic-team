@@ -144,6 +144,11 @@ with Codex `--dangerously-bypass-approvals-and-sandbox` or Claude
 `--dangerously-skip-permissions`. Slackgentic strips the tag from the task
 prompt and marks active dangerous-mode tasks on the roster.
 
+Tasks run with the provider's own default model. Add `model=<name>` to a task,
+for example `@riley model=example-model fix the flaky test`, to launch that
+agent with an explicit model instead. Slackgentic strips the option from the
+prompt and keeps it for later turns of the same agent in that thread.
+
 ### Thread = Context Boundary
 
 A Slack thread is the continuity boundary. If the same agent continues in that

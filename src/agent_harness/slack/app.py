@@ -8510,6 +8510,13 @@ class SlackTeamController:
             )
         if request.dangerous_mode or _task_dangerous_mode(previous_task):
             metadata[DANGEROUS_MODE_METADATA_KEY] = True
+        if not previous_task.metadata.get(LOOP_ID_METADATA_KEY):
+            # Same agent, same thread: keep a model the requester explicitly
+            # chose (or switch to a newly requested one). Without one, the
+            # provider's default model is used.
+            model = request.model or previous_task.metadata.get(MODEL_OVERRIDE_METADATA_KEY)
+            if model:
+                metadata[MODEL_OVERRIDE_METADATA_KEY] = model
         task = replace(
             previous_task,
             prompt=request.prompt,
