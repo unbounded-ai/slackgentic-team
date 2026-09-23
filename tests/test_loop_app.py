@@ -2291,6 +2291,33 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(card["blocks"][0]["type"], "task_card")
         self.assertEqual(card["blocks"][0]["status"], "error")
 
+    def test_channel_topic_is_humanized_and_only_set_when_it_changes(self):
+        loop = self._activate_loop()
+        self.assertEqual(len(self.gateway.topics), 1)
+        self.assertIn("every 5 minutes", self.gateway.topics[0][1])
+
+        self._send_loop_command(loop, "loop pause", "320.000001")
+        self.assertEqual(len(self.gateway.topics), 1)
+
+        self._send_loop_command(loop, "loop schedule: every ten minutes", "320.000002")
+        task, agent, thread = self.runtime.started[-1]
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "title": "Cloud Billing Watch",
+                    "bot_name": "Billing Bot",
+                    "mission": "Inspect cloud billing and report material anomalies.",
+                    "schedule": {"frequency": "interval", "interval_seconds": 600},
+                }
+            ),
+        )
+        self.assertEqual(len(self.gateway.topics), 2)
+        self.assertIn("every 10 minutes", self.gateway.topics[-1][1])
+
     def test_panels_are_rerendered_once_per_version_after_upgrade(self):
         loop = self._activate_loop()
         self.gateway.updates.clear()

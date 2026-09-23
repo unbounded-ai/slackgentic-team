@@ -1908,6 +1908,7 @@ class SlackTeamController:
             if loop.status in {LoopStatus.ACTIVE, LoopStatus.PAUSED} and loop.charter_message_ts:
                 try:
                     self._refresh_loop_panel(loop)
+                    self._refresh_loop_topic(loop)
                 except Exception:
                     LOGGER.debug("failed to refresh loop panel %s", loop.loop_id, exc_info=True)
                     continue
@@ -2197,8 +2198,9 @@ class SlackTeamController:
             )
         )
         # System entries record owner-visible configuration changes, so the
-        # pinned panel always reflects them.
+        # pinned panel and channel topic always reflect them.
         self._refresh_loop_panel(loop)
+        self._refresh_loop_topic(loop)
 
     def _post_loop_help(self, loop: Loop, *, event: dict | None = None) -> None:
         self._post_loop_surface(loop, self._loop_help_text(), event=event)
@@ -7094,10 +7096,6 @@ class SlackTeamController:
             is_private=latest.visibility != LoopVisibility.PUBLIC,
         )
         self.gateway.invite_users(channel_id, [latest.owner_slack_user_id])
-        self.gateway.set_channel_topic(
-            channel_id,
-            _shorten(self._loop_channel_topic(latest, spec), 250),
-        )
         charter = self.gateway.post_session_parent(
             channel_id,
             f"{spec.title} — {spec.schedule_description}",
@@ -7135,6 +7133,7 @@ class SlackTeamController:
         self.store.update_loop_status(latest.loop_id, LoopStatus.ACTIVE)
         self.store.update_loop_pending_spec(latest.loop_id, None)
         resolved = self.store.get_loop(latest.loop_id) or latest
+        self._refresh_loop_topic(resolved)
         self._refresh_loop_panel(resolved)
         self._rewrite_loop_preview(
             resolved,
@@ -7187,12 +7186,30 @@ class SlackTeamController:
             blocks=blocks,
         )
 
-    def _loop_channel_topic(self, loop: Loop, spec: LoopSpec) -> str:
+    def _loop_channel_topic(
+        self,
+        loop: Loop,
+        recurrence: dict[str, object],
+        timezone: str | None,
+    ) -> str:
         return (
-            f"🔁 {spec.title} — {spec.schedule_description}. "
-            f"Owner: <@{loop.owner_slack_user_id}>. This bot only takes instructions from "
-            "its owner; other messages are not shown to it."
+            f"🔁 {loop.title} · {describe_loop_schedule(recurrence, timezone)} · "
+            f"owner <@{loop.owner_slack_user_id}>. Only the owner can instruct this bot."
         )
+
+    def _refresh_loop_topic(self, loop: Loop) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if not latest.channel_id or latest.status not in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
+            return
+        topic = _shorten(self._loop_channel_topic(latest, latest.recurrence, latest.timezone), 250)
+        # Every topic change posts a channel notice, so only set it when it changed.
+        if latest.metadata.get("channel_topic") == topic:
+            return
+        with suppress(Exception):
+            if self.gateway.set_channel_topic(latest.channel_id, topic) is not False:
+                metadata = dict(latest.metadata)
+                metadata["channel_topic"] = topic
+                self.store.update_loop_metadata(latest.loop_id, metadata)
 
     def _schedule_from_action(
         self,
