@@ -4277,12 +4277,12 @@ class SlackTeamController:
         self._refresh_loop_panel(loop)
         threading.Thread(
             target=self._delete_loop_thread,
-            args=(loop.channel_id, old_ts),
+            args=(loop.channel_id, old_ts, loop.owner_slack_user_id),
             name=f"loop-thread-cleanup-{loop.loop_id}",
             daemon=True,
         ).start()
 
-    def _delete_loop_thread(self, channel_id: str, thread_ts: str) -> None:
+    def _delete_loop_thread(self, channel_id: str, thread_ts: str, owner_id: str) -> None:
         with suppress(Exception):
             self.gateway.unpin_message(channel_id, thread_ts)
         try:
@@ -4291,15 +4291,28 @@ class SlackTeamController:
             LOGGER.warning("failed to list loop thread %s for cleanup", thread_ts, exc_info=True)
             messages = []
         replies = [
-            str(message["ts"])
-            for message in messages
-            if message.get("ts") and message.get("ts") != thread_ts
+            message for message in messages if message.get("ts") and message.get("ts") != thread_ts
         ]
-        # Replies first, so the parent does not linger as a "deleted" placeholder.
-        # Messages the bot did not write (the owner's replies) cannot be deleted.
-        for ts in [*reversed(replies), thread_ts]:
-            self.gateway.delete_message(channel_id, ts)
+        # Slack has no "delete thread": removing only the parent leaves a "This
+        # message was deleted" placeholder with every reply still reachable. So
+        # replies go first, then the parent. The bot can only delete its own
+        # messages; the owner's replies need the optional owner token.
+        kept = 0
+        for message in reversed(replies):
+            ts = str(message["ts"])
+            deleted = self.gateway.delete_message(channel_id, ts)
+            if not deleted and message.get("user") == owner_id and not message.get("bot_id"):
+                deleted = self.gateway.delete_message(channel_id, ts, as_owner=True)
+            kept += 0 if deleted else 1
             time.sleep(LOOP_THREAD_DELETE_INTERVAL_SECONDS)
+        self.gateway.delete_message(channel_id, thread_ts)
+        if kept:
+            LOGGER.warning(
+                "loop thread %s cleanup left %d replies; set SLACK_USER_TOKEN so the "
+                "owner's replies can be deleted too",
+                thread_ts,
+                kept,
+            )
 
     def _queue_loop_compaction_if_needed(self, loop: Loop) -> None:
         entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
@@ -13828,7 +13841,7 @@ class SocketModeSlackApp:
         self._active_socket_client = None
         self.store = Store(config.state_db)
         self.store.init_schema()
-        self.gateway = SlackGateway(config.slack.bot_token)
+        self.gateway = SlackGateway(config.slack.bot_token, user_token=config.slack.user_token)
         auth = self.gateway.auth_test()
         _ensure_codex_mcp_for_slack_app(config)
         _ensure_claude_native_input_hook_for_slack_app(config)

@@ -2650,7 +2650,9 @@ class LoopCreationFlowTests(unittest.TestCase):
                 self.target(*self.args)
 
         deleted = []
-        self.gateway.delete_message = lambda channel, ts: deleted.append((channel, ts)) or True
+        self.gateway.delete_message = lambda channel, ts, as_owner=False: (
+            deleted.append((channel, ts)) or True
+        )
         with (
             patch("agent_harness.slack.app.threading.Thread", InlineThread),
             patch("agent_harness.slack.app.LOOP_THREAD_DELETE_INTERVAL_SECONDS", 0),
@@ -2678,6 +2680,39 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.controller.fire_loop_now(rolled)
         next_task, *_ = self._running_task_and_run(rolled)
         self.assertEqual(next_task.thread_ts, rolled.charter_message_ts)
+
+    def test_run_log_cleanup_deletes_owner_replies_with_the_owner_token(self):
+        self.gateway.thread_history_messages[("CNEW", "900.panel")] = [
+            {"ts": "900.panel", "bot_id": "B1", "text": "panel"},
+            {"ts": "901.1", "bot_id": "B1", "text": "run notes"},
+            {"ts": "902.1", "user": "UOWNER", "text": "why?"},
+            {"ts": "903.1", "user": "UOTHER", "text": "hmm"},
+        ]
+        attempts = []
+
+        def delete_message(channel, ts, as_owner=False):
+            attempts.append((ts, as_owner))
+            # The bot can delete only its own messages; the owner token only the owner's.
+            return ts in {"900.panel", "901.1"} or (as_owner and ts == "902.1")
+
+        self.gateway.thread_messages = lambda channel, ts, limit=20, oldest=None: (
+            self.gateway.thread_history_messages[(channel, ts)]
+        )
+        self.gateway.delete_message = delete_message
+        with patch("agent_harness.slack.app.LOOP_THREAD_DELETE_INTERVAL_SECONDS", 0):
+            self.controller._delete_loop_thread("CNEW", "900.panel", "UOWNER")
+
+        self.assertEqual(
+            attempts,
+            [
+                ("903.1", False),
+                ("902.1", False),
+                ("902.1", True),
+                ("901.1", False),
+                ("900.panel", False),
+            ],
+        )
+        self.assertIn(("CNEW", "900.panel"), self.gateway.unpins)
 
     def test_loops_that_post_every_run_never_roll_over_their_panel_thread(self):
         loop = self._activate_loop()

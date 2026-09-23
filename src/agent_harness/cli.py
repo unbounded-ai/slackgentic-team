@@ -995,6 +995,10 @@ def _slack_doctor(config) -> int:
     for name, passed in checks:
         print(f"{'ok' if passed else 'missing'} {name}")
         ok = ok and passed
+    print(
+        f"{'ok' if config.slack.user_token else 'optional'} SLACK_USER_TOKEN "
+        "(lets quiet loops delete your replies when clearing their run log)"
+    )
     print(f"config file {config.config_file}")
     print("delivery mode socket")
     print(f"slash command {config.slack.slash_command}")

@@ -237,6 +237,11 @@ a quiet loop clears it every 120 runs (change it under **Edit** → *Clear the r
 log every*): the old panel and its thread are deleted, one message in the channel
 records the dates, run counts, and the agent's short note on the period, and a
 fresh panel is pinned. Loops that post every run have no shared log to clear.
+The bot can only delete its own messages, so to also remove replies you wrote in
+that thread, give Slackgentic a token that acts as you: in your Slack app's
+**OAuth & Permissions**, add the User Token Scope `chat:write`, reinstall the
+app, and set the **User OAuth Token** (`xoxp-…`) as `SLACK_USER_TOKEN` in the
+Slackgentic config, then restart. It is used only to delete your replies there.
 
 New loops are **read-only**. Every tool call passes through a loop guard before
 it runs: known reads run without asking, anything that could change state
