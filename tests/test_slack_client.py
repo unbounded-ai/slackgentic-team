@@ -258,6 +258,31 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertEqual([block["type"] for block in blocks], ["table"])
         self.assertEqual(blocks[0]["rows"][1][0]["elements"][0]["elements"][0]["text"], "silas")
 
+    def test_permalinks_are_built_locally_after_one_auth_call(self):
+        gateway = object.__new__(SlackGateway)
+        calls = []
+
+        class Client:
+            def auth_test(self):
+                calls.append("auth_test")
+                return {"ok": True, "url": "https://example.slack.com/"}
+
+            def chat_getPermalink(self, **kwargs):
+                calls.append("chat_getPermalink")
+                return {"permalink": "https://example.slack.com/archives/C1/p1"}
+
+        gateway.client = Client()
+        gateway._workspace_url = None
+        gateway._workspace_url_checked = False
+
+        links = [gateway.permalink("C1", f"171234567{index}.000100") for index in range(5)]
+
+        self.assertEqual(calls, ["auth_test"])
+        self.assertEqual(links[0], "https://example.slack.com/archives/C1/p1712345670000100")
+        self.assertEqual(
+            gateway.permalink("C1", "not-a-ts"), "https://example.slack.com/archives/C1/p1"
+        )
+
     def test_rejected_modern_blocks_retry_as_classic_blocks_with_buttons(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = InvalidBlocksOnceClient()
