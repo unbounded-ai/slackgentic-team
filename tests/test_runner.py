@@ -79,6 +79,37 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("--permission-mode", args)
         self.assertNotIn("--dangerously-skip-permissions", args)
 
+    def test_loop_guard_hook_ignores_modules_planted_in_scratch(self):
+        import subprocess
+        import tempfile
+
+        from agent_harness.runtime.runner import loop_guard_settings
+
+        command = loop_guard_settings()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertIn(" -I -m agent_harness.loop_guard", command)
+        with tempfile.TemporaryDirectory() as scratch:
+            for name in ("inspect.py", "json.py", "re.py", "agent_harness.py"):
+                Path(scratch, name).write_text("raise SystemExit(99)\n")
+            payload = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONPATH", "PYTHONSAFEPATH"}
+            }
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=scratch,
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                env={**env, "SLACKGENTIC_LOOP_SCRATCH": scratch},
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(decision, "deny")
+
     def test_read_only_codex_loop_writes_only_in_its_scratch_sandbox(self):
         request = LaunchRequest(
             provider=Provider.CODEX,

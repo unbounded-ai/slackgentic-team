@@ -146,7 +146,10 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
 
 def loop_guard_settings() -> dict:
     """Claude settings that route every tool call through the loop guard."""
-    command = f"{shlex.quote(sys.executable)} -m agent_harness.loop_guard"
+    # -I (isolated mode) keeps the hook from importing anything the agent writes
+    # into its scratch working directory (a scratch "inspect.py" or "json.py"
+    # would otherwise shadow the standard library inside the guard itself).
+    command = f"{shlex.quote(sys.executable)} -I -m agent_harness.loop_guard"
     return {
         "hooks": {
             "PreToolUse": [
