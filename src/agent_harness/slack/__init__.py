@@ -17,6 +17,7 @@ from agent_harness.loops import (
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    LATEST_UPDATE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
     AgentSession,
@@ -2314,16 +2315,22 @@ def build_task_thread_blocks(
     *,
     include_actions: bool = True,
 ) -> list[dict[str, Any]]:
-    """The task thread header: a live task card for the agent's work."""
+    """The task thread header: a live task card for the agent's work.
+
+    The title next to the spinner is the agent's latest message; the original
+    request stays in the card's details.
+    """
     task_label = "PR review" if task.kind.value == "review" else "task"
     original = _task_original_prompt(task)
+    latest_update = task.metadata.get(LATEST_UPDATE_METADATA_KEY)
+    latest_update = latest_update.strip() if isinstance(latest_update, str) else ""
     summary = task.metadata.get(ROSTER_SUMMARY_METADATA_KEY)
     summary = summary.strip() if isinstance(summary, str) else ""
     finished = task.status.value in {"done", "cancelled"}
     card: dict[str, Any] = {
         "type": "task_card",
         "task_id": task.task_id[:255],
-        "title": _task_card_title(original),
+        "title": _task_card_title(latest_update or original),
         "status": "complete" if finished else "in_progress",
         "details": _rich_text(original[:2500]),
     }
@@ -2369,6 +2376,17 @@ def build_task_thread_blocks(
             }
         )
     return blocks
+
+
+def agent_update_line(text: str, limit: int = 150) -> str:
+    """The first line of an agent message, as plain text for a card title."""
+    for line in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+\.)\s+", "", line)
+        line = re.sub(r"[*_`~]", "", line)
+        line = " ".join(line.split())
+        if line:
+            return line if len(line) <= limit else f"{line[: limit - 1].rstrip()}…"
+    return ""
 
 
 def _task_card_title(prompt: str) -> str:

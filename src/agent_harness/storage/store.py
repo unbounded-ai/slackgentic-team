@@ -1174,6 +1174,36 @@ class Store:
             message_ts=row["parent_ts"],
         )
 
+    def list_observed_session_threads(
+        self,
+        team_id: str,
+        channel_id: str,
+    ) -> list[tuple[Provider, str, SlackThreadRef]]:
+        """Threads mirroring sessions started outside Slack, newest first."""
+        rows = self.conn.execute(
+            """
+            SELECT t.provider, t.session_id, t.channel_id, t.thread_ts, t.parent_ts
+            FROM slack_threads t
+            JOIN sessions s ON s.provider = t.provider AND s.session_id = t.session_id
+            WHERE t.team_id = ? AND t.channel_id = ? AND s.control_mode = ?
+              AND NOT EXISTS (SELECT 1 FROM agent_tasks a WHERE a.session_id = t.session_id)
+            ORDER BY t.thread_ts DESC
+            """,
+            (team_id or "", channel_id, ControlMode.OBSERVED.value),
+        ).fetchall()
+        return [
+            (
+                Provider(row["provider"]),
+                row["session_id"],
+                SlackThreadRef(
+                    channel_id=row["channel_id"],
+                    thread_ts=row["thread_ts"],
+                    message_ts=row["parent_ts"],
+                ),
+            )
+            for row in rows
+        ]
+
     def find_slack_thread_for_session_channel(
         self,
         provider: Provider,
@@ -1333,6 +1363,7 @@ class Store:
             prefixes += (
                 "external_session_activity.",
                 "external_session_summary.",
+                "external_session_card.",
                 "session_channel_notice.",
                 "codex_response_item_recovery.v1.",
             )
