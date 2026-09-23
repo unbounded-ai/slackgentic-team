@@ -19,6 +19,7 @@ from agent_harness.loops import (
     build_loop_fetch_result,
     build_loop_resolution_prompt,
     build_loop_run_prompt,
+    describe_loop_schedule,
     loop_spec_from_json,
     loop_spec_to_json,
     parse_agent_loop_signal,
@@ -1762,15 +1763,24 @@ class LoopCreationFlowTests(unittest.TestCase):
         rendered = str(posts[0]["blocks"])
         self.assertIn(f"<#{loop.channel_id}>", rendered)
         self.assertIn("carousel", rendered)
-        card = posts[0]["blocks"][2]["elements"][0]
-        pause = next(item for item in card["actions"] if item["action_id"] == "loop.pause")
+        carousel = posts[0]["blocks"][2]["elements"]
+        self.assertEqual(carousel[0]["actions"][0]["action_id"], "loop.create.open")
+        card = carousel[1]
+        self.assertEqual(
+            [item["action_id"] for item in card["actions"]],
+            ["loop.pause", "loop.edit.open", "loop.delete"],
+        )
+        # The channel name in the body is the way into the channel.
+        self.assertIn(f"<#{loop.channel_id}>", card["body"]["text"])
+        delete = card["actions"][2]
+        self.assertIn("confirm", delete)
         self.controller.handle_block_action(
             {
                 "actions": [
                     {
-                        "action_id": "loop.pause",
+                        "action_id": "loop.delete",
                         "block_id": card["block_id"],
-                        "value": pause["value"],
+                        "value": delete["value"],
                     }
                 ],
                 "channel": {"id": "CMAIN"},
@@ -1778,11 +1788,43 @@ class LoopCreationFlowTests(unittest.TestCase):
                 "user": {"id": "UOWNER"},
             }
         )
+        deleted = self.store.get_loop(loop.loop_id)
+        assert deleted is not None
+        self.assertEqual(deleted.status, LoopStatus.CANCELLED)
+        self.assertIn(loop.channel_id, self.gateway.archived_channels)
+        list_update = next(item for item in self.gateway.updates if item["ts"] == posts[0]["ts"])
+        self.assertNotIn(loop.loop_id, str(list_update["blocks"]))
+        self.assertIn("loop.create.open", str(list_update["blocks"]))
+
+    def test_panel_lets_members_run_and_pause_but_not_delete(self):
+        loop = self._activate_loop()
+
+        def click(action_id: str) -> None:
+            self.controller.handle_block_action(
+                {
+                    "actions": [
+                        {
+                            "action_id": action_id,
+                            "block_id": f"loop.panel.card.{loop.loop_id}",
+                            "value": encode_action_value(action_id, loop_id=loop.loop_id),
+                        }
+                    ],
+                    "channel": {"id": loop.channel_id},
+                    "message": {"ts": loop.charter_message_ts},
+                    "user": {"id": "UOTHER"},
+                }
+            )
+
+        click("loop.delete")
+        still_active = self.store.get_loop(loop.loop_id)
+        assert still_active is not None
+        self.assertEqual(still_active.status, LoopStatus.ACTIVE)
+        self.assertIn("Only the loop owner", self.gateway.ephemerals[-1][2])
+
+        click("loop.pause")
         paused = self.store.get_loop(loop.loop_id)
         assert paused is not None
         self.assertEqual(paused.status, LoopStatus.PAUSED)
-        list_update = next(item for item in self.gateway.updates if item["ts"] == posts[0]["ts"])
-        self.assertIn("Paused", str(list_update["blocks"]))
 
     def test_pause_resume_and_run_now_commands_drive_lifecycle(self):
         loop = self._activate_loop()
@@ -2190,6 +2232,54 @@ class LoopCreationFlowTests(unittest.TestCase):
             item for item in self.gateway.updates if item["ts"] == task.parent_message_ts
         ]
         self.assertIn("Mission and schedule updated", confirmation[-1]["text"])
+
+    def test_edit_visibility_recreates_channel_with_members_and_archives_old(self):
+        loop = self._activate_loop()
+        self.assertEqual(loop.visibility, LoopVisibility.PRIVATE)
+        self.gateway.channel_members["CNEW"] = ["UOWNER", "UTEAM", self.gateway.bot_user_id()]
+        self.gateway.create_channel = lambda name, is_private: (
+            self.gateway.channels.append((name, is_private)) or "CPUBLIC"
+        )
+        view = build_loop_edit_modal(loop, schedule_text="every hour", channel_id="CNEW")
+        self.assertIn("recreates the channel", str(view["blocks"]))
+
+        result = self.controller.handle_view_submission(
+            {
+                "user": {"id": "UOWNER"},
+                "view": {
+                    "callback_id": "loop.edit",
+                    "private_metadata": view["private_metadata"],
+                    "state": {
+                        "values": {
+                            "loop_mission": {"value": {"value": loop.mission}},
+                            "loop_schedule": {
+                                "value": {
+                                    "value": describe_loop_schedule(loop.recurrence, loop.timezone)
+                                }
+                            },
+                            "loop_visibility": {"value": {"selected_option": {"value": "public"}}},
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertIsNone(result)
+        moved = self.store.get_loop(loop.loop_id)
+        assert moved is not None
+        self.assertEqual(moved.channel_id, "CPUBLIC")
+        self.assertEqual(moved.visibility, LoopVisibility.PUBLIC)
+        self.assertEqual(self.gateway.channels[-1], (loop.channel_name, False))
+        self.assertEqual(self.gateway.renames[0][0], "CNEW")
+        invited = {
+            user
+            for channel, users in self.gateway.invites
+            if channel == "CPUBLIC"
+            for user in users
+        }
+        self.assertEqual(invited, {"UOWNER", "UTEAM"})
+        self.assertIn("CNEW", self.gateway.archived_channels)
+        self.assertIn(("CPUBLIC", moved.charter_message_ts), self.gateway.pins)
 
     def test_new_loops_default_to_read_only_and_run_inside_scratch(self):
         loop = self._activate_loop()

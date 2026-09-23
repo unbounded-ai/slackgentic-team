@@ -3241,6 +3241,54 @@ class TaskRuntimeTests(unittest.TestCase):
                 shut_down_runtime(runtime)
                 store.close()
 
+    def test_runtime_idle_claude_turn_is_not_replayed_after_restart(self):
+        class SendableHoldingProcess(HoldingProcess):
+            def send(self, message):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=HoldingProcess,
+                )
+                running = self._claude_idle_running_task(agent)
+                running.process = SendableHoldingProcess(None)
+                task = replace(
+                    running.task,
+                    metadata={
+                        MANAGED_RUN_STARTED_METADATA_KEY: datetime.now(UTC).isoformat(),
+                        MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY: 1,
+                    },
+                )
+                store.upsert_agent_task(task)
+                running.task = task
+                with runtime._lock:
+                    runtime._running[task.task_id] = running
+
+                # The answer is posted and the agent idles: a daemon restart now must
+                # not re-send the prompt, but retry bookkeeping is kept.
+                runtime._capture_turn_completion(running, '{"type":"result","is_error":false}\n')
+                idle = store.get_agent_task(task.task_id)
+                assert idle is not None
+                self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, idle.metadata)
+                self.assertEqual(managed_run_transient_provider_retries(idle), 1)
+                self.assertFalse(should_resume_managed_run(idle))
+
+                # A follow-up turn is in flight again, so it is resumable once more.
+                self.assertTrue(runtime.send_to_task(task.task_id, "one more thing"))
+                busy = store.get_agent_task(task.task_id)
+                assert busy is not None
+                self.assertTrue(should_resume_managed_run(busy))
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
     def test_runtime_send_to_task_rearms_watchdog_after_completed_turn(self):
         class SendableHoldingProcess(HoldingProcess):
             def __init__(self, request):

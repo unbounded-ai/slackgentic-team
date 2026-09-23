@@ -430,6 +430,8 @@ class ManagedTaskRuntime:
         # progress/stall watchdog and start its clock from now. Without resetting
         # the activity timestamps an agent that idled past the stall window would
         # be restarted as "stalled" the instant a follow-up arrives.
+        if running.turn_complete:
+            self._remark_managed_run_started(task_id, running)
         now = time.monotonic()
         running.turn_complete = False
         running.turn_buffer = ""
@@ -1176,8 +1178,13 @@ class ManagedTaskRuntime:
             output,
             running.turn_buffer,
         )
-        if completed:
+        if completed and not running.turn_complete:
             running.turn_complete = True
+            # The turn's answer is already in Slack. Drop the in-flight marker so a
+            # daemon restart while the agent idles does not replay the prompt and
+            # make it answer the same message twice.
+            # Retry counters stay: a failed turn also ends with a `result` event.
+            self._drop_managed_run_marker(running.task.task_id)
 
     def _capture_transcript_activity(self, running: RunningTask) -> None:
         session_id = running.task.session_id
@@ -1636,6 +1643,24 @@ class ManagedTaskRuntime:
         updated = replace(task, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
         return updated
+
+    def _drop_managed_run_marker(self, task_id: str) -> None:
+        try:
+            current = self.store.get_agent_task(task_id)
+            if current is None or MANAGED_RUN_STARTED_METADATA_KEY not in current.metadata:
+                return
+            metadata = dict(current.metadata)
+            metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+            self.store.upsert_agent_task(replace(current, metadata=metadata, updated_at=utc_now()))
+        except Exception:
+            LOGGER.debug("failed to drop managed run marker for %s", task_id, exc_info=True)
+
+    def _remark_managed_run_started(self, task_id: str, running: RunningTask) -> None:
+        try:
+            current = self.store.get_agent_task(task_id) or running.task
+            self._mark_managed_run_started(current)
+        except Exception:
+            LOGGER.debug("failed to re-mark managed run for task %s", task_id, exc_info=True)
 
     def _clear_managed_session_for_task(self, task_id: str) -> None:
         try:

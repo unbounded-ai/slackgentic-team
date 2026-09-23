@@ -18,6 +18,7 @@ from agent_harness.models import (
     AgentTask,
     Loop,
     LoopStatus,
+    LoopVisibility,
     PermissionMode,
     Provider,
     SlackThreadRef,
@@ -160,6 +161,12 @@ def build_loop_create_modal(
         metadata["guide_message_ts"] = guide_message_ts
     automatic = _option("Automatic", "automatic", "Use the configured default provider")
     private = _option("Private", "private")
+    every_run = _option("Post every run", "every-run", "Each run posts its report card")
+    quiet = _option(
+        "Only when attention is needed",
+        "quiet",
+        "All-clear runs stay silent and only update the pinned panel",
+    )
     return {
         "type": "modal",
         "callback_id": "loop.create",
@@ -206,6 +213,17 @@ def build_loop_create_modal(
                     "action_id": "value",
                     "initial_option": private,
                     "options": [private, _option("Public", "public")],
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_notify",
+                "label": {"type": "plain_text", "text": "When should it post?"},
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "value",
+                    "initial_option": every_run,
+                    "options": [every_run, quiet],
                 },
             },
             {
@@ -601,12 +619,16 @@ def build_loop_list_blocks(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"{active} active · {len(rows)} total · `loop create` to add one",
+                    "text": (
+                        f"{active} active · {len(rows)} total"
+                        if rows
+                        else "No loops yet. Create one to get started."
+                    ),
                 }
             ],
         },
     ]
-    cards = [_loop_list_card(row) for row in rows]
+    cards = [_loop_new_card(), *(_loop_list_card(row) for row in rows)]
     for start in range(0, len(cards), LOOP_CAROUSEL_MAX_CARDS):
         chunk = cards[start : start + LOOP_CAROUSEL_MAX_CARDS]
         blocks.append(
@@ -617,6 +639,23 @@ def build_loop_list_blocks(
             }
         )
     return blocks[:SLACK_MAX_MESSAGE_BLOCKS]
+
+
+def _loop_new_card() -> dict[str, Any]:
+    return {
+        "type": "card",
+        "block_id": "loop.list.new",
+        "title": {"type": "mrkdwn", "text": ":heavy_plus_sign: *New loop*"},
+        "body": {"type": "mrkdwn", "text": "A recurring task with its own channel."},
+        "actions": [
+            _button(
+                "Create",
+                "loop.create.open",
+                encode_action_value("loop.create.open", source="list"),
+                "primary",
+            )
+        ],
+    }
 
 
 def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
@@ -649,25 +688,9 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
             "text": _shorten_text(" ".join(body_parts) or row["schedule_text"], 200),
         },
     }
+    # Cards hold at most three buttons: Pause/Resume, Edit, and Delete. The channel
+    # name in the body opens the channel; Run now lives on the pinned panel.
     actions: list[dict[str, Any]] = []
-    channel_id = row.get("channel_id")
-    if channel_id:
-        actions.append(
-            _button(
-                "Open",
-                "loop.open",
-                encode_action_value("loop.open", loop_id=loop.loop_id),
-                url=f"https://slack.com/app_redirect?channel={channel_id}",
-            )
-        )
-    if loop.status == LoopStatus.ACTIVE and not row.get("running"):
-        actions.append(
-            _button(
-                "▶ Run now",
-                "loop.run_now",
-                encode_action_value("loop.run_now", loop_id=loop.loop_id),
-            )
-        )
     if loop.status == LoopStatus.ACTIVE:
         actions.append(
             _button(
@@ -683,9 +706,75 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
                 "primary",
             )
         )
+    actions.append(
+        _button(
+            "✏️ Edit",
+            "loop.edit.open",
+            encode_action_value("loop.edit.open", loop_id=loop.loop_id),
+        )
+    )
+    actions.append(_loop_delete_button(loop))
     if actions:
         card["actions"] = actions[:3]
     return card
+
+
+def _loop_delete_button(loop: Loop) -> dict[str, Any]:
+    return _button(
+        "🗑 Delete",
+        "loop.delete",
+        encode_action_value("loop.delete", loop_id=loop.loop_id),
+        "danger",
+        confirm=_loop_delete_confirm(loop),
+    )
+
+
+def _loop_delete_confirm(loop: Loop) -> dict[str, Any]:
+    channel = f" and archives <#{loop.channel_id}>" if loop.channel_id else ""
+    return {
+        "title": {"type": "plain_text", "text": "Delete this loop?"},
+        "text": {
+            "type": "mrkdwn",
+            "text": f"This stops *{_mrkdwn_escape(loop.title)}*{channel}. It cannot be undone."[
+                :300
+            ],
+        },
+        "confirm": {"type": "plain_text", "text": "Delete loop"},
+        "deny": {"type": "plain_text", "text": "Keep it"},
+        "style": "danger",
+    }
+
+
+def build_loop_delete_confirmation_blocks(loop: Loop) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"Delete *{_mrkdwn_escape(loop.title)}*? This stops the loop and archives "
+                    "its channel. It cannot be undone."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"loop.delete.confirm.{loop.loop_id}"[:255],
+            "elements": [
+                _button(
+                    "Delete loop",
+                    "loop.delete",
+                    encode_action_value("loop.delete", loop_id=loop.loop_id),
+                    "danger",
+                ),
+                _button(
+                    "Keep it",
+                    "loop.stop.dismiss",
+                    encode_action_value("loop.stop.dismiss", loop_id=loop.loop_id),
+                ),
+            ],
+        },
+    ]
 
 
 def build_loop_edit_modal(
@@ -720,6 +809,8 @@ def build_loop_edit_modal(
     }
     if loop.cwd:
         cwd_element["initial_value"] = loop.cwd
+    private = _option("Private", LoopVisibility.PRIVATE.value)
+    public = _option("Public", LoopVisibility.PUBLIC.value)
     return {
         "type": "modal",
         "callback_id": "loop.edit",
@@ -800,6 +891,27 @@ def build_loop_edit_modal(
                     "text": "The repo the loop reads. Read-only loops never change it.",
                 },
                 "element": cwd_element,
+            },
+            {
+                "type": "input",
+                "block_id": "loop_visibility",
+                "label": {"type": "plain_text", "text": "Channel visibility"},
+                "hint": {
+                    "type": "plain_text",
+                    "text": (
+                        "⚠️ Changing this recreates the channel: a new channel with the same "
+                        "name and members takes over the loop, and this one is archived with "
+                        "its run history."
+                    ),
+                },
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "value",
+                    "initial_option": (
+                        public if loop.visibility == LoopVisibility.PUBLIC else private
+                    ),
+                    "options": [private, public],
+                },
             },
         ],
     }
@@ -1019,6 +1131,9 @@ def _loop_overflow(
             )
     options.append(
         _option("Stop loop…", encode_action_value("loop.stop.request", loop_id=loop.loop_id))
+    )
+    options.append(
+        _option("Delete loop…", encode_action_value("loop.delete.request", loop_id=loop.loop_id))
     )
     return {"type": "overflow", "action_id": "loop.more", "options": options}
 
@@ -1566,7 +1681,7 @@ def build_channel_overview_blocks(
     claude_command: str,
 ) -> list[dict[str, Any]]:
     """The welcome card posted when the agent channel is set up."""
-    guide = f"""**Start work** — write anything here, or `@agentname ...` for someone specific. The agent replies in your thread and keeps the thread's context.
+    guide = f"""**Start work** — write `somebody ...` for any free agent, or `@agentname ...` for someone specific. The agent replies in your thread and keeps the thread's context.
 
 **Thread subtasks** — reply `somebody ...` in a task thread to pull in another agent; the original agent picks the thread back up with the added context.
 
@@ -1580,6 +1695,7 @@ def build_channel_overview_blocks(
 - `external sessions` unassigned outside-Slack sessions
 - `scheduled tasks` active schedules
 - `hire 3 agents` · `fire everyone`
+- `settings` auto-update, release checks and repo root
 
 **Sessions started outside Slack** — Codex: `{codex_command}`. Claude: run `slackgentic claude-channel --install` once, then `{claude_command}`. Each session gets a tracked thread here; Slack replies and tool approvals relay through it. Restart already-open Claude sessions after installing the channel."""
     return [
@@ -1590,11 +1706,154 @@ def build_channel_overview_blocks(
             "subtitle": {"type": "mrkdwn", "text": "Your agent team works right here"},
             "body": {
                 "type": "mrkdwn",
-                "text": "Write anything in this channel to start a task. Agents reply in threads.",
+                "text": "Write `somebody ...` in this channel to start a task. Agents reply in threads.",
             },
         },
         {"type": "markdown", "text": guide},
     ]
+
+
+SETTINGS_BLOCK_ID = "slackgentic.settings"
+
+
+@dataclass(frozen=True)
+class SettingsSnapshot:
+    version: str
+    auto_update: bool
+    update_checks: bool
+    repo_root: str
+    last_checked_at: datetime | None = None
+    update_available: str | None = None
+    available: bool = True
+
+
+def build_settings_blocks(settings: SettingsSnapshot) -> list[dict[str, Any]]:
+    """The `settings` card: each row shows its current value and one control."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "block_id": SETTINGS_BLOCK_ID,
+            "text": {"type": "mrkdwn", "text": "*⚙️ Slackgentic settings*"},
+        }
+    ]
+    if settings.available:
+        blocks.append(
+            _settings_toggle_row(
+                "auto_update",
+                "Auto-update",
+                settings.auto_update,
+                "Installs new releases and restarts the service on its own, "
+                "once no agent task is running.",
+            )
+        )
+        blocks.append(
+            _settings_toggle_row(
+                "update_checks",
+                "Release checks",
+                settings.update_checks,
+                "Looks for new releases and posts an update card here. Auto-update needs this on.",
+            )
+        )
+    blocks.append(
+        {
+            "type": "section",
+            "block_id": f"{SETTINGS_BLOCK_ID}.repo_root",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Repo root*  `{settings.repo_root}`\nWhere agents start work by default.",
+            },
+            "accessory": _button(
+                "Change",
+                "slackgentic.settings.repo_root",
+                encode_action_value("settings.repo_root.open"),
+            ),
+        }
+    )
+    version_parts = [f"Running Slackgentic {settings.version}"]
+    if settings.update_available:
+        version_parts.append(f"{settings.update_available} is available")
+    if settings.last_checked_at is not None:
+        version_parts.append(
+            f"checked {_slack_time(settings.last_checked_at, '{date_short_pretty} at {time}')}"
+        )
+    blocks.append(
+        {
+            "type": "context",
+            "block_id": f"{SETTINGS_BLOCK_ID}.version",
+            "elements": [{"type": "mrkdwn", "text": "  ·  ".join(version_parts)}],
+        }
+    )
+    if settings.available and settings.update_checks:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"{SETTINGS_BLOCK_ID}.actions",
+                "elements": [
+                    _button(
+                        "Check for updates",
+                        "slackgentic.settings.check_updates",
+                        encode_action_value("settings.check_updates"),
+                    )
+                ],
+            }
+        )
+    return blocks
+
+
+def _settings_toggle_row(
+    setting: str,
+    label: str,
+    enabled: bool,
+    description: str,
+) -> dict[str, Any]:
+    state = "*On*" if enabled else "*Off*"
+    return {
+        "type": "section",
+        "block_id": f"{SETTINGS_BLOCK_ID}.{setting}",
+        "text": {"type": "mrkdwn", "text": f"*{label}*  {state}\n{description}"},
+        "accessory": _button(
+            "Turn off" if enabled else "Turn on",
+            f"slackgentic.settings.{setting}",
+            encode_action_value("settings.toggle", setting=setting, enabled=not enabled),
+            None if enabled else "primary",
+        ),
+    }
+
+
+def build_repo_root_modal(
+    repo_root: str,
+    *,
+    channel_id: str,
+    message_ts: str | None,
+) -> dict[str, Any]:
+    return {
+        "type": "modal",
+        "callback_id": "settings.repo_root",
+        "private_metadata": json.dumps(
+            {"channel_id": channel_id, "message_ts": message_ts},
+            separators=(",", ":"),
+        ),
+        "title": {"type": "plain_text", "text": "Repo root"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "repo_root",
+                "label": {"type": "plain_text", "text": "Repos root"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": repo_root,
+                    "placeholder": {"type": "plain_text", "text": "~/code"},
+                },
+                "hint": {
+                    "type": "plain_text",
+                    "text": "Agents launch here by default. Named sibling repos can be selected from this root.",
+                },
+            }
+        ],
+    }
 
 
 def build_update_prompt_blocks(
@@ -2434,6 +2693,7 @@ def _button(
     value: str,
     style: str | None = None,
     url: str | None = None,
+    confirm: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     button: dict[str, Any] = {
         "type": "button",
@@ -2445,6 +2705,8 @@ def _button(
         button["style"] = style
     if url:
         button["url"] = url
+    if confirm:
+        button["confirm"] = confirm
     return button
 
 

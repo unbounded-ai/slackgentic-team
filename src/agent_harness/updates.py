@@ -52,6 +52,17 @@ SETTING_UPDATE_CANDIDATE_PREFIX = "slackgentic.update.candidate."
 # post-restart status update.
 SETTING_UPDATE_RESTART_PENDING = "slackgentic.update.restart_pending"
 SETTING_UPDATE_RESTART_HELPER = "slackgentic.update.restart_helper"
+# Slack-editable switches. Unset means "use the configured default".
+SETTING_UPDATE_CHECKS_ENABLED = "slackgentic.update.checks_enabled"
+SETTING_UPDATE_AUTO_INSTALL = "slackgentic.update.auto_install"
+# Auto-update tries each release once; a failed attempt leaves the card's
+# buttons for a manual retry instead of reinstalling on every poll.
+SETTING_UPDATE_AUTO_ATTEMPTED_VERSION = "slackgentic.update.auto_attempted_version"
+SETTING_UPDATE_AUTO_WAITING_VERSION = "slackgentic.update.auto_waiting_version"
+AUTO_UPDATE_WAITING_TEXT = (
+    "Auto-update is on. Installing once running agent tasks finish, "
+    "so a restart does not interrupt them."
+)
 
 
 class UpdateCheckError(RuntimeError):
@@ -477,6 +488,8 @@ class SlackgenticUpdateRunner:
         status_blocks: Callable[[UpdateCandidate, str, bool], list[dict[str, Any]]],
         restart: Callable[[], None] | None = None,
         enabled: bool = True,
+        auto_install: bool = False,
+        is_busy: Callable[[], bool] | None = None,
         poll_seconds: float = DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS,
     ):
         self.store = store
@@ -488,15 +501,42 @@ class SlackgenticUpdateRunner:
         self.status_blocks = status_blocks
         self.restart = restart
         self.enabled = enabled
+        self.auto_install = auto_install
+        self.is_busy = is_busy
         self.poll_seconds = max(60.0, poll_seconds)
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._upgrade_lock = threading.Lock()
+        self._sync_lock = threading.Lock()
         self._upgrade_thread: threading.Thread | None = None
 
+    def checks_enabled(self) -> bool:
+        return setting_flag(self.store, SETTING_UPDATE_CHECKS_ENABLED, self.enabled)
+
+    def auto_install_enabled(self) -> bool:
+        return setting_flag(self.store, SETTING_UPDATE_AUTO_INSTALL, self.auto_install)
+
+    def set_checks_enabled(self, enabled: bool) -> None:
+        self.store.set_setting(SETTING_UPDATE_CHECKS_ENABLED, _flag_value(enabled))
+        if enabled:
+            self.check_soon()
+
+    def set_auto_install_enabled(self, enabled: bool) -> None:
+        self.store.set_setting(SETTING_UPDATE_AUTO_INSTALL, _flag_value(enabled))
+        if enabled:
+            # Turning auto-update on is an explicit request to install, so a
+            # release it gave up on earlier gets another attempt.
+            self.store.delete_setting(SETTING_UPDATE_AUTO_ATTEMPTED_VERSION)
+            self.check_soon()
+
+    def check_soon(self) -> None:
+        """Wake the poll loop so a settings change takes effect without waiting."""
+        self._wake.set()
+
     def start(self) -> None:
-        if not self.enabled:
-            return
+        # The poll thread always runs so release checks can be switched on from
+        # Slack; ``sync_once`` skips the network while checks are off.
         if self._thread and self._thread.is_alive():
             return
         self.store.delete_setting(SETTING_UPDATE_INSTALLING_VERSION)
@@ -611,6 +651,7 @@ class SlackgenticUpdateRunner:
 
     def stop(self) -> bool:
         self._stop.set()
+        self._wake.set()
         stopped = True
         if self._thread:
             self._thread.join(timeout=2)
@@ -622,26 +663,70 @@ class SlackgenticUpdateRunner:
         return stopped
 
     def sync_once(self) -> UpdateCandidate | None:
-        if not self.enabled:
+        if not self.checks_enabled():
             return None
-        self.store.set_setting(SETTING_UPDATE_LAST_CHECK_AT, utc_now().isoformat())
-        candidate = self.checker.check()
-        if candidate is None:
+        with self._sync_lock:
+            self.store.set_setting(SETTING_UPDATE_LAST_CHECK_AT, utc_now().isoformat())
+            candidate = self.checker.check()
+            if candidate is None:
+                return None
+            self._remember_candidate(candidate)
+            prompted = self.store.get_setting(SETTING_UPDATE_PROMPTED_VERSION)
+            last_error = self.store.get_setting(SETTING_UPDATE_LAST_ERROR)
+            if prompted != candidate.version or last_error:
+                channel_id = self.channel_id()
+                if not channel_id:
+                    return candidate
+                message_ts = self.prompt(channel_id, candidate)
+                if not message_ts:
+                    return candidate
+                self._retire_previous_prompt(candidate, channel_id, message_ts)
+                self.store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, candidate.version)
+                self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
+            self._maybe_auto_install(candidate)
+            return candidate
+
+    def _maybe_auto_install(self, candidate: UpdateCandidate) -> None:
+        if not self.auto_install_enabled():
+            return
+        version = candidate.version
+        if version in {
+            self.store.get_setting(SETTING_UPDATE_DISMISSED_VERSION),
+            self.store.get_setting(SETTING_UPDATE_AUTO_ATTEMPTED_VERSION),
+        }:
+            return
+        if self.store.get_setting(SETTING_UPDATE_INSTALLING_VERSION):
+            return
+        prompt_message = self._prompt_message_for_version(version)
+        if prompt_message is None:
+            return
+        channel_id, message_ts = prompt_message
+        if self.is_busy is not None and self.is_busy():
+            if self.store.get_setting(SETTING_UPDATE_AUTO_WAITING_VERSION) != version:
+                self.update_message(
+                    channel_id,
+                    message_ts,
+                    AUTO_UPDATE_WAITING_TEXT,
+                    self.status_blocks(candidate, AUTO_UPDATE_WAITING_TEXT, True),
+                )
+                self.store.set_setting(SETTING_UPDATE_AUTO_WAITING_VERSION, version)
+            return
+        self.store.set_setting(SETTING_UPDATE_AUTO_ATTEMPTED_VERSION, version)
+        self.store.delete_setting(SETTING_UPDATE_AUTO_WAITING_VERSION)
+        self.start_upgrade(version, channel_id, message_ts)
+
+    def _prompt_message_for_version(self, version: str) -> tuple[str, str] | None:
+        try:
+            prompt = json.loads(self.store.get_setting(SETTING_UPDATE_PROMPT_MESSAGE) or "{}")
+        except json.JSONDecodeError:
             return None
-        self._remember_candidate(candidate)
-        prompted = self.store.get_setting(SETTING_UPDATE_PROMPTED_VERSION)
-        last_error = self.store.get_setting(SETTING_UPDATE_LAST_ERROR)
-        if prompted == candidate.version and not last_error:
-            return candidate
-        channel_id = self.channel_id()
-        if not channel_id:
-            return candidate
-        message_ts = self.prompt(channel_id, candidate)
-        if message_ts:
-            self._retire_previous_prompt(candidate, channel_id, message_ts)
-            self.store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, candidate.version)
-            self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
-        return candidate
+        if not isinstance(prompt, dict) or prompt.get("version") != version:
+            return None
+        channel_id = prompt.get("channel_id")
+        message_ts = prompt.get("ts")
+        if not isinstance(channel_id, str) or not isinstance(message_ts, str):
+            return None
+        return channel_id, message_ts
 
     def _retire_previous_prompt(
         self,
@@ -753,13 +838,15 @@ class SlackgenticUpdateRunner:
 
     def _run(self) -> None:
         while not self._stop.wait(0.1):
+            self._wake.clear()
             try:
                 wait_seconds = self._run_once()
             except Exception:
                 LOGGER.exception("failed to check for Slackgentic updates")
                 self.store.set_setting(SETTING_UPDATE_LAST_ERROR, "update check failed")
                 wait_seconds = self.poll_seconds
-            if self._stop.wait(wait_seconds):
+            self._wake.wait(wait_seconds)
+            if self._stop.is_set():
                 break
 
     def _run_once(self) -> float:
@@ -872,6 +959,17 @@ class SlackgenticUpdateRunner:
             ),
             repository=self.checker.release_source.repository,
         )
+
+
+def setting_flag(store: Any, key: str, default: bool) -> bool:
+    value = store.get_setting(key)
+    if value is None:
+        return default
+    return value == "on"
+
+
+def _flag_value(enabled: bool) -> str:
+    return "on" if enabled else "off"
 
 
 def normalize_repository(value: str) -> str:

@@ -4990,6 +4990,55 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_desktop_claude_session_is_not_closed_for_missing_terminal(self):
+        # A Claude Desktop session has no terminal process at all, so the missing
+        # process must not read as "the terminal closed" and free its agent.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=0, claude_count=1)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.IDLE,
+                    started_at=started,
+                    last_seen_at=started,
+                    metadata={"entrypoint": "claude-desktop"},
+                )
+                store.upsert_session(session)
+                store.set_setting("external_session_agent.claude.s1", agents[0].agent_id)
+                store.upsert_slack_thread_for_session(
+                    Provider.CLAUDE, "s1", "T1", SlackThreadRef("C1", "171.000001", "171.000001")
+                )
+                mirror = SessionMirror(
+                    store,
+                    FakeGateway(),
+                    [FakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([], provider_targets=[]),
+                    missing_target_grace_seconds=0,
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                self.assertEqual(
+                    store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.IDLE
+                )
+                self.assertIsNone(store.get_setting("external_session_ignored.claude.s1"))
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"), agents[0].agent_id
+                )
+            finally:
+                store.close()
+
 
 COMPACTION_SUMMARY = (
     "This session is being continued from a previous conversation that ran out of context.\n\n"

@@ -99,9 +99,11 @@ from agent_harness.team.commands import (
     HireCommand,
     RosterCommand,
     ScheduledTasksCommand,
+    SettingsCommand,
     UnassignedExternalSessionsCommand,
 )
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
+from agent_harness.updates import SlackgenticUpdateRunner
 from tests.polling import POLL_TIMEOUT_SECONDS, shut_down_runtime, wait_until
 
 
@@ -147,6 +149,29 @@ def roster_action_blocks(blocks):
     return flattened
 
 
+def _settings_update_runner(store):
+    return SlackgenticUpdateRunner(
+        store=store,
+        checker=types.SimpleNamespace(check=lambda: None),
+        updater=object(),
+        channel_id=lambda: "C1",
+        prompt=lambda channel_id, candidate: None,
+        update_message=lambda *args: None,
+        status_blocks=lambda *args: [],
+        auto_install=True,
+    )
+
+
+def _repo_root_submission(view, value):
+    return {
+        "type": "view_submission",
+        "view": {
+            **view,
+            "state": {"values": {"repo_root": {"value": {"value": value}}}},
+        },
+    }
+
+
 class FakeGateway:
     bot_user_id_value = "UBOT"
 
@@ -169,6 +194,8 @@ class FakeGateway:
         self.uploads = []
         self.channel_infos = {}
         self.archived_channels = []
+        self.channel_members = {}
+        self.renames = []
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -197,6 +224,13 @@ class FakeGateway:
 
     def invite_users(self, channel_id, user_ids):
         self.invites.append((channel_id, user_ids))
+
+    def channel_member_ids(self, channel_id):
+        return list(self.channel_members.get(channel_id, []))
+
+    def rename_channel(self, channel_id, name):
+        self.renames.append((channel_id, name))
+        return True
 
     def post_ephemeral(self, channel_id, user_id, text):
         self.ephemerals.append((channel_id, user_id, text))
@@ -1625,6 +1659,192 @@ class SlackAppTests(unittest.TestCase):
                 for documented in ("roster", "sessions", "scheduled tasks", "hire", "fire", "help"):
                     self.assertIn(documented, text)
                 self.assertIn("Slackgentic commands", text)
+            finally:
+                store.close()
+
+    def test_unrecognized_top_level_message_gets_the_command_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "fix the flaky login test",
+                            "ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(len(gateway.thread_replies), 1)
+                reply = gateway.thread_replies[0]
+                self.assertEqual(reply["thread"].thread_ts, "171.000001")
+                self.assertIn("didn't recognize `fix the flaky login test`", reply["text"])
+                self.assertIn("Slackgentic commands", reply["text"])
+                self.assertIn("`settings`", reply["text"])
+                self.assertIn("`somebody ...`", reply["text"])
+            finally:
+                store.close()
+
+    def test_unrecognized_thread_reply_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "sounds good, thanks",
+                            "ts": "171.000002",
+                            "thread_ts": "171.000001",
+                        }
+                    }
+                )
+
+                self.assertEqual(gateway.thread_replies, [])
+                self.assertEqual(gateway.posts, [])
+            finally:
+                store.close()
+
+    def test_unrecognized_slash_command_replies_privately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_slash_command(
+                    {"text": "frobnicate", "channel_id": "C1", "user_id": "U1"}
+                )
+
+                self.assertEqual(len(gateway.ephemerals), 1)
+                channel_id, user_id, text = gateway.ephemerals[0]
+                self.assertEqual((channel_id, user_id), ("C1", "U1"))
+                self.assertIn("didn't recognize `frobnicate`", text)
+                self.assertIn("Slackgentic commands", text)
+            finally:
+                store.close()
+
+    def test_settings_command_posts_the_settings_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting("slack.repo_root", tmp)
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller.set_update_runner(_settings_update_runner(store))
+
+                controller.handle_team_command(
+                    SettingsCommand(), SlackReplyTarget(channel_id="C1", thread_ts=None)
+                )
+
+                self.assertEqual(len(gateway.posts), 1)
+                rendered = json.dumps(gateway.posts[0]["blocks"])
+                self.assertIn("Auto-update", rendered)
+                self.assertIn("Release checks", rendered)
+                self.assertIn(tmp, rendered)
+                self.assertIn("Check for updates", rendered)
+            finally:
+                store.close()
+
+    def test_settings_toggle_switches_auto_update_and_refreshes_the_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runner = _settings_update_runner(store)
+                controller.set_update_runner(runner)
+                self.assertTrue(runner.auto_install_enabled())
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.settings"},
+                        "actions": [
+                            {
+                                "value": encode_action_value(
+                                    "settings.toggle", setting="auto_update", enabled=False
+                                )
+                            }
+                        ],
+                    }
+                )
+
+                self.assertFalse(runner.auto_install_enabled())
+                self.assertEqual(len(gateway.updates), 1)
+                self.assertEqual(gateway.updates[0]["ts"], "171.settings")
+                self.assertIn("Turn on", json.dumps(gateway.updates[0]["blocks"]))
+            finally:
+                store.close()
+
+    def test_settings_text_switch_confirms_the_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                runner = _settings_update_runner(store)
+                controller.set_update_runner(runner)
+
+                controller.handle_team_command(
+                    SettingsCommand("update_checks", False),
+                    SlackReplyTarget(channel_id="C1", thread_ts=None),
+                )
+
+                self.assertFalse(runner.checks_enabled())
+                self.assertIn("Release checks are off", gateway.posts[-1]["text"])
+            finally:
+                store.close()
+
+    def test_repo_root_settings_modal_saves_and_refreshes_the_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "trigger_id": "T1",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.settings"},
+                        "actions": [{"value": encode_action_value("settings.repo_root.open")}],
+                    }
+                )
+                self.assertEqual(gateway.views[0][1]["callback_id"], "settings.repo_root")
+
+                bad = controller.handle_view_submission(
+                    _repo_root_submission(gateway.views[0][1], str(Path(tmp) / "missing"))
+                )
+                self.assertEqual(bad["response_action"], "errors")
+
+                result = controller.handle_view_submission(
+                    _repo_root_submission(gateway.views[0][1], tmp)
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(store.get_setting("slack.repo_root"), str(Path(tmp).resolve()))
+                self.assertEqual(gateway.updates[-1]["ts"], "171.settings")
             finally:
                 store.close()
 
@@ -4266,7 +4486,8 @@ class SlackAppTests(unittest.TestCase):
                 self.assertNotIn("Free up this agent", dismissed_blocks)
                 self.assertIn("Finished and freed up this agent", dismissed_blocks)
                 self.assertNotIn("Continuing", dismissed_blocks)
-                self.assertTrue(
+                # The rewritten prompt already says it; no second notice in the thread.
+                self.assertFalse(
                     any(
                         reply.get("text") == "Finished and freed up this agent."
                         for reply in gateway.thread_replies
@@ -4295,7 +4516,7 @@ class SlackAppTests(unittest.TestCase):
                         for reply in gateway.thread_replies
                         if reply.get("text") == "Finished and freed up this agent."
                     ],
-                    ["Finished and freed up this agent."],
+                    [],
                 )
             finally:
                 store.close()
@@ -5843,7 +6064,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("Claude outside Slack", text)
                 self.assertIn("slackgentic claude-channel --install", text)
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("Write anything in this channel", blocks)
+                self.assertIn("in this channel to start a task", blocks)
                 self.assertIn("type them here", blocks)
                 self.assertIn("Thread subtasks", blocks)
                 self.assertIn("Dangerous mode", blocks)

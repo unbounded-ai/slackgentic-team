@@ -11,7 +11,12 @@ from unittest.mock import patch
 from agent_harness.models import utc_now
 from agent_harness.storage.store import Store
 from agent_harness.updates import (
+    AUTO_UPDATE_WAITING_TEXT,
+    SETTING_UPDATE_AUTO_ATTEMPTED_VERSION,
+    SETTING_UPDATE_AUTO_INSTALL,
     SETTING_UPDATE_CANDIDATE_PREFIX,
+    SETTING_UPDATE_CHECKS_ENABLED,
+    SETTING_UPDATE_DISMISSED_VERSION,
     SETTING_UPDATE_INSTALLED_VERSION,
     SETTING_UPDATE_INSTALLING_VERSION,
     SETTING_UPDATE_LAST_ERROR,
@@ -344,6 +349,127 @@ class SelfUpdaterTests(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertEqual(calls[0][-1], archive_url)
         self.assertEqual(calls[1][-1], archive_url)
+
+
+class _StaticChecker:
+    release_source = GitHubReleaseSource("example-org/example-repo")
+
+    def __init__(self, candidate):
+        self.candidate = candidate
+        self.calls = 0
+
+    def check(self):
+        self.calls += 1
+        return self.candidate
+
+
+class AutoUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self._tmp.name) / "state.sqlite")
+        self.store.init_schema()
+        self.candidate = UpdateCandidate(
+            current_version="0.1.0",
+            release=ReleaseInfo(version="99.0.0", tag_name="v99.0.0"),
+            repository="example-org/example-repo",
+        )
+        self.checker = _StaticChecker(self.candidate)
+        self.updates = []
+        self.upgrades = []
+        self.busy = False
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def _runner(self, **kwargs):
+        runner = SlackgenticUpdateRunner(
+            store=self.store,
+            checker=self.checker,
+            updater=object(),
+            channel_id=lambda: "C1",
+            prompt=lambda channel_id, update: "171",
+            update_message=lambda channel_id, ts, text, blocks: self.updates.append(
+                (channel_id, ts, text)
+            ),
+            status_blocks=lambda update, status, include_actions: [],
+            is_busy=lambda: self.busy,
+            **kwargs,
+        )
+        runner.start_upgrade = lambda version, channel_id, ts: self.upgrades.append(
+            (version, channel_id, ts)
+        )
+        return runner
+
+    def test_auto_install_upgrades_from_the_posted_card(self):
+        runner = self._runner(auto_install=True)
+
+        runner.sync_once()
+        runner.sync_once()
+
+        self.assertEqual(self.upgrades, [("99.0.0", "C1", "171")])
+        self.assertEqual(self.store.get_setting(SETTING_UPDATE_AUTO_ATTEMPTED_VERSION), "99.0.0")
+
+    def test_auto_install_off_only_prompts(self):
+        runner = self._runner(auto_install=False)
+
+        runner.sync_once()
+
+        self.assertEqual(self.upgrades, [])
+
+    def test_auto_install_waits_while_agent_tasks_run(self):
+        runner = self._runner(auto_install=True)
+        self.busy = True
+
+        runner.sync_once()
+        runner.sync_once()
+
+        self.assertEqual(self.upgrades, [])
+        self.assertEqual(self.updates, [("C1", "171", AUTO_UPDATE_WAITING_TEXT)])
+
+        self.busy = False
+        runner.sync_once()
+
+        self.assertEqual(self.upgrades, [("99.0.0", "C1", "171")])
+
+    def test_auto_install_skips_dismissed_version(self):
+        self.store.set_setting(SETTING_UPDATE_DISMISSED_VERSION, "99.0.0")
+        runner = self._runner(auto_install=True)
+
+        runner.sync_once()
+
+        self.assertEqual(self.upgrades, [])
+
+    def test_slack_setting_overrides_configured_default(self):
+        runner = self._runner(auto_install=True)
+        runner.set_auto_install_enabled(False)
+
+        runner.sync_once()
+
+        self.assertFalse(runner.auto_install_enabled())
+        self.assertEqual(self.store.get_setting(SETTING_UPDATE_AUTO_INSTALL), "off")
+        self.assertEqual(self.upgrades, [])
+
+    def test_turning_auto_install_on_retries_a_previously_attempted_release(self):
+        self.store.set_setting(SETTING_UPDATE_AUTO_ATTEMPTED_VERSION, "99.0.0")
+        runner = self._runner(auto_install=False)
+
+        runner.sync_once()
+        self.assertEqual(self.upgrades, [])
+
+        runner.set_auto_install_enabled(True)
+        runner.sync_once()
+
+        self.assertEqual(self.upgrades, [("99.0.0", "C1", "171")])
+
+    def test_release_checks_off_skips_the_network(self):
+        self.store.set_setting(SETTING_UPDATE_CHECKS_ENABLED, "off")
+        runner = self._runner(auto_install=True)
+
+        self.assertIsNone(runner.sync_once())
+
+        self.assertEqual(self.checker.calls, 0)
+        self.assertEqual(self.upgrades, [])
 
 
 class UpdateRunnerTests(unittest.TestCase):
