@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -9065,6 +9066,86 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(len(bridge.sent), 1)
                 self.assertEqual(bridge.sent[0][0].session_id, "s1")
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    agent.agent_id,
+                )
+            finally:
+                store.close()
+
+    def test_idle_released_session_thread_reply_keeps_reserved_agent(self):
+        from agent_harness.sessions.mirror import SessionMirror
+
+        class NoProcesses:
+            def targets_for_session(self, session):
+                return []
+
+            def provider_processes(self, provider):
+                return []
+
+            def provider_process_for_pid(self, provider, pid):
+                return None
+
+        class NoDiscovery:
+            provider = Provider.CODEX
+
+            def discover(self):
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(1, 0)[0]
+                store.upsert_team_agent(agent)
+                transcript = Path(tmp) / "codex.jsonl"
+                transcript.write_text("{}\n")
+                old = (utc_now() - timedelta(days=3)).timestamp()
+                os.utime(transcript, (old, old))
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=transcript,
+                    status=SessionStatus.IDLE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "pick this back up",
+                            "ts": "171.000002",
+                            "thread_ts": thread.thread_ts,
+                        }
+                    }
+                )
+                # The session has not written the reply yet; the mirror must not
+                # treat the stale transcript as idle and free the agent again.
+                SessionMirror(
+                    store,
+                    gateway,
+                    [NoDiscovery()],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=NoProcesses(),
+                    idle_release_seconds=3600,
+                ).sync_once()
+
+                self.assertEqual(len(bridge.sent), 1)
                 self.assertEqual(
                     store.get_setting("external_session_agent.codex.s1"),
                     agent.agent_id,

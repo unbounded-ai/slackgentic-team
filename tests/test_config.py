@@ -27,6 +27,7 @@ class ConfigTests(unittest.TestCase):
                         ["/workspace/repos"]
                     ),
                     "SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS": "20",
+                    "SLACKGENTIC_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS": "1800",
                     "SLACKGENTIC_UPDATE_REPOSITORY": "example-org/example-repo",
                     "SLACKGENTIC_UPDATE_CHECK_INTERVAL_SECONDS": "120",
                     "SLACKGENTIC_STATE_DB": str(Path(tmp) / "file.sqlite"),
@@ -65,6 +66,7 @@ class ConfigTests(unittest.TestCase):
                 ("/workspace/repos", "/workspace/scratch"),
             )
             self.assertEqual(config.sessions.external_session_mirror_poll_seconds, 20)
+            self.assertEqual(config.sessions.external_session_idle_release_seconds, 1800)
             self.assertEqual(config.updates.repository, "example-org/example-repo")
             self.assertEqual(config.updates.check_interval_seconds, 120)
             self.assertEqual(config.state_db, Path(tmp) / "file.sqlite")
@@ -85,6 +87,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.team.default_codex_agents, 1)
             self.assertEqual(config.team.default_claude_agents, 1)
             self.assertEqual(config.sessions.external_session_mirror_poll_seconds, 15)
+            self.assertEqual(config.sessions.external_session_idle_release_seconds, 7200)
             self.assertEqual(config.updates.check_interval_seconds, 300)
 
     def test_save_stored_config_preserves_existing_values_and_uses_private_mode(self):

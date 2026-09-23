@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_harness.models import (
+    WORKER_KINDS,
     AgentEvent,
     AgentSession,
     AgentTaskStatus,
@@ -24,6 +25,7 @@ from agent_harness.sessions.mirror import (
     SessionMirror,
     _cwd_matches_allowed_prefixes,
     _cwd_matches_ignored_patterns,
+    record_external_session_activity,
     render_session_event,
 )
 from agent_harness.sessions.native_input import claude_native_input_setting_key
@@ -5009,6 +5011,315 @@ class CliStateIsNotMirroredAsThePersonTests(unittest.TestCase):
                     )
                 finally:
                     store.close()
+
+
+def _background_records(provider_kind, timestamp):
+    """Records a provider app writes when it lists or reopens a session."""
+    if provider_kind == Provider.CLAUDE:
+        return [
+            {"type": "last-prompt", "leafUuid": "example-leaf"},
+            {"type": "ai-title", "aiTitle": "Example title"},
+            {"type": "mode", "mode": "default"},
+            {"type": "permission-mode", "permissionMode": "default"},
+            {
+                "type": "system",
+                "subtype": "away_summary",
+                "content": "While you were away",
+                "timestamp": timestamp.isoformat(),
+            },
+        ]
+    return [
+        {
+            "timestamp": timestamp.isoformat(),
+            "type": "event_msg",
+            "payload": {"type": "thread_settings_applied", "thread_id": "s1"},
+        },
+        {
+            "timestamp": timestamp.isoformat(),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": None},
+        },
+    ]
+
+
+def _tool_activity_records(provider_kind, timestamp):
+    if provider_kind == Provider.CLAUDE:
+        return [
+            {
+                "timestamp": timestamp.isoformat(),
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]
+                },
+            },
+            {
+                "timestamp": timestamp.isoformat(),
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]
+                },
+            },
+        ]
+    return [
+        {
+            "timestamp": timestamp.isoformat(),
+            "type": "response_item",
+            "payload": {"type": "function_call", "name": "exec_command", "arguments": "{}"},
+        }
+    ]
+
+
+class ObservedSessionIdleReleaseTests(unittest.TestCase):
+    IDLE_RELEASE_SECONDS = 3600
+
+    def _mirror(self, store, gateway, providers, home):
+        return SessionMirror(
+            store,
+            gateway,
+            providers,
+            team_id="T1",
+            channel_id="C1",
+            terminal_notifier=FakeTerminalNotifier(),
+            home=home,
+            idle_release_seconds=self.IDLE_RELEASE_SECONDS,
+        )
+
+    def _seed_occupied_session(self, store, provider_kind, path, cursor):
+        agent = next(
+            agent
+            for agent in store.idle_team_agents()
+            if agent.provider_preference == provider_kind and agent.kind in WORKER_KINDS
+        )
+        thread = SlackThreadRef("C1", "171.000001", "171.000001")
+        store.upsert_session(
+            AgentSession(
+                provider=provider_kind,
+                session_id="s1",
+                transcript_path=path,
+                cwd=path.parent,
+                status=SessionStatus.IDLE,
+            )
+        )
+        store.upsert_slack_thread_for_session(provider_kind, "s1", "T1", thread)
+        store.set_session_mirror_cursor(provider_kind, "s1", cursor)
+        store.set_setting(f"external_session_agent.{provider_kind.value}.s1", agent.agent_id)
+        store.set_setting(f"external_session_summary.{provider_kind.value}.s1", "Example task")
+        return agent, thread
+
+    def test_stale_session_frees_agent_until_it_has_new_activity(self):
+        for provider_kind in Provider:
+            with (
+                self.subTest(provider=provider_kind),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(hours=3)
+                    )
+                    # Rescan every sync, as the periodic full scan eventually would.
+                    provider._path_index.full_scan_interval_seconds = 0
+                    _, thread = self._seed_occupied_session(
+                        store, provider_kind, path, len(records)
+                    )
+                    agent_key = f"external_session_agent.{provider_kind.value}.s1"
+                    gateway = FakeGateway()
+                    mirror = self._mirror(store, gateway, [provider], Path(tmp))
+
+                    mirror.sync_once()
+
+                    self.assertIsNone(store.get_setting(agent_key))
+                    self.assertEqual(
+                        store.get_slack_thread_for_session(provider_kind, "s1", "T1", "C1"),
+                        thread,
+                    )
+                    self.assertEqual(
+                        store.get_session_mirror_cursor(provider_kind, "s1"), len(records)
+                    )
+                    self.assertEqual(
+                        store.get_setting(f"external_session_summary.{provider_kind.value}.s1"),
+                        "Example task",
+                    )
+                    self.assertEqual(
+                        [(reply[0], reply[1]) for reply in gateway.replies],
+                        [
+                            (
+                                thread,
+                                "No activity for 1 hour; freed up this agent. New activity "
+                                "in this session continues in this thread.",
+                            )
+                        ],
+                    )
+
+                    # A provider app reopening the session rewrites bookkeeping
+                    # records and bumps the mtime; that is not activity.
+                    records.extend(_background_records(provider_kind, now))
+                    _write_external_records(path, records, now)
+                    self.assertEqual(provider.discover()[0].status, SessionStatus.ACTIVE)
+                    mirror.sync_once()
+                    mirror.sync_once()
+
+                    self.assertIsNone(store.get_setting(agent_key))
+                    self.assertIsNone(
+                        store.get_setting(f"external_session_pending.{provider_kind.value}.s1")
+                    )
+                    self.assertEqual(len(gateway.replies), 1)
+
+                    records.append(_external_message_record(provider_kind, now, "New answer"))
+                    _write_external_records(path, records, now)
+                    mirror.sync_once()
+
+                    self.assertIsNotNone(store.get_setting(agent_key))
+                    self.assertEqual(gateway.parents, [])
+                    self.assertEqual(gateway.replies[-1][0], thread)
+                    self.assertEqual(gateway.replies[-1][1], "New answer")
+                finally:
+                    store.close()
+
+    def test_background_writes_do_not_let_an_unused_session_claim_an_agent(self):
+        for provider_kind in Provider:
+            with (
+                self.subTest(provider=provider_kind),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(hours=3)
+                    )
+                    records.extend(_background_records(provider_kind, now))
+                    _write_external_records(path, records, now)
+                    gateway = FakeGateway()
+                    mirror = self._mirror(store, gateway, [provider], Path(tmp))
+
+                    mirror.sync_once()
+                    mirror.sync_once()
+
+                    self.assertEqual(
+                        store.list_settings(f"external_session_agent.{provider_kind.value}."),
+                        {},
+                    )
+                    self.assertEqual(
+                        store.list_settings(f"external_session_pending.{provider_kind.value}."),
+                        {},
+                    )
+                    self.assertEqual(gateway.parents, [])
+                finally:
+                    store.close()
+
+    def test_session_dropped_by_discovery_frees_agent_when_idle(self):
+        for idle_release_seconds in (None, self.IDLE_RELEASE_SECONDS):
+            with (
+                self.subTest(idle_release_seconds=idle_release_seconds),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    # Older than the discovery horizon, so only the stored thread
+                    # keeps it tracked.
+                    old = datetime.now(UTC) - timedelta(days=3)
+                    provider, path, records = _external_transcript(Path(tmp), Provider.CLAUDE, old)
+                    self.assertEqual(provider.discover(), [])
+                    self._seed_occupied_session(store, Provider.CLAUDE, path, len(records))
+                    gateway = FakeGateway()
+                    mirror = SessionMirror(
+                        store,
+                        gateway,
+                        [provider],
+                        team_id="T1",
+                        channel_id="C1",
+                        terminal_notifier=FakeTerminalNotifier(),
+                        home=Path(tmp),
+                        idle_release_seconds=idle_release_seconds,
+                    )
+
+                    mirror.sync_once()
+
+                    assigned = store.get_setting("external_session_agent.claude.s1")
+                    if idle_release_seconds is None:
+                        self.assertIsNotNone(assigned)
+                        continue
+                    self.assertIsNone(assigned)
+                    self.assertIsNotNone(
+                        store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", "C1")
+                    )
+                    self.assertEqual(len(gateway.replies), 1)
+                    self.assertIn("freed up this agent", gateway.replies[0][1])
+                finally:
+                    store.close()
+
+    def test_tool_activity_and_slack_replies_keep_the_agent(self):
+        for provider_kind, source in product(Provider, ("tool", "slack")):
+            with (
+                self.subTest(provider=provider_kind, source=source),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(hours=3)
+                    )
+                    agent, _ = self._seed_occupied_session(store, provider_kind, path, len(records))
+                    if source == "tool":
+                        recent = now - timedelta(minutes=20)
+                        records.extend(_tool_activity_records(provider_kind, recent))
+                        _write_external_records(path, records, recent)
+                    else:
+                        record_external_session_activity(store, provider_kind, "s1")
+                    gateway = FakeGateway()
+                    mirror = self._mirror(store, gateway, [provider], Path(tmp))
+
+                    mirror.sync_once()
+
+                    self.assertEqual(
+                        store.get_setting(f"external_session_agent.{provider_kind.value}.s1"),
+                        agent.agent_id,
+                    )
+                    self.assertEqual(gateway.replies, [])
+                finally:
+                    store.close()
+
+    def test_managed_slack_task_is_not_idle_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=1, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                task = create_agent_task(agents[0], "managed task", "C1")
+                store.upsert_agent_task(task)
+                store.update_agent_task_session(task.task_id, Provider.CODEX, "s1")
+                now = datetime.now(UTC)
+                provider, _, _ = _external_transcript(
+                    Path(tmp), Provider.CODEX, now - timedelta(hours=3)
+                )
+                gateway = FakeGateway()
+                mirror = self._mirror(store, gateway, [provider], Path(tmp))
+
+                mirror.sync_once()
+
+                current = store.get_agent_task(task.task_id)
+                self.assertEqual(current.status, task.status)
+                self.assertEqual(current.session_id, "s1")
+                self.assertEqual(
+                    store.active_task_for_agent(agents[0].agent_id).task_id, task.task_id
+                )
+                self.assertEqual(gateway.replies, [])
+                self.assertIsNone(store.get_setting("external_session_activity.codex.s1"))
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":
