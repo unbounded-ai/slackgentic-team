@@ -2340,7 +2340,8 @@ class SessionMirrorTests(unittest.TestCase):
 
                 mirror.sync_once()
 
-                self.assertEqual(refreshed_channels, ["C1", "C1"])
+                # Occupancy changes in one sync are coalesced into a single refresh.
+                self.assertEqual(refreshed_channels, ["C1"])
                 self.assertIsNotNone(
                     store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
                 )

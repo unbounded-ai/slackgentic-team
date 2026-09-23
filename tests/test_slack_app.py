@@ -1854,7 +1854,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_refresh_roster_updates_all_remembered_roster_messages(self):
+    def test_refresh_roster_keeps_only_the_newest_roster_live(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -1873,8 +1873,11 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(returned_ts, second_roster_ts)
                 updated = {item["ts"]: item["text"] for item in gateway.updates}
-                self.assertEqual(set(updated), {first_roster_ts, second_roster_ts})
+                self.assertEqual(set(updated), {second_roster_ts})
                 self.assertTrue(all("1 available, 1 occupied" in text for text in updated.values()))
+                gateway.updates.clear()
+                controller.refresh_or_post_roster("C1")
+                self.assertNotIn(first_roster_ts, {item["ts"] for item in gateway.updates})
             finally:
                 store.close()
 
@@ -1924,7 +1927,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertEqual(returned_ts, "171.000003")
                 updated = {item["ts"]: item["text"] for item in gateway.updates}
-                self.assertEqual(set(updated), {"171.000001", "171.000003"})
+                self.assertEqual(set(updated), {"171.000003"})
                 self.assertTrue(all("1 available, 1 occupied" in text for text in updated.values()))
             finally:
                 store.close()

@@ -210,6 +210,17 @@ class SessionMirror:
         return False
 
     def sync_once(self, backfill_new_sessions: bool = True) -> None:
+        # Occupancy changes within one sync are coalesced into a single roster
+        # refresh at the end instead of one full refresh per session.
+        self._occupancy_changes: set[str] | None = set()
+        try:
+            self._sync_once(backfill_new_sessions)
+        finally:
+            changed, self._occupancy_changes = self._occupancy_changes, None
+            for channel_id in sorted(changed or ()):
+                self._notify_external_session_occupancy_changed(channel_id)
+
+    def _sync_once(self, backfill_new_sessions: bool) -> None:
         channel_id = self._channel_id()
         if not channel_id:
             return
@@ -1241,6 +1252,10 @@ class SessionMirror:
 
     def _notify_external_session_occupancy_changed(self, channel_id: str) -> None:
         if self.on_external_session_occupancy_change is None:
+            return
+        pending = getattr(self, "_occupancy_changes", None)
+        if pending is not None:
+            pending.add(channel_id)
             return
         try:
             self.on_external_session_occupancy_change(channel_id)

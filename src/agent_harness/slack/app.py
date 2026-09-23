@@ -5845,7 +5845,11 @@ class SlackTeamController:
                     self._pin_roster_once(channel_id, latest_roster_ts)
                 except Exception:
                     LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
-            for roster_ts in roster_ts_values:
+            # Only the newest roster is kept live; older copies stop being edited
+            # (their buttons still resolve through the live handlers).
+            for stale_ts in roster_ts_values[:-1]:
+                self.store.delete_setting(_roster_message_setting_key(channel_id, stale_ts))
+            for roster_ts in roster_ts_values[-1:]:
                 if self._roster_render_is_current(channel_id, roster_ts, text, blocks):
                     continue
                 try:
@@ -12792,13 +12796,7 @@ class SlackMessageBackfill:
         if remaining == 0:
             return thread_ts_values
         try:
-            sessions = sorted(
-                self.store.list_sessions(),
-                key=lambda session: (
-                    session.status != SessionStatus.ACTIVE,
-                    -((session.last_seen_at or utc_now()).timestamp()),
-                ),
-            )
+            sessions = self.store.list_sessions(active_first=True, limit=remaining)
         except sqlite3.Error:
             return thread_ts_values
         for session in sessions[:remaining]:

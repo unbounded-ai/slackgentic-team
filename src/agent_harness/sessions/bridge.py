@@ -645,7 +645,7 @@ def _is_latest_active_session_for_cwd(store: Store, session: AgentSession) -> bo
     cutoff_seconds = 30 * 60
     now = utc_now()
     matches: list[AgentSession] = []
-    for candidate in store.list_sessions(session.provider):
+    for candidate in store.list_sessions(session.provider, statuses=(SessionStatus.ACTIVE,)):
         if not _session_can_use_live_target(candidate):
             continue
         if candidate.status != SessionStatus.ACTIVE:
@@ -675,7 +675,11 @@ def _is_latest_live_session_for_cwd(
     target_started_at = target.started_at.astimezone() if target.started_at else None
     matches: list[AgentSession] = []
     seen_session_ids: set[str] = set()
-    for candidate in [*store.list_sessions(session.provider), session]:
+    live_statuses = tuple(status for status in SessionStatus if status != SessionStatus.DONE)
+    for candidate in [
+        *store.list_sessions(session.provider, statuses=live_statuses),
+        session,
+    ]:
         if candidate.session_id in seen_session_ids:
             continue
         seen_session_ids.add(candidate.session_id)

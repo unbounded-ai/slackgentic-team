@@ -896,20 +896,41 @@ class Store:
         ).fetchone()
         return _session_from_row(row) if row else None
 
-    def list_sessions(self, provider: Provider | None = None) -> list[AgentSession]:
-        where = ""
-        params: tuple[str, ...] = ()
+    def list_sessions(
+        self,
+        provider: Provider | None = None,
+        *,
+        statuses: tuple[SessionStatus, ...] | None = None,
+        active_first: bool = False,
+        limit: int | None = None,
+    ) -> list[AgentSession]:
+        """Sessions, newest first. Filter by status in SQL: the table keeps every
+        finished session, so unfiltered scans load far more rows than callers use."""
+        clauses: list[str] = []
+        params: list[object] = []
         if provider is not None:
-            where = "WHERE provider = ?"
-            params = (provider.value,)
+            clauses.append("provider = ?")
+            params.append(provider.value)
+        if statuses:
+            clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
+            params.extend(status.value for status in statuses)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = "COALESCE(last_seen_at, started_at, '') DESC, session_id"
+        if active_first:
+            order = f"CASE status WHEN 'active' THEN 0 ELSE 1 END, {order}"
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(max(0, limit))
         rows = self.conn.execute(
             f"""
             SELECT *
             FROM sessions
             {where}
-            ORDER BY COALESCE(last_seen_at, started_at, '') DESC, session_id
+            ORDER BY {order}
+            {limit_sql}
             """,
-            params,
+            tuple(params),
         ).fetchall()
         return [_session_from_row(row) for row in rows]
 
