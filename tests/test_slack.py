@@ -565,7 +565,7 @@ class SlackTests(unittest.TestCase):
         self.assertEqual(parse_agent_handles("please ask @Riley and @sage"), ["riley", "sage"])
 
     def test_update_prompt_blocks_show_call_to_action_only_before_status(self):
-        from agent_harness.updates import ReleaseInfo, UpdateCandidate
+        from agent_harness.updates import ReleaseInfo, UpdateCandidate, update_draining_text
 
         candidate = UpdateCandidate(
             current_version="0.1.0",
@@ -624,6 +624,17 @@ class SlackTests(unittest.TestCase):
         self.assertNotIn("Upgrade now to install the published release", done_text)
         self.assertIn(":white_check_mark:", done_text)
         self.assertIn("restarted successfully", done_text)
+
+        draining_text = update_draining_text(600)
+        self.assertLessEqual(len(draining_text), 200)
+        draining = build_update_prompt_blocks(candidate, status_text=draining_text, draining=True)
+        self.assertEqual(draining[0]["body"]["text"], draining_text)
+        # While waiting on running agents the only choice left is to stop waiting.
+        self.assertEqual(
+            [action["text"]["text"] for action in draining[0]["actions"]],
+            ["Install now", "What's new"],
+        )
+        self.assertIn("update.install_now", draining[0]["actions"][0]["value"])
 
 
 if __name__ == "__main__":

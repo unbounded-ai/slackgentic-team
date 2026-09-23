@@ -1861,8 +1861,13 @@ def build_update_prompt_blocks(
     *,
     status_text: str | None = None,
     include_actions: bool = True,
+    draining: bool = False,
 ) -> list[dict[str, Any]]:
-    """An update card: what's new, one click to upgrade, and live install status."""
+    """An update card: what's new, one click to upgrade, and live install status.
+
+    While the upgrade waits for running agents (`draining`), the card offers to
+    install right away instead of waiting.
+    """
     release = candidate.release
     if status_text is None:
         body = "Upgrade now to install the published release and restart the service."
@@ -1879,14 +1884,21 @@ def build_update_prompt_blocks(
         "body": {"type": "mrkdwn", "text": _shorten_text(body, 200)},
     }
     if include_actions:
-        actions = [
-            _button(
+        if draining:
+            install_button = _button(
+                "Install now",
+                "slackgentic.update.install_now",
+                encode_action_value("update.install_now", version=release.version),
+                "danger",
+            )
+        else:
+            install_button = _button(
                 "Upgrade now",
                 "slackgentic.update.install",
                 encode_action_value("update.install", version=release.version),
                 "primary",
-            ),
-        ]
+            )
+        actions = [install_button]
         if release.html_url:
             actions.append(
                 _button(
@@ -1896,13 +1908,14 @@ def build_update_prompt_blocks(
                     url=release.html_url,
                 )
             )
-        actions.append(
-            _button(
-                "Not now",
-                "slackgentic.update.dismiss",
-                encode_action_value("update.dismiss", version=release.version),
+        if not draining:
+            actions.append(
+                _button(
+                    "Not now",
+                    "slackgentic.update.dismiss",
+                    encode_action_value("update.dismiss", version=release.version),
+                )
             )
-        )
         card["actions"] = actions
     blocks: list[dict[str, Any]] = [card]
     release_notes = _release_notes_excerpt(release.body)

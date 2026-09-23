@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import threading
 import tomllib
 import types
 import unittest
@@ -11,7 +12,6 @@ from unittest.mock import patch
 from agent_harness.models import utc_now
 from agent_harness.storage.store import Store
 from agent_harness.updates import (
-    AUTO_UPDATE_WAITING_TEXT,
     SETTING_UPDATE_AUTO_ATTEMPTED_VERSION,
     SETTING_UPDATE_AUTO_INSTALL,
     SETTING_UPDATE_CANDIDATE_PREFIX,
@@ -37,7 +37,7 @@ from agent_harness.updates import (
     is_newer_version,
     run_update_helper,
 )
-from tests.polling import POLL_TIMEOUT_SECONDS
+from tests.polling import POLL_TIMEOUT_SECONDS, wait_until
 
 
 class UpdateVersionTests(unittest.TestCase):
@@ -417,17 +417,12 @@ class AutoUpdateTests(unittest.TestCase):
 
         self.assertEqual(self.upgrades, [])
 
-    def test_auto_install_waits_while_agent_tasks_run(self):
+    def test_auto_install_does_not_wait_for_an_idle_team(self):
+        # The upgrade drains running agents itself; waiting here for a fully
+        # idle team could postpone the update forever.
         runner = self._runner(auto_install=True)
         self.busy = True
 
-        runner.sync_once()
-        runner.sync_once()
-
-        self.assertEqual(self.upgrades, [])
-        self.assertEqual(self.updates, [("C1", "171", AUTO_UPDATE_WAITING_TEXT)])
-
-        self.busy = False
         runner.sync_once()
 
         self.assertEqual(self.upgrades, [("99.0.0", "C1", "171")])
@@ -1232,6 +1227,149 @@ class _FakeClock:
     def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
         self._now += timedelta(seconds=seconds)
+
+
+class _Checker:
+    release_source = GitHubReleaseSource("example-org/example-repo")
+
+    def check(self):
+        return None
+
+
+class RestartDrainTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self._tmp.name) / "state.sqlite")
+        self.store.init_schema()
+        candidate = UpdateCandidate(
+            current_version="0.1.0",
+            release=ReleaseInfo(version="99.0.0", tag_name="v99.0.0"),
+            repository="example-org/example-repo",
+        )
+        self.store.set_setting(f"{SETTING_UPDATE_CANDIDATE_PREFIX}99.0.0", candidate.to_json())
+        self.busy = threading.Event()
+        self.updates = []
+        self.draining_cards = []
+        self.installs = []
+        self.restarts = []
+        self.paused = []
+        self.install_succeeds = True
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def _runner(self, **kwargs):
+        test = self
+
+        class Updater:
+            def install(self, release):
+                test.installs.append(release.version)
+                if test.install_succeeds:
+                    return UpgradeResult(True, UpgradePlan("test upgrade", ()))
+                return UpgradeResult(
+                    False, UpgradePlan("test upgrade", ()), failure_message="install failed"
+                )
+
+        def status_blocks(update, status, include_actions, *, draining=False):
+            if draining:
+                self.draining_cards.append(status)
+            return []
+
+        return SlackgenticUpdateRunner(
+            store=self.store,
+            checker=_Checker(),
+            updater=Updater(),
+            channel_id=lambda: "C1",
+            prompt=lambda channel_id, update: "171",
+            update_message=lambda channel_id, ts, text, blocks: self.updates.append(text),
+            status_blocks=status_blocks,
+            restart=lambda: self.restarts.append(True),
+            is_busy=self.busy.is_set,
+            pause_new_work=self.paused.append,
+            drain_poll_seconds=0.01,
+            **kwargs,
+        )
+
+    def _join(self, thread):
+        assert thread is not None
+        thread.join(timeout=POLL_TIMEOUT_SECONDS)
+        self.assertFalse(thread.is_alive())
+
+    def test_idle_team_installs_without_draining(self):
+        thread = self._runner().start_upgrade("99.0.0", "C1", "171")
+        self._join(thread)
+
+        self.assertEqual(self.draining_cards, [])
+        self.assertEqual(self.installs, ["99.0.0"])
+        self.assertEqual(self.restarts, [True])
+        # New work stays paused into the restart; the next daemon accepts work.
+        self.assertEqual(self.paused, [True])
+
+    def test_waits_for_mid_turn_agents_before_installing(self):
+        self.busy.set()
+        runner = self._runner()
+
+        thread = runner.start_upgrade("99.0.0", "C1", "171")
+
+        self.assertTrue(wait_until(lambda: self.draining_cards))
+        self.assertEqual(self.paused, [True])
+        self.assertEqual(self.installs, [])
+        self.busy.clear()
+        self._join(thread)
+        self.assertEqual(self.installs, ["99.0.0"])
+        self.assertEqual(self.restarts, [True])
+
+    def test_drain_timeout_restarts_anyway(self):
+        self.busy.set()
+        runner = self._runner(drain_timeout_seconds=0.05)
+
+        self._join(runner.start_upgrade("99.0.0", "C1", "171"))
+
+        self.assertEqual(len(self.draining_cards), 1)
+        self.assertEqual(self.installs, ["99.0.0"])
+        self.assertEqual(self.restarts, [True])
+
+    def test_install_now_skips_the_wait(self):
+        self.busy.set()
+        runner = self._runner()
+        thread = runner.start_upgrade("99.0.0", "C1", "171")
+        self.assertTrue(wait_until(lambda: self.draining_cards))
+
+        self.assertIsNone(runner.start_upgrade("99.0.0", "C1", "171", force=True))
+
+        self._join(thread)
+        self.assertEqual(self.installs, ["99.0.0"])
+        self.assertEqual(self.restarts, [True])
+
+    def test_forced_upgrade_never_drains(self):
+        self.busy.set()
+
+        self._join(self._runner().start_upgrade("99.0.0", "C1", "171", force=True))
+
+        self.assertEqual(self.draining_cards, [])
+        self.assertEqual(self.restarts, [True])
+
+    def test_failed_install_resumes_new_work(self):
+        self.install_succeeds = False
+
+        self._join(self._runner().start_upgrade("99.0.0", "C1", "171"))
+
+        self.assertEqual(self.paused, [True, False])
+        self.assertEqual(self.restarts, [])
+        self.assertIsNone(self.store.get_setting(SETTING_UPDATE_INSTALLING_VERSION))
+
+    def test_stopping_mid_drain_does_not_install(self):
+        self.busy.set()
+        runner = self._runner()
+        thread = runner.start_upgrade("99.0.0", "C1", "171")
+        self.assertTrue(wait_until(lambda: self.draining_cards))
+
+        runner.stop()
+
+        self._join(thread)
+        self.assertEqual(self.installs, [])
+        self.assertEqual(self.restarts, [])
 
 
 class UpdateHelperConfirmTests(unittest.TestCase):
