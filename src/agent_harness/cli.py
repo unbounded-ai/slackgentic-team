@@ -92,6 +92,47 @@ def main(argv: list[str] | None = None) -> int:
         help="Register the Slackgentic MCP server in user-level Codex config",
     )
 
+    loop = sub.add_parser("loop", help="Request and inspect Slackgentic loops")
+    loop_sub = loop.add_subparsers(dest="loop_command", required=True)
+    loop_create = loop_sub.add_parser(
+        "create",
+        help="Ask the running service to post a loop request for the owner to approve",
+    )
+    loop_create.add_argument("text", nargs="+", help="The loop's task and schedule")
+    loop_create.add_argument("--provider", choices=[item.value for item in Provider])
+    loop_visibility = loop_create.add_mutually_exclusive_group()
+    loop_visibility.add_argument(
+        "--public", dest="visibility", action="store_const", const="public"
+    )
+    loop_visibility.add_argument(
+        "--private", dest="visibility", action="store_const", const="private"
+    )
+    loop_create.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Return right after queueing instead of waiting for the service",
+    )
+    loop_create.add_argument("--db", type=Path)
+    loop_create.add_argument("--json", action="store_true")
+    loop_request = loop_sub.add_parser(
+        "request-status", help="Show what happened to a queued loop request"
+    )
+    loop_request.add_argument("request_id")
+    loop_request.add_argument("--db", type=Path)
+    loop_request.add_argument("--json", action="store_true")
+    loop_list = loop_sub.add_parser("list", help="List loops")
+    loop_list.add_argument("--all", action="store_true", help="Include stopped loops")
+    loop_list.add_argument("--db", type=Path)
+    loop_list.add_argument("--json", action="store_true")
+
+    skills = sub.add_parser("skills", help="Install agent skills that teach Slackgentic usage")
+    skills_sub = skills.add_subparsers(dest="skills_command", required=True)
+    skills_install = skills_sub.add_parser(
+        "install", help="Install Slackgentic skills for Claude Code and Codex"
+    )
+    skills_install.add_argument("--claude", action="store_true", help="Only install for Claude")
+    skills_install.add_argument("--codex", action="store_true", help="Only install for Codex")
+
     team = sub.add_parser("team", help="Manage the lightweight agent team")
     team_sub = team.add_subparsers(dest="team_command", required=True)
 
@@ -348,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.install:
             install_claude_mcp_server()
             print("registered Claude MCP server: slackgentic")
+            _install_skills_quietly("claude")
             print(
                 "Start Claude with: "
                 "claude --dangerously-load-development-channels server:slackgentic"
@@ -363,8 +405,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.install:
             install_codex_mcp_server()
             print("registered Codex MCP server: slackgentic")
+            _install_skills_quietly("codex")
             return 0
         return run_channel_server(args.db, provider_label="Codex")
+    if args.command == "loop":
+        return _loop(args)
+    if args.command == "skills":
+        return _skills(args)
     if args.command == "team":
         return _team(args)
     if args.command == "service":
@@ -656,6 +703,95 @@ def _usage(args: argparse.Namespace) -> int:
             )
         )
     return 0
+
+
+def _loop_store(args: argparse.Namespace) -> Store:
+    db_path = args.db
+    if db_path is None:
+        from agent_harness.config import load_config_from_env
+
+        db_path = load_config_from_env().state_db
+    store = Store(db_path)
+    store.init_schema()
+    return store
+
+
+def _loop(args: argparse.Namespace) -> int:
+    from agent_harness.loops import (
+        describe_agent_loop_create_request,
+        enqueue_agent_loop_create_request,
+        wait_for_agent_loop_create_request,
+    )
+    from agent_harness.models import LoopCreateRequestStatus, LoopStatus
+
+    store = _loop_store(args)
+    try:
+        if args.loop_command == "create":
+            result = enqueue_agent_loop_create_request(
+                store,
+                " ".join(args.text),
+                provider=args.provider,
+                visibility=args.visibility,
+                source="cli",
+            )
+            if result.request is None:
+                print(f"error: {result.error}", file=sys.stderr)
+                return 2
+            request = result.request
+            if not args.no_wait:
+                request = wait_for_agent_loop_create_request(store, request.request_id) or request
+            if args.json:
+                print(json.dumps(_jsonable(request), indent=2, sort_keys=True))
+            else:
+                print(f"request: {request.request_id}")
+                print(describe_agent_loop_create_request(request))
+            return 1 if request.status == LoopCreateRequestStatus.FAILED else 0
+        if args.loop_command == "request-status":
+            request = store.get_loop_create_request(args.request_id)
+            if args.json:
+                print(json.dumps(_jsonable(request), indent=2, sort_keys=True))
+            else:
+                print(describe_agent_loop_create_request(request))
+            return 0 if request is not None else 1
+        statuses = None if args.all else tuple(s for s in LoopStatus if s != LoopStatus.CANCELLED)
+        loops = store.list_loops(statuses=statuses)
+        if args.json:
+            print(json.dumps(_jsonable(loops), indent=2, sort_keys=True))
+            return 0
+        if not loops:
+            print("No loops. Create one with `slackgentic loop create <task and schedule>`.")
+            return 0
+        for item in loops:
+            channel = f"#{item.channel_name}" if item.channel_name else "(no channel yet)"
+            next_run = item.next_run_at.isoformat() if item.next_run_at else "-"
+            print(
+                f"{item.loop_id}\t{item.status.value}\t{channel}\t{item.title}\t"
+                f"next={next_run}\truns={item.run_count}"
+            )
+        return 0
+    finally:
+        store.close()
+
+
+def _skills(args: argparse.Namespace) -> int:
+    from agent_harness.agent_skills import install_agent_skills
+
+    providers: tuple[str, ...] = tuple(
+        name for name, selected in (("claude", args.claude), ("codex", args.codex)) if selected
+    ) or ("claude", "codex")
+    for path in install_agent_skills(providers=providers):
+        print(f"installed {path}")
+    return 0
+
+
+def _install_skills_quietly(provider: str) -> None:
+    from agent_harness.agent_skills import install_agent_skills
+
+    try:
+        for path in install_agent_skills(providers=(provider,)):
+            print(f"installed skill: {path}")
+    except OSError as exc:
+        print(f"Warning: failed to install Slackgentic skills: {exc}")
 
 
 def _team(args: argparse.Namespace) -> int:

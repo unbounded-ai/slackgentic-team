@@ -15,7 +15,18 @@ from typing import Any, NamedTuple
 
 from agent_harness.config import load_config_from_env
 from agent_harness.internal_notifications import is_internal_task_notification_text
-from agent_harness.models import PermissionMode, Provider, SlackThreadRef
+from agent_harness.loops import (
+    AGENT_LOOP_REQUEST_WAIT_SECONDS,
+    describe_agent_loop_create_request,
+    enqueue_agent_loop_create_request,
+    wait_for_agent_loop_create_request,
+)
+from agent_harness.models import (
+    LoopCreateRequestStatus,
+    PermissionMode,
+    Provider,
+    SlackThreadRef,
+)
 from agent_harness.permissions import (
     claude_channel_permission_mode_from_env,
     claude_safe_auto_permission_request_allowed,
@@ -58,7 +69,10 @@ CHANNEL_INSTRUCTIONS = (
     "PR creation still works when Claude Bash is sandboxed. When you need the "
     "contents of another Slackgentic thread from a Slack link, use the "
     "`read_thread` MCP tool; it only reads links from the configured Slackgentic "
-    "channel."
+    "channel. When the user asks you to create a Slackgentic loop, a recurring "
+    "report or check that runs in its own Slack channel, call the `create_loop` "
+    "tool with the task and schedule; the owner approves the resulting preview in "
+    "Slack."
 )
 CODEX_MCP_INSTRUCTIONS = (
     "Slackgentic provides MCP tools for Slack-mediated workflows. When opening a "
@@ -66,9 +80,13 @@ CODEX_MCP_INSTRUCTIONS = (
     "`gh pr create` workflow through Slackgentic so PR creation still works when "
     "ordinary shell networking or sandbox policy gets in the way. When you need the "
     "contents of another Slackgentic thread from a Slack link, use `read_thread`; it "
-    "only reads links from the configured Slackgentic channel."
+    "only reads links from the configured Slackgentic channel. When the user asks "
+    "you to create a Slackgentic loop, a recurring report or check that runs in "
+    "its own Slack channel, call `create_loop` with the task and schedule; the "
+    "owner approves the resulting preview in Slack."
 )
 SLACKGENTIC_MCP_TOOL_NAMES = {
+    f"mcp__{CHANNEL_NAME}__create_loop",
     f"mcp__{CHANNEL_NAME}__create_pull_request",
     f"mcp__{CHANNEL_NAME}__read_thread",
     f"mcp__{CHANNEL_NAME}__request_approval",
@@ -97,6 +115,7 @@ class ClaudeChannelServer:
         slack_channel_id: str | None = None,
         command_runner: CommandRunner | None = None,
         instructions: str = CHANNEL_INSTRUCTIONS,
+        loop_request_wait_seconds: float = AGENT_LOOP_REQUEST_WAIT_SECONDS,
     ):
         self.store = store
         self.target_pid = target_pid or os.getppid()
@@ -106,6 +125,7 @@ class ClaudeChannelServer:
         self.slack_channel_id = _configured_slack_channel_id(store, slack_channel_id)
         self.command_runner = command_runner or subprocess.run
         self.instructions = instructions
+        self.loop_request_wait_seconds = loop_request_wait_seconds
         self._current_thread = _thread_from_env()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -233,7 +253,32 @@ class ClaudeChannelServer:
             return self._handle_create_pull_request_tool(arguments)
         if name == "read_thread":
             return self._handle_read_thread_tool(arguments)
+        if name == "create_loop":
+            return self._handle_create_loop_tool(arguments)
         return _tool_result(f"Unknown Slackgentic tool: {name}", is_error=True)
+
+    def _handle_create_loop_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        result = enqueue_agent_loop_create_request(
+            self.store,
+            _string_arg(arguments, "request"),
+            provider=_string_arg(arguments, "provider") or None,
+            visibility=_string_arg(arguments, "visibility") or None,
+            source="mcp",
+        )
+        if result.request is None:
+            return _tool_result(f"create_loop failed: {result.error}", is_error=True)
+        request = (
+            wait_for_agent_loop_create_request(
+                self.store,
+                result.request.request_id,
+                timeout_seconds=self.loop_request_wait_seconds,
+            )
+            or result.request
+        )
+        return _tool_result(
+            describe_agent_loop_create_request(request),
+            is_error=request.status == LoopCreateRequestStatus.FAILED,
+        )
 
     def _handle_read_thread_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.gateway is None:
@@ -1008,6 +1053,41 @@ def _is_slackgentic_mcp_tool(tool_name: str) -> bool:
 
 def _tools() -> list[dict[str, Any]]:
     return [
+        {
+            "name": "create_loop",
+            "description": (
+                "Request a Slackgentic loop: a recurring, read-only task that runs on a "
+                "schedule and reports in its own Slack channel. Slackgentic posts the request "
+                "in the agent channel, resolves it into a preview, and the owner clicks Create "
+                "in Slack to make the channel. Describe the task, the schedule, what to report, "
+                "and whether it should stay quiet on all-clear runs."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "string",
+                        "description": (
+                            "The loop's standing task and recurring schedule in plain "
+                            "language, for example 'every weekday at 9am America/New_York, "
+                            "check CI on main in example-org/example-repo and report failures; "
+                            "only post when something fails'."
+                        ),
+                    },
+                    "provider": {
+                        "type": "string",
+                        "enum": ["claude", "codex"],
+                        "description": "Optional provider for the loop's runs.",
+                    },
+                    "visibility": {
+                        "type": "string",
+                        "enum": ["private", "public"],
+                        "description": "Loop channel visibility. Defaults to private.",
+                    },
+                },
+                "required": ["request"],
+            },
+        },
         {
             "name": "create_pull_request",
             "description": (

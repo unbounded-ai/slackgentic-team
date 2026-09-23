@@ -258,6 +258,13 @@ prompt, journal, thread context, or history retrieval.
 | `loop stop [archive]` | Stop the loop, optionally archiving its channel |
 | `loop help` | Show the in-channel command reference |
 
+Agents can request loops too. When you ask a Codex or Claude session to create
+a loop, it calls Slackgentic's `create_loop` MCP tool (or runs
+`slackgentic loop create "<task and schedule>"`). The running service posts the
+request in the agent channel as if you had typed `loop create`, and you still
+review the preview and click Create. Agent-requested loops always start
+read-only. `slackgentic loop list` shows loops from a terminal.
+
 Use `loops` or `loop list` in the main agent channel to see every loop in one
 message, with its latest result and a menu to run, pause, resume, or stop it. Loops intentionally cannot delegate to roster
 agents, start PM initiatives, or read Slack file and attachment contents.
@@ -395,6 +402,24 @@ If you revive an ended session from its Slack thread, Slackgentic uses a free
 matching Codex or Claude seat to resume that exact session. If no matching seat
 is free, hire or free that provider; `somebody ...` can still start a new
 session in the same thread using the Slack context.
+
+## Agent Skills
+
+Slackgentic ships skills that teach Claude Code and Codex how to use it:
+`slackgentic` covers the whole feature set (Slack commands, hidden task control
+lines, MCP tools, CLI) and `slackgentic-loops` walks an agent through creating
+and managing loops. With them installed you can say "create a slackgentic loop
+that checks CI every weekday morning" in any session and the agent knows what
+to do.
+
+`slackgentic claude-channel --install` and `slackgentic codex-mcp --install`
+install them into `~/.claude/skills` and `~/.codex/skills` (or
+`$CODEX_HOME/skills`), and the service refreshes them on every start so they
+match the installed version. Install them manually with:
+
+```sh
+slackgentic skills install
+```
 
 ## Service
 

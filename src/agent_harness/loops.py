@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import shutil
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -13,6 +15,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from agent_harness.loop_icons import LoopBadgeSpec, parse_loop_badge_spec
 from agent_harness.models import (
     Loop,
+    LoopCreateQueueRequest,
+    LoopCreateRequestStatus,
     LoopJournalEntry,
     LoopRun,
     LoopVisibility,
@@ -68,6 +72,11 @@ LOOP_CREATE_VERBS = (
     "new loop",
     "loop:",
 )
+# Local agents queue loop requests through the CLI or MCP tool; the daemon posts
+# each one to the agent channel, where the owner still approves the preview.
+AGENT_LOOP_REQUEST_MAX_CHARS = 4_000
+AGENT_LOOP_REQUEST_MAX_PENDING = 5
+AGENT_LOOP_REQUEST_WAIT_SECONDS = 20.0
 LOOP_SUMMARY_STATUSES = frozenset({"ok", "found_issue", "action_taken", "failed"})
 LOOP_CHART_TYPES = frozenset({"line", "bar", "area"})
 LOOP_CHART_MAX_POINTS = 20
@@ -397,6 +406,118 @@ def parse_loop_command(text: str) -> LoopCommand | None:
     if re.fullmatch(r"loop help", cleaned, re.I):
         return LoopHelpCommand()
     return None
+
+
+@dataclass(frozen=True)
+class AgentLoopRequestResult:
+    request: LoopCreateQueueRequest | None = None
+    command: str | None = None
+    error: str | None = None
+
+
+def prepare_agent_loop_create_command(
+    text: str,
+    *,
+    provider: Provider | str | None = None,
+    visibility: LoopVisibility | str | None = None,
+) -> AgentLoopRequestResult:
+    """Normalize a local agent's loop request into a `loop create ...` command."""
+
+    body = re.sub(r"\s+", " ", text or "").strip()
+    if not body:
+        return AgentLoopRequestResult(error="describe the loop's task and schedule")
+    if len(body) > AGENT_LOOP_REQUEST_MAX_CHARS:
+        return AgentLoopRequestResult(
+            error=f"keep the loop request under {AGENT_LOOP_REQUEST_MAX_CHARS} characters"
+        )
+    command = body if looks_like_loop_create_request(body) else f"loop create {body}"
+    if provider is not None:
+        try:
+            provider_value = Provider(str(getattr(provider, "value", provider)).lower())
+        except ValueError:
+            return AgentLoopRequestResult(error="provider must be codex or claude")
+        command = f"{command} provider={provider_value.value}"
+    if visibility is not None:
+        try:
+            visibility_value = LoopVisibility(str(getattr(visibility, "value", visibility)).lower())
+        except ValueError:
+            return AgentLoopRequestResult(error="visibility must be private or public")
+        command = f"{command} #{visibility_value.value}"
+    parsed = parse_loop_create_request(command)
+    if parsed is None or not parsed.description:
+        return AgentLoopRequestResult(error="describe the loop's task and schedule")
+    if parsed.permission_mode != PermissionMode.READ_ONLY:
+        return AgentLoopRequestResult(
+            error=(
+                "loops requested by an agent start read-only; drop #dangerous-mode and let "
+                "the owner change permissions from the loop channel"
+            )
+        )
+    return AgentLoopRequestResult(command=command)
+
+
+def enqueue_agent_loop_create_request(
+    store,
+    text: str,
+    *,
+    provider: Provider | str | None = None,
+    visibility: LoopVisibility | str | None = None,
+    source: str | None = None,
+) -> AgentLoopRequestResult:
+    prepared = prepare_agent_loop_create_command(text, provider=provider, visibility=visibility)
+    if prepared.command is None:
+        return prepared
+    if store.count_pending_loop_create_requests() >= AGENT_LOOP_REQUEST_MAX_PENDING:
+        return AgentLoopRequestResult(
+            error=(
+                f"{AGENT_LOOP_REQUEST_MAX_PENDING} loop requests are already waiting for the "
+                "Slackgentic service; check that it is running with `slackgentic service status`"
+            )
+        )
+    request = store.enqueue_loop_create_request(prepared.command, source=source)
+    return AgentLoopRequestResult(request=request, command=prepared.command)
+
+
+def wait_for_agent_loop_create_request(
+    store,
+    request_id: str,
+    *,
+    timeout_seconds: float = AGENT_LOOP_REQUEST_WAIT_SECONDS,
+    poll_seconds: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> LoopCreateQueueRequest | None:
+    """Wait until the daemon posts or rejects a queued loop request."""
+
+    deadline = monotonic() + max(0.0, timeout_seconds)
+    while True:
+        current = store.get_loop_create_request(request_id)
+        if current is None or current.status in {
+            LoopCreateRequestStatus.POSTED,
+            LoopCreateRequestStatus.FAILED,
+        }:
+            return current
+        if monotonic() >= deadline:
+            return current
+        sleep(poll_seconds)
+
+
+def describe_agent_loop_create_request(request: LoopCreateQueueRequest | None) -> str:
+    if request is None:
+        return "The loop request could not be found."
+    if request.status == LoopCreateRequestStatus.POSTED:
+        return (
+            "Slackgentic posted the loop request in the agent channel and is resolving it "
+            "into a preview. The owner must review the preview and click Create in Slack; "
+            "the loop channel appears after that."
+        )
+    if request.status == LoopCreateRequestStatus.FAILED:
+        return f"Slackgentic could not post the loop request: {request.error or 'unknown error'}"
+    return (
+        f"The loop request {request.request_id} is queued, but the Slackgentic service has "
+        "not picked it up yet. It will post as soon as the service is running; check with "
+        "`slackgentic service status`."
+    )
 
 
 def build_loop_resolution_prompt(
