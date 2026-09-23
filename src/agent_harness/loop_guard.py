@@ -85,7 +85,7 @@ _READ_ONLY_EXECUTABLES = frozenset(
 )  # fmt: skip
 _DENIED_EXECUTABLES = frozenset(
     {
-        "rm", "rmdir", "mv", "chmod", "chown", "chgrp", "chflags", "ln", "dd",
+        "chmod", "chown", "chgrp", "chflags", "ln", "dd",
         "truncate", "shred", "srm", "kill", "pkill", "killall", "shutdown",
         "reboot", "halt", "launchctl", "systemctl", "service", "crontab", "sudo",
         "su", "doas", "brew", "apt", "apt-get", "yum", "dnf", "port", "gem",
@@ -161,7 +161,6 @@ _CODE_MUTATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"\.(unlink|rmdir|rename|chmod|rm|writeFile|appendFile|copyFile|mkdir)(Sync)?\s*\(", "deletes, moves, or writes files"),
         (r"\brequests\.(post|put|patch|delete)\s*\(|\bhttpx\.(post|put|patch|delete)\s*\(", "sends a mutating HTTP request"),
         (r"method\s*[=:]\s*['\"](post|put|patch|delete)['\"]", "sends a mutating HTTP request"),
-        (r"\.(?!write_(?:text|bytes)\b)(delete|put|create|update|terminate|modify|remove|write|upload|restore|revoke|authorize|deregister|register|tag|untag|attach|detach|reboot|stop|start|invoke|publish|send|cancel|rotate|purge|batch_write|batch_delete)_[a-z0-9_]+\s*\(", "calls a mutating cloud API"),
         (r"\.(command|insert|insert_df|insert_arrow)\s*\(", "runs a database write"),
         (r"['\"]\s*(insert|update|delete|drop|alter|create|truncate|optimize|grant|revoke)\s+", "runs mutating SQL"),
         (r"\bfs\.(write|append|unlink|rm|rename|mkdir|copy)\w*\s*\(", "writes or deletes files"),
@@ -169,6 +168,19 @@ _CODE_MUTATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"\bunlink\s*[\(\s'\"]|\bFile\.(delete|unlink|rename)|\bFileUtils\.(rm|mv|cp)", "deletes or moves files"),
     )
 )  # fmt: skip
+# boto-style mutating calls (delete_object, put_item, ...) only mean anything when
+# the script talks to a cloud SDK; stdlib names like socket.create_connection or
+# ssl.create_default_context must not trip them.
+_CLOUD_SDK_IMPORT_RE = re.compile(
+    r"^\s*(?:import|from)\s+(boto3|botocore|aiobotocore|google\.cloud|azure|kubernetes|openstack)\b",
+    re.MULTILINE,
+)
+_CLOUD_MUTATION_RE = re.compile(
+    r"\.(delete|put|create|update|terminate|modify|remove|write|upload|restore|revoke|"
+    r"authorize|deregister|register|tag|untag|attach|detach|reboot|stop|start|invoke|publish|"
+    r"send|cancel|rotate|purge|batch_write|batch_delete)_[a-z0-9_]+\s*\(",
+    re.IGNORECASE,
+)
 _ABSOLUTE_PATH_WRITE_RES = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -332,7 +344,8 @@ def _handle_scratch_only(name: str):
     def handler(args, stdin_text, context) -> GuardDecision:
         targets = [arg for arg in args if not arg.startswith("-")]
         if not targets:
-            return GuardDecision(UNDECIDED, f"`{name}` without a target")
+            return _deny(f"loops are read-only; `{name}` needs explicit paths inside scratch")
+        # cp only writes its destination; rm, mv, mkdir and touch touch every path.
         check = targets[-1:] if name == "cp" else targets
         for target in check:
             if not context.in_scratch(target):
@@ -604,6 +617,19 @@ def _handle_gcloud(args, stdin_text, context) -> GuardDecision:
 
 
 def _handle_curl(args, stdin_text, context) -> GuardDecision:
+    config_paths = _all_option_values(args, ("-K", "--config"))
+    if config_paths:
+        extra: list[str] = []
+        for path in config_paths:
+            content = _read_text(path) if Path(os.path.expanduser(path)).is_absolute() else None
+            if content is None:
+                return _deny("loops are read-only; curl config files must be readable")
+            parsed = _curl_config_args(content)
+            if parsed is None or any(arg in {"-K", "--config"} for arg in parsed):
+                return _deny("loops are read-only; could not check this curl config file")
+            extra.extend(parsed)
+        remaining = _without_options(args, ("-K", "--config"))
+        return _handle_curl(remaining + extra, stdin_text, context)
     method = _option_value(args, ("-X", "--request"))
     data_values = _all_option_values(
         args,
@@ -614,8 +640,6 @@ def _handle_curl(args, stdin_text, context) -> GuardDecision:
     output = _option_value(args, ("-o", "--output"))
     if output and not context.in_scratch(output):
         return _deny(f"loops are read-only; curl output must go inside {context.scratch_dir}")
-    if any(arg in {"-K", "--config"} or arg.startswith("--config=") for arg in args):
-        return _deny("loops are read-only; curl config files can hide mutating options")
     headers = " ".join(_all_option_values(args, ("-H", "--header"))).lower()
     if "method-override" in headers:
         return _deny("loops are read-only; HTTP method overrides can change remote state")
@@ -623,6 +647,9 @@ def _handle_curl(args, stdin_text, context) -> GuardDecision:
         return _deny(f"loops are read-only; use `-o` with a path inside {context.scratch_dir}")
     if method and method.upper() not in {"GET", "HEAD", "POST"}:
         return _deny(f"loops are read-only; HTTP {method.upper()} can change remote state")
+    if ("-G" in args or "--get" in args) and (method is None or method.upper() in {"GET", "HEAD"}):
+        # -G sends every --data value as URL query parameters on a GET.
+        return GuardDecision(ALLOW, "HTTP GET with query parameters")
     if data_values or (method and method.upper() == "POST"):
         bodies = [_read_data_value(value, context) for value in data_values]
         if bodies and all(body is not None and _sql_is_read_only(body) for body in bodies):
@@ -632,6 +659,43 @@ def _handle_curl(args, stdin_text, context) -> GuardDecision:
             "everything else)"
         )
     return GuardDecision(ALLOW, "HTTP GET")
+
+
+def _curl_config_args(content: str) -> list[str] | None:
+    args: list[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^(-{0,2}[A-Za-z][\w-]*)\s*(?:[=:]\s*|\s+)?(.*)$", line)
+        if match is None:
+            return None
+        name, value = match.group(1), match.group(2).strip()
+        if not name.startswith("-"):
+            name = f"-{name}" if len(name) == 1 else f"--{name}"
+        args.append(name)
+        if value:
+            try:
+                args.extend(shlex.split(value))
+            except ValueError:
+                return None
+    return args
+
+
+def _without_options(args: list[str], names: tuple[str, ...]) -> list[str]:
+    kept: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in names:
+            skip = True
+            continue
+        if any(arg.startswith(f"{name}=") for name in names if name.startswith("--")):
+            continue
+        kept.append(arg)
+    return kept
 
 
 def _handle_wget(args, stdin_text, context) -> GuardDecision:
@@ -750,6 +814,8 @@ def _evaluate_code(code: str, context: GuardContext) -> GuardDecision:
     for pattern, reason in _CODE_MUTATION_PATTERNS:
         if pattern.search(code):
             return _deny(f"loops are read-only; this script {reason}")
+    if _CLOUD_SDK_IMPORT_RE.search(code) and _CLOUD_MUTATION_RE.search(code):
+        return _deny("loops are read-only; this script calls a mutating cloud API")
     for pattern in _ABSOLUTE_PATH_WRITE_RES:
         for match in pattern.finditer(code):
             if not context.in_scratch(match.group("path")):
@@ -842,6 +908,10 @@ _EXECUTABLE_HANDLERS = {
     "gawk": _handle_awk,
     "tee": _handle_tee,
     "cp": _handle_scratch_only("cp"),
+    "rm": _handle_scratch_only("rm"),
+    "rmdir": _handle_scratch_only("rmdir"),
+    "mv": _handle_scratch_only("mv"),
+    "unlink": _handle_scratch_only("unlink"),
     "mkdir": _handle_scratch_only("mkdir"),
     "touch": _handle_scratch_only("touch"),
     "gzip": _handle_gzip,
@@ -1099,7 +1169,8 @@ the question; the only question is whether the call can CHANGE state.
 ALLOW if the call only reads, lists, describes, queries, searches, fetches logs,
 or computes, and any files it writes are inside the scratch directory {scratch}.
 Unfamiliar CLIs are fine when their verbs and flags are reads (list, get, show,
-describe, status, query, search, logs, report, export to stdout, --dry-run).
+view, describe, inspect, status, query, search, recall, read, logs, report, diff,
+check, export to stdout, --dry-run).
 DENY if it could create, modify, delete, move, upload, send, publish, deploy,
 restart, kill, install, change permissions or configuration, or spend money on
 any system (local files outside scratch, repos, databases, cloud resources,
@@ -1126,7 +1197,9 @@ def judge_tool_call(
     runner=None,
 ) -> GuardDecision:
     """Ask an isolated model whether a call the rules could not classify is read-only."""
-    call = json.dumps({"tool": tool_name, "input": tool_input}, sort_keys=True, default=str)
+    call = redact_secrets(
+        json.dumps({"tool": tool_name, "input": tool_input}, sort_keys=True, default=str)
+    )
     key = hashlib.sha256(call.encode()).hexdigest()
     cached = _judge_cache_get(cache_path, key)
     if cached is not None:
@@ -1265,6 +1338,25 @@ def main() -> int:
     return 0
 
 
+_SECRET_PATTERNS = (
+    re.compile(
+        r"((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)=)[^\s&'\"]+", re.I
+    ),
+    re.compile(r"((?:-u|--user)\s+['\"]?[^:\s'\"]+:)[^\s'\"]+"),
+    re.compile(
+        r"((?:authorization|x-api-key|x-clickhouse-key)\s*:\s*(?:bearer\s+|basic\s+)?)[^\s'\"]+",
+        re.I,
+    ),
+    re.compile(r"(\"(?:password|secret|token)\"\s*:\s*\")[^\"]+", re.I),
+)
+
+
+def redact_secrets(text: str) -> str:
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(r"\1***", text)
+    return text
+
+
 def _log_decision(
     tool_name: str,
     tool_input,
@@ -1278,18 +1370,20 @@ def _log_decision(
     preview = ""
     if isinstance(tool_input, dict):
         preview = str(tool_input.get("command") or tool_input.get("file_path") or "")
+    preview = redact_secrets(preview)
     entry = {
         "at": datetime.now(UTC).isoformat(),
         "run_id": os.environ.get(LOOP_GUARD_RUN_ENV),
         "tool": tool_name,
         "decision": decision.decision,
         "judged": judged,
-        "reason": decision.reason,
+        "reason": redact_secrets(decision.reason),
         "preview": preview[:300],
     }
     try:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as handle:
+        descriptor = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
     except OSError:
         pass

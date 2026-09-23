@@ -645,9 +645,19 @@ class PureLoopLogicTests(unittest.TestCase):
             loop_logic.format_loop_timestamp(self.now, "America/Los_Angeles"),
             "Sun Aug 16, 9:00 AM PDT",
         )
-        self.assertEqual(
+        self.assertRegex(
             loop_logic.describe_loop_schedule(self.loop.recurrence, self.loop.timezone),
-            "daily at 09:00 America/Los_Angeles",
+            r"^daily at 9:00 AM P[DS]T$",
+        )
+        self.assertEqual(
+            loop_logic.describe_loop_schedule(
+                {"frequency": "weekly", "time": "17:30", "weekday": 0}, "UTC"
+            ),
+            "every Monday at 5:30 PM UTC",
+        )
+        self.assertEqual(
+            loop_logic.describe_loop_schedule({"frequency": "daily", "time": "bogus"}, "UTC"),
+            "daily at bogus UTC",
         )
 
 

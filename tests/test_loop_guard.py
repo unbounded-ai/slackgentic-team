@@ -195,12 +195,67 @@ class LoopGuardTests(unittest.TestCase):
             f"aws s3 cp s3://example-bucket/key {self.scratch}/key",
             "python3 - <<'EOF'\nitems = [1, 2]\nitems.remove(1)\nprint(items)\nEOF",
             "python3 - <<'EOF'\ncur.execute('SELECT 1')\nEOF",
+            "python3 - <<'EOF'\nimport socket, ssl\nsock = socket.create_connection(('h', 1))\n"
+            "ctx = ssl.create_default_context()\nEOF",
             "gh api graphql -f query='query { viewer { login } }'",
             "sqlite3 app.db '.tables'",
             "aws kms decrypt --ciphertext-blob fileb://blob --query Plaintext",
         ):
             with self.subTest(command=command):
                 self.assertDecision(command, ALLOW)
+
+    def test_live_run_regressions(self):
+        config = self.scratch / "curl.cfg"
+        config.write_text('user = "reader:secret"\nheader = "Accept: text/plain"\n')
+        bad_config = self.scratch / "bad.cfg"
+        bad_config.write_text("request = DELETE\n")
+        host = "https://ch.example.com:8443/"
+        allowed = (
+            f"curl -sS -G -K {config} {host} --data-urlencode 'query=SELECT 1'",
+            f"curl -sS -G {host} --data-urlencode user=reader --data-urlencode "
+            "'query=SELECT count() FROM otel_logs'",
+            f"rm {self.scratch}/pw.txt {self.scratch}/curl.cfg",
+            f"rm -rf {self.scratch}/tmp",
+            f"mv {self.scratch}/a.json {self.scratch}/b.json",
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                self.assertDecision(command, ALLOW)
+        for command in (
+            f"curl -K {bad_config} {host}",
+            f"curl -G -X DELETE {host} --data-urlencode x=1",
+            "curl -K relative.cfg https://example.com",
+            f"rm {self.scratch}/../outside.txt",
+            f"mv {self.scratch}/a.json /workspace/repos/example-project/a.json",
+            "rm -rf build",
+        ):
+            with self.subTest(command=command):
+                self.assertDecision(command, DENY)
+
+    def test_secrets_are_redacted_before_logging_or_judging(self):
+        text = (
+            "curl -u reader:hunter2 'https://h/?password=hunter2&user=x' "
+            "-H 'Authorization: Bearer abc.def' --data-urlencode 'password=hunter2'"
+        )
+        redacted = loop_guard.redact_secrets(text)
+        self.assertNotIn("hunter2", redacted)
+        self.assertNotIn("abc.def", redacted)
+        self.assertIn("user=x", redacted)
+
+        captured = []
+
+        def runner(argv, **kwargs):
+            captured.append(argv[-1])
+            return SimpleNamespace(stdout=json.dumps({"result": '{"decision": "deny"}'}))
+
+        judge_tool_call(
+            "Bash",
+            {"command": text},
+            context=self.context,
+            claude_binary="claude",
+            runner=runner,
+        )
+        self.assertNotIn("hunter2", captured[0])
 
     def test_unknown_commands_fall_through_to_an_approval(self):
         for command in (

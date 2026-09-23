@@ -1058,16 +1058,28 @@ def describe_loop_schedule(recurrence: dict[str, object], timezone: str | None) 
     if frequency == "interval":
         seconds = interval_seconds_from_recurrence(recurrence)
         return format_interval_seconds(seconds) if seconds is not None else "invalid interval"
-    time_text = recurrence.get("time")
-    zone = timezone or recurrence.get("timezone") or "UTC"
+    zone = str(timezone or recurrence.get("timezone") or "UTC")
+    clock = _friendly_clock(recurrence.get("time"), zone)
     if frequency == "weekly":
         weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
         weekday = recurrence.get("weekday")
-        day = weekdays[weekday] if isinstance(weekday, int) and 0 <= weekday <= 6 else "weekly"
-        return f"every {day} at {time_text} {zone}"
+        day = weekdays[weekday] if isinstance(weekday, int) and 0 <= weekday <= 6 else "week"
+        return f"every {day} at {clock}"
     if frequency == "daily":
-        return f"daily at {time_text} {zone}"
+        return f"daily at {clock}"
     return "recurring schedule"
+
+
+def _friendly_clock(time_text: object, zone: str) -> str:
+    """Render ``HH:MM`` in a zone as ``8:00 AM PDT`` (falls back to the raw text)."""
+    try:
+        hour, minute = (int(part) for part in str(time_text).split(":", 1))
+        tz = ZoneInfo(zone)
+    except (ValueError, ZoneInfoNotFoundError):
+        return f"{time_text} {zone}"
+    abbreviation = datetime.now(tz).strftime("%Z") or zone
+    suffix = "AM" if hour < 12 else "PM"
+    return f"{hour % 12 or 12}:{minute:02d} {suffix} {abbreviation}"
 
 
 def normalize_loop_channel_name(value: str) -> str:

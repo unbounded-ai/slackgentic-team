@@ -505,9 +505,8 @@ def build_loop_panel_blocks(
     buttons = _loop_panel_buttons(loop, running=running)
     if buttons:
         card["actions"] = buttons
-    mission = loop.mission.strip()
-    if len(mission) > 1400:
-        mission = mission[:1400].rstrip() + "…"
+    # The panel is a glanceable header; the full mission lives in Edit.
+    mission = _shorten_text(loop.mission.strip(), 280)
     mission_section: dict[str, Any] = {
         "type": "section",
         "block_id": f"loop.{context}.mission.{loop.loop_id}"[:255],

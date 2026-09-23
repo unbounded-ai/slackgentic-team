@@ -2041,7 +2041,7 @@ class LoopCreationFlowTests(unittest.TestCase):
 
         card = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
         self.assertIn("did not finish", str(card["blocks"]))
-        self.assertIn("cancelled", str(card["blocks"]))
+        self.assertIn("The run stopped before it finished", str(card["blocks"]))
 
     def test_session_approvals_are_remembered_for_future_runs(self):
         loop = self._activate_loop()
@@ -2283,6 +2283,19 @@ class LoopCreationFlowTests(unittest.TestCase):
         card = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
         self.assertEqual(card["blocks"][0]["type"], "task_card")
         self.assertEqual(card["blocks"][0]["status"], "error")
+
+    def test_panels_are_rerendered_once_per_version_after_upgrade(self):
+        loop = self._activate_loop()
+        self.gateway.updates.clear()
+
+        self.assertEqual(self.controller.refresh_loop_panels_after_upgrade(), 1)
+        self.assertEqual(self.controller.refresh_loop_panels_after_upgrade(), 0)
+
+        panel_updates = [
+            item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts
+        ]
+        self.assertEqual(len(panel_updates), 1)
+        self.assertEqual(panel_updates[0]["blocks"][0]["type"], "card")
 
     def test_loop_help_works_through_slash_command_in_loop_channel(self):
         loop = self._activate_loop()

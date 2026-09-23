@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 
+from agent_harness import __version__
 from agent_harness.config import AgentCommandConfig, AppConfig, load_config_from_env
 from agent_harness.deferred import (
     DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
@@ -384,6 +385,7 @@ SETTING_LOOP_IGNORED_NOTICE_PREFIX = "slack.loop_ignored_notice."
 SETTING_LOOP_SUMMARY_NUDGE_PREFIX = "slack.loop_summary_nudge."
 SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
 SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
+SETTING_LOOP_PANELS_RENDERED_VERSION = "slack.loop_panels_rendered_version"
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
 LOOP_SUMMARY_NUDGE_METADATA_KEY = "loop_summary_nudge"
 LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
@@ -1896,6 +1898,22 @@ class SlackTeamController:
             context=context,
         )
         return f"{latest.title}: {latest.status.value}; next run {next_run_text}.", blocks
+
+    def refresh_loop_panels_after_upgrade(self) -> int:
+        """Re-render pinned panels once per version so older loops get the current design."""
+        if self.store.get_setting(SETTING_LOOP_PANELS_RENDERED_VERSION) == __version__:
+            return 0
+        refreshed = 0
+        for loop in self.store.list_loops(limit=1_000):
+            if loop.status in {LoopStatus.ACTIVE, LoopStatus.PAUSED} and loop.charter_message_ts:
+                try:
+                    self._refresh_loop_panel(loop)
+                except Exception:
+                    LOGGER.debug("failed to refresh loop panel %s", loop.loop_id, exc_info=True)
+                    continue
+                refreshed += 1
+        self.store.set_setting(SETTING_LOOP_PANELS_RENDERED_VERSION, __version__)
+        return refreshed
 
     def _refresh_loop_panel(self, loop: Loop) -> None:
         latest = self.store.get_loop(loop.loop_id) or loop
@@ -3585,7 +3603,8 @@ class SlackTeamController:
             self._record_loop_failure(
                 loop,
                 current_run,
-                current_run.error or "the managed loop task was cancelled",
+                current_run.error
+                or "The run stopped before it finished. The thread shows the last step.",
             )
             return True
         if current_run.kind == LoopRunKind.COMPACTION:
@@ -4162,7 +4181,11 @@ class SlackTeamController:
         """Scratch directory, guard decision log, and read-only reference dir."""
         loop_dir = self._loop_dir(loop.loop_id)
         scratch = loop_dir / "scratch"
-        scratch.mkdir(parents=True, exist_ok=True)
+        # Runs may keep credentials here (for example a reader password file).
+        scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with suppress(OSError):
+            loop_dir.chmod(0o700)
+            scratch.chmod(0o700)
         reference = Path(loop.cwd).expanduser() if loop.cwd else self.default_cwd
         return scratch, loop_dir / "guard.jsonl", reference if reference.exists() else None
 
@@ -12988,6 +13011,7 @@ class SocketModeSlackApp:
         self.runtime.agent_icon_url = self.controller._agent_icon_url
         self.controller.cancel_orphaned_active_tasks()
         self.controller.reconcile_loop_runs()
+        self.controller.refresh_loop_panels_after_upgrade()
         self.session_mirror = SessionMirror(
             self.store,
             self.gateway,
