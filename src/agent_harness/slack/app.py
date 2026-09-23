@@ -16,7 +16,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness import __version__
@@ -47,6 +47,11 @@ from agent_harness.loops import (
     LOOP_MAX_CONSECUTIVE_FAILURES,
     LOOP_RUNNER_POLL_FLOOR_SECONDS,
     LOOP_SUMMARY_NUDGE_ATTEMPTS,
+    LOOP_THREAD_ROLLOVER_MAX_RUNS,
+    LOOP_THREAD_ROLLOVER_MIN_RUNS,
+    LOOP_THREAD_ROLLOVER_PENDING_KEY,
+    LOOP_THREAD_ROLLOVER_RUNS_KEY,
+    LOOP_THREAD_RUN_COUNT_KEY,
     MAX_ACTIVE_LOOPS,
     MAX_LOOP_RESOLUTION_ATTEMPTS,
     LoopCompactNowCommand,
@@ -78,6 +83,7 @@ from agent_harness.loops import (
     loop_spec_from_json,
     loop_spec_to_json,
     loop_summary_from_json,
+    loop_thread_rollover_runs,
     loop_visible_messages,
     normalize_loop_channel_name,
     parse_agent_loop_compact_signal,
@@ -88,6 +94,7 @@ from agent_harness.loops import (
     parse_loop_create_request,
     provisional_loop_agent,
     render_loop_journal,
+    slack_loop_date,
     slack_loop_time,
 )
 from agent_harness.models import (
@@ -103,6 +110,7 @@ from agent_harness.models import (
     LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
     LOOP_SCRATCH_DIR_METADATA_KEY,
+    LOOP_SILENT_OUTPUT_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -296,6 +304,7 @@ from agent_harness.slack import (
     build_loop_run_report_blocks,
     build_loop_run_running_blocks,
     build_loop_stop_confirmation_blocks,
+    build_loop_thread_archive_blocks,
     build_repo_root_modal,
     build_settings_blocks,
     build_setup_modal,
@@ -427,6 +436,9 @@ LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
 # launches with them so unattended runs do not stall on the same prompt again.
 LOOP_REMEMBERED_TOOLS_KEY = "allowed_tools"
 LOOP_QUIET_CHOICE_KEY = "quiet_choice"
+LOOP_THREAD_ROLLOVER_SUMMARY_KEY = "thread_rollover_summary"
+# Pace thread cleanup under chat.delete's rate limit (Tier 3, ~50/minute).
+LOOP_THREAD_DELETE_INTERVAL_SECONDS = 1.3
 # Anyone in a loop channel may run or pause it; editing and deleting stay owner-only.
 LOOP_SHARED_ACTIONS = frozenset({"loop.open", "loop.pause", "loop.resume", "loop.run_now"})
 LOOP_PANEL_RECENT_RUNS = 8
@@ -503,6 +515,7 @@ SLACK_TRIGGER_BOUND_ACTIONS = frozenset(
     {
         "external.session.assign.open",
         "loop.create.open",
+        "loop.edit.open",
         "roster.work.open",
         "schedule.change",
     }
@@ -645,6 +658,10 @@ class SlackTeamController:
     def handle_block_action(self, payload: dict) -> None:
         action = _first_action(payload)
         if action is None:
+            return
+        view = payload.get("view") or {}
+        if view.get("callback_id") == "loop.edit" and action.get("block_id") == "loop_quiet":
+            self._redraw_loop_edit_modal(payload)
             return
         decoded = decode_action_value(
             action.get("value") or (action.get("selected_option") or {}).get("value") or "{}"
@@ -2836,6 +2853,32 @@ class SlackTeamController:
             callback()
         return None
 
+    def _redraw_loop_edit_modal(self, payload: dict) -> None:
+        """Show or hide the run-log setting as the Quiet box is toggled."""
+        view = payload.get("view") or {}
+        view_id = view.get("id")
+        metadata = _decode_loop_create_metadata(view.get("private_metadata"))
+        loop = self.store.get_loop(metadata.get("loop_id") or "")
+        if loop is None or not isinstance(view_id, str) or not view_id:
+            return
+        values = view.get("state", {}).get("values", {})
+        quiet = "quiet" in _view_checked_values(values, "loop_quiet", "value")
+        try:
+            self.gateway.update_view(
+                view_id,
+                build_loop_edit_modal(
+                    loop,
+                    schedule_text=describe_loop_schedule(loop.recurrence, loop.timezone),
+                    channel_id=str(metadata.get("channel_id") or loop.channel_id or ""),
+                    message_ts=metadata.get("message_ts"),
+                    quiet=quiet,
+                    thread_rollover_runs=loop_thread_rollover_runs(loop.metadata),
+                ),
+                view.get("hash"),
+            )
+        except Exception:
+            LOGGER.debug("failed to redraw loop edit modal", exc_info=True)
+
     def _handle_loop_edit_submission(
         self,
         payload: dict,
@@ -2868,6 +2911,19 @@ class SlackTeamController:
             if cwd is None:
                 return _view_errors("loop_cwd", "Use an existing local folder path.")
         quiet = "quiet" in _view_checked_values(values, "loop_quiet", "value")
+        rollover_value = (_view_plain_value(values, "loop_thread_rollover", "value") or "").strip()
+        rollover_runs: int | None = None
+        if quiet and rollover_value:
+            try:
+                rollover_runs = int(rollover_value)
+            except ValueError:
+                rollover_runs = 0
+            if not LOOP_THREAD_ROLLOVER_MIN_RUNS <= rollover_runs <= LOOP_THREAD_ROLLOVER_MAX_RUNS:
+                return _view_errors(
+                    "loop_thread_rollover",
+                    f"Use a whole number from {LOOP_THREAD_ROLLOVER_MIN_RUNS} to "
+                    f"{LOOP_THREAD_ROLLOVER_MAX_RUNS}.",
+                )
         visibility_value = _view_selected_value(values, "loop_visibility", "value")
         try:
             visibility = LoopVisibility(visibility_value) if visibility_value else loop.visibility
@@ -2889,6 +2945,16 @@ class SlackTeamController:
                 latest = self.store.get_loop(loop.loop_id) or latest
             if quiet != _loop_is_quiet(latest):
                 self._set_loop_quiet(latest, quiet)
+                latest = self.store.get_loop(loop.loop_id) or latest
+            if rollover_runs is not None and rollover_runs != loop_thread_rollover_runs(
+                latest.metadata
+            ):
+                metadata = dict(latest.metadata)
+                metadata[LOOP_THREAD_ROLLOVER_RUNS_KEY] = rollover_runs
+                self.store.update_loop_metadata(latest.loop_id, metadata)
+                self._append_loop_system_entry(
+                    latest, f"run log now clears every {rollover_runs} quiet runs"
+                )
                 latest = self.store.get_loop(loop.loop_id) or latest
             if cwd is not None:
                 self._update_loop_identity_values(latest, cwd=str(cwd))
@@ -3407,6 +3473,10 @@ class SlackTeamController:
             and kind != LoopRunKind.COMPACTION
             and bool(loop.charter_message_ts)
         )
+        # Compaction is housekeeping: it never posts to the channel (a new top-level
+        # message would notify every member). It runs silently against the pinned
+        # panel's thread, and its output is dropped rather than posted there.
+        silent_run = kind == LoopRunKind.COMPACTION and bool(loop.charter_message_ts)
         if kind == LoopRunKind.COMPACTION:
             header_text = "🧹 Compacting memory"
             header_blocks = [
@@ -3428,7 +3498,7 @@ class SlackTeamController:
                 previous_headline=_shorten(_loop_headline(previous), 160) if previous else None,
             )
         try:
-            if quiet_run:
+            if quiet_run or silent_run:
                 # Quiet runs work silently inside the pinned panel's thread; a card is
                 # only posted to the channel when the run needs attention.
                 posted = PostedMessage(loop.channel_id, str(loop.charter_message_ts))
@@ -3455,8 +3525,10 @@ class SlackTeamController:
             self._record_loop_failure(loop, failed, error_code or str(exc))
             return True
         thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
-        run = replace(run, thread_ts=None if quiet_run else posted.ts)
+        run = replace(run, thread_ts=None if quiet_run or silent_run else posted.ts)
         self.store.create_loop_run(run)
+        if quiet_run:
+            self._count_loop_thread_run(loop)
         guard_paths = (
             self._loop_guard_paths(loop)
             if loop.permission_mode == PermissionMode.READ_ONLY and kind != LoopRunKind.COMPACTION
@@ -3476,6 +3548,11 @@ class SlackTeamController:
                 loop,
                 journal_rendered=journal,
                 bot_name=agent.full_name,
+                thread_rollover_runs=(
+                    _loop_thread_run_count(loop)
+                    if loop.metadata.get(LOOP_THREAD_ROLLOVER_PENDING_KEY) is True
+                    else None
+                ),
             )
             if kind == LoopRunKind.COMPACTION
             else build_loop_run_prompt(
@@ -3504,6 +3581,8 @@ class SlackTeamController:
             LOOP_RUN_ID_METADATA_KEY: run.run_id,
             PERMISSION_MODE_METADATA_KEY: loop.permission_mode.value,
         }
+        if silent_run:
+            metadata[LOOP_SILENT_OUTPUT_METADATA_KEY] = True
         remembered_tools = self._loop_remembered_tools(loop)
         if remembered_tools:
             metadata[LOOP_ALLOWED_TOOLS_METADATA_KEY] = list(remembered_tools)
@@ -3651,6 +3730,20 @@ class SlackTeamController:
         )
         return self._inject_loop_fetch_result(updated_task, payload)
 
+    def _return_loop_signal_error(self, task: AgentTask, message: str) -> bool:
+        """Hand a rejected control line back to the running agent so it can retry.
+
+        Posting the error to Slack instead left the agent unaware, so the run's
+        summary or memory was silently lost."""
+        if self.runtime is None:
+            return False
+        feedback = f"[LOOP HARNESS]\n{message}"
+        if self.runtime.send_to_task(task.task_id, feedback):
+            return True
+        if self.runtime.interrupt_task(task.task_id):
+            return self.runtime.send_to_interrupted_task(task.task_id, feedback)
+        return False
+
     def _inject_loop_fetch_result(self, task: AgentTask, payload: str) -> bool:
         if self.runtime is None:
             return True
@@ -3690,12 +3783,18 @@ class SlackTeamController:
             return True
         parsed = parse_agent_loop_summary_signal(signal)
         if parsed.summary is None:
+            error = parsed.error or "invalid summary payload"
+            if self._return_loop_signal_error(
+                task,
+                f"The harness rejected your LOOP_SUMMARY line: {error}. Nothing was "
+                "recorded. Fix it and emit the corrected LOOP_SUMMARY line.",
+            ):
+                return True
             key = f"{SETTING_LOOP_INVALID_SUMMARY_PREFIX}{run.run_id}"
             if not self.store.get_setting(key):
                 self.gateway.post_thread_reply(
                     thread,
-                    "I could not record that run summary: "
-                    f"{parsed.error or 'invalid summary payload'}.",
+                    f"I could not record that run summary: {error}.",
                     persona=agent,
                     icon_url=self._agent_icon_url(agent),
                 )
@@ -3735,13 +3834,27 @@ class SlackTeamController:
             return True
         parsed = parse_agent_loop_compact_signal(signal)
         if parsed.snapshot is None:
-            self.gateway.post_thread_reply(
-                thread,
-                f"I could not compact loop memory: {parsed.error or 'invalid compaction payload'}.",
-                persona=agent,
-                icon_url=self._agent_icon_url(agent),
-            )
+            error = parsed.error or "invalid compaction payload"
+            if self._return_loop_signal_error(
+                task,
+                f"The harness rejected your LOOP_COMPACT line: {error}. Memory was not "
+                "changed. Emit a corrected LOOP_COMPACT line (tighten the snapshot if it "
+                "was too long).",
+            ):
+                return True
+            if task.metadata.get(LOOP_SILENT_OUTPUT_METADATA_KEY) is not True:
+                self.gateway.post_thread_reply(
+                    thread,
+                    f"I could not compact loop memory: {error}.",
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                )
             return True
+        if parsed.thread_summary and loop.metadata.get(LOOP_THREAD_ROLLOVER_PENDING_KEY):
+            metadata = dict(loop.metadata)
+            metadata[LOOP_THREAD_ROLLOVER_SUMMARY_KEY] = parsed.thread_summary
+            self.store.update_loop_metadata(loop.loop_id, metadata)
+            loop = self.store.get_loop(loop.loop_id) or loop
         if any(
             entry.kind == "compaction" and entry.run_id == run.run_id
             for entry in self.store.list_loop_journal(
@@ -3812,6 +3925,7 @@ class SlackTeamController:
                     current_run,
                     "the compaction run completed without a memory snapshot",
                 )
+                self._rollover_loop_thread_if_pending(loop)
                 return True
             self._mark_loop_task_done(current_task)
             self.store.update_loop_run(
@@ -3820,6 +3934,7 @@ class SlackTeamController:
                 finished_at=utc_now(),
             )
             self.store.reset_loop_failures(loop.loop_id)
+            self._rollover_loop_thread_if_pending(loop)
             return True
         if not current_run.summary_json and self._start_loop_summary_nudge(
             loop,
@@ -3849,6 +3964,7 @@ class SlackTeamController:
         )
         self.store.reset_loop_failures(loop.loop_id)
         self._queue_loop_compaction_if_needed(loop)
+        self._queue_loop_thread_rollover_if_needed(loop)
         self._publish_loop_run_card(
             loop, self.store.get_loop_run(current_run.run_id) or current_run
         )
@@ -4061,6 +4177,142 @@ class SlackTeamController:
                 limit=10_000,
             )
         )
+
+    def _count_loop_thread_run(self, loop: Loop) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        metadata = dict(latest.metadata)
+        metadata[LOOP_THREAD_RUN_COUNT_KEY] = _loop_thread_run_count(latest) + 1
+        self.store.update_loop_metadata(latest.loop_id, metadata)
+
+    def _queue_loop_thread_rollover_if_needed(self, loop: Loop) -> None:
+        """Quiet runs pile up in the pinned panel's thread; archive it every N runs.
+
+        The rollover rides on a memory compaction run so the agent can leave a short
+        note for posterity, then _rollover_loop_thread swaps in a fresh panel."""
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if (
+            not _loop_is_quiet(latest)
+            or not latest.charter_message_ts
+            or latest.metadata.get(LOOP_THREAD_ROLLOVER_PENDING_KEY) is True
+            or _loop_thread_run_count(latest) < loop_thread_rollover_runs(latest.metadata)
+        ):
+            return
+        metadata = dict(latest.metadata)
+        metadata[LOOP_THREAD_ROLLOVER_PENDING_KEY] = True
+        metadata["compaction_pending"] = True
+        metadata.pop(LOOP_THREAD_ROLLOVER_SUMMARY_KEY, None)
+        self.store.update_loop_metadata(latest.loop_id, metadata)
+
+    def _rollover_loop_thread_if_pending(self, loop: Loop) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if latest.metadata.get(LOOP_THREAD_ROLLOVER_PENDING_KEY) is not True:
+            return
+        if not _loop_is_quiet(latest):
+            # Quiet mode was turned off meanwhile: every run has its own thread now.
+            metadata = dict(latest.metadata)
+            metadata.pop(LOOP_THREAD_ROLLOVER_PENDING_KEY, None)
+            metadata.pop(LOOP_THREAD_ROLLOVER_SUMMARY_KEY, None)
+            self.store.update_loop_metadata(latest.loop_id, metadata)
+            return
+        try:
+            self._rollover_loop_thread(latest)
+        except Exception:
+            LOGGER.warning("failed to roll over loop thread %s", latest.loop_id, exc_info=True)
+
+    def _rollover_loop_thread(self, loop: Loop) -> None:
+        """Replace the pinned panel (and its thread of quiet runs) with a fresh one.
+
+        One summary message stays in the channel for posterity; the old panel and
+        every reply the bot can delete are removed in the background."""
+        old_ts = loop.charter_message_ts
+        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
+        metadata = dict(loop.metadata)
+        agent_note = metadata.pop(LOOP_THREAD_ROLLOVER_SUMMARY_KEY, None)
+        metadata.pop(LOOP_THREAD_ROLLOVER_PENDING_KEY, None)
+        if not loop.channel_id or not old_ts or agent is None:
+            self.store.update_loop_metadata(loop.loop_id, metadata)
+            return
+        started_at = _slack_ts_datetime(old_ts)
+        runs = [
+            run
+            for run in self.store.list_loop_runs(loop.loop_id, limit=10_000)
+            if run.kind != LoopRunKind.COMPACTION
+            and (started_at is None or run.created_at >= started_at)
+        ]
+        text, blocks = build_loop_thread_archive_blocks(
+            period_text=_loop_archive_period_text(runs, loop.timezone),
+            runs=len(runs),
+            succeeded=sum(1 for run in runs if _loop_run_succeeded(run)),
+            flagged=sum(1 for run in runs if _loop_run_flagged(run)),
+            failed=sum(1 for run in runs if run.status == LoopRunStatus.FAILED),
+            agent_note=agent_note if isinstance(agent_note, str) else None,
+        )
+        self.gateway.post_session_parent(
+            loop.channel_id,
+            text,
+            persona=agent,
+            icon_url=self._agent_icon_url(agent),
+            blocks=blocks,
+        )
+        panel_text, panel_blocks = self._loop_panel(loop)
+        charter = self.gateway.post_session_parent(
+            loop.channel_id,
+            panel_text,
+            persona=agent,
+            icon_url=self._agent_icon_url(agent),
+            blocks=panel_blocks,
+        )
+        self._pin_message(loop.channel_id, charter.ts, "loop panel")
+        metadata[LOOP_THREAD_RUN_COUNT_KEY] = 0
+        self.store.update_loop_metadata(loop.loop_id, metadata)
+        self.store.update_loop_channel(
+            loop.loop_id,
+            channel_id=loop.channel_id,
+            channel_name=loop.channel_name or "",
+            charter_message_ts=charter.ts,
+        )
+        self._append_loop_system_entry(
+            loop, f"archived the panel thread after {len(runs)} quiet runs"
+        )
+        self._refresh_loop_panel(loop)
+        threading.Thread(
+            target=self._delete_loop_thread,
+            args=(loop.channel_id, old_ts, loop.owner_slack_user_id),
+            name=f"loop-thread-cleanup-{loop.loop_id}",
+            daemon=True,
+        ).start()
+
+    def _delete_loop_thread(self, channel_id: str, thread_ts: str, owner_id: str) -> None:
+        with suppress(Exception):
+            self.gateway.unpin_message(channel_id, thread_ts)
+        try:
+            messages = self.gateway.thread_messages(channel_id, thread_ts, limit=5_000)
+        except Exception:
+            LOGGER.warning("failed to list loop thread %s for cleanup", thread_ts, exc_info=True)
+            messages = []
+        replies = [
+            message for message in messages if message.get("ts") and message.get("ts") != thread_ts
+        ]
+        # Slack has no "delete thread": removing only the parent leaves a "This
+        # message was deleted" placeholder with every reply still reachable. So
+        # replies go first, then the parent. The bot can only delete its own
+        # messages; the owner's replies need the optional owner token.
+        kept = 0
+        for message in reversed(replies):
+            ts = str(message["ts"])
+            deleted = self.gateway.delete_message(channel_id, ts)
+            if not deleted and message.get("user") == owner_id and not message.get("bot_id"):
+                deleted = self.gateway.delete_message(channel_id, ts, as_owner=True)
+            kept += 0 if deleted else 1
+            time.sleep(LOOP_THREAD_DELETE_INTERVAL_SECONDS)
+        self.gateway.delete_message(channel_id, thread_ts)
+        if kept:
+            LOGGER.warning(
+                "loop thread %s cleanup left %d replies; set SLACK_USER_TOKEN so the "
+                "owner's replies can be deleted too",
+                thread_ts,
+                kept,
+            )
 
     def _queue_loop_compaction_if_needed(self, loop: Loop) -> None:
         entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
@@ -7357,6 +7609,7 @@ class SlackTeamController:
                         schedule_text=describe_loop_schedule(loop.recurrence, loop.timezone),
                         channel_id=channel_id,
                         message_ts=message_ts,
+                        thread_rollover_runs=loop_thread_rollover_runs(loop.metadata),
                     ),
                 )
             except Exception:
@@ -13588,7 +13841,7 @@ class SocketModeSlackApp:
         self._active_socket_client = None
         self.store = Store(config.state_db)
         self.store.init_schema()
-        self.gateway = SlackGateway(config.slack.bot_token)
+        self.gateway = SlackGateway(config.slack.bot_token, user_token=config.slack.user_token)
         auth = self.gateway.auth_test()
         _ensure_codex_mcp_for_slack_app(config)
         _ensure_claude_native_input_hook_for_slack_app(config)
@@ -14339,7 +14592,10 @@ def _is_trigger_bound_block_action_request(request) -> bool:
     if action_id in SLACK_TRIGGER_BOUND_ACTIONS:
         return True
     try:
-        action_name = decode_action_value(action.get("value") or "{}").get("action")
+        # Overflow menus carry the action in the chosen option, not the element.
+        action_name = decode_action_value(
+            action.get("value") or (action.get("selected_option") or {}).get("value") or "{}"
+        ).get("action")
     except (json.JSONDecodeError, TypeError, ValueError):
         return False
     return action_name in SLACK_TRIGGER_BOUND_ACTIONS
@@ -15755,6 +16011,39 @@ def _decode_roster_work_metadata(value) -> dict[str, str]:
 
 def _loop_is_quiet(loop: Loop) -> bool:
     return loop.metadata.get("quiet") is True
+
+
+def _loop_thread_run_count(loop: Loop) -> int:
+    value = loop.metadata.get(LOOP_THREAD_RUN_COUNT_KEY)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _slack_ts_datetime(ts: str) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(float(ts), tz=UTC)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _loop_run_succeeded(run: LoopRun) -> bool:
+    return run.status == LoopRunStatus.DONE
+
+
+def _loop_run_flagged(run: LoopRun) -> bool:
+    summary = loop_summary_from_json(run.summary_json)
+    return (
+        run.status == LoopRunStatus.DONE
+        and summary is not None
+        and summary.status in {"found_issue", "action_taken"}
+    )
+
+
+def _loop_archive_period_text(runs: list[LoopRun], timezone: str | None) -> str:
+    moments = [run.due_at for run in runs if run.due_at is not None]
+    if not moments:
+        return "No runs"
+    first, last = slack_loop_date(min(moments), timezone), slack_loop_date(max(moments), timezone)
+    return first if first.split("|")[1] == last.split("|")[1] else f"{first} to {last}"
 
 
 def _loop_owns_parent_message(task: AgentTask) -> bool:

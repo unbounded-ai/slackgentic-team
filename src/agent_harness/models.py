@@ -24,6 +24,9 @@ LOOP_ALLOWED_TOOLS_METADATA_KEY = "loop_allowed_tools"
 LOOP_SCRATCH_DIR_METADATA_KEY = "loop_scratch_dir"
 LOOP_REFERENCE_DIR_METADATA_KEY = "loop_reference_dir"
 LOOP_GUARD_LOG_METADATA_KEY = "loop_guard_log"
+# Task metadata: the agent's visible text is dropped instead of posted to Slack
+# (memory compaction runs work without a thread of their own).
+LOOP_SILENT_OUTPUT_METADATA_KEY = "loop_silent_output"
 MODEL_OVERRIDE_METADATA_KEY = "model_override"
 EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
 DEFERRED_WORK_DEPENDENCY_PREFIX = "deferred_work:"

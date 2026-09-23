@@ -9,6 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_harness.loops import (
+    LOOP_THREAD_ROLLOVER_DEFAULT_RUNS,
+    LOOP_THREAD_ROLLOVER_MAX_RUNS,
+    LOOP_THREAD_ROLLOVER_MIN_RUNS,
+)
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
@@ -544,12 +549,21 @@ def build_loop_panel_blocks(
         "block_id": f"loop.{context}.mission.{loop.loop_id}"[:255],
         "text": {"type": "mrkdwn", "text": _quote_mrkdwn(mission)},
     }
+    blocks: list[dict[str, Any]] = [card]
+    # Cards only hold buttons, so the "more" menu sits in its own row right under
+    # the card instead of hanging off the mission text.
     overflow = _loop_overflow(
         loop, include_primary=False, remembered_approvals=remembered_approvals
     )
     if overflow is not None:
-        mission_section["accessory"] = overflow
-    blocks: list[dict[str, Any]] = [card, mission_section]
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"loop.{context}.more.{loop.loop_id}"[:255],
+                "elements": [overflow],
+            }
+        )
+    blocks.append(mission_section)
     history: list[str] = []
     if recent_runs:
         chips = " ".join(
@@ -777,12 +791,92 @@ def build_loop_delete_confirmation_blocks(loop: Loop) -> list[dict[str, Any]]:
     ]
 
 
+def _loop_thread_rollover_block(*, quiet: bool, runs: int) -> dict[str, Any]:
+    if not quiet:
+        return {
+            "type": "context",
+            "block_id": "loop_thread_rollover_off",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "_Clearing the run log only applies to quiet loops. This loop posts "
+                        "every run as its own message, so there is no shared log to clear._"
+                    ),
+                }
+            ],
+        }
+    return {
+        "type": "input",
+        "block_id": "loop_thread_rollover",
+        "optional": True,
+        "label": {"type": "plain_text", "text": "Clear the run log every"},
+        "hint": {
+            "type": "plain_text",
+            "text": (
+                "Quiet runs log to the pinned panel's thread. After this many runs that "
+                "thread is deleted and replaced by one summary message and a fresh panel. "
+                f"Default {LOOP_THREAD_ROLLOVER_DEFAULT_RUNS}."
+            ),
+        },
+        "element": {
+            "type": "number_input",
+            "action_id": "value",
+            "is_decimal_allowed": False,
+            "min_value": str(LOOP_THREAD_ROLLOVER_MIN_RUNS),
+            "max_value": str(LOOP_THREAD_ROLLOVER_MAX_RUNS),
+            "initial_value": str(runs),
+            "placeholder": {"type": "plain_text", "text": "runs"},
+        },
+    }
+
+
+def build_loop_thread_archive_blocks(
+    *,
+    period_text: str,
+    runs: int,
+    succeeded: int,
+    flagged: int,
+    failed: int,
+    agent_note: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """The one message a quiet loop leaves behind when its panel thread is archived."""
+    run_word = "run" if runs == 1 else "runs"
+    counts = [f"{runs} quiet {run_word}", f"✅ {succeeded} succeeded"]
+    if flagged:
+        counts.append(f"🔎 {flagged} flagged")
+    if failed:
+        counts.append(f"{LOOP_RUN_ERROR_EMOJI} {failed} failed")
+    stats = " · ".join(counts)
+    lines = [f"🗂️ *Run log archived* · {period_text}", stats]
+    if agent_note:
+        lines.append(_quote_mrkdwn(_mrkdwn_escape(agent_note)))
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n".join(lines)[:2900]},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "The old log was cleared; the pinned panel below starts a fresh one.",
+                }
+            ],
+        },
+    ]
+    return f"Run log archived: {stats}.", blocks
+
+
 def build_loop_edit_modal(
     loop: Loop,
     *,
     schedule_text: str,
     channel_id: str,
     message_ts: str | None = None,
+    quiet: bool | None = None,
+    thread_rollover_runs: int = LOOP_THREAD_ROLLOVER_DEFAULT_RUNS,
 ) -> dict[str, Any]:
     metadata = {"loop_id": loop.loop_id, "channel_id": channel_id}
     if message_ts:
@@ -796,7 +890,8 @@ def build_loop_edit_modal(
     current_mode = next(
         (option for option in modes if option["value"] == loop.permission_mode.value), modes[0]
     )
-    quiet = loop.metadata.get("quiet") is True
+    if quiet is None:
+        quiet = loop.metadata.get("quiet") is True
     quiet_option = _option(
         "Only post when a run needs attention",
         "quiet",
@@ -873,6 +968,8 @@ def build_loop_edit_modal(
                 "type": "input",
                 "block_id": "loop_quiet",
                 "optional": True,
+                # Toggling redraws the form so the log setting below follows it.
+                "dispatch_action": True,
                 "label": {"type": "plain_text", "text": "Notifications"},
                 "element": {
                     "type": "checkboxes",
@@ -881,6 +978,7 @@ def build_loop_edit_modal(
                     **({"initial_options": [quiet_option]} if quiet else {}),
                 },
             },
+            _loop_thread_rollover_block(quiet=quiet, runs=thread_rollover_runs),
             {
                 "type": "input",
                 "block_id": "loop_cwd",

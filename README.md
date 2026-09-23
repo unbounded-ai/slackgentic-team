@@ -222,7 +222,7 @@ and a strip of recent runs linking to each report. Its buttons run the loop now,
 pause or resume it, and open an **Edit** form for the mission, schedule,
 permissions, reference directory, and channel visibility (switching visibility
 recreates the channel with the same members and archives the old one); the
-overflow menu compacts memory, forgets remembered approvals, stops the loop, or
+**⋯** menu under the card compacts memory, forgets remembered approvals, stops the loop, or
 deletes it (stop and archive its channel). Anyone in the loop's channel may run,
 pause, or resume it; only the owner can edit or delete it. `loops` in the main
 channel shows every loop as a card in one carousel, led by a **New loop** card.
@@ -232,7 +232,16 @@ work silently in the pinned panel's thread and only tick the panel's "last check
 line. A run that finds something (or fails) posts one report card, so a
 notification always means real signal. Ask for it when creating the loop ("only
 post when there are errors"), tick *Only post when a run needs attention* in
-**Edit**, or use `loop quiet: on`.
+**Edit**, or use `loop quiet: on`. So the panel's thread does not grow forever,
+a quiet loop clears it every 120 runs (change it under **Edit** → *Clear the run
+log every*): the old panel and its thread are deleted, one message in the channel
+records the dates, run counts, and the agent's short note on the period, and a
+fresh panel is pinned. Loops that post every run have no shared log to clear.
+The bot can only delete its own messages, so to also remove replies you wrote in
+that thread, give Slackgentic a token that acts as you: in your Slack app's
+**OAuth & Permissions**, add the User Token Scope `chat:write`, reinstall the
+app, and set the **User OAuth Token** (`xoxp-…`) as `SLACK_USER_TOKEN` in the
+Slackgentic config, then restart. It is used only to delete your replies there.
 
 New loops are **read-only**. Every tool call passes through a loop guard before
 it runs: known reads run without asking, anything that could change state
@@ -249,6 +258,7 @@ for later runs.
 
 Run summaries and owner notes form a durable journal; older run detail is
 available through bounded retrieval, and long journals compact automatically.
+Compaction runs silently: it never posts to the channel.
 
 Inside the loop channel, only the owner can instruct the bot. Other members'
 messages remain visible to people, but Slackgentic marks them with 🚫 and never
