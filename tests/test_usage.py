@@ -75,58 +75,27 @@ class UsageTests(unittest.TestCase):
         assert usage is not None
         self.assertEqual(usage.total_tokens, 17)
 
-    def test_format_daily_usage_emphasizes_bars_and_percentages(self):
+    def test_format_daily_usage_shows_codex_quota_and_tokens(self):
         codex = parse_token_count(
             {
                 "timestamp": "2026-04-26T17:00:00.000Z",
                 "payload": {
                     "type": "token_count",
-                    "info": {
-                        "total_token_usage": {
-                            "input_tokens": 10,
-                            "cached_input_tokens": 5,
-                            "output_tokens": 3,
-                            "total_tokens": 18,
-                        }
-                    },
-                    "rate_limits": {"primary": {"used_percent": 25.0}},
+                    "info": {"total_token_usage": {"total_tokens": 18}},
+                    "rate_limits": {"primary": {"used_percent": 25.0, "window_minutes": 300}},
                 },
             },
             "codex-session",
         )
-        claude_usage = claude_usage_from_record(
-            {
-                "message": {
-                    "usage": {
-                        "input_tokens": 10,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 2,
-                    }
-                }
-            }
-        )
-        assert claude_usage is not None
-        from agent_harness.models import UsageSnapshot
 
-        claude = UsageSnapshot(
-            provider=Provider.CLAUDE,
-            session_id="claude-session",
-            as_of=datetime(2026, 4, 26, 18, 0, tzinfo=UTC),
-            usage=claude_usage,
-        )
+        text = format_daily_usage("2026-04-26", [codex], [codex])
 
-        text = format_daily_usage("2026-04-26", [codex, claude], [codex, claude])
-
-        self.assertIn("Agent status", text)
-        self.assertIn("quota window", text)
-        self.assertIn("█", text)
-        self.assertIn("week share", text)
-        self.assertIn("Claude", text)
-        self.assertIn("```", text)
-        self.assertIn("Mix:", text)
-        self.assertIn("Tokens: `18` today / `18` week", text)
-        self.assertIn("Updated: `2026-04-26 17:00 UTC`", text)
+        self.assertIn("Agent status · 2026-04-26", text)
+        self.assertIn("Codex CLI", text)
+        self.assertIn("5h   ▰▰▰▱▱▱▱▱▱▱ 25%", text)
+        self.assertIn("Today 18 tokens · 1 session · week 18", text)
+        self.assertIn("Claude CLI + app", text)
+        self.assertIn("Quota unavailable right now", text)
 
 
 if __name__ == "__main__":

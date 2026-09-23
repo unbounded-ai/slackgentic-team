@@ -314,15 +314,20 @@ class CodexProvider:
         for path in transcript_paths:
             session_id = _session_id_from_filename(path) or None
             latest_for_session: UsageSnapshot | None = None
+            surface: str | None = None
             for _, record in iter_jsonl(path):
+                payload = record.get("payload")
+                if record.get("type") == "session_meta" and isinstance(payload, dict):
+                    originator = payload.get("originator")
+                    surface = str(originator) if originator else surface
+                    continue
                 timestamp = parse_timestamp(record.get("timestamp"))
                 if not timestamp or timestamp.date().isoformat() != day:
                     continue
-                payload = record.get("payload")
                 if isinstance(payload, dict) and payload.get("type") == "token_count":
                     latest_for_session = parse_token_count(record, session_id)
             if latest_for_session:
-                snapshots.append(latest_for_session)
+                snapshots.append(replace(latest_for_session, surface=surface))
         return snapshots
 
 

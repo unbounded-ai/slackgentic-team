@@ -12,6 +12,7 @@ from typing import Any
 
 from agent_harness.models import AgentTaskKind, Provider, TeamAgentKind
 from agent_harness.providers import ClaudeProvider, CodexProvider
+from agent_harness.providers.quota import probe_claude_quota, read_claude_sign_ins
 from agent_harness.providers.usage import (
     collect_daily_usage,
     collect_weekly_usage,
@@ -645,7 +646,15 @@ def _usage(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(_jsonable(snapshots), indent=2, sort_keys=True))
     else:
-        print(format_daily_usage(day, snapshots, collect_weekly_usage(day, home=args.home)))
+        print(
+            format_daily_usage(
+                day,
+                snapshots,
+                collect_weekly_usage(day, home=args.home),
+                claude_quota=probe_claude_quota(),
+                claude_sign_ins=read_claude_sign_ins(args.home),
+            )
+        )
     return 0
 
 

@@ -1032,6 +1032,20 @@ class Store:
         ).fetchone()
         return _agent_task_from_row(row) if row else None
 
+    def get_latest_task_by_session(self, provider: Provider, session_id: str) -> AgentTask | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM agent_tasks
+            WHERE session_provider = ?
+              AND session_id = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (provider.value, session_id),
+        ).fetchone()
+        return _agent_task_from_row(row) if row else None
+
     def has_agent_task_session(self, provider: Provider, session_id: str) -> bool:
         row = self.conn.execute(
             """

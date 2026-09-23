@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
@@ -21,8 +22,10 @@ from agent_harness.storage.store import Store
 from agent_harness.team import (
     AGENT_LIMIT_MESSAGE,
     AVATAR_IDENTITY_BANK,
+    DEFAULT_AGENT_AVATAR_BASE_URL,
     DEFAULT_AVATAR_BANK_SIZE,
     DEFAULT_TEAM_SIZE,
+    agent_card_icon_url,
     agent_icon_url,
     build_initial_model_team,
     build_initial_team,
@@ -490,6 +493,17 @@ class TeamTests(unittest.TestCase):
             agent_icon_url(store, worker),
             f"https://example.com/avatars/{worker.avatar_slug}.png",
         )
+        self.assertEqual(
+            agent_card_icon_url(store, worker),
+            f"https://example.com/avatars/{worker.avatar_slug}.png",
+        )
+        bundled = type("SettingsStore", (), {"get_setting": lambda self, key: None})()
+        with patch.dict("os.environ", {"SLACKGENTIC_AGENT_AVATAR_BASE_URL": ""}):
+            self.assertEqual(
+                agent_card_icon_url(bundled, worker),
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/64/{worker.avatar_slug}.png",
+            )
+        self.assertEqual(agent_card_icon_url(store, loop_agent), "https://example.com/loop.png")
 
     def test_handoff_request_uses_plain_target_handle_on_new_paragraph(self):
         sender, target = build_initial_model_team(codex_count=2, claude_count=0)

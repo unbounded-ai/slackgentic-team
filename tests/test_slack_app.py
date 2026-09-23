@@ -6022,6 +6022,72 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_status_refresh_button_updates_the_card_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(
+                    store, gateway, default_channel_id="C1", home=Path(tmp)
+                )
+                controller.handle_slash_command({"text": "status", "channel_id": "C1"})
+                card_ts = gateway.updates[-1]["ts"]
+
+                controller.handle_block_action(
+                    {
+                        "channel": {"id": "C1"},
+                        "container": {"message_ts": card_ts},
+                        "actions": [
+                            {
+                                "action_id": "usage.refresh",
+                                "value": encode_action_value("usage.refresh"),
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(len(gateway.posts), 1)
+                self.assertEqual(gateway.updates[-1]["ts"], card_ts)
+                blocks = gateway.updates[-1]["blocks"]
+                self.assertEqual(blocks[0]["type"], "header")
+                self.assertEqual(blocks[-1]["elements"][0]["action_id"], "usage.refresh")
+            finally:
+                store.close()
+
+    def test_status_probes_claude_quota_once_and_reuses_a_fresh_reading(self):
+        from agent_harness.providers.quota import ClaudeQuota, QuotaWindow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(
+                    store, gateway, default_channel_id="C1", home=Path(tmp)
+                )
+                controller.runtime = types.SimpleNamespace(
+                    commands=types.SimpleNamespace(claude_binary="/opt/example/claude")
+                )
+                quota = ClaudeQuota(
+                    windows=(QuotaWindow("5h", 42.0, utc_now() + timedelta(hours=2)),),
+                    as_of=utc_now(),
+                )
+                calls = []
+
+                def probe(binary, **kwargs):
+                    calls.append(binary)
+                    return quota
+
+                with patch("agent_harness.slack.app.probe_claude_quota", probe):
+                    controller.publish_usage("C1")
+                    controller.publish_usage("C1")
+
+                self.assertEqual(calls, ["/opt/example/claude"])
+                self.assertIn("42%", str(gateway.updates[-1]["blocks"]))
+            finally:
+                store.close()
+
     def test_slash_command_targets_configured_agent_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

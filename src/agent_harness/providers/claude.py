@@ -304,6 +304,7 @@ class ClaudeProvider:
     def usage_for_day(self, transcript_paths: Iterable[Path], day: str) -> list[UsageSnapshot]:
         totals: dict[str, TokenUsage] = {}
         latest: dict[str, datetime] = {}
+        surfaces: dict[str, str] = {}
         seen_message_ids: set[tuple[str, str]] = set()
         for path in transcript_paths:
             session_id = path.stem
@@ -312,6 +313,8 @@ class ClaudeProvider:
                 if not timestamp or timestamp.date().isoformat() != day:
                     continue
                 session_id = str(record.get("sessionId") or session_id)
+                if record.get("entrypoint"):
+                    surfaces[session_id] = str(record["entrypoint"])
                 usage = claude_usage_from_record(record)
                 if not usage:
                     continue
@@ -329,6 +332,7 @@ class ClaudeProvider:
                 as_of=latest[session_id],
                 usage=usage,
                 remaining_description="remaining quota unavailable from local Claude transcripts",
+                surface=surfaces.get(session_id),
             )
             for session_id, usage in sorted(totals.items())
         ]

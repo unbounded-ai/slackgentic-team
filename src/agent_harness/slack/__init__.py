@@ -5,6 +5,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,11 @@ from agent_harness.models import (
     TeamAgentKind,
 )
 from agent_harness.pr_links import pr_urls_from_metadata, slack_pr_links
+from agent_harness.providers.usage import (
+    AccountStatus,
+    account_heading,
+    account_tokens_line,
+)
 from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
@@ -1303,6 +1309,8 @@ ROSTER_HIRE_OPTIONS: tuple[tuple[str, str | None, str | None], ...] = (
 def build_team_roster_blocks(
     agents: list[TeamAgent],
     statuses: dict[str, AgentRosterStatus] | None = None,
+    *,
+    icon_urls: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """The team roster: a summary, team actions, and a carousel of agent cards per group."""
     visible_agents = [agent for agent in agents if agent.kind != TeamAgentKind.LOOP]
@@ -1376,7 +1384,11 @@ def build_team_roster_blocks(
                     "type": "carousel",
                     "block_id": f"{block_id}.cards.{start // 10}",
                     "elements": [
-                        _agent_roster_card(agent, _status(agent, statuses))
+                        _agent_roster_card(
+                            agent,
+                            _status(agent, statuses),
+                            (icon_urls or {}).get(agent.agent_id),
+                        )
                         for agent in ordered[start : start + 10]
                     ],
                 }
@@ -1388,7 +1400,11 @@ def _status(agent: TeamAgent, statuses: dict[str, AgentRosterStatus] | None):
     return statuses.get(agent.agent_id) if statuses else None
 
 
-def _agent_roster_card(agent: TeamAgent, status: AgentRosterStatus | None) -> dict[str, Any]:
+def _agent_roster_card(
+    agent: TeamAgent,
+    status: AgentRosterStatus | None,
+    icon_url: str | None = None,
+) -> dict[str, Any]:
     label = status.label if status else "Available"
     subtitle = f"{ROSTER_STATUS_STYLES.get(label, '•')} {label}"
     if agent.provider_preference is not None:
@@ -1408,6 +1424,8 @@ def _agent_roster_card(agent: TeamAgent, status: AgentRosterStatus | None) -> di
         "subtitle": {"type": "mrkdwn", "text": subtitle[:150]},
         "body": {"type": "mrkdwn", "text": body},
     }
+    if icon_url:
+        card["icon"] = {"type": "image", "image_url": icon_url, "alt_text": agent.full_name}
     actions: list[dict[str, Any]] = []
     if status and status.task_id:
         actions.append(
@@ -2310,6 +2328,96 @@ def _query_value(query: str, name: str) -> str | None:
 
 def _normalize_bold_markers(text: str) -> str:
     return re.sub(r"\*\*([^*\n][^*]*?)\*\*", r"*\1*", text)
+
+
+STATUS_REFRESH_ACTION = "usage.refresh"
+
+
+def build_status_blocks(
+    accounts: list[AccountStatus],
+    *,
+    day_text: str,
+    updated_at: datetime,
+) -> list[dict[str, Any]]:
+    """Quota and usage per signed-in account, most urgent numbers first."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "📊 Agent status", "emoji": True},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"{day_text} · updated {_slack_time(updated_at, '{time}')}",
+                }
+            ],
+        },
+    ]
+    for account in accounts:
+        blocks.append({"type": "divider"})
+        lines = [f"*{_mrkdwn_escape(account_heading(account))}*"]
+        for window in account.windows:
+            lines.append(_status_window_line(window))
+        if account.quota_note:
+            lines.append(f"_{_mrkdwn_escape(account.quota_note)}_")
+        blocks.append(
+            {
+                "type": "section",
+                "block_id": f"usage.account.{account.key}"[:255],
+                "text": {"type": "mrkdwn", "text": "\n".join(lines)[:2900]},
+            }
+        )
+        details = [account_tokens_line(account)]
+        if account.top_sessions:
+            top = " · ".join(
+                f"{_mrkdwn_escape(_shorten_text(session.label, 48))} *{session.percent:.0f}%*"
+                for session in account.top_sessions
+            )
+            details.append(f"Top today: {top}")
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "\n".join(details)[:2900]}],
+            }
+        )
+    blocks.append(
+        {
+            "type": "actions",
+            "block_id": "usage.actions",
+            "elements": [
+                _button(
+                    "↻ Refresh",
+                    STATUS_REFRESH_ACTION,
+                    encode_action_value(STATUS_REFRESH_ACTION),
+                )
+            ],
+        }
+    )
+    return blocks
+
+
+def _status_window_line(window) -> str:
+    percent = window.used_percent
+    reset = ""
+    if window.resets_at is not None:
+        reset = f"  ·  resets {_slack_time(window.resets_at, '{date_short_pretty} at {time}')}"
+    return f"{_quota_bar(percent)}  *{percent:.0f}%* {window.label}{reset}"
+
+
+def _quota_bar(percent: float, width: int = 10) -> str:
+    clamped = max(0.0, min(100.0, percent))
+    filled = int(clamped / 100.0 * width + 0.5)
+    if clamped > 0 and filled == 0:
+        filled = 1
+    color = "🟥" if clamped >= 90 else "🟧" if clamped >= 75 else "🟩"
+    return color * filled + "⬜" * (width - filled)
+
+
+def _slack_time(value: datetime, token_format: str) -> str:
+    fallback = value.astimezone(UTC).strftime("%b %d %H:%M UTC")
+    return f"<!date^{int(value.timestamp())}^{token_format}|{fallback}>"
 
 
 def _button(

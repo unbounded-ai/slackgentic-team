@@ -36,6 +36,8 @@ DEFAULT_AGENT_AVATAR_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/avatars"
 )
 DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
+# Avatar sets keep a copy at this size in a subdirectory, for card icons.
+AGENT_CARD_ICON_SIZE = 64
 
 COLORS = [
     "#2457a6",
@@ -801,6 +803,20 @@ def agent_icon_url(store, agent: TeamAgent) -> str | None:
     if base_url.lower() in DISABLED_AVATAR_BASE_VALUES:
         return None
     return f"{base_url.rstrip('/')}/{agent.avatar_slug}.png"
+
+
+def agent_card_icon_url(store, agent: TeamAgent) -> str | None:
+    """A small avatar for Block Kit card icons.
+
+    Slack crops card icons from the middle of the image at its own size, so a
+    full-size avatar shows only a nose. The bundled avatars ship a 64px copy;
+    a custom avatar set is used as it is.
+    """
+    url = agent_icon_url(store, agent)
+    bundled_prefix = f"{DEFAULT_AGENT_AVATAR_BASE_URL}/"
+    if url is None or agent.metadata.get("icon_url") or not url.startswith(bundled_prefix):
+        return url
+    return f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{AGENT_CARD_ICON_SIZE}/{url[len(bundled_prefix) :]}"
 
 
 def agent_personal_context(agent: TeamAgent) -> str:

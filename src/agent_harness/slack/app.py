@@ -186,7 +186,13 @@ from agent_harness.pm import (
 )
 from agent_harness.pr_links import metadata_with_pr_urls, pr_urls_from_metadata
 from agent_harness.providers import ClaudeProvider, CodexProvider
+from agent_harness.providers.quota import (
+    ClaudeQuota,
+    probe_claude_quota,
+    read_claude_sign_ins,
+)
 from agent_harness.providers.usage import (
+    build_status_report,
     collect_daily_usage,
     collect_weekly_usage,
     day_string,
@@ -261,6 +267,7 @@ from agent_harness.slack import (
     LOOP_RUN_ERROR_EMOJI,
     LOOP_RUN_RUNNING_EMOJI,
     LOOP_RUN_SKIPPED_EMOJI,
+    STATUS_REFRESH_ACTION,
     AgentRosterStatus,
     LoopRunCardChart,
     LoopRunCardMetric,
@@ -283,6 +290,7 @@ from agent_harness.slack import (
     build_loop_run_running_blocks,
     build_loop_stop_confirmation_blocks,
     build_setup_modal,
+    build_status_blocks,
     build_task_thread_blocks,
     build_team_roster_blocks,
     build_unassigned_external_session_blocks,
@@ -307,6 +315,7 @@ from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
     MAX_TEAM_AGENTS,
+    agent_card_icon_url,
     agent_icon_url,
     agent_personal_context,
     build_initialization_messages,
@@ -354,6 +363,9 @@ SETTING_ROSTER_DISCOVERY_PREFIX = "slack.roster_discovery."
 SETTING_ROSTER_RENDER_HASH_PREFIX = "slack.roster_render_hash."
 SETTING_ROSTER_PINNED_PREFIX = "slack.roster_pinned."
 SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
+SETTING_CLAUDE_QUOTA = "usage.claude_quota"
+# A status request reuses a quota reading this recent instead of probing again.
+CLAUDE_QUOTA_FRESH_SECONDS = 120
 SETTING_HUMAN_USER_ID = "slack.human_user_id"
 SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
@@ -636,6 +648,8 @@ class SlackTeamController:
                 message_ts,
                 payload.get("trigger_id"),
             )
+        elif action_name == STATUS_REFRESH_ACTION:
+            self.publish_usage(channel_id, show_loading=False)
         elif action_name.startswith("update."):
             self._update_from_action(decoded, channel_id, message_ts)
         elif action_name.startswith("pm_initiative."):
@@ -5813,7 +5827,9 @@ class SlackTeamController:
         ]
         statuses = self._roster_statuses(agents)
         text = _roster_text(agents, statuses)
-        blocks = build_team_roster_blocks(agents, statuses)
+        blocks = build_team_roster_blocks(
+            agents, statuses, icon_urls=self._roster_icon_urls(agents)
+        )
         posted = self.gateway.post_message(
             channel_id,
             text,
@@ -5919,7 +5935,17 @@ class SlackTeamController:
             agent for agent in self.store.list_team_agents() if agent.kind != TeamAgentKind.LOOP
         ]
         statuses = self._roster_statuses(agents)
-        return _roster_text(agents, statuses), build_team_roster_blocks(agents, statuses)
+        return _roster_text(agents, statuses), build_team_roster_blocks(
+            agents, statuses, icon_urls=self._roster_icon_urls(agents)
+        )
+
+    def _roster_icon_urls(self, agents: list[TeamAgent]) -> dict[str, str]:
+        urls: dict[str, str] = {}
+        for agent in agents:
+            url = agent_card_icon_url(self.store, agent)
+            if url:
+                urls[agent.agent_id] = url
+        return urls
 
     def _refresh_existing_roster(self, channel_id: str) -> None:
         if self._remembered_roster_ts_values(channel_id):
@@ -6072,16 +6098,77 @@ class SlackTeamController:
             ts = posted.ts
             self.store.set_setting(setting_key, ts)
 
-        text = format_daily_usage(
-            day,
-            collect_daily_usage(day, home=self.home),
-            collect_weekly_usage(day, home=self.home),
-        )
-        if ts and self._try_update_message(channel_id, ts, text):
+        text, blocks = self._status_payload(day)
+        if ts and self._try_update_message(channel_id, ts, text, blocks=blocks):
             return ts
-        posted = self.gateway.post_message(channel_id, text)
+        posted = self.gateway.post_message(channel_id, text, blocks=blocks)
         self.store.set_setting(setting_key, posted.ts)
         return posted.ts
+
+    def _status_payload(self, day: str) -> tuple[str, list[dict]]:
+        snapshots = collect_daily_usage(day, home=self.home)
+        weekly = collect_weekly_usage(day, home=self.home)
+        quota = self._claude_quota()
+        sign_ins = read_claude_sign_ins(self.home)
+        now = utc_now()
+        accounts = build_status_report(
+            day,
+            snapshots,
+            weekly,
+            claude_quota=quota,
+            claude_sign_ins=sign_ins,
+            session_label=self._usage_session_label,
+            now=now,
+        )
+        text = format_daily_usage(
+            day,
+            snapshots,
+            weekly,
+            claude_quota=quota,
+            claude_sign_ins=sign_ins,
+            session_label=self._usage_session_label,
+            now=now,
+        )
+        local_day = now.astimezone()
+        day_text = f"{local_day.strftime('%A, %b')} {local_day.day}"
+        return text, build_status_blocks(accounts, day_text=day_text, updated_at=now)
+
+    def _claude_quota(self) -> ClaudeQuota | None:
+        cached = ClaudeQuota.from_json(self.store.get_setting(SETTING_CLAUDE_QUOTA))
+        if (
+            cached is not None
+            and (utc_now() - cached.as_of).total_seconds() < CLAUDE_QUOTA_FRESH_SECONDS
+        ):
+            return cached
+        commands = getattr(self.runtime, "commands", None)
+        claude_binary = getattr(commands, "claude_binary", None)
+        if claude_binary is None:
+            # Without a runtime this controller launches no agent CLIs at all.
+            return cached
+        probed = probe_claude_quota(claude_binary, cwd=self.home)
+        if probed is None:
+            return cached
+        self.store.set_setting(SETTING_CLAUDE_QUOTA, probed.to_json())
+        return probed
+
+    def _usage_session_label(self, snapshot) -> str | None:
+        if not snapshot.session_id:
+            return None
+        summary = self.store.get_setting(
+            f"external_session_summary.{snapshot.provider.value}.{snapshot.session_id}"
+        )
+        if summary:
+            return " ".join(summary.split())
+        task = self.store.get_latest_task_by_session(snapshot.provider, snapshot.session_id)
+        if task is None:
+            return None
+        loop_id = task.metadata.get(LOOP_ID_METADATA_KEY) if task.metadata else None
+        if loop_id:
+            loop = self.store.get_loop(str(loop_id))
+            if loop is not None:
+                return f"🔁 {loop.title}"
+        first_line = next((line for line in task.prompt.splitlines() if line.strip()), "")
+        return first_line.strip() or None
 
     def _try_update_message(
         self,
