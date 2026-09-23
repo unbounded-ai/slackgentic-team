@@ -16,7 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_harness.config import default_config_file, load_stored_config, save_stored_config
+from agent_harness.config import (
+    default_config_file,
+    load_stored_config,
+    save_stored_config,
+    tokens_in_keychain,
+)
 
 BOT_SCOPES = [
     "app_mentions:read",
@@ -601,7 +606,10 @@ def _open_url(url: str, open_browser: bool) -> None:
 
 
 def _has_existing_credentials(values: dict[str, Any]) -> bool:
-    return bool(values.get("SLACK_BOT_TOKEN") and values.get("SLACK_APP_TOKEN"))
+    return bool(
+        (values.get("SLACK_BOT_TOKEN") and values.get("SLACK_APP_TOKEN"))
+        or tokens_in_keychain(values)
+    )
 
 
 def _slackgentic_executable() -> str:

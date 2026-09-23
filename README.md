@@ -537,10 +537,27 @@ slackgentic slack setup --force
 The config file lives at `~/.slackgentic-team/config.json`. Environment
 variables override stored values.
 
+On macOS the Slack tokens can live in your login keychain instead of that file:
+
+```sh
+slackgentic slack tokens keychain   # move them in (slackgentic slack tokens file moves them back)
+slackgentic service restart
+```
+
+Each token is written and read back before it leaves the file. Tokens are
+written and read only through Apple's `/usr/bin/security` tool, so the daemon
+reads them with no "allow access" prompts, even after updates. That also means
+any program running as you can read them the same way. The keychain keeps them
+out of plain-text files, backups, and searches; it does not hide them from your
+own processes. `slackgentic slack tokens` and `slackgentic slack doctor` show
+where they are stored.
+
 | Variable | Purpose |
 | --- | --- |
 | `SLACK_BOT_TOKEN` | Slack bot Web API token. |
 | `SLACK_APP_TOKEN` | Slack Socket Mode app token. |
+| `SLACK_USER_TOKEN` | Optional token that acts as you (user scope `chat:write`); used only to delete your replies when a quiet loop clears its run log. |
+| `SLACKGENTIC_TOKENS_IN_KEYCHAIN` | Set by `slackgentic slack tokens keychain`: tokens missing from the file are read from the macOS login keychain. |
 | `SLACK_TEAM_ID` | Slack workspace team id. |
 | `SLACK_CHANNEL_ID` | Default agent channel id. |
 | `SLACKGENTIC_CONFIG_FILE` | Alternate config path. |

@@ -7,6 +7,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agent_harness.keychain import (
+    KEYCHAIN_CONFIG_KEY,
+    SECRET_CONFIG_KEYS,
+    KeychainError,
+    delete_keychain_secret,
+    read_keychain_secret,
+    write_keychain_secret,
+)
 from agent_harness.team import DEFAULT_CLAUDE_TEAM_SIZE, DEFAULT_CODEX_TEAM_SIZE
 from agent_harness.updates import (
     DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS,
@@ -187,15 +195,82 @@ def load_stored_config(config_file: Path | None = None) -> dict[str, Any]:
 
 def save_stored_config(values: dict[str, Any], config_file: Path | None = None) -> Path:
     path = config_file or default_config_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_stored_config(path)
     merged = {**existing, **{key: value for key, value in values.items() if value is not None}}
+    _write_stored_config(merged, path)
+    if merged.get(KEYCHAIN_CONFIG_KEY) is True and any(
+        merged.get(key) for key in SECRET_CONFIG_KEYS
+    ):
+        # Tokens saved after the move (a re-run of setup) follow the others in.
+        move_tokens_to_keychain(path)
+    return path
+
+
+def _write_stored_config(values: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
-    tmp_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+    tmp_path.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n")
     os.chmod(tmp_path, 0o600)
     tmp_path.replace(path)
     os.chmod(path, 0o600)
-    return path
+
+
+def tokens_in_keychain(values: dict[str, Any]) -> bool:
+    return values.get(KEYCHAIN_CONFIG_KEY) is True
+
+
+def resolve_keychain_tokens(values: dict[str, Any], config_file: Path) -> dict[str, Any]:
+    """Fill secret keys the file and environment leave empty from the keychain."""
+    if not tokens_in_keychain(values):
+        return values
+    resolved = dict(values)
+    for key in SECRET_CONFIG_KEYS:
+        if not resolved.get(key):
+            secret = read_keychain_secret(key, config_file)
+            if secret:
+                resolved[key] = secret
+    return resolved
+
+
+def move_tokens_to_keychain(config_file: Path | None = None) -> list[str]:
+    """Move Slack tokens from the config file into the login keychain.
+
+    Every token is written and read back before any is removed from the file, so
+    a failure part-way leaves the file untouched."""
+    path = config_file or default_config_file()
+    stored = load_stored_config(path)
+    moved = [key for key in SECRET_CONFIG_KEYS if stored.get(key)]
+    for key in moved:
+        write_keychain_secret(key, str(stored[key]), path)
+    remaining = {key: value for key, value in stored.items() if key not in moved}
+    remaining[KEYCHAIN_CONFIG_KEY] = True
+    _write_stored_config(remaining, path)
+    return moved
+
+
+def move_tokens_to_file(config_file: Path | None = None) -> list[str]:
+    """Undo move_tokens_to_keychain: write the tokens back to the file."""
+    path = config_file or default_config_file()
+    stored = load_stored_config(path)
+    restored: dict[str, Any] = {}
+    for key in SECRET_CONFIG_KEYS:
+        if stored.get(key):
+            continue
+        secret = read_keychain_secret(key, path)
+        if secret:
+            restored[key] = secret
+    if (
+        stored.get(KEYCHAIN_CONFIG_KEY)
+        and not restored
+        and not any(stored.get(key) for key in SECRET_CONFIG_KEYS)
+    ):
+        raise KeychainError("no Slackgentic tokens were found in the keychain")
+    updated = {**stored, **restored}
+    updated.pop(KEYCHAIN_CONFIG_KEY, None)
+    _write_stored_config(updated, path)
+    for key in restored:
+        delete_keychain_secret(key, path)
+    return list(restored)
 
 
 def load_config_from_env(config_file: Path | None = None) -> AppConfig:
@@ -206,7 +281,7 @@ def load_config_from_env(config_file: Path | None = None) -> AppConfig:
         for key, value in os.environ.items()
         if key.startswith(("SLACK_", "SLACKGENTIC_"))
     }
-    merged_values = {**stored_values, **env_values}
+    merged_values = resolve_keychain_tokens({**stored_values, **env_values}, resolved_config_file)
     state_db = merged_values.get("SLACKGENTIC_STATE_DB")
     home = merged_values.get("SLACKGENTIC_HOME")
     config_values: dict[str, Any] = {"config_file": resolved_config_file}
