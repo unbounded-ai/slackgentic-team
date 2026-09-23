@@ -20,6 +20,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from agent_harness import __version__
+from agent_harness.agent_skills import install_agent_skills
 from agent_harness.config import AgentCommandConfig, AppConfig, load_config_from_env
 from agent_harness.deferred import (
     DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
@@ -116,6 +117,7 @@ from agent_harness.models import (
     DeferredWork,
     DeferredWorkStatus,
     Loop,
+    LoopCreateRequestStatus,
     LoopJournalEntry,
     LoopOverlapPolicy,
     LoopRun,
@@ -494,6 +496,7 @@ CLAUDE_EXTERNAL_COMMAND = "claude --dangerously-load-development-channels server
 CLAUDE_CHANNEL_PERMISSION_METHOD = "claude/channel/permission"
 SLACKGENTIC_MCP_PERMISSION_TOOLS = frozenset(
     {
+        "mcp__slackgentic__create_loop",
         "mcp__slackgentic__read_thread",
         "mcp__slackgentic__request_approval",
         "mcp__slackgentic__request_user_input",
@@ -2641,6 +2644,62 @@ class SlackTeamController:
             return True
         self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
+
+    def process_queued_loop_create_requests(self) -> int:
+        """Post loop requests queued by local agents as owner loop requests.
+
+        The owner still reviews the resolved preview and clicks Create, so a
+        queued request never creates a loop channel on its own.
+        """
+
+        processed = 0
+        for request in self.store.claim_pending_loop_create_requests(limit=5):
+            processed += 1
+            channel_id = self._configured_agent_channel_id()
+            owner = self.store.get_setting(SETTING_HUMAN_USER_ID)
+            if not channel_id or not owner:
+                self.store.finish_loop_create_request(
+                    request.request_id,
+                    LoopCreateRequestStatus.FAILED,
+                    error="Slackgentic setup has not finished; run setup in Slack first",
+                )
+                continue
+            try:
+                posted = self.gateway.post_message(
+                    channel_id,
+                    f"🔁 A local agent requested a loop for <@{owner}>:\n>{request.text}",
+                )
+            except Exception as exc:
+                LOGGER.exception("failed to post a queued loop request")
+                self.store.finish_loop_create_request(
+                    request.request_id,
+                    LoopCreateRequestStatus.FAILED,
+                    channel_id=channel_id,
+                    error=f"could not post to Slack: {exc}",
+                )
+                continue
+            event = {"ts": posted.ts, "user": owner, "channel": channel_id}
+            try:
+                handled = self._handle_loop_create_request(event, channel_id, request.text)
+            except Exception as exc:
+                LOGGER.exception("failed to start a queued loop request")
+                handled = False
+                error = f"could not start the loop resolver: {exc}"
+            else:
+                error = None if handled else "the request was not a valid loop request"
+            if not handled:
+                self.gateway.post_thread_reply(
+                    SlackThreadRef(channel_id=channel_id, thread_ts=posted.ts),
+                    f"I could not start this loop request: {error}.",
+                )
+            self.store.finish_loop_create_request(
+                request.request_id,
+                LoopCreateRequestStatus.POSTED if handled else LoopCreateRequestStatus.FAILED,
+                channel_id=channel_id,
+                message_ts=posted.ts,
+                error=error,
+            )
+        return processed
 
     def _post_loop_create_guide(self, channel_id: str) -> None:
         self.gateway.post_message(
@@ -12915,6 +12974,7 @@ class LoopRunner:
         return True
 
     def sync_once(self) -> int:
+        self.controller.process_queued_loop_create_requests()
         self.controller.reconcile_loop_runs()
         fired = 0
         for loop in self.store.list_due_loops(limit=20):
@@ -13165,6 +13225,7 @@ class SocketModeSlackApp:
         auth = self.gateway.auth_test()
         _ensure_codex_mcp_for_slack_app(config)
         _ensure_claude_native_input_hook_for_slack_app(config)
+        _refresh_agent_skills_for_slack_app(config)
         self.codex_app_server = None
         codex_app_server_url = config.commands.codex_app_server_url
         if config.commands.codex_app_server_autostart and codex_app_server_url:
@@ -13764,6 +13825,21 @@ def _ensure_codex_mcp_for_slack_app(config: AppConfig) -> None:
         return
     if registered:
         LOGGER.info("registered Codex MCP server: slackgentic")
+
+
+def _refresh_agent_skills_for_slack_app(config: AppConfig) -> None:
+    """Keep installed Slackgentic skills in step with the running version."""
+
+    try:
+        installed = install_agent_skills(
+            home=None if config.home == Path.home() else config.home,
+            only_existing=True,
+        )
+    except Exception:
+        LOGGER.warning("failed to refresh Slackgentic agent skills", exc_info=True)
+        return
+    if installed:
+        LOGGER.info("refreshed %d Slackgentic agent skill directories", len(installed))
 
 
 def _ensure_claude_native_input_hook_for_slack_app(config: AppConfig) -> None:
