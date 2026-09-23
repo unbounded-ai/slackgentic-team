@@ -1,3 +1,4 @@
+import json
 import unittest
 from dataclasses import replace
 
@@ -12,6 +13,7 @@ from agent_harness.models import (
 from agent_harness.slack import (
     SLACK_MAX_MESSAGE_BLOCKS,
     AgentRosterStatus,
+    agent_update_line,
     build_external_session_capacity_blocks,
     build_setup_modal,
     build_start_session_modal,
@@ -322,6 +324,21 @@ class SlackTests(unittest.TestCase):
             [item["text"]["text"] for item in elements], ["Finish and free up this agent"]
         )
         self.assertEqual([item["action_id"] for item in elements], ["task.done"])
+
+    def test_task_card_title_follows_the_agents_latest_update(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = create_agent_task(agent, "do the thing", "C1")
+        self.assertEqual(build_task_thread_blocks(task, agent)[0]["title"], "do the thing")
+
+        task = replace(
+            task,
+            metadata={**task.metadata, "latest_update": agent_update_line("- *Tests* pass.\nMore")},
+        )
+        card = build_task_thread_blocks(task, agent)[0]
+        self.assertEqual(card["title"], "Tests pass.")
+        self.assertIn("do the thing", json.dumps(card["details"]))
 
     def test_task_blocks_lead_the_byline_with_the_provider_logo(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]

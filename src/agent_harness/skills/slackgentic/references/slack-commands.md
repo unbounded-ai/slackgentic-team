@@ -94,5 +94,6 @@ slackgentic codex-mcp --install
 codex --remote ws://127.0.0.1:47684
 ```
 
-If every matching agent is busy, Slackgentic posts a hire button and backfills
-the thread once capacity frees up.
+If every matching agent is busy, Slackgentic hires one for the session. At the
+team size limit it posts a hire button instead and backfills the thread once
+capacity frees up.

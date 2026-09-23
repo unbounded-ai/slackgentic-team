@@ -4,11 +4,11 @@ Each avatar is a monoline portrait: ink outlines over flat fills on a soft
 background blob. Traits (skin, hair, clothes, glasses, ...) are derived from
 the avatar index and name, so regenerating is deterministic.
 
-Writes ``<out>/<n>.png`` (256px), ``<out>/64/<n>.png`` (card icons, drawn with
+Writes ``<out>/<n>.png`` (256px), ``<out>/36/<n>.png`` (card icons, drawn with
 heavier lines so they stay crisp small), and ``<out>/manifest.json``. SVGs are
 rasterized with ``scripts/svg2png.swift`` and palettized with ImageMagick, so
 this runs on macOS with Xcode command line tools and ``magick``. Run ``scripts/generate_provider_badges.sh`` afterwards to
-refresh the provider-badged card icons.
+refresh the provider-badged copies.
 """
 
 from __future__ import annotations
@@ -646,7 +646,7 @@ def generate(out_dir: Path, count: int) -> None:
             card_svg = work / f"{identity.avatar_index}-card.svg"
             full_svg.write_text(render_avatar_svg(traits))
             # Card icons are tiny: heavier lines and features keep them legible.
-            card_svg.write_text(render_avatar_svg(traits, line=4.6, detail=1.35))
+            card_svg.write_text(render_avatar_svg(traits, line=7, detail=1.6))
             full_jobs.append((full_svg, out_dir / name))
             card_jobs.append((card_svg, card_dir / name))
             manifest.append(

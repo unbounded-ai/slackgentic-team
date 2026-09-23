@@ -101,6 +101,7 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    LATEST_UPDATE_METADATA_KEY,
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
     LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
@@ -287,6 +288,7 @@ from agent_harness.slack import (
     LoopRunChip,
     SettingsSnapshot,
     UnassignedExternalSessionListItem,
+    agent_update_line,
     build_channel_overview_blocks,
     build_external_session_capacity_blocks,
     build_idle_release_closed_blocks,
@@ -5696,6 +5698,28 @@ class SlackTeamController:
             self.store.upsert_team_agent(agent)
         return hired
 
+    def hire_agent_for_external_session(self, provider: Provider) -> TeamAgent | None:
+        """Hire one agent for a session started outside Slack that no free agent can take."""
+        if not self._can_hire(1):
+            return None
+        agent = self.hire_agents(1, provider)[0]
+        LOGGER.info(
+            "hired @%s for a %s session started outside Slack", agent.handle, provider.value
+        )
+        roster_ts = self.store.get_setting(SETTING_ROSTER_TS)
+        channel_id = self._configured_agent_channel_id()
+        if roster_ts and channel_id:
+            try:
+                self.gateway.post_thread_reply(
+                    SlackThreadRef(channel_id=channel_id, thread_ts=roster_ts),
+                    format_agent_introduction(agent),
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                )
+            except Exception:
+                LOGGER.debug("failed to post hired agent introduction", exc_info=True)
+        return agent
+
     def _release_inactive_handle(self, handle: str) -> None:
         existing = self.store.get_team_agent(handle, include_fired=True)
         if existing is None or existing.status == TeamAgentStatus.ACTIVE:
@@ -8760,6 +8784,7 @@ class SlackTeamController:
         if not thread.thread_ts:
             return False
         self._remember_agent_authored_message(task, agent, thread, message_ts, text)
+        task = self._record_task_latest_update(task, agent, text)
         task = self._record_task_pr_urls(task, agent, thread, text)
         if self._handle_agent_authored_specific_request(task, agent, thread, text, message_ts):
             return True
@@ -8857,6 +8882,20 @@ class SlackTeamController:
         if task is None:
             return False
         return self.handle_runtime_agent_message(task, agent, thread, text, message_ts)
+
+    def _record_task_latest_update(self, task: AgentTask, agent, text: str) -> AgentTask:
+        update = agent_update_line(text)
+        current = self.store.get_agent_task(task.task_id) or task
+        if not update or current.metadata.get(LATEST_UPDATE_METADATA_KEY) == update:
+            return current
+        updated = replace(
+            current,
+            metadata={**current.metadata, LATEST_UPDATE_METADATA_KEY: update},
+            updated_at=utc_now(),
+        )
+        self.store.upsert_agent_task(updated)
+        self._refresh_task_thread_header(updated, agent)
+        return updated
 
     def _record_task_pr_urls(
         self,
@@ -13931,6 +13970,7 @@ class SocketModeSlackApp:
                 self.controller.handle_external_session_occupancy_change
             ),
             on_agent_message=self.controller.handle_mirrored_session_agent_message,
+            hire_agent=self.controller.hire_agent_for_external_session,
             home=config.home,
             ignored_cwd_patterns=config.sessions.ignored_external_session_cwds,
             allowed_cwd_prefixes=config.sessions.allowed_external_session_cwd_prefixes,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
@@ -70,6 +71,62 @@ _CLAUDE_LEGACY_CLI_TEXT_MARKERS = (
     "<task-notification>",
     "<system-reminder>",
 )
+
+
+# Where the Claude desktop app keeps one JSON file per Code session. Each file
+# names the CLI session it runs (`cliSessionId`) and whether it was archived.
+CLAUDE_DESKTOP_SESSIONS_DIR = (
+    Path("Library") / "Application Support" / "Claude" / "claude-code-sessions"
+)
+
+
+class ClaudeDesktopSessionIndex:
+    """Which CLI sessions the Claude desktop app has archived.
+
+    The app runs a CLI process only while a turn is going, so a missing process
+    says nothing about a desktop session. Archiving it in the app is the only
+    signal that the person is done with it. Files are re-read only when they
+    change, and a missing or unreadable directory means nothing is archived.
+    """
+
+    def __init__(self, home: Path | None = None):
+        self.root = (home or Path.home()) / CLAUDE_DESKTOP_SESSIONS_DIR
+        self._files: dict[Path, tuple[int, str | None, bool]] = {}
+
+    def archived_session_ids(self) -> frozenset[str]:
+        try:
+            paths = list(self.root.glob("*/*/local_*.json"))
+        except OSError:
+            return frozenset()
+        files: dict[Path, tuple[int, str | None, bool]] = {}
+        for path in paths:
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                continue
+            cached = self._files.get(path)
+            if cached is not None and cached[0] == mtime_ns:
+                files[path] = cached
+                continue
+            files[path] = (mtime_ns, *_desktop_session_archive_state(path))
+        self._files = files
+        return frozenset(
+            session_id for _, session_id, archived in files.values() if session_id and archived
+        )
+
+
+def _desktop_session_archive_state(path: Path) -> tuple[str | None, bool]:
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, False
+    if not isinstance(record, dict):
+        return None, False
+    session_id = record.get("cliSessionId")
+    return (
+        session_id if isinstance(session_id, str) and session_id else None,
+        record.get("isArchived") is True,
+    )
 
 
 class ClaudeProvider:

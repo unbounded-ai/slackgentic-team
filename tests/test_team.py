@@ -500,12 +500,16 @@ class TeamTests(unittest.TestCase):
         bundled = type("SettingsStore", (), {"get_setting": lambda self, key: None})()
         with patch.dict("os.environ", {"SLACKGENTIC_AGENT_AVATAR_BASE_URL": ""}):
             self.assertEqual(
+                agent_icon_url(bundled, worker),
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/codex/{worker.avatar_slug}.png",
+            )
+            self.assertEqual(
                 agent_card_icon_url(bundled, worker),
-                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/64/codex/{worker.avatar_slug}.png",
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/36/codex/{worker.avatar_slug}.png",
             )
             self.assertEqual(
                 agent_card_icon_url(bundled, replace(worker, provider_preference=None)),
-                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/64/{worker.avatar_slug}.png",
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/36/{worker.avatar_slug}.png",
             )
         self.assertEqual(agent_card_icon_url(store, loop_agent), "https://example.com/loop.png")
 
