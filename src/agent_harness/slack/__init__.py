@@ -617,7 +617,11 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
         "title": {"type": "mrkdwn", "text": f"{icon}*{_mrkdwn_escape(loop.title)}*"[:150]},
         "subtitle": {
             "type": "mrkdwn",
-            "text": f"{state} · next {row['next_run_text']}"[:150],
+            "text": (
+                f"{state} · next {row['next_run_text']}"
+                if loop.status == LoopStatus.ACTIVE
+                else f"{state} · {row['schedule_text']}"
+            )[:150],
         },
         "body": {
             "type": "mrkdwn",
