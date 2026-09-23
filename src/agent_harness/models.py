@@ -244,6 +244,9 @@ class UsageSnapshot:
     secondary_limit: RateLimitWindow | None = None
     plan_type: str | None = None
     remaining_description: str | None = None
+    # Where the session ran: a Claude entrypoint (``cli``, ``claude-desktop``,
+    # ``sdk-cli``) or a Codex originator (``codex-tui``, ``Codex Desktop``).
+    surface: str | None = None
 
 
 @dataclass(frozen=True)

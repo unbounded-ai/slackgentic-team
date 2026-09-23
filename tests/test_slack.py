@@ -158,6 +158,26 @@ class SlackTests(unittest.TestCase):
         self.assertEqual(card["body"]["text"], "repair the installer")
         self.assertNotIn("Slack task:", str(blocks))
 
+    def test_roster_cards_show_agent_faces_when_given(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+
+        with_face = self._cards(
+            build_team_roster_blocks(
+                [agent], icon_urls={agent.agent_id: "https://example.com/64/7.png"}
+            )
+        )[agent.agent_id]
+        without_face = self._cards(build_team_roster_blocks([agent]))[agent.agent_id]
+
+        self.assertEqual(
+            with_face["icon"],
+            {
+                "type": "image",
+                "image_url": "https://example.com/64/7.png",
+                "alt_text": agent.full_name,
+            },
+        )
+        self.assertNotIn("icon", without_face)
+
     def test_roster_blocks_show_pr_links_separately_from_status_summary(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         blocks = build_team_roster_blocks(

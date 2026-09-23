@@ -149,6 +149,15 @@ for example `@riley model=example-model fix the flaky test`, to launch that
 agent with an explicit model instead. Slackgentic strips the option from the
 prompt and keeps it for later turns of the same agent in that thread.
 
+`status` posts a status card with one section per signed-in account. The
+Claude CLI and the Claude app appear together only when they share an account;
+Codex CLI and the Codex app appear together only when their quota readings match.
+Each section shows the quota windows it has, with viewer-local reset times, plus
+today's and this week's tokens and the sessions that used them. Codex quotas come
+from its transcripts. Claude quotas come from a one-character headless request on
+the CLI sign-in, at most once every two minutes. The Claude app's quota is
+visible only inside the app. `↻ Refresh` updates the card in place.
+
 ### Thread = Context Boundary
 
 A Slack thread is the continuity boundary. If the same agent continues in that
