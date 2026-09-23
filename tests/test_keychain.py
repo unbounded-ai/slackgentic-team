@@ -151,6 +151,8 @@ class KeychainTokenTests(unittest.TestCase):
             patch.object(setup, "_verify_app_token"),
             patch.object(setup, "_install_claude_channel_if_available"),
             patch.object(setup, "_install_codex_mcp_if_available"),
+            # Setup imports the check directly; pretend to be macOS there too.
+            patch.object(setup, "keychain_available", lambda: True),
         ]
         for item in patches:
             item.start()
