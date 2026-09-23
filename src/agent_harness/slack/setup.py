@@ -19,9 +19,11 @@ from typing import Any
 from agent_harness.config import (
     default_config_file,
     load_stored_config,
+    move_tokens_to_keychain,
     save_stored_config,
     tokens_in_keychain,
 )
+from agent_harness.keychain import KeychainError, keychain_available
 
 BOT_SCOPES = [
     "app_mentions:read",
@@ -60,6 +62,8 @@ class SlackSetupOptions:
     force: bool = False
     bootstrap_tools: bool = True
     instance: str | None = None
+    # On macOS, tokens go to the login keychain rather than the config file.
+    tokens_in_keychain: bool = True
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,20 @@ def run_interactive_setup(options: SlackSetupOptions | None = None) -> int:
         options.config_file,
     )
     print(f"Saved Slackgentic credentials to {saved_path}.")
+    if (
+        options.tokens_in_keychain
+        and keychain_available()
+        and not tokens_in_keychain(load_stored_config(saved_path))
+    ):
+        try:
+            move_tokens_to_keychain(saved_path)
+        except KeychainError as exc:
+            print(f"Kept the Slack tokens in {saved_path}: {exc}.")
+        else:
+            print(
+                "Moved the Slack tokens into your login keychain "
+                "(slackgentic slack tokens file moves them back)."
+            )
     _install_claude_channel_if_available()
     _install_codex_mcp_if_available()
     print("Sessions started outside Slack will be mirrored with this Slack app identity.")

@@ -66,8 +66,10 @@ new TCC prompt identity.
 
 `slackgentic slack setup` creates a teammate-specific Slack app, for example
 `/slackgentic-riley`. It uses Slack's official CLI for app creation, opens
-Slack-hosted token pages, then saves credentials in
-`~/.slackgentic-team/config.json` with mode `0600`.
+Slack-hosted token pages, then saves settings in
+`~/.slackgentic-team/config.json` with mode `0600`. On macOS the Slack tokens go
+to your login keychain instead (see Configuration); pass `--tokens-in-file` to
+keep them in the file.
 
 Choose a suffix explicitly when needed:
 
@@ -545,7 +547,9 @@ slackgentic slack setup --force
 The config file lives at `~/.slackgentic-team/config.json`. Environment
 variables override stored values.
 
-On macOS the Slack tokens can live in your login keychain instead of that file:
+On macOS, setup keeps the Slack tokens in your login keychain instead of that
+file. Installs from before 1.0.1, or ones set up with `--tokens-in-file`, can
+move them over:
 
 ```sh
 slackgentic slack tokens keychain   # move them in (slackgentic slack tokens file moves them back)

@@ -134,6 +134,63 @@ class KeychainTokenTests(unittest.TestCase):
         load_config_from_env(self.config_file)
         self.assertEqual(self.security.argv, [])
 
+    def _run_setup(self, **options):
+        from agent_harness.slack import setup
+
+        self.config_file.unlink()
+        patches = [
+            patch.object(setup, "_configuration_token", return_value="xoxe-config"),
+            patch.object(
+                setup,
+                "_create_slack_app_with_retry",
+                return_value=setup.CreatedSlackApp("A999", {}),
+            ),
+            patch.object(setup, "_bot_token", return_value="xoxb-new"),
+            patch.object(setup, "_app_token", return_value="xapp-1-new"),
+            patch.object(setup, "_slack_api_post", return_value={"team_id": "T1"}),
+            patch.object(setup, "_verify_app_token"),
+            patch.object(setup, "_install_claude_channel_if_available"),
+            patch.object(setup, "_install_codex_mcp_if_available"),
+            # Setup imports the check directly; pretend to be macOS there too.
+            patch.object(setup, "keychain_available", lambda: True),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return setup.run_interactive_setup(
+            setup.SlackSetupOptions(
+                config_file=self.config_file, open_browser=False, instance="example", **options
+            )
+        )
+
+    def test_setup_keeps_new_tokens_in_the_keychain_by_default_on_macos(self):
+        self.assertEqual(self._run_setup(), 0)
+
+        stored = load_stored_config(self.config_file)
+        self.assertTrue(stored[KEYCHAIN_CONFIG_KEY])
+        self.assertNotIn("SLACK_BOT_TOKEN", stored)
+        self.assertNotIn("xoxb-new", self.config_file.read_text())
+        config = load_config_from_env(self.config_file)
+        self.assertEqual(config.slack.bot_token, "xoxb-new")
+        self.assertEqual(config.slack.app_token, "xapp-1-new")
+
+    def test_setup_can_keep_tokens_in_the_file(self):
+        self.assertEqual(self._run_setup(tokens_in_keychain=False), 0)
+
+        stored = load_stored_config(self.config_file)
+        self.assertEqual(stored["SLACK_BOT_TOKEN"], "xoxb-new")
+        self.assertNotIn(KEYCHAIN_CONFIG_KEY, stored)
+        self.assertEqual(self.security.items, {})
+
+    def test_setup_falls_back_to_the_file_when_the_keychain_write_fails(self):
+        self.security.fail_writes = True
+
+        self.assertEqual(self._run_setup(), 0)
+
+        stored = load_stored_config(self.config_file)
+        self.assertEqual(stored["SLACK_BOT_TOKEN"], "xoxb-new")
+        self.assertNotIn(KEYCHAIN_CONFIG_KEY, stored)
+
 
 if __name__ == "__main__":
     unittest.main()
