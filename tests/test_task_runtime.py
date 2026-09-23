@@ -25,6 +25,7 @@ from agent_harness.models import (
     PermissionMode,
     Provider,
     SlackThreadRef,
+    utc_now,
 )
 from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX
 from agent_harness.runtime.runner import build_command
@@ -32,14 +33,18 @@ from agent_harness.runtime.tasks import (
     AGENT_REACTION_SIGNAL_PREFIX,
     AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_ACTIVE_AT_METADATA_KEY,
     MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY,
     MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES,
     MANAGED_RUN_MAX_RESUME_AGE,
     MANAGED_RUN_MAX_RESUMES,
+    MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
     MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY,
     MANAGED_RUN_STARTED_METADATA_KEY,
     MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY,
+    RESTART_INTERRUPTED_NOTICE,
+    RESTART_RESUMED_NOTICE,
     ManagedTaskRuntime,
     RunningTask,
     _allowed_session_tools_for_claude_denial,
@@ -58,6 +63,7 @@ from agent_harness.runtime.tasks import (
     _requested_repo_cwd,
     _session_id_from_output,
     build_task_prompt,
+    claude_session_turn_in_progress,
     managed_run_empty_text_block_api_retries,
     managed_run_resume_attempts,
     managed_run_transient_provider_retries,
@@ -5710,6 +5716,210 @@ class TaskRuntimeTests(unittest.TestCase):
             finally:
                 shut_down_runtime(runtime)
                 store.close()
+
+
+class _SendableHoldingProcess(HoldingProcess):
+    def send(self, message):
+        pass
+
+
+class RestartResumeTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.store = Store(self.home / "state.sqlite")
+        self.store.init_schema()
+        self.gateway = FakeGateway()
+        self.agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+        self.store.upsert_team_agent(self.agent)
+        self.runtime = ManagedTaskRuntime(
+            self.store,
+            self.gateway,
+            AgentCommandConfig(),
+            process_factory=_SendableHoldingProcess,
+            home=self.home,
+        )
+
+    def tearDown(self):
+        shut_down_runtime(self.runtime)
+        self.store.close()
+        self._tmp.cleanup()
+
+    def _running(self, *, metadata=None, turn_complete=False):
+        task = replace(
+            create_agent_task(self.agent, "what did you find?", "C1"),
+            status=AgentTaskStatus.ACTIVE,
+            thread_ts="171.000001",
+            session_provider=Provider.CLAUDE,
+            session_id="claude-session-restart",
+            metadata=dict(metadata or {}),
+        )
+        self.store.upsert_agent_task(task)
+        running = RunningTask(
+            task=task,
+            agent=self.agent,
+            process=_SendableHoldingProcess(None),
+            thread=SlackThreadRef("C1", "171.000001"),
+            worker=threading.Thread(),
+            turn_complete=turn_complete,
+        )
+        with self.runtime._lock:
+            self.runtime._running[task.task_id] = running
+        return running
+
+    def _task(self, running):
+        task = self.store.get_agent_task(running.task.task_id)
+        assert task is not None
+        return task
+
+    def test_followup_queued_mid_turn_stays_resumable_after_the_first_result(self):
+        running = self._running(metadata={MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat()})
+
+        # The follow-up lands while the agent is still working on the last turn.
+        self.assertTrue(self.runtime.send_to_task(running.task.task_id, "what did you find?"))
+        self.runtime._capture_turn_completion(running, '{"type":"result","is_error":false}\n')
+        self.assertTrue(running.turn_complete)
+        self.assertFalse(should_resume_managed_run(self._task(running)))
+
+        # Claude then picks up the queued follow-up without another send.
+        self.runtime._capture_turn_completion(
+            running,
+            '{"type":"assistant","message":{"content":[{"type":"tool_use"}]}}\n',
+        )
+
+        self.assertFalse(running.turn_complete)
+        self.assertTrue(self.runtime.has_tasks_mid_turn())
+        self.assertTrue(should_resume_managed_run(self._task(running)))
+
+    def test_result_and_new_turn_in_one_read_leaves_the_turn_open(self):
+        running = self._running()
+
+        self.runtime._capture_turn_completion(
+            running,
+            '{"type":"result"}\n{"type":"user","message":{"content":[]}}\n',
+        )
+
+        self.assertFalse(running.turn_complete)
+
+    def test_idle_claude_session_does_not_block_a_restart(self):
+        self._running(turn_complete=True)
+
+        self.assertTrue(self.runtime.has_running_tasks())
+        self.assertFalse(self.runtime.has_tasks_mid_turn())
+
+    def test_prepare_for_restart_records_and_announces_in_flight_turns(self):
+        busy = self._running()
+        idle = self._running(turn_complete=True)
+
+        self.assertEqual(self.runtime.prepare_for_restart(), 1)
+
+        interrupted = self._task(busy)
+        # Even a turn that lost its marker is resumable once recorded.
+        self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, interrupted.metadata)
+        self.assertIn(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, interrupted.metadata)
+        self.assertTrue(should_resume_managed_run(interrupted))
+        self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, self._task(idle).metadata)
+        self.assertEqual(self.gateway.replies, [RESTART_INTERRUPTED_NOTICE])
+
+    def test_resume_age_follows_last_activity_not_run_start(self):
+        now = utc_now()
+        old = (now - MANAGED_RUN_MAX_RESUME_AGE * 4).isoformat()
+        task = replace(
+            create_agent_task(self.agent, "long investigation", "C1"),
+            metadata={
+                MANAGED_RUN_STARTED_METADATA_KEY: old,
+                MANAGED_RUN_ACTIVE_AT_METADATA_KEY: (now - timedelta(minutes=1)).isoformat(),
+            },
+        )
+        self.assertTrue(should_resume_managed_run(task, now=now))
+
+        stale = replace(
+            task,
+            metadata={**task.metadata, MANAGED_RUN_ACTIVE_AT_METADATA_KEY: old},
+        )
+        self.assertFalse(should_resume_managed_run(stale, now=now))
+
+    def test_heartbeat_refreshes_activity_for_in_flight_turns_only(self):
+        running = self._running(metadata={MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat()})
+        running.last_activity_monotonic = time.monotonic()
+
+        self.runtime._record_run_heartbeat(running)
+        self.assertIn(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, self._task(running).metadata)
+
+        unmarked = self._running()
+        unmarked.last_activity_monotonic = time.monotonic()
+        self.runtime._record_run_heartbeat(unmarked)
+        self.assertNotIn(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, self._task(unmarked).metadata)
+
+    def test_resume_tells_the_agent_it_was_interrupted(self):
+        task = replace(
+            create_agent_task(self.agent, "what did you find?", "C1"),
+            status=AgentTaskStatus.ACTIVE,
+            thread_ts="171.000001",
+            session_provider=Provider.CLAUDE,
+            session_id="claude-session-restart",
+            metadata={MANAGED_RUN_STARTED_METADATA_KEY: utc_now().isoformat()},
+        )
+        self.store.upsert_agent_task(task)
+
+        self.assertTrue(
+            self.runtime.resume_orphaned_task(task, self.agent, SlackThreadRef("C1", "171.000001"))
+        )
+
+        resumed = self.store.get_agent_task(task.task_id)
+        assert resumed is not None
+        self.assertIn("Slackgentic restarted", resumed.prompt)
+        self.assertIn("what did you find?", resumed.prompt)
+        self.assertEqual(
+            resumed.metadata[MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY], "what did you find?"
+        )
+        self.assertEqual(managed_run_resume_attempts(resumed), 1)
+        self.assertEqual(self.gateway.replies, [RESTART_RESUMED_NOTICE])
+
+
+class ClaudeTranscriptTurnTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.project = self.home / ".claude" / "projects" / "example-project"
+        self.project.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, *records):
+        path = self.project / "session-1.jsonl"
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        return path
+
+    def test_transcript_ending_in_a_tool_result_is_mid_turn(self):
+        self._write(
+            {"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}},
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+            {"type": "attachment"},
+            {"type": "last-prompt"},
+        )
+
+        self.assertTrue(claude_session_turn_in_progress("session-1", self.home))
+
+    def test_transcript_ending_in_end_turn_is_finished(self):
+        self._write(
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+            {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}},
+            {"type": "system", "subtype": "stop_hook_summary"},
+        )
+
+        self.assertFalse(claude_session_turn_in_progress("session-1", self.home))
+
+    def test_old_interrupted_transcript_is_not_resumed(self):
+        self._write({"type": "user", "message": {"content": [{"type": "tool_result"}]}})
+
+        later = utc_now() + MANAGED_RUN_MAX_RESUME_AGE + timedelta(minutes=1)
+
+        self.assertFalse(claude_session_turn_in_progress("session-1", self.home, now=later))
+
+    def test_missing_transcript_is_not_mid_turn(self):
+        self.assertFalse(claude_session_turn_in_progress("session-unknown", self.home))
 
 
 if __name__ == "__main__":

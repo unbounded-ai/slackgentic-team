@@ -209,6 +209,7 @@ from agent_harness.runtime.health import LoopBackoff, ProcessCpuWatchdog, log_lo
 from agent_harness.runtime.power import ActiveSessionAwakeKeeper
 from agent_harness.runtime.tasks import (
     AGENT_THREAD_DONE_SIGNAL,
+    MANAGED_RUN_ACTIVE_AT_METADATA_KEY,
     MANAGED_RUN_MAX_STALL_RECOVERIES,
     MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY,
     MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY,
@@ -216,6 +217,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_STALL_TIMEOUT,
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
+    claude_session_turn_in_progress,
     managed_run_resume_attempts,
     managed_run_stall_recoveries,
     managed_run_started_age,
@@ -508,6 +510,10 @@ SLACK_TRIGGER_BOUND_ACTIONS = frozenset(
 CAPACITY_MESSAGE = (
     "No agents are available right now. Hire more agents and I will resume this thread "
     "automatically."
+)
+RESTART_QUEUED_MESSAGE = (
+    "Slackgentic is about to restart for an update. I queued this and will start it "
+    "as soon as the service is back."
 )
 CLAUDE_EXTERNAL_COMMAND = "claude --dangerously-load-development-channels server:slackgentic"
 CLAUDE_CHANNEL_PERMISSION_METHOD = "claude/channel/permission"
@@ -1637,6 +1643,8 @@ class SlackTeamController:
         return blocks
 
     def _assignment_unavailable_text(self, request: WorkRequest) -> str:
+        if self.store.new_assignments_paused():
+            return RESTART_QUEUED_MESSAGE
         if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
             agent = self.store.get_team_agent(request.requested_handle)
             if agent is not None:
@@ -6336,7 +6344,9 @@ class SlackTeamController:
             if callable(is_running) and is_running(task.task_id):
                 continue
             if MANAGED_RUN_STARTED_METADATA_KEY not in task.metadata:
-                continue
+                task = self._orphan_with_recovered_run_marker(task, now=now)
+                if task is None:
+                    continue
             if not should_resume_managed_run(task, now=now):
                 LOGGER.info(
                     "skipping resume of orphaned task %s (age/attempt bounds exceeded: attempts=%d)",
@@ -6359,9 +6369,39 @@ class SlackTeamController:
                 resumed += 1
         return resumed
 
+    def _orphan_with_recovered_run_marker(
+        self,
+        task: AgentTask,
+        *,
+        now: datetime,
+    ) -> AgentTask | None:
+        """Recover the in-flight marker for a turn the transcript shows was cut off.
+
+        Without the marker an interrupted task is neither resumed nor released,
+        so it stays active with no worker. The marker is normally present; this
+        covers any path that dropped it while the agent was still working.
+        """
+        if task.session_provider != Provider.CLAUDE or not task.session_id:
+            return None
+        if not claude_session_turn_in_progress(
+            task.session_id,
+            self.home or Path.home(),
+            now=now,
+        ):
+            return None
+        LOGGER.info("recovering in-flight marker for interrupted task %s", task.task_id)
+        stamp = now.isoformat()
+        metadata = dict(task.metadata)
+        metadata[MANAGED_RUN_STARTED_METADATA_KEY] = stamp
+        metadata[MANAGED_RUN_ACTIVE_AT_METADATA_KEY] = stamp
+        recovered = replace(task, metadata=metadata, updated_at=now)
+        self.store.upsert_agent_task(recovered)
+        return recovered
+
     def _abandon_orphaned_task(self, task: AgentTask) -> None:
         metadata = dict(task.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, None)
         metadata.pop("managed_run_resume_attempts", None)
         cancelled = replace(
             task,
@@ -6604,6 +6644,8 @@ class SlackTeamController:
         action = payload.get("action")
         if action == "update.install":
             update_runner.start_upgrade(version, channel_id, message_ts)
+        elif action == "update.install_now":
+            update_runner.start_upgrade(version, channel_id, message_ts, force=True)
         elif action == "update.dismiss":
             update_runner.dismiss(version, channel_id, message_ts)
 
@@ -13595,15 +13637,19 @@ class SocketModeSlackApp:
             channel_id=self.controller.update_channel_id,
             prompt=self._post_update_prompt,
             update_message=self.gateway.update_message,
-            status_blocks=lambda candidate, status, include_actions: build_update_prompt_blocks(
-                candidate,
-                status_text=status,
-                include_actions=include_actions,
+            status_blocks=lambda candidate, status, include_actions, **options: (
+                build_update_prompt_blocks(
+                    candidate,
+                    status_text=status,
+                    include_actions=include_actions,
+                    **options,
+                )
             ),
             restart=self._restart_after_update,
             enabled=config.updates.enabled,
             auto_install=config.updates.auto_install,
-            is_busy=self.runtime.has_running_tasks,
+            is_busy=self.runtime.has_tasks_mid_turn,
+            pause_new_work=self._set_new_work_paused,
             poll_seconds=config.updates.check_interval_seconds,
         )
         self.controller.set_update_runner(self.update_runner)
@@ -13710,6 +13756,14 @@ class SocketModeSlackApp:
         all_stopped = self.scheduled_timers.stop() and all_stopped
         all_stopped = self.session_mirror.stop() and all_stopped
         if self.runtime is not None:
+            prepare = getattr(self.runtime, "prepare_for_restart", None)
+            if callable(prepare):
+                try:
+                    # Mark in-flight turns as interrupted (and say so in their
+                    # threads) so the next daemon resumes them.
+                    prepare()
+                except Exception:
+                    LOGGER.exception("failed to record interrupted tasks before shutdown")
             stop_all = getattr(self.runtime, "stop_all_running_tasks", None)
             if callable(stop_all):
                 try:
@@ -13734,6 +13788,13 @@ class SocketModeSlackApp:
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
+
+    def _set_new_work_paused(self, paused: bool) -> None:
+        self.store.set_new_assignments_paused(paused)
+        if not paused:
+            # Work queued during an abandoned drain would otherwise wait for the
+            # next time an agent frees up.
+            self.controller.resume_pending_work_requests_for_configured_channel()
 
     def _post_update_prompt(self, channel_id: str, candidate: UpdateCandidate) -> str | None:
         if not self._socket_mode_ready.is_set():

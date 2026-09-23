@@ -473,9 +473,16 @@ You do not need to `git pull` or rerun `pip install` to update Slackgentic.
 The running daemon checks GitHub Releases of `unbounded-ai/slackgentic-team`
 every five minutes. When a newer published version appears it posts one
 card in the agent channel. Auto-update is on by default: the daemon installs
-the release itself once no agent task is running, so a restart never cuts one
-off, and edits the card as it goes. Each release is tried once automatically;
-if that attempt fails, the card keeps its buttons for a manual retry.
+the release itself and edits the card as it goes. Each release is tried once
+automatically; if that attempt fails, the card keeps its buttons for a manual
+retry.
+
+Before restarting, Slackgentic drains: new work waits in the queue, and the
+restart happens as soon as no agent is in the middle of a turn, or after ten
+minutes at most. Agents idling between turns do not hold it up. A turn that is
+still running at that point is stopped with a note in its thread and resumes
+on its own session once the new daemon is up. While the card is waiting,
+*Install now* skips the wait.
 
 Type `settings` in the agent channel to switch auto-update or release checks
 off and on, change the repo root, or check for a release right away.
@@ -486,8 +493,9 @@ auto-update off, the card waits for you:
 > Current: `0.1.0`  Latest: `0.1.1`
 > [Upgrade now] [Skip]
 
-Clicking *Upgrade now* fetches and checks out the release tag in the local
-source checkout, reinstalls the editable package, restarts the service, and
+Clicking *Upgrade now* drains as above, then fetches and checks out the
+release tag in the local source checkout, reinstalls the editable package,
+restarts the service, and
 edits the same Slack message in place with a green checkmark once the new
 daemon is back up. Non-source installs upgrade from the release tarball.
 

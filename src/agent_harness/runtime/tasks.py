@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from secrets import token_urlsafe
 
@@ -71,6 +71,10 @@ AGENT_THREAD_DONE_SIGNAL = "SLACKGENTIC: THREAD_DONE"
 AGENT_ROSTER_STATUS_SIGNAL_PREFIX = "SLACKGENTIC: ROSTER "
 AGENT_REACTION_SIGNAL_PREFIX = "SLACKGENTIC: REACT "
 MANAGED_RUN_STARTED_METADATA_KEY = "managed_run_started_at"
+# Refreshed while an in-flight turn shows activity, and stamped when a restart
+# interrupts the turn, so resume eligibility follows the last sign of life
+# instead of when a long-running turn started.
+MANAGED_RUN_ACTIVE_AT_METADATA_KEY = "managed_run_active_at"
 MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY = "managed_run_resume_attempts"
 MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY = "managed_run_stall_recoveries"
 MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY = "managed_run_original_prompt"
@@ -81,6 +85,7 @@ MANAGED_RUN_MAX_STALL_RECOVERIES = 2
 MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES = 2
 MANAGED_RUN_TRANSIENT_PROVIDER_RETRY_DELAYS = (2.0, 10.0)
 MANAGED_RUN_MAX_RESUME_AGE = timedelta(minutes=15)
+MANAGED_RUN_HEARTBEAT_SECONDS = 60.0
 CODEX_THREAD_START_TIMEOUT = timedelta(minutes=2)
 MANAGED_RUN_PROGRESS_WARNING_TIMEOUT = timedelta(minutes=5)
 MANAGED_RUN_STALL_TIMEOUT = timedelta(minutes=15)
@@ -93,6 +98,12 @@ CLAUDE_DEFAULT_EFFORT = "xhigh"
 PM_CLAUDE_EFFORT = "max"
 PM_CODEX_REASONING_EFFORT = "high"
 FAST_STREAM_POLL_SECONDS = 0.1
+CLAUDE_TURN_ACTIVITY_EVENT_TYPES = frozenset({"assistant", "user", "stream_event"})
+RESTART_INTERRUPTED_NOTICE = (
+    "Slackgentic is restarting, so this run stopped mid-step. "
+    "I will pick it back up automatically once the service is back."
+)
+RESTART_RESUMED_NOTICE = "Slackgentic restarted; resuming where I left off."
 MIN_STREAM_POLL_SECONDS = 0.01
 TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS = 5.0
 TRANSCRIPT_ACTIVITY_DISCOVERY_INTERVAL_SECONDS = 30.0
@@ -152,6 +163,7 @@ class RunningTask:
     last_transcript_activity_check_monotonic: float = 0.0
     last_transcript_discovery_monotonic: float = 0.0
     progress_warning_monotonic: float | None = None
+    last_heartbeat_monotonic: float = 0.0
     # True once the agent has emitted a turn-ending `result` event and is idle
     # waiting for the next user turn (a managed Claude process stays alive across
     # turns). This is an intentional stop — e.g. the agent asked to be released,
@@ -429,17 +441,21 @@ class ManagedTaskRuntime:
         # A new user turn means the agent is working again, so re-arm the
         # progress/stall watchdog and start its clock from now. Without resetting
         # the activity timestamps an agent that idled past the stall window would
-        # be restarted as "stalled" the instant a follow-up arrives.
-        if running.turn_complete:
-            self._remark_managed_run_started(task_id, running)
+        # be restarted as "stalled" the instant a follow-up arrives. Re-mark the
+        # run even mid-turn: the current turn's `result` can drop the marker
+        # while this message is still queued behind it.
+        self._remark_managed_run_started(task_id, running)
+        self._reopen_turn(running)
+        running.turn_buffer = ""
+        running.wake_event.set()
+        return True
+
+    def _reopen_turn(self, running: RunningTask) -> None:
         now = time.monotonic()
         running.turn_complete = False
-        running.turn_buffer = ""
         running.last_activity_monotonic = now
         running.last_output_monotonic = now
         running.progress_warning_monotonic = None
-        running.wake_event.set()
-        return True
 
     def stop_task(
         self,
@@ -588,6 +604,47 @@ class ManagedTaskRuntime:
         with self._lock:
             return bool(self._running)
 
+    def has_tasks_mid_turn(self) -> bool:
+        """Whether a restart now would cut an agent off in the middle of a turn.
+
+        A managed Claude process idling between turns is safe to stop: its
+        session resumes from the transcript on the next follow-up.
+        """
+        with self._lock:
+            return any(_running_mid_turn(running) for running in self._running.values())
+
+    def prepare_for_restart(self) -> int:
+        """Record every in-flight turn as interrupted so startup resumes it.
+
+        Call before stopping workers for a daemon restart. Returns how many
+        turns were interrupted.
+        """
+        with self._lock:
+            interrupted = [
+                running for running in self._running.values() if _running_mid_turn(running)
+            ]
+        now = utc_now().isoformat()
+        for running in interrupted:
+            task_id = running.task.task_id
+            try:
+                self.store.merge_agent_task_metadata(
+                    task_id,
+                    {MANAGED_RUN_ACTIVE_AT_METADATA_KEY: now},
+                    defaults={MANAGED_RUN_STARTED_METADATA_KEY: now},
+                )
+            except Exception:
+                LOGGER.debug("failed to record restart interruption for %s", task_id, exc_info=True)
+            try:
+                self.gateway.post_thread_reply(
+                    running.thread,
+                    RESTART_INTERRUPTED_NOTICE,
+                    persona=running.agent,
+                    icon_url=self._agent_icon_url(running.agent),
+                )
+            except Exception:
+                LOGGER.debug("failed to post restart notice for %s", task_id, exc_info=True)
+        return len(interrupted)
+
     def running_tasks(self) -> list[RunningTask]:
         with self._lock:
             return list(self._running.values())
@@ -636,6 +693,7 @@ class ManagedTaskRuntime:
             self._capture_session_id(running, output)
             self._capture_turn_completion(running, output)
             self._capture_transcript_activity(running)
+            self._record_run_heartbeat(running)
             permission_denied = self._capture_permission_denials(running, output)
             self._capture_resume_errors(running, output)
             self._capture_empty_text_block_api_error(running, output)
@@ -1174,17 +1232,46 @@ class ManagedTaskRuntime:
         # Claude; the flag is cleared when the next user turn is sent.
         if _provider_for_running(running) != Provider.CLAUDE:
             return
-        completed, running.turn_buffer = _claude_turn_completed_from_output(
+        was_complete = running.turn_complete
+        complete, running.turn_buffer = _claude_turn_state_from_output(
             output,
             running.turn_buffer,
+            turn_complete=was_complete,
         )
-        if completed and not running.turn_complete:
+        if complete == was_complete:
+            return
+        if complete:
             running.turn_complete = True
             # The turn's answer is already in Slack. Drop the in-flight marker so a
             # daemon restart while the agent idles does not replay the prompt and
             # make it answer the same message twice.
             # Retry counters stay: a failed turn also ends with a `result` event.
             self._drop_managed_run_marker(running.task.task_id)
+            return
+        # Claude started another turn on its own, for example to answer a
+        # follow-up that was queued behind the previous turn or a background
+        # task that finished. That work is in flight again, so a restart must
+        # resume it and the watchdog must cover it.
+        self._remark_managed_run_started(running.task.task_id, running)
+        self._reopen_turn(running)
+
+    def _record_run_heartbeat(self, running: RunningTask) -> None:
+        if running.turn_complete:
+            return
+        if running.last_activity_monotonic <= running.last_heartbeat_monotonic:
+            return
+        now = time.monotonic()
+        if now - running.last_heartbeat_monotonic < MANAGED_RUN_HEARTBEAT_SECONDS:
+            return
+        running.last_heartbeat_monotonic = now
+        try:
+            self.store.merge_agent_task_metadata(
+                running.task.task_id,
+                {MANAGED_RUN_ACTIVE_AT_METADATA_KEY: utc_now().isoformat()},
+                only_if_present=MANAGED_RUN_STARTED_METADATA_KEY,
+            )
+        except Exception:
+            LOGGER.debug("failed to record run heartbeat", exc_info=True)
 
     def _capture_transcript_activity(self, running: RunningTask) -> None:
         session_id = running.task.session_id
@@ -1640,6 +1727,7 @@ class ManagedTaskRuntime:
     def _mark_managed_run_started(self, task: AgentTask) -> AgentTask:
         metadata = dict(task.metadata)
         metadata[MANAGED_RUN_STARTED_METADATA_KEY] = utc_now().isoformat()
+        metadata.pop(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, None)
         updated = replace(task, metadata=metadata, updated_at=utc_now())
         self.store.upsert_agent_task(updated)
         return updated
@@ -1651,6 +1739,7 @@ class ManagedTaskRuntime:
                 return
             metadata = dict(current.metadata)
             metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+            metadata.pop(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, None)
             self.store.upsert_agent_task(replace(current, metadata=metadata, updated_at=utc_now()))
         except Exception:
             LOGGER.debug("failed to drop managed run marker for %s", task_id, exc_info=True)
@@ -1704,6 +1793,7 @@ class ManagedTaskRuntime:
             return current
         metadata = dict(current.metadata)
         metadata.pop(MANAGED_RUN_STARTED_METADATA_KEY, None)
+        metadata.pop(MANAGED_RUN_ACTIVE_AT_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY, None)
         metadata.pop(MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY, None)
@@ -1731,13 +1821,33 @@ class ManagedTaskRuntime:
         attempts = managed_run_resume_attempts(current) + 1
         metadata = dict(current.metadata)
         metadata[MANAGED_RUN_RESUME_ATTEMPTS_METADATA_KEY] = attempts
-        bumped = replace(current, metadata=metadata, updated_at=utc_now())
+        prompt = current.prompt
+        if current.session_id:
+            # The session still holds the interrupted turn, so tell the agent it
+            # was cut off instead of replaying the request as if it were new.
+            original_prompt = metadata.get(MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY)
+            if not isinstance(original_prompt, str) or not original_prompt.strip():
+                original_prompt = current.prompt
+            metadata[MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY] = original_prompt
+            prompt = _restart_resume_prompt(original_prompt)
+        bumped = replace(current, prompt=prompt, metadata=metadata, updated_at=utc_now())
         try:
             self.store.upsert_agent_task(bumped)
         except Exception:
             LOGGER.debug("failed to record managed run resume attempt", exc_info=True)
             bumped = current
-        return self.start_task(bumped, agent, thread)
+        started = self.start_task(bumped, agent, thread)
+        if started:
+            try:
+                self.gateway.post_thread_reply(
+                    thread,
+                    RESTART_RESUMED_NOTICE,
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                )
+            except Exception:
+                LOGGER.debug("failed to post resume notice", exc_info=True)
+        return started
 
 
 def managed_run_resume_attempts(task: AgentTask) -> int:
@@ -1794,6 +1904,21 @@ def _progress_stall_recovery_prompt(original_prompt: str, timeout: timedelta) ->
         "progress.\n\n"
         f"Original task: {original_prompt}"
     )
+
+
+def _restart_resume_prompt(original_prompt: str) -> str:
+    return (
+        "Slackgentic restarted while you were in the middle of this turn, which "
+        "stopped your previous run. Your session history is intact. Continue from "
+        "where you left off: check what already finished (files, commands, and "
+        "messages you already posted) instead of redoing it, and do not repeat a "
+        "Slack reply you already sent.\n\n"
+        f"The request you were working on: {original_prompt}"
+    )
+
+
+def _running_mid_turn(running: RunningTask) -> bool:
+    return not running.turn_complete and not running.stop_requested
 
 
 def _progress_timeout_cancel_message(
@@ -1871,6 +1996,22 @@ def managed_run_started_age(
     return reference - started
 
 
+def managed_run_idle_age(
+    task: AgentTask,
+    *,
+    now: datetime | None = None,
+) -> timedelta | None:
+    """Time since the in-flight run last showed activity (or started)."""
+    started_age = managed_run_started_age(task, now=now)
+    if started_age is None:
+        return None
+    active_at = task.metadata.get(MANAGED_RUN_ACTIVE_AT_METADATA_KEY)
+    active = parse_timestamp(active_at) if isinstance(active_at, str) else None
+    if active is None:
+        return started_age
+    return min(started_age, (now or utc_now()) - active)
+
+
 def should_resume_managed_run(
     task: AgentTask,
     *,
@@ -1882,10 +2023,52 @@ def should_resume_managed_run(
         return False
     if managed_run_resume_attempts(task) >= max_resumes:
         return False
-    age = managed_run_started_age(task, now=now)
+    age = managed_run_idle_age(task, now=now)
     if age is None:
         return False
     return age <= max_age
+
+
+def claude_session_turn_in_progress(
+    session_id: str,
+    home: Path,
+    *,
+    now: datetime | None = None,
+    max_age: timedelta = MANAGED_RUN_MAX_RESUME_AGE,
+) -> bool:
+    """Whether a Claude transcript was cut off mid-turn recently.
+
+    A finished turn ends with an assistant message whose stop reason is
+    `end_turn`; a transcript whose last message is a tool call or a user/tool
+    result was stopped while the agent was still working.
+    """
+    snapshot = _session_transcript_activity_snapshot(Provider.CLAUDE, session_id, home)
+    if snapshot is None:
+        return False
+    path, (_, mtime_ns, _) = snapshot
+    modified = datetime.fromtimestamp(mtime_ns / 1_000_000_000, tz=UTC)
+    if (now or utc_now()) - modified > max_age:
+        return False
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("type")
+        if kind == "user":
+            return True
+        if kind != "assistant":
+            continue
+        message = record.get("message")
+        stop_reason = message.get("stop_reason") if isinstance(message, dict) else None
+        return stop_reason != "end_turn"
+    return False
 
 
 def _loop_guard_launch_fields(task: AgentTask) -> dict[str, object]:
@@ -2748,38 +2931,45 @@ def _session_id_from_line(provider: Provider, line: str) -> str | None:
     return None
 
 
-def _claude_turn_completed_from_output(
+def _claude_turn_state_from_output(
     text: str,
     buffer: str = "",
     *,
-    final: bool = False,
+    turn_complete: bool,
 ) -> tuple[bool, str]:
-    """Report whether `text` contains a managed Claude turn-ending event.
+    """Return whether the managed Claude turn is complete after `text`.
 
-    A `result` event is the last thing Claude emits for a turn; afterwards the
-    `--input-format stream-json` process stays alive waiting for the next user
-    turn. Buffer a trailing partial line like the other stream scanners so a
-    result event split across reads is still recognized once it completes.
+    A `result` event ends a turn. Assistant or user (tool result) events after
+    it mean Claude began another turn without a new send, for example to handle
+    a follow-up queued mid-turn.
     """
     combined = buffer + text
     if not combined:
-        return False, buffer
+        return turn_complete, buffer
     lines = combined.splitlines(keepends=True)
     next_buffer = ""
-    if lines and not _line_has_ending(lines[-1]) and not final:
+    if lines and not _line_has_ending(lines[-1]):
         next_buffer = lines.pop()
-    completed = any(_claude_line_is_turn_result(line.strip()) for line in lines)
-    return completed, next_buffer
+    for line in lines:
+        kind = _claude_line_event_type(line.strip())
+        if kind == "result":
+            turn_complete = True
+        elif kind in CLAUDE_TURN_ACTIVITY_EVENT_TYPES:
+            turn_complete = False
+    return turn_complete, next_buffer
 
 
-def _claude_line_is_turn_result(line: str) -> bool:
+def _claude_line_event_type(line: str) -> str | None:
     if not line:
-        return False
+        return None
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
-        return False
-    return isinstance(event, dict) and event.get("type") == "result"
+        return None
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type")
+    return kind if isinstance(kind, str) else None
 
 
 def _codex_exec_chunks(

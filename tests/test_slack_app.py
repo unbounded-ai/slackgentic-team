@@ -67,6 +67,7 @@ from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
     CLAUDE_CHANNEL_PERMISSION_METHOD,
     IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY,
+    RESTART_QUEUED_MESSAGE,
     SETTING_ROSTER_TS,
     SETTING_SLACK_BACKFILL_LAST_AWAKE,
     SETTING_SLACK_BACKFILL_LAST_THREAD_SCAN,
@@ -13685,6 +13686,131 @@ class DeferredWorkFlowTests(unittest.TestCase):
                 self.assertEqual(refreshed.status, DeferredWorkStatus.CANCELLED)
             finally:
                 store.close()
+
+
+class RestartDrainControllerTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.store = Store(self.home / "state.sqlite")
+        self.store.init_schema()
+        self.gateway = FakeGateway()
+        self.runtime = DetachedRuntime()
+        self.controller = SlackTeamController(
+            self.store,
+            self.gateway,
+            default_channel_id="C1",
+            runtime=self.runtime,
+            home=self.home,
+        )
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def _claude_task(self, session_id, *, metadata=None):
+        agent = build_initial_model_team(0, 1)[0]
+        self.store.upsert_team_agent(agent)
+        task = replace(
+            create_agent_task(agent, "what did you find?", "C1"),
+            status=AgentTaskStatus.ACTIVE,
+            thread_ts="171.thread",
+            parent_message_ts="171.parent",
+            session_provider=Provider.CLAUDE,
+            session_id=session_id,
+            metadata=dict(metadata or {}),
+        )
+        self.store.upsert_agent_task(task)
+        self.store.upsert_managed_thread_task(task, SlackThreadRef("C1", "171.thread"))
+        return task
+
+    def _transcript(self, session_id, *records):
+        project = self.home / ".claude" / "projects" / "example-project"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / f"{session_id}.jsonl").write_text(
+            "".join(json.dumps(record) + "\n" for record in records)
+        )
+
+    def test_startup_resumes_turn_that_lost_its_marker(self):
+        task = self._claude_task("claude-interrupted")
+        self._transcript(
+            "claude-interrupted",
+            {"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}},
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        )
+
+        resumed = self.controller.cancel_orphaned_active_tasks()
+
+        self.assertEqual(resumed, 1)
+        self.assertEqual([item[0].task_id for item in self.runtime.resumed], [task.task_id])
+        persisted = self.store.get_agent_task(task.task_id)
+        assert persisted is not None
+        self.assertIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+
+    def test_startup_leaves_finished_idle_session_for_the_next_followup(self):
+        task = self._claude_task("claude-idle")
+        self._transcript(
+            "claude-idle",
+            {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}},
+        )
+
+        resumed = self.controller.cancel_orphaned_active_tasks()
+
+        self.assertEqual(resumed, 0)
+        self.assertEqual(self.runtime.started, [])
+        persisted = self.store.get_agent_task(task.task_id)
+        assert persisted is not None
+        self.assertEqual(persisted.status, AgentTaskStatus.ACTIVE)
+        self.assertNotIn(MANAGED_RUN_STARTED_METADATA_KEY, persisted.metadata)
+
+    def test_new_work_is_queued_while_assignments_are_paused(self):
+        for agent in build_initial_model_team(1, 0):
+            self.store.upsert_team_agent(agent)
+        self.store.set_new_assignments_paused(True)
+
+        self.controller.handle_event(
+            {
+                "event": {
+                    "type": "message",
+                    "channel": "C1",
+                    "user": "U1",
+                    "text": "somebody write a tiny validation note",
+                    "ts": "171.000001",
+                }
+            }
+        )
+
+        self.assertEqual(self.runtime.started, [])
+        self.assertEqual(len(self.store.list_pending_work_requests()), 1)
+        self.assertIn(
+            RESTART_QUEUED_MESSAGE,
+            [reply["text"] for reply in self.gateway.thread_replies]
+            + [post["text"] for post in self.gateway.posts],
+        )
+
+        self.store.set_new_assignments_paused(False)
+        self.assertEqual(self.controller.resume_pending_work_requests_for_configured_channel(), 1)
+        self.assertEqual(len(self.runtime.started), 1)
+
+    def test_install_now_button_forces_the_upgrade(self):
+        calls = []
+
+        class UpdateRunner:
+            def start_upgrade(self, version, channel_id, message_ts, *, force=False):
+                calls.append((version, force))
+
+        self.controller.set_update_runner(UpdateRunner())
+
+        self.controller.handle_block_action(
+            {
+                "type": "block_actions",
+                "channel": {"id": "C1"},
+                "message": {"ts": "171.000001"},
+                "actions": [{"value": encode_action_value("update.install_now", version="0.2.0")}],
+            }
+        )
+
+        self.assertEqual(calls, [("0.2.0", True)])
 
 
 if __name__ == "__main__":

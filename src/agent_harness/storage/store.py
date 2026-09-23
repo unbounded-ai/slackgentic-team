@@ -477,6 +477,15 @@ class Store:
         self._local = threading.local()
         self._connections: dict[int, sqlite3.Connection] = {}
         self._closed = False
+        # In-memory on purpose: a restarted daemon always starts accepting work.
+        self._new_assignments_paused = False
+
+    def set_new_assignments_paused(self, paused: bool) -> None:
+        """Hold new work in the pending queue, e.g. while draining for a restart."""
+        self._new_assignments_paused = paused
+
+    def new_assignments_paused(self) -> bool:
+        return self._new_assignments_paused
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -661,6 +670,8 @@ class Store:
         return [_team_agent_from_row(row) for row in rows]
 
     def idle_team_agents(self) -> list[TeamAgent]:
+        if self._new_assignments_paused:
+            return []
         rows = self.conn.execute(
             """
             SELECT ta.*
@@ -743,6 +754,44 @@ class Store:
                 _agent_task_values(task),
             )
             self.conn.commit()
+
+    def merge_agent_task_metadata(
+        self,
+        task_id: str,
+        values: dict[str, object],
+        *,
+        defaults: dict[str, object] | None = None,
+        only_if_present: str | None = None,
+    ) -> bool:
+        """Set metadata keys in one statement so concurrent writers keep theirs.
+
+        `defaults` are only written when the key is absent. With
+        `only_if_present`, nothing is written unless that key exists.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT metadata_json FROM agent_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if only_if_present is not None and only_if_present not in metadata:
+                return False
+            for key, value in (defaults or {}).items():
+                metadata.setdefault(key, value)
+            metadata.update(values)
+            self.conn.execute(
+                "UPDATE agent_tasks SET metadata_json = ? WHERE task_id = ?",
+                (json.dumps(metadata, sort_keys=True), task_id),
+            )
+            self.conn.commit()
+            return True
 
     def update_agent_task_thread(
         self, task_id: str, thread_ts: str, parent_message_ts: str | None = None

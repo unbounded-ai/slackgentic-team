@@ -58,11 +58,21 @@ SETTING_UPDATE_AUTO_INSTALL = "slackgentic.update.auto_install"
 # Auto-update tries each release once; a failed attempt leaves the card's
 # buttons for a manual retry instead of reinstalling on every poll.
 SETTING_UPDATE_AUTO_ATTEMPTED_VERSION = "slackgentic.update.auto_attempted_version"
+# Left behind by older releases that waited for every task to finish.
 SETTING_UPDATE_AUTO_WAITING_VERSION = "slackgentic.update.auto_waiting_version"
-AUTO_UPDATE_WAITING_TEXT = (
-    "Auto-update is on. Installing once running agent tasks finish, "
-    "so a restart does not interrupt them."
-)
+# Before restarting, wait this long for agents mid-turn to reach a stopping
+# point. Anything still running after that is interrupted and resumed on startup.
+DEFAULT_RESTART_DRAIN_TIMEOUT_SECONDS = 10 * 60
+DEFAULT_RESTART_DRAIN_POLL_SECONDS = 5.0
+
+
+def update_draining_text(timeout_seconds: float) -> str:
+    minutes = max(1, round(timeout_seconds / 60))
+    unit = "minute" if minutes == 1 else "minutes"
+    return (
+        f"Upgrading once running agents reach a stopping point (at most {minutes} {unit}). "
+        "New work waits in the queue; anything cut off resumes after the restart."
+    )
 
 
 class UpdateCheckError(RuntimeError):
@@ -490,7 +500,10 @@ class SlackgenticUpdateRunner:
         enabled: bool = True,
         auto_install: bool = False,
         is_busy: Callable[[], bool] | None = None,
+        pause_new_work: Callable[[bool], None] | None = None,
         poll_seconds: float = DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS,
+        drain_timeout_seconds: float = DEFAULT_RESTART_DRAIN_TIMEOUT_SECONDS,
+        drain_poll_seconds: float = DEFAULT_RESTART_DRAIN_POLL_SECONDS,
     ):
         self.store = store
         self.checker = checker
@@ -502,8 +515,14 @@ class SlackgenticUpdateRunner:
         self.restart = restart
         self.enabled = enabled
         self.auto_install = auto_install
+        # True while an agent is mid-turn, i.e. a restart would interrupt it.
         self.is_busy = is_busy
+        self.pause_new_work = pause_new_work
         self.poll_seconds = max(60.0, poll_seconds)
+        self.drain_timeout_seconds = max(0.0, drain_timeout_seconds)
+        self.drain_poll_seconds = max(0.01, drain_poll_seconds)
+        self._skip_drain = threading.Event()
+        self._draining = threading.Event()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -652,6 +671,7 @@ class SlackgenticUpdateRunner:
     def stop(self) -> bool:
         self._stop.set()
         self._wake.set()
+        self._skip_drain.set()
         stopped = True
         if self._thread:
             self._thread.join(timeout=2)
@@ -701,16 +721,8 @@ class SlackgenticUpdateRunner:
         if prompt_message is None:
             return
         channel_id, message_ts = prompt_message
-        if self.is_busy is not None and self.is_busy():
-            if self.store.get_setting(SETTING_UPDATE_AUTO_WAITING_VERSION) != version:
-                self.update_message(
-                    channel_id,
-                    message_ts,
-                    AUTO_UPDATE_WAITING_TEXT,
-                    self.status_blocks(candidate, AUTO_UPDATE_WAITING_TEXT, True),
-                )
-                self.store.set_setting(SETTING_UPDATE_AUTO_WAITING_VERSION, version)
-            return
+        # The upgrade drains running agents itself, so it never waits on a
+        # fully idle team that may never happen.
         self.store.set_setting(SETTING_UPDATE_AUTO_ATTEMPTED_VERSION, version)
         self.store.delete_setting(SETTING_UPDATE_AUTO_WAITING_VERSION)
         self.start_upgrade(version, channel_id, message_ts)
@@ -789,7 +801,16 @@ class SlackgenticUpdateRunner:
         version: str,
         channel_id: str,
         message_ts: str,
+        *,
+        force: bool = False,
     ) -> threading.Thread | None:
+        """Install `version` and restart once running agents reach a stopping point.
+
+        With `force`, skip the wait: an upgrade already draining proceeds now.
+        """
+        if force and self._draining.is_set():
+            self._skip_drain.set()
+            return None
         candidate = self._candidate_for_version(version)
         if candidate is None:
             candidate = self._fallback_candidate(version)
@@ -819,13 +840,9 @@ class SlackgenticUpdateRunner:
                 )
                 return None
             self.store.set_setting(SETTING_UPDATE_INSTALLING_VERSION, candidate.version)
-        text = f"Installing Slackgentic {candidate.release.tag_name} and preparing a restart."
-        self.update_message(
-            channel_id,
-            message_ts,
-            text,
-            self.status_blocks(candidate, text, False),
-        )
+            self._skip_drain.clear()
+            if force:
+                self._skip_drain.set()
         thread = threading.Thread(
             target=self._upgrade_in_background,
             args=(candidate, channel_id, message_ts),
@@ -856,13 +873,63 @@ class SlackgenticUpdateRunner:
         self.sync_once()
         return self.poll_seconds
 
+    def _drain_before_restart(
+        self,
+        candidate: UpdateCandidate,
+        channel_id: str,
+        message_ts: str,
+    ) -> None:
+        """Wait until no agent is mid-turn, the timeout passes, or the user skips it."""
+        if self.is_busy is None or self._skip_drain.is_set() or not self.is_busy():
+            return
+        text = update_draining_text(self.drain_timeout_seconds)
+        self._draining.set()
+        try:
+            self.update_message(
+                channel_id,
+                message_ts,
+                text,
+                self.status_blocks(candidate, text, True, draining=True),
+            )
+            deadline = time.monotonic() + self.drain_timeout_seconds
+            while self.is_busy():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    LOGGER.info("restart drain timed out; interrupting running agents")
+                    return
+                if self._skip_drain.wait(min(self.drain_poll_seconds, remaining)):
+                    return
+        finally:
+            self._draining.clear()
+
+    def _set_new_work_paused(self, paused: bool) -> None:
+        if self.pause_new_work is None:
+            return
+        try:
+            self.pause_new_work(paused)
+        except Exception:
+            LOGGER.exception("failed to %s new work", "pause" if paused else "resume")
+
     def _upgrade_in_background(
         self,
         candidate: UpdateCandidate,
         channel_id: str,
         message_ts: str,
     ) -> None:
+        restarting = False
+        self._set_new_work_paused(True)
         try:
+            self._drain_before_restart(candidate, channel_id, message_ts)
+            if self._stop.is_set():
+                # The daemon is shutting down; the next process re-offers the update.
+                return
+            text = f"Installing Slackgentic {candidate.release.tag_name} and preparing a restart."
+            self.update_message(
+                channel_id,
+                message_ts,
+                text,
+                self.status_blocks(candidate, text, False),
+            )
             result = self.updater.install(candidate.release)
             if not result.succeeded:
                 message = result.failure_message or "Slackgentic upgrade failed."
@@ -902,8 +969,10 @@ class SlackgenticUpdateRunner:
                 ),
             )
             if self.restart is not None:
+                restarting = True
                 self.restart()
         except Exception as exc:
+            restarting = False
             LOGGER.exception("failed to install Slackgentic update")
             message = f"Slackgentic upgrade failed: {exc}"
             self.store.set_setting(SETTING_UPDATE_LAST_ERROR, message)
@@ -916,6 +985,8 @@ class SlackgenticUpdateRunner:
             )
         finally:
             self.store.delete_setting(SETTING_UPDATE_INSTALLING_VERSION)
+            if not restarting:
+                self._set_new_work_paused(False)
 
     def _remember_candidate(self, candidate: UpdateCandidate) -> None:
         self.store.set_setting(
