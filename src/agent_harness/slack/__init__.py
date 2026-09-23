@@ -262,6 +262,7 @@ def build_loop_preview_blocks(
                     f"• Schedule: {spec.schedule_description} (next run {next_run_text})\n"
                     f"• Permissions: {loop.permission_mode.value}{cwd}\n"
                     f"• Icon: :{spec.icon.emoji}:"
+                    + ("\n• 🔕 Quiet: posts only when a run needs attention" if spec.quiet else "")
                 ),
             },
         },
@@ -400,6 +401,7 @@ def build_loop_run_report_blocks(
     duration_text: str | None = None,
     guard_note: str | None = None,
     feedback_value: dict[str, str] | None = None,
+    notes_in_thread: bool = True,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Render a finished run as a report-first card for the run's parent message."""
     emoji, label = loop_result_style(status)
@@ -429,7 +431,7 @@ def build_loop_run_report_blocks(
         footer.append(f"took {duration_text}")
     if guard_note:
         footer.append(guard_note)
-    footer.append("🧵 working notes in thread")
+    footer.append("🧵 working notes in thread" if notes_in_thread else "🔕 quiet loop")
     blocks.append(
         {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(footer)[:2900]}]}
     )
@@ -484,11 +486,15 @@ def build_loop_panel_blocks(
     running: bool = False,
     remembered_approvals: int = 0,
     context: str = "panel",
+    quiet: bool = False,
+    last_check_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """The loop's control panel: pinned in its channel and reused by `loop status`."""
     icon = f"{icon_emoji} " if icon_emoji else ""
     state_text = _loop_state_text(loop, running=running)
     subtitle = f"{state_text} · {schedule_text}"
+    if quiet:
+        subtitle += " · 🔕 quiet"
     if loop.status == LoopStatus.ACTIVE and not running:
         subtitle += f" · next {next_run_text}"
     body = (
@@ -528,6 +534,11 @@ def build_loop_panel_blocks(
             for chip in recent_runs
         )
         history.append(f"*Recent runs*  {chips}")
+    if quiet:
+        quiet_line = "🔕 *Quiet* — posts only when a run needs attention"
+        if last_check_text:
+            quiet_line += f" · {last_check_text}"
+        history.append(quiet_line)
     if latest_url and latest_headline:
         history.append(f"<{latest_url}|Open the latest report →>")
     if history:
@@ -612,6 +623,8 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
         if part
     ]
     state = _loop_state_text(loop, running=bool(row.get("running")))
+    if row.get("quiet"):
+        state += " · 🔕"
     card: dict[str, Any] = {
         "type": "card",
         "block_id": f"loop.list.item.{loop.loop_id}"[:255],
@@ -687,6 +700,12 @@ def build_loop_edit_modal(
     current_mode = next(
         (option for option in modes if option["value"] == loop.permission_mode.value), modes[0]
     )
+    quiet = loop.metadata.get("quiet") is True
+    quiet_option = _option(
+        "Only post when a run needs attention",
+        "quiet",
+        "All-clear runs stay silent and only update the pinned panel",
+    )
     cwd_element: dict[str, Any] = {
         "type": "plain_text_input",
         "action_id": "value",
@@ -750,6 +769,18 @@ def build_loop_edit_modal(
                     "action_id": "value",
                     "initial_option": current_mode,
                     "options": modes,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_quiet",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Notifications"},
+                "element": {
+                    "type": "checkboxes",
+                    "action_id": "value",
+                    "options": [quiet_option],
+                    **({"initial_options": [quiet_option]} if quiet else {}),
                 },
             },
             {

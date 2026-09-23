@@ -19,6 +19,9 @@ from agent_harness.loops import (
     build_loop_fetch_result,
     build_loop_resolution_prompt,
     build_loop_run_prompt,
+    loop_spec_from_json,
+    loop_spec_to_json,
+    parse_agent_loop_signal,
 )
 from agent_harness.models import (
     LOOP_ID_METADATA_KEY,
@@ -43,7 +46,7 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.runtime.tasks import ManagedTaskRuntime
-from agent_harness.slack import encode_action_value
+from agent_harness.slack import build_loop_edit_modal, encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
     SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
@@ -2330,6 +2333,117 @@ class LoopCreationFlowTests(unittest.TestCase):
         ]
         self.assertEqual(len(panel_updates), 1)
         self.assertEqual(panel_updates[0]["blocks"][0]["type"], "card")
+
+    def _activate_quiet_loop(self):
+        loop = self._activate_loop()
+        self._send_loop_command(loop, "loop quiet: on", "330.000001")
+        quiet = self.store.get_loop(loop.loop_id)
+        assert quiet is not None
+        self.assertTrue(quiet.metadata["quiet"])
+        return quiet
+
+    def test_quiet_loop_all_clear_runs_post_nothing_to_the_channel(self):
+        loop = self._activate_quiet_loop()
+        posts_before = len(self.gateway.posts)
+
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.assertIsNone(run.thread_ts)
+        self.assertEqual(task.thread_ts, loop.charter_message_ts)
+        self.assertEqual(thread.thread_ts, None)
+        self.assertIn("Quiet loop", task.prompt)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts),
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps({"summary": "No errors.", "headline": "No errors", "status": "ok"}),
+        )
+        self.controller.handle_runtime_task_done(
+            task, agent, SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+        )
+
+        self.assertEqual(self.gateway.posts[posts_before:], [])
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertIsNone(finished.thread_ts)
+        panel = [item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts][-1]
+        self.assertIn("🔕 quiet", str(panel["blocks"]))
+        self.assertIn("✅ last check", str(panel["blocks"]))
+        self.assertEqual([r for r in self.gateway.reactions if r[1] == loop.charter_message_ts], [])
+
+    def test_quiet_loop_posts_a_single_notifying_card_when_something_is_wrong(self):
+        loop = self._activate_quiet_loop()
+        posts_before = len(self.gateway.posts)
+        self.controller.fire_loop_now(loop)
+        task, agent, run, _ = self._running_task_and_run(loop)
+        thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "summary": "Error spike in the API.",
+                    "headline": "5xx errors up 12x in the last hour",
+                    "status": "found_issue",
+                    "report": "- `POST /v1/query` 5xx: 212 (was ~18/h)",
+                }
+            ),
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        new_posts = self.gateway.posts[posts_before:]
+        self.assertEqual(len(new_posts), 1)
+        self.assertIn("5xx errors up 12x", new_posts[0]["text"])
+        self.assertIn("⚠️ *5xx errors up 12x in the last hour*", str(new_posts[0]["blocks"]))
+        self.assertIn("🔕 quiet loop", str(new_posts[0]["blocks"]))
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.thread_ts, new_posts[0]["ts"])
+
+    def test_quiet_loop_runtime_failures_are_reported(self):
+        loop = self._activate_quiet_loop()
+        posts_before = len(self.gateway.posts)
+        self.controller.fire_loop_now(loop)
+        task, agent, _, _ = self._running_task_and_run(loop)
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+
+        self.controller.handle_runtime_task_done(
+            self.store.get_agent_task(task.task_id),
+            agent,
+            SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts),
+        )
+
+        new_posts = self.gateway.posts[posts_before:]
+        self.assertEqual(len(new_posts), 1)
+        self.assertEqual(new_posts[0]["blocks"][0]["status"], "error")
+
+    def test_quiet_mode_is_set_from_the_spec_and_shown_in_the_edit_modal(self):
+        spec = parse_agent_loop_signal(
+            AGENT_LOOP_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "title": "Prod Errors",
+                    "bot_name": "Prod Errors Bot",
+                    "mission": "Report unexpected errors.",
+                    "schedule": {"frequency": "interval", "interval_seconds": 3600},
+                    "quiet": True,
+                }
+            )
+        ).spec
+        assert spec is not None
+        self.assertTrue(spec.quiet)
+        self.assertTrue(loop_spec_from_json(loop_spec_to_json(spec)).quiet)
+
+        loop = self._activate_quiet_loop()
+        view = build_loop_edit_modal(loop, schedule_text="every 5 minutes", channel_id="C")
+        quiet_block = next(
+            block for block in view["blocks"] if block.get("block_id") == "loop_quiet"
+        )
+        self.assertEqual(quiet_block["element"]["initial_options"][0]["value"], "quiet")
 
     def test_loop_help_works_through_slash_command_in_loop_channel(self):
         loop = self._activate_loop()
