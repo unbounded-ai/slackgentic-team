@@ -461,9 +461,6 @@ def _roster_work_submission_payload(
     prompt: str,
     timing: str,
     dangerous: bool = False,
-    repeat_time: str = "",
-    timezone: str = "",
-    weekday: str | None = None,
     run_at: str = "",
     dependency: str = "none",
     delay: str = "",
@@ -477,11 +474,6 @@ def _roster_work_submission_payload(
         "roster_work_kind": {"value": {"selected_option": {"value": "work"}}},
         "roster_work_timing": {"value": {"selected_option": {"value": timing}}},
         "roster_work_run_at": {"value": {"value": run_at}},
-        "roster_work_time": {"value": {"value": repeat_time}},
-        "roster_work_timezone": {"value": {"value": timezone}},
-        "roster_work_weekday": {
-            "value": {"selected_option": {"value": weekday} if weekday is not None else None}
-        },
         "roster_work_dependency": {"value": {"selected_option": {"value": dependency}}},
         "roster_work_delay": {"value": {"value": delay}},
         "roster_work_permissions": {
@@ -2347,13 +2339,15 @@ class SlackAppTests(unittest.TestCase):
                     if block.get("block_id") == "roster_work_timing"
                 )
                 self.assertEqual(timing["element"]["initial_option"]["value"], "now")
-                timezone = next(
-                    block
-                    for block in view["blocks"]
-                    if block.get("block_id") == "roster_work_timezone"
+                # Recurring work belongs to loops, so the form offers no repeat options.
+                self.assertEqual(
+                    [option["value"] for option in timing["element"]["options"]],
+                    ["now", "once"],
                 )
-                self.assertTrue(timezone["element"].get("initial_value"))
-                self.assertIn("Required for daily or weekly", timezone["hint"]["text"])
+                block_ids = {block.get("block_id") for block in view["blocks"]}
+                self.assertFalse(
+                    block_ids & {"roster_work_time", "roster_work_timezone", "roster_work_weekday"}
+                )
             finally:
                 store.close()
 
@@ -2481,7 +2475,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_roster_work_submission_creates_recurring_schedule(self):
+    def test_roster_work_submission_points_repeats_to_loops(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -2491,25 +2485,14 @@ class SlackAppTests(unittest.TestCase):
                 store.upsert_team_agent(agent)
                 controller = SlackTeamController(store, gateway, default_channel_id="C1")
 
+                # A form opened before repeats were removed can still submit "daily".
                 response = controller.handle_view_submission(
-                    _roster_work_submission_payload(
-                        agent,
-                        prompt="check CI",
-                        timing="daily",
-                        repeat_time="17:00",
-                        timezone="America/Chicago",
-                    )
+                    _roster_work_submission_payload(agent, prompt="check CI", timing="daily")
                 )
 
-                self.assertIsNone(response)
-                scheduled = store.list_scheduled_work()
-                self.assertEqual(len(scheduled), 1)
-                self.assertEqual(scheduled[0].requested_handle, agent.handle)
-                self.assertEqual(scheduled[0].schedule_kind, ScheduledWorkKind.RECURRING)
-                self.assertEqual(scheduled[0].recurrence["frequency"], "daily")
-                self.assertIn(f"Scheduled: @{agent.handle} `check CI`", gateway.updates[-1]["text"])
-                self.assertIn("daily at 17:00 America/Chicago", gateway.updates[-1]["text"])
-                self.assertNotIn("schedule_", gateway.updates[-1]["text"])
+                self.assertEqual(response["response_action"], "errors")
+                self.assertIn("loop create", response["errors"]["roster_work_timing"])
+                self.assertEqual(store.list_scheduled_work(), [])
             finally:
                 store.close()
 
@@ -2528,9 +2511,8 @@ class SlackAppTests(unittest.TestCase):
                     _roster_work_submission_payload(
                         agent,
                         prompt="check CI",
-                        timing="daily",
-                        repeat_time="17:00",
-                        timezone="America/Chicago",
+                        timing="once",
+                        run_at="2099-01-01T17:00:00+00:00",
                     )
                 )
 
@@ -2622,9 +2604,8 @@ class SlackAppTests(unittest.TestCase):
                     _roster_work_submission_payload(
                         pm_agent,
                         prompt="plan the multi-tenancy operator",
-                        timing="daily",
-                        repeat_time="09:00",
-                        timezone="America/Chicago",
+                        timing="once",
+                        run_at="2099-01-01T09:00:00+00:00",
                     )
                 )
 

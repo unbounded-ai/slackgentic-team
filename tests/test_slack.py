@@ -323,6 +323,31 @@ class SlackTests(unittest.TestCase):
         )
         self.assertEqual([item["action_id"] for item in elements], ["task.done"])
 
+    def test_task_blocks_lead_the_byline_with_the_provider_logo(self):
+        agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+        from agent_harness.team import create_agent_task
+
+        task = create_agent_task(agent, "do the thing", "C1")
+
+        context = next(
+            block for block in build_task_thread_blocks(task, agent) if block["type"] == "context"
+        )
+        logo, byline = context["elements"]
+        self.assertEqual(logo["type"], "image")
+        self.assertTrue(logo["image_url"].endswith("/docs/assets/providers/codex.png"))
+        self.assertEqual(logo["alt_text"], "Codex")
+        self.assertIn(f"`@{agent.handle}` picked up this task", byline["text"])
+        self.assertNotIn("codex", byline["text"])
+
+        # The session's provider wins over the agent's preference.
+        claude_task = replace(task, session_provider=Provider.CLAUDE)
+        context = next(
+            block
+            for block in build_task_thread_blocks(claude_task, agent)
+            if block["type"] == "context"
+        )
+        self.assertTrue(context["elements"][0]["image_url"].endswith("/providers/claude.png"))
+
     def test_task_blocks_show_original_task_and_latest_summary(self):
         agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
         from agent_harness.team import create_agent_task

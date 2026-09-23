@@ -38,6 +38,9 @@ DEFAULT_AGENT_AVATAR_BASE_URL = (
 DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 # Avatar sets keep a copy at this size in a subdirectory, for card icons.
 AGENT_CARD_ICON_SIZE = 64
+PROVIDER_LOGO_BASE_URL = (
+    "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/providers"
+)
 
 COLORS = [
     "#2457a6",
@@ -809,14 +812,24 @@ def agent_card_icon_url(store, agent: TeamAgent) -> str | None:
     """A small avatar for Block Kit card icons.
 
     Slack crops card icons from the middle of the image at its own size, so a
-    full-size avatar shows only a nose. The bundled avatars ship a 64px copy;
+    full-size avatar shows only a nose. The bundled avatars ship a 64px copy,
+    plus one per provider with that provider's logo in the top-right corner;
     a custom avatar set is used as it is.
     """
     url = agent_icon_url(store, agent)
     bundled_prefix = f"{DEFAULT_AGENT_AVATAR_BASE_URL}/"
     if url is None or agent.metadata.get("icon_url") or not url.startswith(bundled_prefix):
         return url
-    return f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{AGENT_CARD_ICON_SIZE}/{url[len(bundled_prefix) :]}"
+    card_dir = f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{AGENT_CARD_ICON_SIZE}"
+    if agent.provider_preference is not None:
+        card_dir = f"{card_dir}/{agent.provider_preference.value}"
+    return f"{card_dir}/{url[len(bundled_prefix) :]}"
+
+
+def provider_logo_url(provider: Provider | None) -> str | None:
+    if provider is None:
+        return None
+    return f"{PROVIDER_LOGO_BASE_URL}/{provider.value}.png"
 
 
 def agent_personal_context(agent: TeamAgent) -> str:
@@ -1068,9 +1081,8 @@ def _digest(seed: str, sort_order: int) -> bytes:
 
 def _avatar_prompt(full_name: str, profile: RoleProfile) -> str:
     return (
-        f"Square Slack avatar, stylized cartoon portrait of {full_name}, "
-        "expressive friendly face, flat vector-like illustration, clean geometric "
-        "shapes, vibrant accent color, simple background, "
+        f"Square Slack avatar, monoline portrait of {full_name}, friendly face, "
+        "confident ink outlines over flat muted fills, soft background shape, "
         "no text, no logo, not photorealistic."
     )
 

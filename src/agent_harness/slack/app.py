@@ -6780,9 +6780,7 @@ class SlackTeamController:
             return _view_errors("roster_work_dependency", dependency_error)
 
         pm_target = self._pm_agent_for_request_target(request)
-        if pm_target is not None and (
-            timing in {"once", "daily", "weekly"} or dependency is not None
-        ):
+        if pm_target is not None and (timing == "once" or dependency is not None):
             return _view_errors(
                 "roster_work_prompt",
                 (
@@ -6804,11 +6802,6 @@ class SlackTeamController:
 
         requested_by = (payload.get("user") or {}).get("id")
         if dependency is not None:
-            if timing in {"daily", "weekly"}:
-                return _view_errors(
-                    "roster_work_timing",
-                    "Repeating schedules cannot wait on an agent yet. Use now or once.",
-                )
             run_at, run_at_error = _optional_future_timestamp(run_at_text)
             if run_at_error:
                 return _view_errors("roster_work_run_at", run_at_error)
@@ -6869,39 +6862,10 @@ class SlackTeamController:
                 callback()
             return None
 
-        if timing in {"daily", "weekly"}:
-            recurrence, recurrence_error = _recurrence_from_roster_work_values(values, timing)
-            if recurrence_error is not None:
-                return _view_errors(*recurrence_error)
-            next_run_at = next_run_after(recurrence, after=utc_now())
-            if next_run_at is None:
-                return _view_errors("roster_work_time", "Could not compute the next run.")
-            timezone = str(recurrence["timezone"])
-            if timing == "weekly":
-                weekday = _weekday_label(recurrence.get("weekday")) or "selected day"
-                description = f"weekly on {weekday} at {recurrence['time']} {timezone}"
-            else:
-                description = f"daily at {recurrence['time']} {timezone}"
-
-            def callback() -> None:
-                self._create_roster_scheduled_work(
-                    channel_id,
-                    request,
-                    schedule_kind=ScheduledWorkKind.RECURRING,
-                    next_run_at=next_run_at,
-                    recurrence=recurrence,
-                    timezone=timezone,
-                    description=description,
-                    requested_by_slack_user=requested_by,
-                )
-
-            if async_success:
-                self._run_after_view_ack("roster-work-scheduled", callback)
-            else:
-                callback()
-            return None
-
-        return _view_errors("roster_work_timing", "Choose when this work should run.")
+        return _view_errors(
+            "roster_work_timing",
+            "Choose now or once. For recurring work, create a loop with `loop create`.",
+        )
 
     def _roster_work_request_from_values(
         self,
@@ -15558,8 +15522,6 @@ def _roster_work_modal(
     timing_options = [
         _modal_option("Now", "now", "Start as soon as capacity is available."),
         _modal_option("Once", "once", "Run once at the Run at timestamp."),
-        _modal_option("Daily", "daily", "Repeat every day at a local time."),
-        _modal_option("Weekly", "weekly", "Repeat weekly at a local time."),
     ]
     timing_by_value = {option["value"]: option for option in timing_options}
     initial_timing_option = timing_by_value.get(initial_timing) or timing_by_value["now"]
@@ -15628,54 +15590,6 @@ def _roster_work_modal(
             "hint": {
                 "type": "plain_text",
                 "text": "Required for once. Optional no-earlier-than time when waiting on an agent.",
-            },
-        },
-        {
-            "type": "input",
-            "block_id": "roster_work_time",
-            "optional": True,
-            "label": {"type": "plain_text", "text": "Repeat time"},
-            "element": {
-                "type": "plain_text_input",
-                "action_id": "value",
-                "placeholder": {"type": "plain_text", "text": "17:00"},
-            },
-            "hint": {"type": "plain_text", "text": "HH:MM, required for daily or weekly."},
-        },
-        {
-            "type": "input",
-            "block_id": "roster_work_timezone",
-            "optional": True,
-            "label": {"type": "plain_text", "text": "Repeat timezone"},
-            "element": {
-                "type": "plain_text_input",
-                "action_id": "value",
-                "initial_value": _default_roster_work_timezone(),
-                "placeholder": {"type": "plain_text", "text": "America/Chicago"},
-            },
-            "hint": {
-                "type": "plain_text",
-                "text": "Required for daily or weekly repeats. Unused for now or once.",
-            },
-        },
-        {
-            "type": "input",
-            "block_id": "roster_work_weekday",
-            "optional": True,
-            "label": {"type": "plain_text", "text": "Repeat weekday"},
-            "element": {
-                "type": "static_select",
-                "action_id": "value",
-                "placeholder": {"type": "plain_text", "text": "Choose for weekly"},
-                "options": [
-                    _modal_option("Monday", "0"),
-                    _modal_option("Tuesday", "1"),
-                    _modal_option("Wednesday", "2"),
-                    _modal_option("Thursday", "3"),
-                    _modal_option("Friday", "4"),
-                    _modal_option("Saturday", "5"),
-                    _modal_option("Sunday", "6"),
-                ],
             },
         },
         {
@@ -15754,29 +15668,6 @@ def _roster_dependency_options(occupied_handles: list[tuple[str, str, str]]) -> 
         if len(options) >= 100:
             break
     return options
-
-
-def _default_roster_work_timezone() -> str:
-    candidates: list[str] = []
-    env_tz = os.environ.get("TZ")
-    if env_tz:
-        candidates.append(env_tz.lstrip(":"))
-    try:
-        localtime = str(Path("/etc/localtime").resolve(strict=False))
-    except OSError:
-        localtime = ""
-    marker = "/zoneinfo/"
-    if marker in localtime:
-        candidates.append(localtime.split(marker, 1)[1])
-    for candidate in candidates:
-        if candidate and _valid_roster_work_timezone(candidate):
-            return candidate
-    return "America/Chicago"
-
-
-def _valid_roster_work_timezone(value: str) -> bool:
-    recurrence = {"frequency": "daily", "time": "00:00", "timezone": value}
-    return next_run_after(recurrence, after=utc_now()) is not None
 
 
 def _modal_option(text: str, value: str, description: str | None = None) -> dict:
@@ -15880,37 +15771,6 @@ def _optional_delay_seconds(value: str | None) -> tuple[int | None, str | None]:
     if parsed < 0:
         return None, "Delay must be zero or greater."
     return parsed, None
-
-
-def _recurrence_from_roster_work_values(
-    values: dict,
-    timing: str,
-) -> tuple[dict[str, object] | None, tuple[str, str] | None]:
-    time_text = (_view_plain_value(values, "roster_work_time", "value") or "").strip()
-    if re.fullmatch(r"\d{2}:\d{2}", time_text) is None:
-        return None, ("roster_work_time", "Use HH:MM, for example 17:00.")
-    timezone = (_view_plain_value(values, "roster_work_timezone", "value") or "").strip()
-    if not timezone:
-        return None, ("roster_work_timezone", "Enter an IANA timezone.")
-    recurrence: dict[str, object] = {
-        "frequency": timing,
-        "time": time_text,
-        "timezone": timezone,
-    }
-    if timing == "weekly":
-        weekday_value = _view_selected_value(values, "roster_work_weekday", "value")
-        if weekday_value is None:
-            return None, ("roster_work_weekday", "Choose a weekday.")
-        try:
-            weekday = int(weekday_value)
-        except ValueError:
-            return None, ("roster_work_weekday", "Choose a weekday.")
-        if weekday < 0 or weekday > 6:
-            return None, ("roster_work_weekday", "Choose a weekday.")
-        recurrence["weekday"] = weekday
-    if next_run_after(recurrence, after=utc_now()) is None:
-        return None, ("roster_work_timezone", "Use a valid IANA timezone.")
-    return recurrence, None
 
 
 def _schedule_change_modal(

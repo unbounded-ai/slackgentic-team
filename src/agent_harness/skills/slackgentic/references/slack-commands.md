@@ -15,8 +15,10 @@ are noted separately.
 | `<task> #dangerous-mode` | Run without approval prompts (user's explicit choice only) |
 | `<task> model=<name>` | Launch with a specific model; later turns in the thread keep it |
 
-The roster message also has **Assign Work** and **Schedule Work** buttons that
-open forms for the same options, including waiting for a busy agent to finish.
+The roster message also has an **Add work** button, and each available agent's
+card has an **Assign** button. Both open a form for the same options: run now or
+once at a set time, optionally waiting for a busy agent to finish. The form has
+no repeat options; recurring work belongs in a loop.
 
 ## Inside a task thread
 
