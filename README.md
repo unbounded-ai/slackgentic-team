@@ -120,10 +120,14 @@ Slackgentic reacts right away, replies in your thread, launches the selected
 provider, and streams the visible result back. Thread replies continue from the
 same Slack context.
 
-The roster also has `Assign Work` and `Schedule Work` buttons. They open a
-Slack form for a task, work/review kind, timing, dangerous mode, repeat cadence,
-and an optional dependency on a currently busy agent finishing its active task or
-external session.
+The roster also has an `Add work` button, and each available agent's card has an
+`Assign` button. They open a Slack form for a task, work/review kind, timing
+(now or once at a set time), dangerous mode, and an optional dependency on a
+currently busy agent finishing its active task or external session. For
+recurring work, create a loop instead.
+
+Roster cards show each agent's face with its provider's logo in the corner, and
+task threads open with the same logo next to the agent's name.
 
 In the main channel, write anything to hand it to an available agent. Use
 `@agentname ...` when you want a specific agent. Inside a task thread, reply

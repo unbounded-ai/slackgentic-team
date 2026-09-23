@@ -62,7 +62,7 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(len(agents[0].metadata["outside_interests"]), 3)
         self.assertEqual(agents[0].metadata["backstory"], agents[0].metadata["personal_context"])
         self.assertIn("avatar", agents[0].metadata["avatar_prompt"].lower())
-        self.assertIn("cartoon", agents[0].metadata["avatar_prompt"].lower())
+        self.assertIn("monoline portrait", agents[0].metadata["avatar_prompt"].lower())
         self.assertEqual(
             agents[0].metadata["avatar_path"],
             f"docs/assets/avatars/{agents[0].avatar_slug}.png",
@@ -501,6 +501,10 @@ class TeamTests(unittest.TestCase):
         with patch.dict("os.environ", {"SLACKGENTIC_AGENT_AVATAR_BASE_URL": ""}):
             self.assertEqual(
                 agent_card_icon_url(bundled, worker),
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/64/codex/{worker.avatar_slug}.png",
+            )
+            self.assertEqual(
+                agent_card_icon_url(bundled, replace(worker, provider_preference=None)),
                 f"{DEFAULT_AGENT_AVATAR_BASE_URL}/64/{worker.avatar_slug}.png",
             )
         self.assertEqual(agent_card_icon_url(store, loop_agent), "https://example.com/loop.png")

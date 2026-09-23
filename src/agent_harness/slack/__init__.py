@@ -33,6 +33,7 @@ from agent_harness.providers.usage import (
 from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
+    provider_logo_url,
 )
 from agent_harness.team.routing import parse_lightweight_handles
 from agent_harness.updates import UpdateCandidate
@@ -1965,16 +1966,23 @@ def build_task_thread_blocks(
             for url, label in _pr_source_labels(pr_urls)[:5]
         ]
     context = [f"*{_mrkdwn_escape(agent.full_name)}* `@{agent.handle}` picked up this {task_label}"]
-    if agent.provider_preference is not None:
-        context.append(agent.provider_preference.value)
+    provider = task.session_provider or agent.provider_preference
     if task.metadata.get(DANGEROUS_MODE_METADATA_KEY):
         context.append("⚡ dangerous mode")
     if finished:
         context.append("✅ done")
-    blocks: list[dict[str, Any]] = [
-        card,
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(context)[:2900]}]},
-    ]
+    context_elements: list[dict[str, Any]] = []
+    if provider is not None:
+        # The provider's logo leads the byline, in place of its name.
+        context_elements.append(
+            {
+                "type": "image",
+                "image_url": provider_logo_url(provider),
+                "alt_text": provider.value.capitalize(),
+            }
+        )
+    context_elements.append({"type": "mrkdwn", "text": " · ".join(context)[:2900]})
+    blocks: list[dict[str, Any]] = [card, {"type": "context", "elements": context_elements}]
     if include_actions:
         blocks.append(
             {
