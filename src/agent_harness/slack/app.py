@@ -402,6 +402,9 @@ SETTING_EXTERNAL_SESSION_DELIVERY_PREFIX = "external_session_delivery."
 TASK_REACTION_ACKNOWLEDGED = "eyes"
 TASK_REACTION_QUEUED = "inbox_tray"
 TASK_REACTION_IN_PROGRESS = "hourglass_flowing_sand"
+# How long an open loop run's task may sit with no running process before the
+# run is closed out.
+LOOP_RUN_STRANDED_GRACE = timedelta(minutes=2)
 TASK_REACTION_DONE = "white_check_mark"
 TASK_STATUS_REACTIONS = (
     TASK_REACTION_ACKNOWLEDGED,
@@ -3865,6 +3868,7 @@ class SlackTeamController:
                 limit=10_000,
             )
         ):
+            self._end_compaction_run(run, thread)
             return True
         now = utc_now()
         entry = LoopJournalEntry(
@@ -3893,7 +3897,17 @@ class SlackTeamController:
                 thread_ts=run.thread_ts,
             )
         )
+        self._end_compaction_run(run, thread)
         return True
+
+    def _end_compaction_run(self, run: LoopRun, thread: SlackThreadRef) -> None:
+        """A compaction run's only job is the snapshot, so accepting it ends the run.
+
+        Managed Claude idles on stdin after each turn, so without this the run
+        would stay open and every scheduled run after it would be skipped.
+        """
+        if run.kind == LoopRunKind.COMPACTION:
+            self._complete_task_thread(thread.channel_id, thread.thread_ts)
 
     def finalize_loop_run(self, run: LoopRun, task: AgentTask) -> bool:
         current_run = self.store.get_loop_run(run.run_id) or run
@@ -4450,9 +4464,29 @@ class SlackTeamController:
                 return True
             return False
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
-            return False
+            if not self._loop_run_task_stranded(task):
+                return False
+            # Nothing is running the task, so nothing will ever finish the run:
+            # close it out on what it recorded before it stopped.
+            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
+            self.store.delete_managed_thread_task(task.task_id)
+            task = self.store.get_agent_task(task.task_id) or task
         self.finalize_loop_run(current, task)
         return True
+
+    def _loop_run_task_stranded(self, task: AgentTask) -> bool:
+        """Whether an open loop run's task has no process left to finish it.
+
+        A restart that finds the turn already over does not resume the task, and
+        a loop run has no Slack reply coming to restart it. The grace period
+        covers the moment between creating a run's task and starting it.
+        """
+        if self.runtime is None:
+            return False
+        is_running = getattr(self.runtime, "is_task_running", None)
+        if not callable(is_running) or is_running(task.task_id):
+            return False
+        return utc_now() - task.updated_at >= LOOP_RUN_STRANDED_GRACE
 
     def _retry_loop_resolution(
         self,
