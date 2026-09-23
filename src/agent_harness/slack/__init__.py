@@ -369,6 +369,7 @@ def build_loop_run_running_blocks(
     run_number: int,
     when_text: str,
     previous_headline: str | None = None,
+    progress: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     text = f"{LOOP_RUN_RUNNING_EMOJI} {title} · run #{run_number} is working…"
     context = f"Run #{run_number} · {when_text} · progress notes in the thread"
@@ -380,6 +381,7 @@ def build_loop_run_running_blocks(
             "task_id": f"run-{run_number}",
             "title": f"{title} — working on it"[:150],
             "status": "in_progress",
+            **({"details": _rich_text(progress)} if progress else {}),
         },
         {"type": "context", "elements": [{"type": "mrkdwn", "text": context[:2900]}]},
     ]

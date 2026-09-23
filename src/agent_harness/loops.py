@@ -846,6 +846,9 @@ def build_loop_run_prompt(
             "Slack layout: this run's top-level channel message becomes your report card, and "
             "this thread holds working notes. Keep thread notes to a few short progress lines; "
             "do not post the final report in the thread.",
+            "As you move between steps, emit a hidden status line such as "
+            "`SLACKGENTIC: ROSTER Querying prod telemetry (2/4)`; the latest one shows live on "
+            "the run card.",
             "When the run's work is finished, emit exactly one hidden single-line JSON control "
             "line (escape newlines inside strings as \\n):",
             f"{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{LOOP_SUMMARY_SIGNAL_EXAMPLE}",

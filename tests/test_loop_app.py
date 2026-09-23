@@ -2275,6 +2275,13 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(running["blocks"][0]["type"], "task_card")
         self.assertEqual(running["blocks"][0]["status"], "in_progress")
 
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: ROSTER Querying prod telemetry (2/4)"
+        )
+        live = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
+        self.assertEqual(live["blocks"][0]["status"], "in_progress")
+        self.assertIn("Querying prod telemetry (2/4)", str(live["blocks"][0]["details"]))
+
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
         self.controller.handle_runtime_task_done(
             self.store.get_agent_task(task.task_id), agent, thread

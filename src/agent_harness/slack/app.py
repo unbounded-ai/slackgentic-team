@@ -3665,6 +3665,26 @@ class SlackTeamController:
         self._refresh_loop_panel(loop)
         return True
 
+    def _show_loop_run_progress(self, task: AgentTask, progress: str) -> None:
+        """Show the agent's latest status line inside the running task card."""
+        run = self.store.get_loop_run(str(task.metadata.get(LOOP_RUN_ID_METADATA_KEY) or ""))
+        loop = self.store.get_loop(str(task.metadata.get(LOOP_ID_METADATA_KEY) or ""))
+        if (
+            run is None
+            or loop is None
+            or run.status != LoopRunStatus.RUNNING
+            or not run.thread_ts
+            or not loop.channel_id
+        ):
+            return
+        text, blocks = build_loop_run_running_blocks(
+            title=loop.title,
+            run_number=run.run_number,
+            when_text=format_loop_timestamp(run.due_at, loop.timezone),
+            progress=_shorten(" ".join(progress.split()), 280),
+        )
+        self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
+
     def _publish_loop_run_card(self, loop: Loop, run: LoopRun) -> None:
         """Turn the run's parent message into the report itself."""
         if not loop.channel_id or not run.thread_ts or run.kind == LoopRunKind.COMPACTION:
@@ -8935,6 +8955,10 @@ class SlackTeamController:
                 return self._handle_loop_compact_signal(task, agent, thread, signal)
             if normalized_signal.startswith(AGENT_LOOP_FETCH_SIGNAL_PREFIX):
                 return self._handle_loop_fetch_signal(task, agent, thread, signal)
+            progress = parse_agent_roster_status_signal(signal)
+            if progress is not None:
+                self._show_loop_run_progress(task, progress)
+                return True
             if signal.strip().upper().startswith("SLACKGENTIC:"):
                 return True
         roster_summary = parse_agent_roster_status_signal(signal)
