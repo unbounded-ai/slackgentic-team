@@ -505,11 +505,11 @@ class TeamTests(unittest.TestCase):
             )
             self.assertEqual(
                 agent_card_icon_url(bundled, worker),
-                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/32/codex/{worker.avatar_slug}.png",
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/36/codex/{worker.avatar_slug}.png",
             )
             self.assertEqual(
                 agent_card_icon_url(bundled, replace(worker, provider_preference=None)),
-                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/32/{worker.avatar_slug}.png",
+                f"{DEFAULT_AGENT_AVATAR_BASE_URL}/36/{worker.avatar_slug}.png",
             )
         self.assertEqual(agent_card_icon_url(store, loop_agent), "https://example.com/loop.png")
 

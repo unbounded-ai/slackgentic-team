@@ -4,7 +4,7 @@ Each avatar is a monoline portrait: ink outlines over flat fills on a soft
 background blob. Traits (skin, hair, clothes, glasses, ...) are derived from
 the avatar index and name, so regenerating is deterministic.
 
-Writes ``<out>/<n>.png`` (256px), ``<out>/32/<n>.png`` (card icons, drawn with
+Writes ``<out>/<n>.png`` (256px), ``<out>/36/<n>.png`` (card icons, drawn with
 heavier lines so they stay crisp small), and ``<out>/manifest.json``. SVGs are
 rasterized with ``scripts/svg2png.swift`` and palettized with ImageMagick, so
 this runs on macOS with Xcode command line tools and ``magick``. Run ``scripts/generate_provider_badges.sh`` afterwards to

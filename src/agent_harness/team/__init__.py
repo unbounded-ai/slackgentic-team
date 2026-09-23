@@ -37,7 +37,7 @@ DEFAULT_AGENT_AVATAR_BASE_URL = (
 )
 DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 # Avatar sets keep a copy at this size in a subdirectory, for card icons.
-AGENT_CARD_ICON_SIZE = 32
+AGENT_CARD_ICON_SIZE = 36
 PROVIDER_LOGO_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/providers"
 )
@@ -816,10 +816,10 @@ def agent_icon_url(store, agent: TeamAgent) -> str | None:
 def agent_card_icon_url(store, agent: TeamAgent) -> str | None:
     """A small avatar for Block Kit card icons.
 
-    Slack draws card icons at the image's own size and shows only the middle
-    32px, so a larger avatar loses its hair, chin, and badge. The bundled
-    avatars ship a 32px copy, with and without the provider logo; a custom
-    avatar set is used as it is.
+    Slack draws card icons at the image's own size in a box about 36px wide:
+    a larger avatar is cropped to its middle and a smaller one sits in a gray
+    frame. The bundled avatars ship a 36px copy, with and without the provider
+    logo; a custom avatar set is used as it is.
     """
     url = agent_icon_url(store, agent)
     if url is None or agent.metadata.get("icon_url"):

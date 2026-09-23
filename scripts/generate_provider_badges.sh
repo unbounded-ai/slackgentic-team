@@ -3,7 +3,7 @@
 #
 # Reads docs/assets/providers/<provider>.png and writes
 # docs/assets/avatars/<provider>/<n>.png (256px message avatars) and
-# docs/assets/avatars/32/<provider>/<n>.png (card icons). Requires ImageMagick 7
+# docs/assets/avatars/36/<provider>/<n>.png (card icons). Requires ImageMagick 7
 # (`magick`).
 set -euo pipefail
 
@@ -36,10 +36,10 @@ stamp() {
 }
 
 stamp "$assets/avatars" 76 +174+6
-stamp "$assets/avatars/32" 13 +18+1
+stamp "$assets/avatars/36" 13 +21+2
 # Flat art survives a 128-color palette losslessly to the eye, at a third of the size.
 for provider in claude codex; do
   magick mogrify -strip -alpha off +dither -colors 128 -define png:color-type=3 \
-    "$assets/avatars/$provider"/*.png "$assets/avatars/32/$provider"/*.png
+    "$assets/avatars/$provider"/*.png "$assets/avatars/36/$provider"/*.png
 done
 echo "badged $(ls "$assets"/avatars/*.png | wc -l | tr -d ' ') avatars per provider"
