@@ -27,7 +27,6 @@ from agent_harness.pr_links import pr_urls_from_metadata, slack_pr_links
 from agent_harness.team import (
     DEFAULT_CLAUDE_TEAM_SIZE,
     DEFAULT_CODEX_TEAM_SIZE,
-    agent_identity_label,
 )
 from agent_harness.team.routing import parse_lightweight_handles
 from agent_harness.updates import UpdateCandidate
@@ -263,6 +262,7 @@ def build_loop_preview_blocks(
                     f"• Schedule: {spec.schedule_description} (next run {next_run_text})\n"
                     f"• Permissions: {loop.permission_mode.value}{cwd}\n"
                     f"• Icon: :{spec.icon.emoji}:"
+                    + ("\n• 🔕 Quiet: posts only when a run needs attention" if spec.quiet else "")
                 ),
             },
         },
@@ -401,6 +401,7 @@ def build_loop_run_report_blocks(
     duration_text: str | None = None,
     guard_note: str | None = None,
     feedback_value: dict[str, str] | None = None,
+    notes_in_thread: bool = True,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Render a finished run as a report-first card for the run's parent message."""
     emoji, label = loop_result_style(status)
@@ -430,7 +431,7 @@ def build_loop_run_report_blocks(
         footer.append(f"took {duration_text}")
     if guard_note:
         footer.append(guard_note)
-    footer.append("🧵 working notes in thread")
+    footer.append("🧵 working notes in thread" if notes_in_thread else "🔕 quiet loop")
     blocks.append(
         {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(footer)[:2900]}]}
     )
@@ -485,11 +486,15 @@ def build_loop_panel_blocks(
     running: bool = False,
     remembered_approvals: int = 0,
     context: str = "panel",
+    quiet: bool = False,
+    last_check_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """The loop's control panel: pinned in its channel and reused by `loop status`."""
     icon = f"{icon_emoji} " if icon_emoji else ""
     state_text = _loop_state_text(loop, running=running)
     subtitle = f"{state_text} · {schedule_text}"
+    if quiet:
+        subtitle += " · 🔕 quiet"
     if loop.status == LoopStatus.ACTIVE and not running:
         subtitle += f" · next {next_run_text}"
     body = (
@@ -529,6 +534,11 @@ def build_loop_panel_blocks(
             for chip in recent_runs
         )
         history.append(f"*Recent runs*  {chips}")
+    if quiet:
+        quiet_line = "🔕 *Quiet* — posts only when a run needs attention"
+        if last_check_text:
+            quiet_line += f" · {last_check_text}"
+        history.append(quiet_line)
     if latest_url and latest_headline:
         history.append(f"<{latest_url}|Open the latest report →>")
     if history:
@@ -613,6 +623,8 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
         if part
     ]
     state = _loop_state_text(loop, running=bool(row.get("running")))
+    if row.get("quiet"):
+        state += " · 🔕"
     card: dict[str, Any] = {
         "type": "card",
         "block_id": f"loop.list.item.{loop.loop_id}"[:255],
@@ -688,6 +700,12 @@ def build_loop_edit_modal(
     current_mode = next(
         (option for option in modes if option["value"] == loop.permission_mode.value), modes[0]
     )
+    quiet = loop.metadata.get("quiet") is True
+    quiet_option = _option(
+        "Only post when a run needs attention",
+        "quiet",
+        "All-clear runs stay silent and only update the pinned panel",
+    )
     cwd_element: dict[str, Any] = {
         "type": "plain_text_input",
         "action_id": "value",
@@ -751,6 +769,18 @@ def build_loop_edit_modal(
                     "action_id": "value",
                     "initial_option": current_mode,
                     "options": modes,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_quiet",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Notifications"},
+                "element": {
+                    "type": "checkboxes",
+                    "action_id": "value",
+                    "options": [quiet_option],
+                    **({"initial_options": [quiet_option]} if quiet else {}),
                 },
             },
             {
@@ -1255,157 +1285,132 @@ def build_start_session_modal(callback_id: str = "session.start") -> dict[str, A
     }
 
 
+ROSTER_STATUS_STYLES: dict[str, str] = {
+    "Available": "🟢",
+    "Working": "🔨",
+    "Queued": "⏳",
+    "Occupied": "👀",
+}
+ROSTER_HIRE_OPTIONS: tuple[tuple[str, str | None, str | None], ...] = (
+    ("Auto (best available)", None, None),
+    ("Codex engineer", Provider.CODEX.value, None),
+    ("Claude engineer", Provider.CLAUDE.value, None),
+    ("PM (Codex)", Provider.CODEX.value, TeamAgentKind.PM.value),
+    ("PM (Claude)", Provider.CLAUDE.value, TeamAgentKind.PM.value),
+)
+
+
 def build_team_roster_blocks(
     agents: list[TeamAgent],
     statuses: dict[str, AgentRosterStatus] | None = None,
 ) -> list[dict[str, Any]]:
+    """The team roster: a summary, team actions, and a carousel of agent cards per group."""
     visible_agents = [agent for agent in agents if agent.kind != TeamAgentKind.LOOP]
     engineers = [agent for agent in visible_agents if not agent.is_pm]
     pms = [agent for agent in visible_agents if agent.is_pm]
+    busy = [agent for agent in engineers if not _agent_accepts_new_work(_status(agent, statuses))]
+    free = [agent for agent in engineers if _agent_accepts_new_work(_status(agent, statuses))]
+    summary = (
+        f"*🤖 Agent team* · {len(visible_agents)} "
+        f"{'agent' if len(visible_agents) == 1 else 'agents'} · {len(busy)} working · "
+        f"{len(free)} free"
+    )
+    breakdown = _provider_breakdown_text(visible_agents)
+    if pms:
+        breakdown += f" · {len(pms)} {'PM' if len(pms) == 1 else 'PMs'}"
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*Agent team*  {len(visible_agents)} active lightweight handles "
-                    f"({len(engineers)} engineers, {len(pms)} PMs)\n"
-                    f"{_provider_breakdown_text(visible_agents)}"
-                ),
-            },
+            "block_id": "team.roster.summary",
+            "text": {"type": "mrkdwn", "text": f"{summary}\n{breakdown}"},
         },
         {
             "type": "actions",
             "block_id": "team.roster.actions",
             "elements": [
                 _button(
-                    "Hire Auto",
-                    "team.hire.auto",
-                    encode_action_value("team.hire", count=1),
-                    "primary",
-                ),
-                _button(
-                    "Hire Codex",
-                    "team.hire.codex",
-                    encode_action_value("team.hire", count=1, provider=Provider.CODEX.value),
-                ),
-                _button(
-                    "Hire Claude",
-                    "team.hire.claude",
-                    encode_action_value("team.hire", count=1, provider=Provider.CLAUDE.value),
-                ),
-                _button(
-                    "Hire PM (Codex)",
-                    "team.hire.pm.codex",
-                    encode_action_value(
-                        "team.hire",
-                        count=1,
-                        provider=Provider.CODEX.value,
-                        kind=TeamAgentKind.PM.value,
-                    ),
-                ),
-                _button(
-                    "Hire PM (Claude)",
-                    "team.hire.pm.claude",
-                    encode_action_value(
-                        "team.hire",
-                        count=1,
-                        provider=Provider.CLAUDE.value,
-                        kind=TeamAgentKind.PM.value,
-                    ),
-                ),
-                _button(
-                    "Add Work",
+                    "📝 Add work",
                     "roster.work.assign",
                     encode_action_value("roster.work.open", mode="now"),
+                    "primary",
                 ),
+                {
+                    "type": "static_select",
+                    "action_id": "team.hire.select",
+                    "placeholder": {"type": "plain_text", "text": "Hire…"},
+                    "options": [
+                        _option(
+                            label,
+                            encode_action_value(
+                                "team.hire",
+                                count=1,
+                                **({"provider": provider} if provider else {}),
+                                **({"kind": kind} if kind else {}),
+                            ),
+                        )
+                        for label, provider, kind in ROSTER_HIRE_OPTIONS
+                    ],
+                },
             ],
         },
     ]
-    group_specs = (
-        (
-            "team.section.engineers",
-            f":hammer_and_wrench: *Engineers* — {len(engineers)}",
-            engineers,
-        ),
-        ("team.section.pms", f":clipboard: *Program managers* — {len(pms)}", pms),
+    groups = (
+        ("team.section.working", "🔨 *Working now*", busy),
+        ("team.section.pms", "📋 *Program managers*", pms),
+        ("team.section.available", "🟢 *Available*", free),
     )
-    shown_counts = _roster_group_allowances(group_specs, reserved=len(blocks))
-    hidden = 0
-    for block_id, heading, members in group_specs:
+    for block_id, heading, members in groups:
         if not members:
             continue
-        shown = shown_counts.get(block_id, 0)
-        hidden += len(members) - shown
-        if not shown:
-            continue
+        ordered = _sorted_roster_agents(members, statuses)
         blocks.append(
             {
                 "type": "context",
                 "block_id": block_id,
-                "elements": [{"type": "mrkdwn", "text": heading}],
+                "elements": [{"type": "mrkdwn", "text": f"{heading} · {len(members)}"}],
             }
         )
-        for agent in _sorted_roster_agents(members, statuses)[:shown]:
-            blocks.extend(_agent_roster_blocks(agent, statuses))
-    if hidden:
-        blocks.append(
-            {
-                "type": "context",
-                "block_id": "team.section.truncated",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": (
-                            f":information_source: {hidden} more "
-                            f"{'agent is' if hidden == 1 else 'agents are'} not listed here; "
-                            f"Slack allows {SLACK_MAX_MESSAGE_BLOCKS} blocks per message. "
-                            "Fire agents you no longer need to free up roster rows."
-                        ),
-                    }
-                ],
-            }
-        )
-    return blocks
+        for start in range(0, len(ordered), 10):
+            blocks.append(
+                {
+                    "type": "carousel",
+                    "block_id": f"{block_id}.cards.{start // 10}",
+                    "elements": [
+                        _agent_roster_card(agent, _status(agent, statuses))
+                        for agent in ordered[start : start + 10]
+                    ],
+                }
+            )
+    return blocks[:SLACK_MAX_MESSAGE_BLOCKS]
 
 
-def _roster_group_allowances(
-    group_specs: tuple[tuple[str, str, list[TeamAgent]], ...],
-    *,
-    reserved: int,
-) -> dict[str, int]:
-    """Decide how many agents per roster group fit inside Slack's block limit.
-
-    Each agent costs ``ROSTER_AGENT_BLOCK_COUNT`` blocks plus one heading block
-    per rendered group. Smaller groups are budgeted first so a long engineer
-    roster cannot push program managers out of the message entirely.
-    """
-
-    populated = [spec for spec in group_specs if spec[2]]
-    remaining = SLACK_MAX_MESSAGE_BLOCKS - reserved
-    full_cost = sum(1 + ROSTER_AGENT_BLOCK_COUNT * len(members) for _, _, members in populated)
-    if full_cost > remaining:
-        remaining -= 1  # leave room for the "not listed here" notice
-    allowances: dict[str, int] = {}
-    for block_id, _, members in sorted(populated, key=lambda spec: len(spec[2])):
-        if remaining < 1 + ROSTER_AGENT_BLOCK_COUNT:
-            allowances[block_id] = 0
-            continue
-        shown = min(len(members), (remaining - 1) // ROSTER_AGENT_BLOCK_COUNT)
-        allowances[block_id] = shown
-        remaining -= 1 + shown * ROSTER_AGENT_BLOCK_COUNT
-    return allowances
+def _status(agent: TeamAgent, statuses: dict[str, AgentRosterStatus] | None):
+    return statuses.get(agent.agent_id) if statuses else None
 
 
-def _agent_roster_blocks(
-    agent: TeamAgent,
-    statuses: dict[str, AgentRosterStatus] | None,
-) -> list[dict[str, Any]]:
-    status = statuses.get(agent.agent_id) if statuses else None
-    status_text = _agent_status_text(status)
-    elements: list[dict[str, Any]] = []
+def _agent_roster_card(agent: TeamAgent, status: AgentRosterStatus | None) -> dict[str, Any]:
+    label = status.label if status else "Available"
+    subtitle = f"{ROSTER_STATUS_STYLES.get(label, '•')} {label}"
+    if agent.provider_preference is not None:
+        subtitle += f" · {agent.provider_preference.value}"
+    if agent.is_pm:
+        subtitle += " · PM"
+    if status and status.dangerous_mode:
+        subtitle += " · ⚡ dangerous"
+    body = _roster_card_body(status)
+    card: dict[str, Any] = {
+        "type": "card",
+        "block_id": f"team.agent.{agent.agent_id}"[:255],
+        "title": {
+            "type": "mrkdwn",
+            "text": f"*{_mrkdwn_escape(agent.full_name)}* `@{agent.handle}`"[:150],
+        },
+        "subtitle": {"type": "mrkdwn", "text": subtitle[:150]},
+        "body": {"type": "mrkdwn", "text": body},
+    }
+    actions: list[dict[str, Any]] = []
     if status and status.task_id:
-        elements.append(
+        actions.append(
             _button(
                 "Free up",
                 "task.done",
@@ -1414,7 +1419,7 @@ def _agent_roster_blocks(
             )
         )
     elif status and status.session_provider and status.session_id:
-        elements.append(
+        actions.append(
             _button(
                 "Detach",
                 "external.session.detach",
@@ -1426,7 +1431,7 @@ def _agent_roster_blocks(
             )
         )
     if status and status.thread_url:
-        elements.append(
+        actions.append(
             _button(
                 "Open thread",
                 "thread.open",
@@ -1435,10 +1440,9 @@ def _agent_roster_blocks(
             )
         )
     if _agent_accepts_new_work(status):
-        assign_label = "Assign Project" if agent.is_pm else "Assign"
-        elements.append(
+        actions.append(
             _button(
-                assign_label,
+                "Assign Project" if agent.is_pm else "Assign",
                 "roster.work.assign",
                 encode_action_value(
                     "roster.work.open",
@@ -1446,9 +1450,10 @@ def _agent_roster_blocks(
                     agent_id=agent.agent_id,
                     handle=agent.handle,
                 ),
+                "primary",
             )
         )
-    elements.append(
+    actions.append(
         _button(
             "Fire",
             "team.fire",
@@ -1456,32 +1461,24 @@ def _agent_roster_blocks(
             "danger",
         )
     )
-    header_label = agent_identity_label(agent)
-    if agent.is_pm:
-        header_label = f"PM · {header_label}"
-    return [
-        {
-            "type": "header",
-            "block_id": f"team.agent.{agent.agent_id}",
-            "text": {
-                "type": "plain_text",
-                "text": _plain_text_header(header_label),
-            },
-        },
-        {
-            "type": "section",
-            "block_id": f"team.status.{agent.agent_id}",
-            "text": {
-                "type": "mrkdwn",
-                "text": status_text,
-            },
-        },
-        {
-            "type": "actions",
-            "block_id": f"team.agent.actions.{agent.agent_id}",
-            "elements": elements,
-        },
-    ]
+    card["actions"] = actions[:3]
+    return card
+
+
+def _roster_card_body(status: AgentRosterStatus | None) -> str:
+    if status is None or status.label == "Available":
+        return "Ready for work."
+    detail = " ".join((status.detail or status.label).split())
+    detail = _mrkdwn_escape(detail)
+    pr_text = ""
+    if status.pr_urls:
+        label = "PRs" if len(status.pr_urls) > 1 else "PR"
+        pr_text = f"\n*{label}:* {slack_pr_links(status.pr_urls, limit=2)}"
+    budget = 200 - len(pr_text)
+    if budget < 60:
+        pr_text = ""
+        budget = 200
+    return _shorten_text(detail, budget) + pr_text
 
 
 def _sorted_roster_agents(
@@ -1549,77 +1546,35 @@ def build_channel_overview_blocks(
     codex_command: str,
     claude_command: str,
 ) -> list[dict[str, Any]]:
+    """The welcome card posted when the agent channel is set up."""
+    guide = f"""**Start work** — write anything here, or `@agentname ...` for someone specific. The agent replies in your thread and keeps the thread's context.
+
+**Thread subtasks** — reply `somebody ...` in a task thread to pull in another agent; the original agent picks the thread back up with the added context.
+
+**Loops** — `loop create` sets up a recurring, read-only report in its own channel. `loops` lists them.
+
+**Dangerous mode** — add `#dangerous-mode` to launch without sandbox or approvals. Active dangerous tasks are flagged on the roster.
+
+**Commands** — type them here, or run `{slash_command} <command>`:
+- `status` usage and active sessions
+- `show roster` the team with its controls
+- `external sessions` unassigned outside-Slack sessions
+- `scheduled tasks` active schedules
+- `hire 3 agents` · `fire everyone`
+
+**Sessions started outside Slack** — Codex: `{codex_command}`. Claude: run `slackgentic claude-channel --install` once, then `{claude_command}`. Each session gets a tracked thread here; Slack replies and tool approvals relay through it. Restart already-open Claude sessions after installing the channel."""
     return [
         {
-            "type": "section",
-            "text": {
+            "type": "card",
+            "block_id": "slackgentic.overview.card",
+            "title": {"type": "mrkdwn", "text": "*👋 Slackgentic is ready*"},
+            "subtitle": {"type": "mrkdwn", "text": "Your agent team works right here"},
+            "body": {
                 "type": "mrkdwn",
-                "text": (
-                    "*Slackgentic is ready.*\n"
-                    "Write anything in this channel to start a task, or write "
-                    "`@agentname ...` to ask a specific agent. The agent replies "
-                    "in your thread."
-                ),
+                "text": "Write anything in this channel to start a task. Agents reply in threads.",
             },
         },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Thread subtasks:*\n"
-                    "Reply with `somebody ...` in a task thread to bring in another "
-                    "agent for that subtask. The original agent picks the thread back "
-                    "up with the added context."
-                ),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Dangerous mode:*\n"
-                    "Add `#dangerous-mode` to a task to launch that agent with Codex "
-                    "no-sandbox/no-approval mode or Claude skip-permissions. Active "
-                    "dangerous-mode tasks are marked on the roster."
-                ),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Commands:* type them directly in this channel, "
-                    f"or run them as `{slash_command} <command>`\n"
-                    f"`{slash_command} status`  usage and active sessions\n"
-                    f"`{slash_command} show roster`  current team\n"
-                    f"`{slash_command} external sessions`  unassigned outside-Slack sessions\n"
-                    f"`{slash_command} scheduled tasks`  active schedules\n"
-                    f"`{slash_command} hire 3 agents`  add capacity\n"
-                    f"`{slash_command} fire everyone`  clear the team\n"
-                    "`status`, `show roster`, `external sessions`, `scheduled tasks`, "
-                    "`hire 3 agents` also work here"
-                ),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Sessions started outside Slack:*\n"
-                    f"*Codex:* `{codex_command}`\n"
-                    "*Claude:* run `slackgentic claude-channel --install` once, then "
-                    f"`{claude_command}`\n"
-                    "Each command creates a tracked Slack thread here. Restart already-open "
-                    "Claude sessions after installing the channel. Slack replies and native "
-                    "Claude tool approvals relay through it; no extra MCP flag is needed unless "
-                    "you use `--strict-mcp-config`."
-                ),
-            },
-        },
+        {"type": "markdown", "text": guide},
     ]
 
 
@@ -1629,63 +1584,52 @@ def build_update_prompt_blocks(
     status_text: str | None = None,
     include_actions: bool = True,
 ) -> list[dict[str, Any]]:
+    """An update card: what's new, one click to upgrade, and live install status."""
     release = candidate.release
-    release_link = (
-        f"\n*Release:* <{release.html_url}|{release.tag_name}>" if release.html_url else ""
-    )
-    status_line = f"\n*Status:* {status_text}" if status_text else ""
-    # Drop the "Upgrade now to install…" prompt once a status line has been
-    # set — by then the upgrade has moved past the prompt stage and repeating
-    # the call-to-action under "Status: Installed…" reads wrong.
-    call_to_action = (
-        "\nUpgrade now to install the published release and restart the service."
-        if status_text is None
-        else ""
-    )
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Slackgentic update available*\n"
-                    f"Current: `{candidate.current_version}`  Latest: `{release.version}`"
-                    f"{release_link}{status_line}{call_to_action}"
-                ),
-            },
-        }
-    ]
-    release_notes = _release_notes_excerpt(release.body)
-    if release_notes:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Release notes:*\n{release_notes}",
-                },
-            }
-        )
+    if status_text is None:
+        body = "Upgrade now to install the published release and restart the service."
+    else:
+        body = status_text
+    card: dict[str, Any] = {
+        "type": "card",
+        "block_id": f"slackgentic.update.card.{release.version}"[:255],
+        "title": {"type": "mrkdwn", "text": f"✨ *Slackgentic {release.version} is out*"[:150]},
+        "subtitle": {
+            "type": "mrkdwn",
+            "text": f"You're on {candidate.current_version}"[:150],
+        },
+        "body": {"type": "mrkdwn", "text": _shorten_text(body, 200)},
+    }
     if include_actions:
-        blocks.append(
-            {
-                "type": "actions",
-                "block_id": f"slackgentic.update.{release.version}",
-                "elements": [
-                    _button(
-                        "Upgrade now",
-                        "slackgentic.update.install",
-                        encode_action_value("update.install", version=release.version),
-                        "primary",
-                    ),
-                    _button(
-                        "Not now",
-                        "slackgentic.update.dismiss",
-                        encode_action_value("update.dismiss", version=release.version),
-                    ),
-                ],
-            }
+        actions = [
+            _button(
+                "Upgrade now",
+                "slackgentic.update.install",
+                encode_action_value("update.install", version=release.version),
+                "primary",
+            ),
+        ]
+        if release.html_url:
+            actions.append(
+                _button(
+                    "What's new",
+                    "slackgentic.update.notes",
+                    encode_action_value("update.notes", version=release.version),
+                    url=release.html_url,
+                )
+            )
+        actions.append(
+            _button(
+                "Not now",
+                "slackgentic.update.dismiss",
+                encode_action_value("update.dismiss", version=release.version),
+            )
         )
+        card["actions"] = actions
+    blocks: list[dict[str, Any]] = [card]
+    release_notes = _release_notes_excerpt(release.body)
+    if release_notes and status_text is None:
+        blocks.append({"type": "markdown", "text": f"**What's new**\n{release_notes}"})
     return blocks
 
 
@@ -1981,29 +1925,37 @@ def build_task_thread_blocks(
     *,
     include_actions: bool = True,
 ) -> list[dict[str, Any]]:
+    """The task thread header: a live task card for the agent's work."""
     task_label = "PR review" if task.kind.value == "review" else "task"
-    dangerous_line = (
-        "*:zap: Dangerous mode*\n" if task.metadata.get(DANGEROUS_MODE_METADATA_KEY) else ""
-    )
+    original = _task_original_prompt(task)
+    summary = task.metadata.get(ROSTER_SUMMARY_METADATA_KEY)
+    summary = summary.strip() if isinstance(summary, str) else ""
+    finished = task.status.value in {"done", "cancelled"}
+    card: dict[str, Any] = {
+        "type": "task_card",
+        "task_id": task.task_id[:255],
+        "title": _task_card_title(original),
+        "status": "complete" if finished else "in_progress",
+        "details": _rich_text(original[:2500]),
+    }
+    if summary and summary != original:
+        card["output"] = _rich_text(f"Latest: {summary[:1500]}")
     pr_urls = pr_urls_from_metadata(task.metadata)
-    pr_line = ""
     if pr_urls:
-        label = "PRs" if len(pr_urls) > 1 else "PR"
-        pr_line = f"\n*{label}:* {slack_pr_links(pr_urls)}"
-    task_lines = _task_display_lines(task)
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*{agent.full_name}* `@{agent.handle}` picked up a {task_label}.\n"
-                    f"{dangerous_line}"
-                    f"{task_lines}"
-                    f"{pr_line}"
-                ),
-            },
-        },
+        card["sources"] = [
+            {"type": "url", "url": url, "text": label}
+            for url, label in _pr_source_labels(pr_urls)[:5]
+        ]
+    context = [f"*{_mrkdwn_escape(agent.full_name)}* `@{agent.handle}` picked up this {task_label}"]
+    if agent.provider_preference is not None:
+        context.append(agent.provider_preference.value)
+    if task.metadata.get(DANGEROUS_MODE_METADATA_KEY):
+        context.append("⚡ dangerous mode")
+    if finished:
+        context.append("✅ done")
+    blocks: list[dict[str, Any]] = [
+        card,
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(context)[:2900]}]},
     ]
     if include_actions:
         blocks.append(
@@ -2021,6 +1973,19 @@ def build_task_thread_blocks(
             }
         )
     return blocks
+
+
+def _task_card_title(prompt: str) -> str:
+    first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "Task")
+    return _shorten_text(first_line, 120)
+
+
+def _pr_source_labels(urls: tuple[str, ...] | list[str]) -> list[tuple[str, str]]:
+    labels = []
+    for url in urls:
+        match = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", url)
+        labels.append((url, f"{match.group(1)}#{match.group(2)}" if match else url))
+    return labels
 
 
 def _task_display_lines(task: AgentTask) -> str:

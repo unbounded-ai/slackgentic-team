@@ -83,7 +83,9 @@ class FakeGateway:
         self.updates = []
         self.calls = []
 
-    def post_message(self, channel_id, text, blocks=None, thread_ts=None):
+    def post_message(
+        self, channel_id, text, blocks=None, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ):
         self.calls.append(("post_message", channel_id, text))
         self.posts.append((channel_id, text, blocks, thread_ts))
         ts = f"170.{len(self.posts):06d}"
@@ -2338,7 +2340,8 @@ class SessionMirrorTests(unittest.TestCase):
 
                 mirror.sync_once()
 
-                self.assertEqual(refreshed_channels, ["C1", "C1"])
+                # Occupancy changes in one sync are coalesced into a single refresh.
+                self.assertEqual(refreshed_channels, ["C1"])
                 self.assertIsNotNone(
                     store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
                 )

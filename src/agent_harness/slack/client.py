@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,6 +39,11 @@ class SlackGateway:
         from slack_sdk import WebClient
 
         self.client = WebClient(token=bot_token)
+        # Permalinks are deterministic once the workspace URL is known, so they
+        # are built locally instead of costing one chat.getPermalink per message
+        # (the roster alone used to make one call per occupied agent).
+        self._workspace_url: str | None = None
+        self._workspace_url_checked = False
 
     def create_channel(self, name: str, is_private: bool) -> str:
         from slack_sdk.errors import SlackApiError
@@ -213,8 +219,24 @@ class SlackGateway:
         return self.user_profile(user_id).display_name
 
     def permalink(self, channel_id: str, message_ts: str) -> str | None:
+        base = self._workspace_base_url()
+        if base and channel_id and re.fullmatch(r"\d+\.\d+", message_ts or ""):
+            return f"{base}archives/{channel_id}/p{message_ts.replace('.', '')}"
         response = self.client.chat_getPermalink(channel=channel_id, message_ts=message_ts)
         return response.get("permalink")
+
+    def _workspace_base_url(self) -> str | None:
+        if not getattr(self, "_workspace_url_checked", False):
+            self._workspace_url_checked = True
+            self._workspace_url = None
+            try:
+                url = self.auth_test().get("url")
+            except Exception:
+                LOGGER.debug("failed to resolve Slack workspace URL", exc_info=True)
+                url = None
+            if isinstance(url, str) and url.startswith("https://"):
+                self._workspace_url = url if url.endswith("/") else f"{url}/"
+        return getattr(self, "_workspace_url", None)
 
     def pin_message(self, channel_id: str, message_ts: str) -> None:
         from slack_sdk.errors import SlackApiError
@@ -232,11 +254,17 @@ class SlackGateway:
         text: str,
         blocks: list[dict[str, Any]] | None = None,
         thread_ts: str | None = None,
+        unfurl_links: bool | None = None,
+        unfurl_media: bool | None = None,
     ) -> PostedMessage:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
             "text": normalize_slack_mrkdwn(text),
         }
+        if unfurl_links is not None:
+            kwargs["unfurl_links"] = unfurl_links
+        if unfurl_media is not None:
+            kwargs["unfurl_media"] = unfurl_media
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
         auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks:

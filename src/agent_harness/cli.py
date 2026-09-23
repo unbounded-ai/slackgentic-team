@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import platform
 import shutil
@@ -480,10 +481,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.slack_command == "doctor":
             return _slack_doctor(config)
         if args.slack_command == "serve":
+            _enable_stack_dumps()
             return run_slack_app(config)
         if args.slack_command == "setup" and args.serve:
+            _enable_stack_dumps()
             return run_slack_app(config)
     raise AssertionError(args.command)
+
+
+def _enable_stack_dumps() -> None:
+    """`kill -USR1 <daemon pid>` writes every thread's stack to the service log."""
+    import faulthandler
+    import signal
+
+    with contextlib.suppress(AttributeError, ValueError, RuntimeError):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 def _managed_runtime_python_issue(args: argparse.Namespace) -> str | None:

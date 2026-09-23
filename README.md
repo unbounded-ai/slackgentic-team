@@ -205,6 +205,13 @@ permissions, and reference directory; the overflow menu compacts memory, forgets
 remembered approvals, or stops the loop. `loops` in the main channel shows every
 loop as a card in one carousel.
 
+**Quiet loops** post nothing, and so notify nobody, on all-clear runs: they
+work silently in the pinned panel's thread and only tick the panel's "last check"
+line. A run that finds something (or fails) posts one report card, so a
+notification always means real signal. Ask for it when creating the loop ("only
+post when there are errors"), tick *Only post when a run needs attention* in
+**Edit**, or use `loop quiet: on`.
+
 New loops are **read-only**. Every tool call passes through a loop guard before
 it runs: known reads run without asking, anything that could change state
 (file edits outside the loop's scratch directory, destructive shell commands,
@@ -237,6 +244,7 @@ prompt, journal, thread context, or history retrieval.
 | `loop icon: :emoji:` | Set an emoji; URLs and `regenerate` are also accepted |
 | `loop cwd: <path>` | Set the working directory for future runs |
 | `loop permissions: <mode>` | Use `read-only` (default), `safe-auto`, `locked`, or confirmed `dangerous` |
+| `loop quiet: on\|off` | Post only when a run needs attention, or every run |
 | `loop compact now` | Queue memory compaction |
 | `loop stop [archive]` | Stop the loop, optionally archiving its channel |
 | `loop help` | Show the in-channel command reference |

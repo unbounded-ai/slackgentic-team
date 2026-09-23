@@ -56,6 +56,7 @@ from agent_harness.loops import (
     LoopNameCommand,
     LoopPauseCommand,
     LoopPermissionsCommand,
+    LoopQuietCommand,
     LoopResumeCommand,
     LoopRunNowCommand,
     LoopScheduleCommand,
@@ -252,6 +253,7 @@ from agent_harness.sessions.mirror import (
     _is_codex_subagent_session,
     format_session_parent,
     record_external_session_activity,
+    session_parent_blocks,
 )
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
@@ -296,7 +298,7 @@ from agent_harness.slack.agent_requests import (
     AGENT_REQUEST_ACTIONS,
     render_persistent_agent_request,
 )
-from agent_harness.slack.client import SlackGateway
+from agent_harness.slack.client import PostedMessage, SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import (
     AGENT_CONTEXT_PLACEHOLDER,
@@ -1743,7 +1745,8 @@ class SlackTeamController:
             "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
             "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
             "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
-            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop compact now`\n"
+            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop quiet: on|off`\n"
+            "`loop compact now` · "
             "`loop stop` · `loop stop archive` · `loop help`"
         )
 
@@ -1815,6 +1818,16 @@ class SlackTeamController:
                 )
                 return
             self._set_loop_permissions(latest, command.permission_mode, event=event)
+            return
+        if isinstance(command, LoopQuietCommand):
+            self._set_loop_quiet(latest, command.enabled)
+            self._post_loop_surface(
+                latest,
+                "🔕 Quiet: this loop now posts only when a run needs attention."
+                if command.enabled
+                else "🔔 This loop now posts a report for every run.",
+                event=event,
+            )
             return
         if isinstance(command, LoopCompactNowCommand):
             if self.request_loop_compaction(latest):
@@ -1897,6 +1910,8 @@ class SlackTeamController:
             running=running,
             remembered_approvals=len(self._loop_remembered_tools(latest)),
             context=context,
+            quiet=_loop_is_quiet(latest),
+            last_check_text=self._loop_last_check_text(latest, runs),
         )
         return f"{latest.title}: {latest.status.value}; next run {next_run_text}.", blocks
 
@@ -1930,6 +1945,15 @@ class SlackTeamController:
             for run in self.store.list_loop_runs(loop_id, limit=LOOP_PANEL_RECENT_RUNS * 3)
             if run.kind != LoopRunKind.COMPACTION
         ]
+
+    def _loop_last_check_text(self, loop: Loop, runs: list[LoopRun]) -> str | None:
+        finished = next((run for run in runs if run.finished_at is not None), None)
+        if finished is None:
+            return None
+        return (
+            f"{self._loop_run_emoji(finished)} last check "
+            f"{format_loop_timestamp(finished.finished_at, loop.timezone)}"
+        )
 
     def _loop_run_emoji(self, run: LoopRun) -> str:
         if run.status == LoopRunStatus.RUNNING:
@@ -2011,6 +2035,7 @@ class SlackTeamController:
                         for run in reversed(runs[:5])
                     ],
                     "latest_headline": headline,
+                    "quiet": _loop_is_quiet(loop),
                 }
             )
         return f"Loops · {len(loops)}", build_loop_list_blocks(rows)
@@ -2152,6 +2177,20 @@ class SlackTeamController:
         self._append_loop_system_entry(loop, f"loop icon changed to {cleaned}")
         self._post_loop_surface(loop, f"Loop icon updated to {cleaned}.", event=event)
 
+    def _set_loop_quiet(self, loop: Loop, enabled: bool) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if _loop_is_quiet(latest) == enabled:
+            return
+        metadata = dict(latest.metadata)
+        metadata["quiet"] = enabled
+        self.store.update_loop_metadata(latest.loop_id, metadata)
+        self._append_loop_system_entry(
+            latest,
+            "quiet mode on: post only when a run needs attention"
+            if enabled
+            else "quiet mode off: post every run",
+        )
+
     def _set_loop_permissions(
         self,
         loop: Loop,
@@ -2212,7 +2251,8 @@ class SlackTeamController:
             "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
             "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
             "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
-            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop compact now`\n"
+            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop quiet: on|off`\n"
+            "`loop compact now` · "
             "`loop stop` · `loop stop archive` · `loop help`\n\n"
             "Only the loop owner can use these commands. Other members' messages are never "
             "shown to the loop agent."
@@ -2713,11 +2753,15 @@ class SlackTeamController:
             cwd = _validated_repo_root(cwd_value)
             if cwd is None:
                 return _view_errors("loop_cwd", "Use an existing local folder path.")
+        quiet = "quiet" in _view_checked_values(values, "loop_quiet", "value")
         mission_changed = mission != loop.mission.strip()
         schedule_changed = schedule != describe_loop_schedule(loop.recurrence, loop.timezone)
 
         def callback() -> None:
             latest = self.store.get_loop(loop.loop_id) or loop
+            if quiet != _loop_is_quiet(latest):
+                self._set_loop_quiet(latest, quiet)
+                latest = self.store.get_loop(loop.loop_id) or latest
             if cwd is not None:
                 self._update_loop_identity_values(latest, cwd=str(cwd))
                 self._append_loop_system_entry(latest, f"working directory changed to {cwd}")
@@ -3229,6 +3273,11 @@ class SlackTeamController:
             started_at=now,
         )
         header_blocks: list[dict] | None = None
+        quiet_run = (
+            _loop_is_quiet(loop)
+            and kind != LoopRunKind.COMPACTION
+            and bool(loop.charter_message_ts)
+        )
         if kind == LoopRunKind.COMPACTION:
             header_text = "🧹 Compacting memory"
             header_blocks = [
@@ -3250,13 +3299,18 @@ class SlackTeamController:
                 previous_headline=_shorten(_loop_headline(previous), 160) if previous else None,
             )
         try:
-            posted = self.gateway.post_session_parent(
-                loop.channel_id,
-                header_text,
-                persona=agent,
-                icon_url=self._agent_icon_url(agent),
-                blocks=header_blocks,
-            )
+            if quiet_run:
+                # Quiet runs work silently inside the pinned panel's thread; a card is
+                # only posted to the channel when the run needs attention.
+                posted = PostedMessage(loop.channel_id, str(loop.charter_message_ts))
+            else:
+                posted = self.gateway.post_session_parent(
+                    loop.channel_id,
+                    header_text,
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                    blocks=header_blocks,
+                )
         except Exception as exc:
             error_code = _slack_error_code(exc)
             failed = replace(
@@ -3272,7 +3326,7 @@ class SlackTeamController:
             self._record_loop_failure(loop, failed, error_code or str(exc))
             return True
         thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
-        run = replace(run, thread_ts=posted.ts)
+        run = replace(run, thread_ts=None if quiet_run else posted.ts)
         self.store.create_loop_run(run)
         guard_paths = (
             self._loop_guard_paths(loop)
@@ -3303,6 +3357,7 @@ class SlackTeamController:
                 bot_name=agent.full_name,
                 scratch_dir=str(guard_paths[0]) if guard_paths else None,
                 reference_dir=str(guard_paths[2]) if guard_paths and guard_paths[2] else None,
+                quiet=quiet_run,
             )
         )
         task = create_agent_task(
@@ -3690,8 +3745,15 @@ class SlackTeamController:
 
     def _publish_loop_run_card(self, loop: Loop, run: LoopRun) -> None:
         """Turn the run's parent message into the report itself."""
-        if not loop.channel_id or not run.thread_ts or run.kind == LoopRunKind.COMPACTION:
+        if not loop.channel_id or run.kind == LoopRunKind.COMPACTION:
             return
+        if not run.thread_ts:
+            self._publish_quiet_loop_run(loop, run)
+            return
+        text, blocks = self._loop_run_card_payload(loop, run)
+        self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
+
+    def _loop_run_card_payload(self, loop: Loop, run: LoopRun) -> tuple[str, list[dict]]:
         when_text = format_loop_timestamp(run.due_at, loop.timezone)
         if run.status == LoopRunStatus.FAILED:
             latest = self.store.get_loop(loop.loop_id) or loop
@@ -3741,8 +3803,35 @@ class SlackTeamController:
                     duration_text=_loop_run_duration(run),
                     guard_note=self._loop_guard_note(loop, run),
                     feedback_value={"loop_id": loop.loop_id, "run_id": run.run_id},
+                    notes_in_thread=not _loop_is_quiet(self.store.get_loop(loop.loop_id) or loop),
                 )
-        self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
+        return text, blocks
+
+    def _publish_quiet_loop_run(self, loop: Loop, run: LoopRun) -> None:
+        """A quiet run posts a card (and so notifies) only when it needs attention."""
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if not _loop_is_quiet(latest) or not latest.channel_id:
+            return
+        summary = loop_summary_from_json(run.summary_json)
+        noteworthy = run.status == LoopRunStatus.FAILED or summary is None or summary.status != "ok"
+        if not noteworthy:
+            return
+        agent = self.store.get_team_agent(latest.agent_id, include_fired=True)
+        if agent is None:
+            return
+        text, blocks = self._loop_run_card_payload(latest, run)
+        try:
+            posted = self.gateway.post_session_parent(
+                latest.channel_id,
+                text,
+                persona=agent,
+                icon_url=self._agent_icon_url(agent),
+                blocks=blocks,
+            )
+        except Exception:
+            LOGGER.warning("failed to post quiet loop report", exc_info=True)
+            return
+        self.store.update_loop_run(run.run_id, thread_ts=posted.ts)
 
     def _remember_loop_run_approvals(self, loop: Loop, task: AgentTask | None) -> Loop:
         raw = task.metadata.get(LOOP_ALLOWED_TOOLS_METADATA_KEY) if task is not None else None
@@ -3776,7 +3865,7 @@ class SlackTeamController:
         self.store.upsert_agent_task(marked)
         self.store.set_setting(key, str(attempts + 1))
         agent = self.store.get_team_agent(loop.agent_id)
-        if agent is None or not run.thread_ts:
+        if agent is None or not (run.thread_ts or task.thread_ts):
             return False
         request = WorkRequest(
             prompt=(
@@ -3792,7 +3881,11 @@ class SlackTeamController:
             request,
             marked,
             agent,
-            SlackThreadRef(loop.channel_id or task.channel_id, run.thread_ts, run.thread_ts),
+            SlackThreadRef(
+                loop.channel_id or task.channel_id,
+                run.thread_ts or task.thread_ts,
+                run.thread_ts or task.thread_ts,
+            ),
             requested_by_slack_user=loop.owner_slack_user_id,
             try_live_send=True,
         )
@@ -4086,6 +4179,11 @@ class SlackTeamController:
         self.store.upsert_team_agent(agent)
         self.store.update_loop_pending_spec(current.loop_id, loop_spec_to_json(spec))
         self.store.update_loop_status(current.loop_id, LoopStatus.AWAITING_APPROVAL)
+        refreshed = self.store.get_loop(current.loop_id) or current
+        if _loop_is_quiet(refreshed) != spec.quiet:
+            metadata = dict(refreshed.metadata)
+            metadata["quiet"] = spec.quiet
+            self.store.update_loop_metadata(refreshed.loop_id, metadata)
         if spec.icon.badge is not None:
             try:
                 badge_path = self._loop_badge_path(current.loop_id)
@@ -5567,6 +5665,7 @@ class SlackTeamController:
             format_session_parent(session, summary),
             agent,
             icon_url=self._agent_icon_url(agent),
+            blocks=session_parent_blocks(session, summary),
         )
         thread = SlackThreadRef(channel_id, posted.ts, posted.ts)
         self.store.upsert_slack_thread_for_session(
@@ -5716,6 +5815,8 @@ class SlackTeamController:
             text,
             blocks=blocks,
             thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
         )
         if remember:
             self._remember_roster_message(channel_id, posted.ts)
@@ -5744,7 +5845,11 @@ class SlackTeamController:
                     self._pin_roster_once(channel_id, latest_roster_ts)
                 except Exception:
                     LOGGER.debug("failed to pin latest Slack roster message", exc_info=True)
-            for roster_ts in roster_ts_values:
+            # Only the newest roster is kept live; older copies stop being edited
+            # (their buttons still resolve through the live handlers).
+            for stale_ts in roster_ts_values[:-1]:
+                self.store.delete_setting(_roster_message_setting_key(channel_id, stale_ts))
+            for roster_ts in roster_ts_values[-1:]:
                 if self._roster_render_is_current(channel_id, roster_ts, text, blocks):
                     continue
                 try:
@@ -5753,6 +5858,9 @@ class SlackTeamController:
                         roster_ts,
                         text,
                         blocks=blocks,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                        attachments=[],
                     )
                     self._remember_roster_render(channel_id, roster_ts, text, blocks)
                 except Exception:
@@ -5788,6 +5896,9 @@ class SlackTeamController:
                 message_ts,
                 text,
                 blocks=blocks,
+                unfurl_links=False,
+                unfurl_media=False,
+                attachments=[],
             )
             self._remember_roster_render(channel_id, message_ts, text, blocks)
             return message_ts
@@ -11366,7 +11477,7 @@ class SlackTeamController:
                     run = self.store.get_loop_run(loop_run_id)
                     if run is not None:
                         finalized = self.finalize_loop_run(run, completed_task)
-                if finalized:
+                if finalized and not completed_task.metadata.get(LOOP_ID_METADATA_KEY):
                     self._mark_task_complete(completed_task, thread, include_thread=True)
                 completed += 1
                 completed_tasks.append(
@@ -12685,13 +12796,7 @@ class SlackMessageBackfill:
         if remaining == 0:
             return thread_ts_values
         try:
-            sessions = sorted(
-                self.store.list_sessions(),
-                key=lambda session: (
-                    session.status != SessionStatus.ACTIVE,
-                    -((session.last_seen_at or utc_now()).timestamp()),
-                ),
-            )
+            sessions = self.store.list_sessions(active_first=True, limit=remaining)
         except sqlite3.Error:
             return thread_ts_values
         for session in sessions[:remaining]:
@@ -13943,7 +14048,7 @@ def _is_roster_message(message: dict) -> bool:
         if not isinstance(text_obj, dict):
             continue
         value = text_obj.get("text")
-        if isinstance(value, str) and value.startswith("*Agent team*"):
+        if isinstance(value, str) and (value.startswith(("*Agent team*", "*🤖 Agent team*"))):
             return True
     return False
 
@@ -15200,6 +15305,10 @@ def _decode_roster_work_metadata(value) -> dict[str, str]:
     if not isinstance(decoded, dict):
         return {}
     return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _loop_is_quiet(loop: Loop) -> bool:
+    return loop.metadata.get("quiet") is True
 
 
 def _loop_owns_parent_message(task: AgentTask) -> bool:

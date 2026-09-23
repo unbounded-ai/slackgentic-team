@@ -114,6 +114,9 @@ class LoopSpec:
     next_run_at: datetime
     schedule_description: str
     icon: LoopIconSpec
+    # Quiet loops post nothing (and so notify nobody) unless a run finds
+    # something that needs attention.
+    quiet: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,6 +268,11 @@ class LoopPermissionsCommand:
 
 
 @dataclass(frozen=True)
+class LoopQuietCommand:
+    enabled: bool
+
+
+@dataclass(frozen=True)
 class LoopCompactNowCommand:
     pass
 
@@ -295,6 +303,7 @@ LoopCommand = (
     | LoopIconCommand
     | LoopCwdCommand
     | LoopPermissionsCommand
+    | LoopQuietCommand
     | LoopCompactNowCommand
     | LoopStopCommand
     | LoopHelpCommand
@@ -379,6 +388,8 @@ def parse_loop_command(text: str) -> LoopCommand | None:
         r"loop permissions:\s*(read-only|locked|safe-auto|dangerous)", cleaned, re.I
     ):
         return LoopPermissionsCommand(PermissionMode(match.group(1).lower()))
+    if match := re.fullmatch(r"loop quiet:\s*(on|off|true|false|yes|no)", cleaned, re.I):
+        return LoopQuietCommand(match.group(1).lower() in {"on", "true", "yes"})
     if re.fullmatch(r"loop compact now", cleaned, re.I):
         return LoopCompactNowCommand()
     if match := re.fullmatch(r"loop stop(?:\s+(archive))?", cleaned, re.I):
@@ -414,6 +425,7 @@ def build_loop_resolution_prompt(
                 "shape": "circle",
             },
         },
+        "quiet": False,
     }
     lines = [
         "Resolve this recurring Slackgentic loop into one implementation-ready specification.",
@@ -427,6 +439,9 @@ def build_loop_resolution_prompt(
         "Rewrite the mission as a complete, self-contained standing runbook paragraph. Choose a "
         "short bot name (ending in Bot when natural), a lowercase-dash channel name prefixed "
         "with loop-, and a standard Slack emoji name without surrounding colons.",
+        "Set quiet to true when the owner wants to hear from the loop only when something is "
+        "wrong (for example 'only post when there are errors or anomalies'); quiet loops post "
+        "nothing and notify nobody on all-clear runs.",
         "The schedule must recur. Daily and weekly schedules require HH:MM and an IANA timezone; "
         "weekly schedules also use weekday 0=Monday through 6=Sunday. Interval schedules use "
         f"interval_seconds and must be at least {LOOP_MIN_INTERVAL_SECONDS} seconds.",
@@ -485,6 +500,9 @@ def parse_agent_loop_signal(
     icon_result = _parse_loop_icon(payload.get("icon"))
     if isinstance(icon_result, str):
         return LoopSpecParseResult(error=icon_result)
+    quiet = payload.get("quiet", False)
+    if not isinstance(quiet, bool):
+        return LoopSpecParseResult(error="loop quiet must be true or false")
     return LoopSpecParseResult(
         spec=LoopSpec(
             title=str(payload["title"]).strip(),
@@ -496,6 +514,7 @@ def parse_agent_loop_signal(
             next_run_at=recurrence.next_run_at,
             schedule_description=recurrence.description,
             icon=icon_result,
+            quiet=quiet,
         )
     )
 
@@ -750,6 +769,7 @@ def loop_spec_to_json(spec: LoopSpec) -> str:
                 else None
             ),
         },
+        "quiet": spec.quiet,
     }
     return json.dumps(payload, sort_keys=True)
 
@@ -785,6 +805,7 @@ def loop_spec_from_json(value: str) -> LoopSpec | None:
         next_run_at=next_run_at,
         schedule_description=str(payload["schedule_description"]),
         icon=icon,
+        quiet=payload.get("quiet") is True,
     )
 
 
@@ -797,6 +818,7 @@ def build_loop_run_prompt(
     bot_name: str | None = None,
     scratch_dir: str | None = None,
     reference_dir: str | None = None,
+    quiet: bool = False,
 ) -> str:
     del now
     identity = bot_name or str(loop.metadata.get("bot_name") or loop.title)
@@ -843,9 +865,21 @@ def build_loop_run_prompt(
             "[THIS RUN]",
             "Perform the mission now. Nobody is watching live: work autonomously, reuse what "
             "earlier runs learned (see memory and carry), and do not stop to ask questions.",
-            "Slack layout: this run's top-level channel message becomes your report card, and "
-            "this thread holds working notes. Keep thread notes to a few short progress lines; "
-            "do not post the final report in the thread.",
+            *(
+                [
+                    "Quiet loop: nothing appears in the channel unless this run needs the "
+                    "owner's attention. Do not post notes or progress at all. If everything is "
+                    "normal, use status ok with a one-line headline; the harness then posts "
+                    "nothing. Use found_issue (or failed) only for something worth a "
+                    "notification, and then keep the report short and specific.",
+                ]
+                if quiet
+                else [
+                    "Slack layout: this run's top-level channel message becomes your report "
+                    "card, and this thread holds working notes. Keep thread notes to a few "
+                    "short progress lines; do not post the final report in the thread.",
+                ]
+            ),
             "As you move between steps, emit a hidden status line such as "
             "`SLACKGENTIC: ROSTER Querying prod telemetry (2/4)`; the latest one shows live on "
             "the run card.",
