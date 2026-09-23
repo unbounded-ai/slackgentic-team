@@ -59,6 +59,40 @@ class BrokenIsAliveChild(FakeChild):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_read_only_claude_loop_runs_behind_the_loop_guard_hook(self):
+        request = LaunchRequest(
+            provider=Provider.CLAUDE,
+            prompt="report",
+            cwd=Path("/tmp/loop-scratch"),
+            permission_mode=PermissionMode.READ_ONLY,
+            loop_scratch_dir=Path("/tmp/loop-scratch"),
+            loop_reference_dir=Path("/workspace/repos/example-project"),
+        )
+
+        _, args = build_command(request)
+
+        settings = json.loads(args[args.index("--settings") + 1])
+        hook = settings["hooks"]["PreToolUse"][0]
+        self.assertEqual(hook["matcher"], "*")
+        self.assertIn("agent_harness.loop_guard", hook["hooks"][0]["command"])
+        self.assertIn("/workspace/repos/example-project", args)
+        self.assertNotIn("--permission-mode", args)
+        self.assertNotIn("--dangerously-skip-permissions", args)
+
+    def test_read_only_codex_loop_writes_only_in_its_scratch_sandbox(self):
+        request = LaunchRequest(
+            provider=Provider.CODEX,
+            prompt="report",
+            cwd=Path("/tmp/loop-scratch"),
+            permission_mode=PermissionMode.READ_ONLY,
+        )
+
+        _, args = build_command(request)
+
+        self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+        self.assertIn("sandbox_workspace_write.network_access=true", args)
+        self.assertEqual(args[args.index("-C") + 1], "/tmp/loop-scratch")
+
     def test_codex_command_uses_argv_not_shell(self):
         command, args = build_command(
             LaunchRequest(

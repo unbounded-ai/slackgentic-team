@@ -1758,23 +1758,16 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("Loops", posts[0]["text"])
         rendered = str(posts[0]["blocks"])
         self.assertIn(f"<#{loop.channel_id}>", rendered)
-        self.assertIn("overflow", rendered)
-        self.assertIn("loop.pause", rendered)
-
-        pause_value = next(
-            option["value"]
-            for block in posts[0]["blocks"]
-            if block.get("accessory")
-            for option in block["accessory"]["options"]
-            if "loop.pause" in option["value"]
-        )
+        self.assertIn("carousel", rendered)
+        card = posts[0]["blocks"][2]["elements"][0]
+        pause = next(item for item in card["actions"] if item["action_id"] == "loop.pause")
         self.controller.handle_block_action(
             {
                 "actions": [
                     {
-                        "action_id": "loop.more",
-                        "block_id": f"loop.list.item.{loop.loop_id}",
-                        "selected_option": {"value": pause_value},
+                        "action_id": "loop.pause",
+                        "block_id": card["block_id"],
+                        "value": pause["value"],
                     }
                 ],
                 "channel": {"id": "CMAIN"},
@@ -2194,6 +2187,102 @@ class LoopCreationFlowTests(unittest.TestCase):
             item for item in self.gateway.updates if item["ts"] == task.parent_message_ts
         ]
         self.assertIn("Mission and schedule updated", confirmation[-1]["text"])
+
+    def test_new_loops_default_to_read_only_and_run_inside_scratch(self):
+        loop = self._activate_loop()
+        self.assertEqual(loop.permission_mode, PermissionMode.READ_ONLY)
+
+        self.controller.fire_loop_now(loop)
+        task, _, _, _ = self._running_task_and_run(loop)
+
+        scratch = Path(task.metadata["loop_scratch_dir"])
+        self.assertTrue(scratch.is_dir())
+        self.assertEqual(task.metadata["cwd"], str(scratch))
+        self.assertTrue(task.metadata["loop_guard_log"].endswith("guard.jsonl"))
+        self.assertEqual(task.metadata["permission_mode"], "read-only")
+        self.assertIn("[READ-ONLY GUARD]", task.prompt)
+        self.assertIn(str(scratch), task.prompt)
+
+    def test_report_card_shows_chart_guard_activity_and_feedback(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        guard_log = Path(task.metadata["loop_guard_log"])
+        guard_log.write_text(
+            json.dumps({"run_id": run.run_id, "decision": "deny", "judged": False})
+            + "\n"
+            + json.dumps({"run_id": "looprun_other", "decision": "deny"})
+            + "\n"
+        )
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "summary": "Calls steady.",
+                    "headline": "Calls steady at 1.2M",
+                    "report": "## Top engines\n| Engine | Calls |\n|---|---|\n| e1 | 410k |",
+                    "chart": {
+                        "type": "line",
+                        "title": "Daily calls",
+                        "categories": ["Mon", "Tue"],
+                        "series": [{"name": "prod", "values": [1.1, 1.2]}],
+                    },
+                }
+            ),
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        card = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
+        types = [block["type"] for block in card["blocks"]]
+        self.assertEqual(
+            types, ["section", "data_visualization", "markdown", "context", "context_actions"]
+        )
+        chart = card["blocks"][1]["chart"]
+        self.assertEqual(chart["axis_config"]["categories"], ["Mon", "Tue"])
+        self.assertEqual(chart["series"][0]["data"][1], {"label": "Tue", "value": 1.2})
+        self.assertIn("| Engine | Calls |", card["blocks"][2]["text"])
+        self.assertIn("🛡️ 1 write blocked", card["blocks"][3]["elements"][0]["text"])
+
+        feedback = card["blocks"][4]["elements"][0]
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "action_id": "loop.feedback",
+                        "value": feedback["negative_button"]["value"],
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": run.thread_ts},
+                "user": {"id": "UOWNER"},
+            }
+        )
+        notes = [
+            entry
+            for entry in self.store.list_loop_journal(loop.loop_id)
+            if entry.kind == "owner_note"
+        ]
+        self.assertEqual(notes[-1].content, "Owner rated the run #1 report not useful.")
+
+    def test_running_and_failed_runs_use_task_cards(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        running = next(post for post in self.gateway.posts if post["ts"] == run.thread_ts)
+        self.assertEqual(running["blocks"][0]["type"], "task_card")
+        self.assertEqual(running["blocks"][0]["status"], "in_progress")
+
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        self.controller.handle_runtime_task_done(
+            self.store.get_agent_task(task.task_id), agent, thread
+        )
+
+        card = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
+        self.assertEqual(card["blocks"][0]["type"], "task_card")
+        self.assertEqual(card["blocks"][0]["status"], "error")
 
     def test_loop_help_works_through_slash_command_in_loop_channel(self):
         loop = self._activate_loop()

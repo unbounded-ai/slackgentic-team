@@ -690,8 +690,8 @@ def _resolved_text(
         return {
             "approve": f"Allowed {provider_label} {request_label} request.",
             "approve_session": (
-                f"Allowed {provider_label} {request_label} request for this loop; later runs "
-                "will not ask again."
+                f"Allowed this exact {request_label} for this loop; later runs will not ask "
+                "again for it."
                 if params and params.get("session_label")
                 else f"Allowed {provider_label} {request_label} request for this session."
             ),

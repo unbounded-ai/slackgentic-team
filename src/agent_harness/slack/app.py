@@ -32,6 +32,7 @@ from agent_harness.deferred import (
     parse_agent_deferred_signal,
 )
 from agent_harness.internal_notifications import is_internal_task_notification_text
+from agent_harness.loop_guard import read_guard_events
 from agent_harness.loop_icons import write_loop_badge
 from agent_harness.loops import (
     AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
@@ -89,11 +90,14 @@ from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
+    LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
+    LOOP_REFERENCE_DIR_METADATA_KEY,
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
+    LOOP_SCRATCH_DIR_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -253,6 +257,7 @@ from agent_harness.slack import (
     LOOP_RUN_RUNNING_EMOJI,
     LOOP_RUN_SKIPPED_EMOJI,
     AgentRosterStatus,
+    LoopRunCardChart,
     LoopRunCardMetric,
     LoopRunChip,
     UnassignedExternalSessionListItem,
@@ -1735,7 +1740,7 @@ class SlackTeamController:
             "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
             "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
             "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
-            "`loop permissions: locked|safe-auto|dangerous` · `loop compact now`\n"
+            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop compact now`\n"
             "`loop stop` · `loop stop archive` · `loop help`"
         )
 
@@ -1970,6 +1975,7 @@ class SlackTeamController:
                 {
                     "loop": loop,
                     "icon_emoji": agent.icon_emoji if agent is not None else None,
+                    "channel_id": loop.channel_id,
                     "channel_text": (
                         f"<#{loop.channel_id}>"
                         if loop.channel_id
@@ -2185,7 +2191,7 @@ class SlackTeamController:
             "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
             "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
             "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
-            "`loop permissions: locked|safe-auto|dangerous` · `loop compact now`\n"
+            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop compact now`\n"
             "`loop stop` · `loop stop archive` · `loop help`\n\n"
             "Only the loop owner can use these commands. Other members' messages are never "
             "shown to the loop agent."
@@ -3247,6 +3253,11 @@ class SlackTeamController:
         thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
         run = replace(run, thread_ts=posted.ts)
         self.store.create_loop_run(run)
+        guard_paths = (
+            self._loop_guard_paths(loop)
+            if loop.permission_mode == PermissionMode.READ_ONLY and kind != LoopRunKind.COMPACTION
+            else None
+        )
         entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
         journal = (
             render_loop_journal(
@@ -3269,6 +3280,8 @@ class SlackTeamController:
                 journal_rendered=journal,
                 now=now,
                 bot_name=agent.full_name,
+                scratch_dir=str(guard_paths[0]) if guard_paths else None,
+                reference_dir=str(guard_paths[2]) if guard_paths and guard_paths[2] else None,
             )
         )
         task = create_agent_task(
@@ -3286,7 +3299,16 @@ class SlackTeamController:
         remembered_tools = self._loop_remembered_tools(loop)
         if remembered_tools:
             metadata[LOOP_ALLOWED_TOOLS_METADATA_KEY] = list(remembered_tools)
-        if loop.cwd:
+        if guard_paths is not None:
+            scratch_dir, guard_log, reference_dir = guard_paths
+            # Read-only runs work inside their scratch directory; the loop's
+            # configured directory is attached as a read-only reference.
+            metadata["cwd"] = str(scratch_dir)
+            metadata[LOOP_SCRATCH_DIR_METADATA_KEY] = str(scratch_dir)
+            metadata[LOOP_GUARD_LOG_METADATA_KEY] = str(guard_log)
+            if reference_dir is not None:
+                metadata[LOOP_REFERENCE_DIR_METADATA_KEY] = str(reference_dir)
+        elif loop.cwd:
             metadata["cwd"] = loop.cwd
         if loop.model:
             metadata[MODEL_OVERRIDE_METADATA_KEY] = loop.model
@@ -3649,8 +3671,10 @@ class SlackTeamController:
                     headline="Run finished without a report",
                     report="The agent did not record a summary. Its notes are in the thread.",
                     duration_text=_loop_run_duration(run),
+                    guard_note=self._loop_guard_note(loop, run),
                 )
             else:
+                chart = summary.chart
                 text, blocks = build_loop_run_report_blocks(
                     title=loop.title,
                     run_number=run.run_number,
@@ -3662,7 +3686,19 @@ class SlackTeamController:
                         LoopRunCardMetric(metric.label, metric.value, metric.delta)
                         for metric in summary.metrics
                     ],
+                    chart=(
+                        LoopRunCardChart(
+                            chart.type,
+                            chart.title,
+                            chart.categories,
+                            tuple((series.name, series.values) for series in chart.series),
+                        )
+                        if chart is not None
+                        else None
+                    ),
                     duration_text=_loop_run_duration(run),
+                    guard_note=self._loop_guard_note(loop, run),
+                    feedback_value={"loop_id": loop.loop_id, "run_id": run.run_id},
                 )
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
 
@@ -4117,7 +4153,32 @@ class SlackTeamController:
         )
 
     def _loop_badge_path(self, loop_id: str) -> Path:
-        return (self.home or Path.home()) / ".slackgentic-team" / "loops" / loop_id / "icon.png"
+        return self._loop_dir(loop_id) / "icon.png"
+
+    def _loop_dir(self, loop_id: str) -> Path:
+        return (self.home or Path.home()) / ".slackgentic-team" / "loops" / loop_id
+
+    def _loop_guard_paths(self, loop: Loop) -> tuple[Path, Path, Path | None]:
+        """Scratch directory, guard decision log, and read-only reference dir."""
+        loop_dir = self._loop_dir(loop.loop_id)
+        scratch = loop_dir / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        reference = Path(loop.cwd).expanduser() if loop.cwd else self.default_cwd
+        return scratch, loop_dir / "guard.jsonl", reference if reference.exists() else None
+
+    def _loop_guard_note(self, loop: Loop, run: LoopRun) -> str | None:
+        events = read_guard_events(self._loop_dir(loop.loop_id) / "guard.jsonl", run.run_id)
+        blocked = sum(1 for event in events if event.get("decision") == "deny")
+        judged = sum(1 for event in events if event.get("judged"))
+        unexpected = sum(1 for event in events if event.get("decision") == "undecided")
+        parts = []
+        if blocked:
+            parts.append(f"🛡️ {blocked} write{'s' if blocked != 1 else ''} blocked")
+        if unexpected:
+            parts.append(f"⚠️ {unexpected} unexpected approval{'s' if unexpected != 1 else ''}")
+        if judged and not blocked:
+            parts.append(f"🛡️ {judged} call{'s' if judged != 1 else ''} judged read-only")
+        return " · ".join(parts) or None
 
     def _handle_pm_request(self, event: dict, channel_id: str, text: str) -> bool:
         # If this message is already a reply inside an active agent thread, let
@@ -6771,6 +6832,22 @@ class SlackTeamController:
                     "`loop schedule:` in the loop channel.",
                 )
             return
+        if action == "loop.open":
+            return
+        if action == "loop.feedback":
+            run = self.store.get_loop_run(str(payload.get("run_id") or ""))
+            if run is None or run.loop_id != loop.loop_id:
+                return
+            useful = payload.get("rating") == "up"
+            self._record_loop_feedback(loop, run, useful=useful)
+            self.gateway.post_ephemeral(
+                channel_id,
+                actor,
+                "Thanks — noted. Future runs will keep doing this."
+                if useful
+                else "Thanks — noted. Reply in the run's thread to say what to change.",
+            )
+            return
         if action == "loop.compact":
             if self.request_loop_compaction(loop):
                 self._append_loop_system_entry(loop, "memory compaction requested by owner")
@@ -6848,6 +6925,20 @@ class SlackTeamController:
             )
             return
         self._approve_loop(loop, message_ts=message_ts)
+
+    def _record_loop_feedback(self, loop: Loop, run: LoopRun, *, useful: bool) -> None:
+        verdict = "useful" if useful else "not useful"
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                loop_id=loop.loop_id,
+                kind="owner_note",
+                content=f"Owner rated the run #{run.run_number} report {verdict}.",
+                created_at=utc_now(),
+                run_id=run.run_id,
+                thread_ts=run.thread_ts,
+            )
+        )
 
     def _refresh_loop_action_card(
         self,

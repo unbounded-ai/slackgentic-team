@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_harness.loop_icons import LoopBadgeSpec, parse_loop_badge_spec
 from agent_harness.models import (
-    DEFAULT_PERMISSION_MODE,
     Loop,
     LoopJournalEntry,
     LoopRun,
@@ -70,12 +69,26 @@ LOOP_CREATE_VERBS = (
     "loop:",
 )
 LOOP_SUMMARY_STATUSES = frozenset({"ok", "found_issue", "action_taken", "failed"})
+LOOP_CHART_TYPES = frozenset({"line", "bar", "area"})
+LOOP_CHART_MAX_POINTS = 20
+LOOP_CHART_MAX_SERIES = 6
+LOOP_CHART_LABEL_MAX_CHARS = 20
+LOOP_CHART_TITLE_MAX_CHARS = 50
+LOOP_CHART_SIGNAL_EXAMPLE = json.dumps(
+    {
+        "type": "line",
+        "title": "<chart title>",
+        "categories": ["<Mon>", "<Tue>"],
+        "series": [{"name": "<prod>", "values": [1, 2]}],
+    }
+)
 LOOP_SUMMARY_SIGNAL_EXAMPLE = json.dumps(
     {
         "status": "ok|found_issue|action_taken|failed",
         "headline": "<the answer in one line>",
         "metrics": [{"label": "<name>", "value": "<value>", "delta": "<change vs baseline>"}],
-        "report": "<Slack mrkdwn report>",
+        "report": "<markdown report>",
+        "chart": "<optional chart object>",
         "summary": "<3-5 sentences for memory>",
         "carry": {},
     }
@@ -117,6 +130,28 @@ class LoopMetric:
 
 
 @dataclass(frozen=True)
+class LoopChartSeries:
+    name: str
+    values: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class LoopChart:
+    type: str
+    title: str
+    categories: tuple[str, ...]
+    series: tuple[LoopChartSeries, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "title": self.title,
+            "categories": list(self.categories),
+            "series": [{"name": item.name, "values": list(item.values)} for item in self.series],
+        }
+
+
+@dataclass(frozen=True)
 class LoopSummary:
     summary: str
     status: str = "ok"
@@ -124,6 +159,7 @@ class LoopSummary:
     headline: str | None = None
     report: str | None = None
     metrics: tuple[LoopMetric, ...] = ()
+    chart: LoopChart | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -140,6 +176,8 @@ class LoopSummary:
                 {"label": metric.label, "value": metric.value, "delta": metric.delta}
                 for metric in self.metrics
             ]
+        if self.chart is not None:
+            payload["chart"] = self.chart.to_payload()
         return payload
 
 
@@ -173,7 +211,7 @@ class LoopCreateRequest:
     visibility: LoopVisibility = LoopVisibility.PRIVATE
     provider: Provider | None = None
     model: str | None = None
-    permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
+    permission_mode: PermissionMode = PermissionMode.READ_ONLY
 
 
 @dataclass(frozen=True)
@@ -298,7 +336,7 @@ def parse_loop_create_request(text: str) -> LoopCreateRequest | None:
     permission_mode = (
         PermissionMode.DANGEROUS
         if re.search(r"(?<!\S)#dangerous-mode\b", description, re.I)
-        else DEFAULT_PERMISSION_MODE
+        else PermissionMode.READ_ONLY
     )
     description = re.sub(
         r"(?<!\S)#(?:public|private|dangerous-mode)\b", "", description, flags=re.I
@@ -337,7 +375,9 @@ def parse_loop_command(text: str) -> LoopCommand | None:
         return LoopIconCommand(match.group(1).strip())
     if match := re.fullmatch(r"loop cwd:\s*(.+)", cleaned, re.I):
         return LoopCwdCommand(match.group(1).strip())
-    if match := re.fullmatch(r"loop permissions:\s*(locked|safe-auto|dangerous)", cleaned, re.I):
+    if match := re.fullmatch(
+        r"loop permissions:\s*(read-only|locked|safe-auto|dangerous)", cleaned, re.I
+    ):
         return LoopPermissionsCommand(PermissionMode(match.group(1).lower()))
     if re.fullmatch(r"loop compact now", cleaned, re.I):
         return LoopCompactNowCommand()
@@ -494,6 +534,9 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
     metrics = _parse_loop_metrics(payload.get("metrics"))
     if isinstance(metrics, str):
         return LoopSummaryParseResult(error=metrics)
+    chart = parse_loop_chart(payload.get("chart"))
+    if isinstance(chart, str):
+        return LoopSummaryParseResult(error=chart)
     return LoopSummaryParseResult(
         summary=LoopSummary(
             summary,
@@ -502,6 +545,7 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
             headline=" ".join(headline.split()) if headline else None,
             report=report,
             metrics=metrics,
+            chart=chart,
         )
     )
 
@@ -524,6 +568,7 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
     headline = payload.get("headline")
     report = payload.get("report")
     metrics = _parse_loop_metrics(payload.get("metrics"))
+    chart = parse_loop_chart(payload.get("chart"))
     return LoopSummary(
         summary=summary.strip(),
         status=status if status in LOOP_SUMMARY_STATUSES else "ok",
@@ -531,6 +576,57 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
         headline=headline.strip() if isinstance(headline, str) and headline.strip() else None,
         report=report.strip() if isinstance(report, str) and report.strip() else None,
         metrics=metrics if isinstance(metrics, tuple) else (),
+        chart=chart if isinstance(chart, LoopChart) else None,
+    )
+
+
+def parse_loop_chart(value: object) -> LoopChart | str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return "loop summary chart must be an object"
+    chart_type = value.get("type", "line")
+    if chart_type not in LOOP_CHART_TYPES:
+        return "loop summary chart type must be line, bar, or area"
+    title = value.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return "loop summary chart needs a title"
+    categories = value.get("categories")
+    if (
+        not isinstance(categories, list)
+        or not 1 <= len(categories) <= LOOP_CHART_MAX_POINTS
+        or not all(isinstance(item, str) and item.strip() for item in categories)
+    ):
+        return f"loop summary chart needs 1-{LOOP_CHART_MAX_POINTS} string categories"
+    labels = [" ".join(item.split())[:LOOP_CHART_LABEL_MAX_CHARS] for item in categories]
+    if len(set(labels)) != len(labels):
+        return "loop summary chart categories must be unique"
+    series_value = value.get("series")
+    if not isinstance(series_value, list) or not 1 <= len(series_value) <= LOOP_CHART_MAX_SERIES:
+        return f"loop summary chart needs 1-{LOOP_CHART_MAX_SERIES} series"
+    series: list[LoopChartSeries] = []
+    for item in series_value:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            return "each loop summary chart series needs a name"
+        values = item.get("values")
+        if (
+            not isinstance(values, list)
+            or len(values) != len(labels)
+            or not all(
+                isinstance(number, (int, float)) and not isinstance(number, bool)
+                for number in values
+            )
+        ):
+            return "each loop summary chart series needs one number per category"
+        name = " ".join(item["name"].split())[:LOOP_CHART_LABEL_MAX_CHARS] or "series"
+        series.append(LoopChartSeries(name, tuple(float(number) for number in values)))
+    if len({item.name for item in series}) != len(series):
+        return "loop summary chart series names must be unique"
+    return LoopChart(
+        type=str(chart_type),
+        title=" ".join(title.split())[:LOOP_CHART_TITLE_MAX_CHARS],
+        categories=tuple(labels),
+        series=tuple(series),
     )
 
 
@@ -699,9 +795,32 @@ def build_loop_run_prompt(
     journal_rendered: str,
     now: datetime,
     bot_name: str | None = None,
+    scratch_dir: str | None = None,
+    reference_dir: str | None = None,
 ) -> str:
     del now
     identity = bot_name or str(loop.metadata.get("bot_name") or loop.title)
+    guard_lines: list[str] = []
+    if scratch_dir:
+        guard_lines = [
+            "",
+            "[READ-ONLY GUARD]",
+            "This loop is read-only. The harness checks every tool call before it runs, "
+            "allows reads automatically, and blocks anything that could change state, "
+            "telling you why. Nobody will approve anything, so choose a read-only route.",
+            f"Your working directory is the scratch directory {scratch_dir}; it is the only "
+            "place you may write. Always use absolute paths inside it for files and "
+            "redirects.",
+            *(
+                [f"Reference directory (read it, never change it): {reference_dir}"]
+                if reference_dir
+                else []
+            ),
+            "Keep shell commands simple: no piping into shells or interpreters. For "
+            "multi-step logic, write a script into the scratch directory and run it by path "
+            "(python3 <script>); scripts must not spawn subprocesses. HTTP must be GET, or "
+            "POST of read-only SQL. SQL must be SELECT/WITH/SHOW/DESCRIBE/EXPLAIN.",
+        ]
     due_text = format_loop_timestamp(run.due_at, loop.timezone)
     schedule = describe_loop_schedule(loop.recurrence, loop.timezone)
     return "\n".join(
@@ -716,6 +835,7 @@ def build_loop_run_prompt(
             "",
             "Mission (your standing instruction):",
             loop.mission,
+            *guard_lines,
             "",
             "[LOOP MEMORY]",
             journal_rendered,
@@ -735,9 +855,14 @@ def build_loop_run_prompt(
             "the answer itself (numbers and verdict), not a description of the work.",
             f"- metrics: up to {LOOP_METRICS_MAX_ITEMS} key numbers shown as tiles; delta "
             "compares with the baseline (for example +12% vs 7d avg).",
-            f"- report: the full report in Slack mrkdwn (*bold*, bullets, `code`, <url|links>), "
-            f"at most {LOOP_REPORT_MAX_CHARS} characters. Lead with what changed or needs "
-            "attention; skip boilerplate and methodology unless it matters.",
+            f"- report: the full report in GitHub-flavored markdown (## headings, **bold**, "
+            f"bullets, `code`, [links](url), and pipe tables for rankings), at most "
+            f"{LOOP_REPORT_MAX_CHARS} characters. Lead with what changed or needs attention; "
+            "skip boilerplate and methodology unless it matters.",
+            f"- chart (optional): one trend chart rendered natively in Slack, e.g. the last "
+            f"7 days. Shape: {LOOP_CHART_SIGNAL_EXAMPLE}. type is line, bar, or area; at most "
+            f"{LOOP_CHART_MAX_POINTS} categories and {LOOP_CHART_MAX_SERIES} series; labels "
+            f"at most {LOOP_CHART_LABEL_MAX_CHARS} characters; one number per category.",
             "- summary: 3-5 plain sentences for your own long-term memory; carry: small JSON "
             "state for the next run (baselines, how you accessed data, open issues).",
             "To read an earlier run, emit one line and wait:",

@@ -7,6 +7,9 @@ Slackgentic launches agents in one of three permission modes:
 * ``safe-auto`` — file edits and read-only inspection commands are auto-approved
   but anything genuinely destructive still prompts. This is the default.
 * ``dangerous`` — full permission bypass for the underlying CLI.
+* ``read-only`` — loops only. Claude runs with the loop guard as a
+  ``PreToolUse`` hook; Codex runs in a workspace sandbox rooted at the loop's
+  scratch directory with network access.
 
 The mode is persisted on :class:`AgentTask` metadata under
 ``permission_mode``. Legacy tasks that only carry the older
@@ -46,6 +49,7 @@ CODEX_SANDBOX_BY_MODE: dict[PermissionMode, str | None] = {
     PermissionMode.LOCKED: "read-only",
     PermissionMode.SAFE_AUTO: "workspace-write",
     PermissionMode.DANGEROUS: None,
+    PermissionMode.READ_ONLY: "workspace-write",
 }
 
 

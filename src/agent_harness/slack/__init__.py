@@ -17,6 +17,7 @@ from agent_harness.models import (
     AgentTask,
     Loop,
     LoopStatus,
+    PermissionMode,
     Provider,
     SlackThreadRef,
     TeamAgent,
@@ -330,7 +331,8 @@ LOOP_RESULT_STYLES: dict[str, tuple[str, str]] = {
 LOOP_RUN_ERROR_EMOJI = "🚫"
 LOOP_RUN_SKIPPED_EMOJI = "⏭️"
 LOOP_RUN_RUNNING_EMOJI = "⏳"
-_LOOP_SECTION_TEXT_LIMIT = 2900
+LOOP_CAROUSEL_MAX_CARDS = 10
+_LOOP_MARKDOWN_BLOCK_LIMIT = 11_000
 
 
 @dataclass(frozen=True)
@@ -338,6 +340,14 @@ class LoopRunCardMetric:
     label: str
     value: str
     delta: str | None = None
+
+
+@dataclass(frozen=True)
+class LoopRunCardChart:
+    type: str
+    title: str
+    categories: tuple[str, ...]
+    series: tuple[tuple[str, tuple[float, ...]], ...]
 
 
 @dataclass(frozen=True)
@@ -366,11 +376,10 @@ def build_loop_run_running_blocks(
         context += f" · previously: {_mrkdwn_escape(previous_headline)}"
     blocks: list[dict[str, Any]] = [
         {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{LOOP_RUN_RUNNING_EMOJI} *{_mrkdwn_escape(title)}* — working on it…",
-            },
+            "type": "task_card",
+            "task_id": f"run-{run_number}",
+            "title": f"{title} — working on it"[:150],
+            "status": "in_progress",
         },
         {"type": "context", "elements": [{"type": "mrkdwn", "text": context[:2900]}]},
     ]
@@ -386,7 +395,10 @@ def build_loop_run_report_blocks(
     headline: str,
     report: str | None,
     metrics: tuple[LoopRunCardMetric, ...] | list[LoopRunCardMetric] = (),
+    chart: LoopRunCardChart | None = None,
     duration_text: str | None = None,
+    guard_note: str | None = None,
+    feedback_value: dict[str, str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Render a finished run as a report-first card for the run's parent message."""
     emoji, label = loop_result_style(status)
@@ -402,24 +414,26 @@ def build_loop_run_report_blocks(
             {
                 "type": "section",
                 "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": _loop_metric_field(metric),
-                    }
+                    {"type": "mrkdwn", "text": _loop_metric_field(metric)}
                     for metric in list(metrics)[:10]
                 ],
             }
         )
+    if chart is not None:
+        blocks.append(_loop_chart_block(chart))
     if report and report.strip():
-        for chunk in _split_mrkdwn(normalize_slack_mrkdwn(report.strip()), limit=2900)[:6]:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+        blocks.append({"type": "markdown", "text": report.strip()[:_LOOP_MARKDOWN_BLOCK_LIMIT]})
     footer = [f"*{label}*", f"{_mrkdwn_escape(title)} · run #{run_number}", when_text]
     if duration_text:
         footer.append(f"took {duration_text}")
+    if guard_note:
+        footer.append(guard_note)
     footer.append("🧵 working notes in thread")
     blocks.append(
         {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(footer)[:2900]}]}
     )
+    if feedback_value is not None:
+        blocks.append(_loop_feedback_block(feedback_value))
     text = f"{emoji} {title}: {' '.join(headline.split())}"
     return text[:1000], blocks
 
@@ -432,12 +446,17 @@ def build_loop_run_error_blocks(
     error: str,
     paused: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
-    detail = _mrkdwn_escape(" ".join(error.split()))[:1500]
-    lines = [f"{LOOP_RUN_ERROR_EMOJI} *Run #{run_number} did not finish*", f"_{detail}_"]
+    detail = " ".join(error.split())[:1500]
     if paused:
-        lines.append("The loop is paused after repeated failures. Use *Resume* on the pinned card.")
+        detail += " The loop is paused after repeated failures; use Resume on the pinned card."
     blocks: list[dict[str, Any]] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+        {
+            "type": "task_card",
+            "task_id": f"run-{run_number}",
+            "title": f"Run #{run_number} did not finish",
+            "status": "error",
+            "output": _rich_text(detail),
+        },
         {
             "type": "context",
             "elements": [
@@ -468,39 +487,38 @@ def build_loop_panel_blocks(
     """The loop's control panel: pinned in its channel and reused by `loop status`."""
     icon = f"{icon_emoji} " if icon_emoji else ""
     state_text = _loop_state_text(loop, running=running)
-    permissions = loop.permission_mode.value
-    if remembered_approvals:
-        suffix = "s" if remembered_approvals != 1 else ""
-        permissions += f" · {remembered_approvals} remembered approval{suffix}"
+    subtitle = f"{state_text} · {schedule_text}"
+    if loop.status == LoopStatus.ACTIVE and not running:
+        subtitle += f" · next {next_run_text}"
+    body = (
+        f"Latest: {_mrkdwn_escape(latest_headline)}"
+        if latest_headline
+        else "No runs yet — the first report lands here."
+    )
+    card: dict[str, Any] = {
+        "type": "card",
+        "block_id": f"loop.{context}.card.{loop.loop_id}"[:255],
+        "title": {"type": "mrkdwn", "text": f"{icon}*{_mrkdwn_escape(loop.title)}*"[:150]},
+        "subtitle": {"type": "mrkdwn", "text": subtitle[:150]},
+        "body": {"type": "mrkdwn", "text": _shorten_text(body, 200)},
+    }
+    buttons = _loop_panel_buttons(loop, running=running)
+    if buttons:
+        card["actions"] = buttons
     mission = loop.mission.strip()
     if len(mission) > 1400:
         mission = mission[:1400].rstrip() + "…"
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"{icon}{loop.title}"[:150], "emoji": True},
-        },
-        {
-            "type": "section",
-            "block_id": f"loop.{context}.mission.{loop.loop_id}"[:255],
-            "text": {"type": "mrkdwn", "text": _quote_mrkdwn(mission)},
-        },
-        {
-            "type": "section",
-            "block_id": f"loop.{context}.facts.{loop.loop_id}"[:255],
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Status*\n{state_text}"},
-                {"type": "mrkdwn", "text": f"*Next run*\n{next_run_text}"},
-                {"type": "mrkdwn", "text": f"*Schedule*\n{schedule_text}"},
-                {"type": "mrkdwn", "text": f"*Owner*\n<@{loop.owner_slack_user_id}>"},
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Agent*\n{_mrkdwn_escape(bot_name)} · {loop.provider.value}",
-                },
-                {"type": "mrkdwn", "text": f"*Permissions*\n{permissions}"},
-            ],
-        },
-    ]
+    mission_section: dict[str, Any] = {
+        "type": "section",
+        "block_id": f"loop.{context}.mission.{loop.loop_id}"[:255],
+        "text": {"type": "mrkdwn", "text": _quote_mrkdwn(mission)},
+    }
+    overflow = _loop_overflow(
+        loop, include_primary=False, remembered_approvals=remembered_approvals
+    )
+    if overflow is not None:
+        mission_section["accessory"] = overflow
+    blocks: list[dict[str, Any]] = [card, mission_section]
     history: list[str] = []
     if recent_runs:
         chips = " ".join(
@@ -509,10 +527,9 @@ def build_loop_panel_blocks(
             else f"{chip.emoji} #{chip.run_number}"
             for chip in recent_runs
         )
-        history.append(f"*Recent runs* {chips}")
-    if latest_headline:
-        latest = _mrkdwn_escape(latest_headline)[:300]
-        history.append(f"*Latest* <{latest_url}|{latest}>" if latest_url else f"*Latest* {latest}")
+        history.append(f"*Recent runs*  {chips}")
+    if latest_url and latest_headline:
+        history.append(f"<{latest_url}|Open the latest report →>")
     if history:
         blocks.append(
             {
@@ -521,15 +538,12 @@ def build_loop_panel_blocks(
                 "text": {"type": "mrkdwn", "text": "\n".join(history)[:2900]},
             }
         )
-    actions = _loop_panel_actions(loop, running=running, remembered_approvals=remembered_approvals)
-    if actions:
-        blocks.append(
-            {
-                "type": "actions",
-                "block_id": f"loop.{context}.actions.{loop.loop_id}"[:255],
-                "elements": actions,
-            }
-        )
+    permissions = loop.permission_mode.value
+    if loop.permission_mode == PermissionMode.READ_ONLY:
+        permissions = "🛡️ read-only"
+    if remembered_approvals:
+        suffix = "s" if remembered_approvals != 1 else ""
+        permissions += f" · {remembered_approvals} remembered approval{suffix}"
     blocks.append(
         {
             "type": "context",
@@ -537,11 +551,11 @@ def build_loop_panel_blocks(
                 {
                     "type": "mrkdwn",
                     "text": (
-                        f"Only <@{loop.owner_slack_user_id}> can instruct this bot; other "
-                        "messages are never shown to it. Reply in a run's thread to follow up, "
-                        "or post in the channel to leave a standing note. `loop help` lists "
-                        "text commands."
-                    ),
+                        f"{_mrkdwn_escape(bot_name)} · {loop.provider.value} · {permissions} · "
+                        f"owner <@{loop.owner_slack_user_id}>. Only the owner can instruct this "
+                        "bot; other messages are never shown to it. Reply in a run's thread to "
+                        "follow up, or post in the channel to leave a standing note."
+                    )[:2900],
                 }
             ],
         }
@@ -552,10 +566,11 @@ def build_loop_panel_blocks(
 def build_loop_list_blocks(
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """One compact message listing every loop with an overflow menu per loop.
+    """Every loop as a card in a carousel (ten cards per carousel).
 
-    Each row carries ``loop``, ``icon_emoji``, ``channel_text``, ``next_run_text``,
-    ``schedule_text``, ``recent_runs`` and ``latest_headline``.
+    Each row carries ``loop``, ``icon_emoji``, ``channel_id``, ``channel_text``,
+    ``next_run_text``, ``schedule_text``, ``recent_runs``, ``running`` and
+    ``latest_headline``.
     """
     active = sum(1 for row in rows if row["loop"].status == LoopStatus.ACTIVE)
     blocks: list[dict[str, Any]] = [
@@ -573,33 +588,80 @@ def build_loop_list_blocks(
             ],
         },
     ]
-    for row in rows[: (SLACK_MAX_MESSAGE_BLOCKS - 2) // 2]:
-        loop: Loop = row["loop"]
-        icon = f"{row['icon_emoji']} " if row.get("icon_emoji") else ""
-        chips = " ".join(chip.emoji for chip in row.get("recent_runs") or ())
-        lines = [
-            f"{icon}*{_mrkdwn_escape(loop.title)}* · {row['channel_text']}",
-            f"{_loop_state_text(loop, running=bool(row.get('running')))} · "
-            f"{row['schedule_text']} · next {row['next_run_text']}",
-        ]
-        latest = row.get("latest_headline")
-        if latest or chips:
-            lines.append(
-                " ".join(part for part in (chips, _mrkdwn_escape(latest or "")[:200]) if part)
+    cards = [_loop_list_card(row) for row in rows]
+    for start in range(0, len(cards), LOOP_CAROUSEL_MAX_CARDS):
+        chunk = cards[start : start + LOOP_CAROUSEL_MAX_CARDS]
+        blocks.append(
+            {
+                "type": "carousel",
+                "block_id": f"loop.list.carousel.{start // LOOP_CAROUSEL_MAX_CARDS}",
+                "elements": chunk,
+            }
+        )
+    return blocks[:SLACK_MAX_MESSAGE_BLOCKS]
+
+
+def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
+    loop: Loop = row["loop"]
+    icon = f"{row['icon_emoji']} " if row.get("icon_emoji") else ""
+    chips = "".join(chip.emoji for chip in row.get("recent_runs") or ())
+    latest = row.get("latest_headline")
+    body_parts = [
+        part
+        for part in (row.get("channel_text"), chips, _mrkdwn_escape(latest) if latest else None)
+        if part
+    ]
+    state = _loop_state_text(loop, running=bool(row.get("running")))
+    card: dict[str, Any] = {
+        "type": "card",
+        "block_id": f"loop.list.item.{loop.loop_id}"[:255],
+        "title": {"type": "mrkdwn", "text": f"{icon}*{_mrkdwn_escape(loop.title)}*"[:150]},
+        "subtitle": {
+            "type": "mrkdwn",
+            "text": f"{state} · next {row['next_run_text']}"[:150],
+        },
+        "body": {
+            "type": "mrkdwn",
+            "text": _shorten_text(" ".join(body_parts) or row["schedule_text"], 200),
+        },
+    }
+    actions: list[dict[str, Any]] = []
+    channel_id = row.get("channel_id")
+    if channel_id:
+        actions.append(
+            _button(
+                "Open",
+                "loop.open",
+                encode_action_value("loop.open", loop_id=loop.loop_id),
+                url=f"https://slack.com/app_redirect?channel={channel_id}",
             )
-        section: dict[str, Any] = {
-            "type": "section",
-            "block_id": f"loop.list.item.{loop.loop_id}"[:255],
-            "text": {"type": "mrkdwn", "text": "\n".join(lines)[:2900]},
-        }
-        overflow = _loop_overflow(loop, include_primary=True)
-        if overflow is not None:
-            section["accessory"] = overflow
-        blocks.append(section)
-        blocks.append({"type": "divider"})
-    if blocks[-1].get("type") == "divider":
-        blocks.pop()
-    return blocks
+        )
+    if loop.status == LoopStatus.ACTIVE and not row.get("running"):
+        actions.append(
+            _button(
+                "▶ Run now",
+                "loop.run_now",
+                encode_action_value("loop.run_now", loop_id=loop.loop_id),
+            )
+        )
+    if loop.status == LoopStatus.ACTIVE:
+        actions.append(
+            _button(
+                "⏸ Pause", "loop.pause", encode_action_value("loop.pause", loop_id=loop.loop_id)
+            )
+        )
+    elif loop.status == LoopStatus.PAUSED:
+        actions.append(
+            _button(
+                "▶ Resume",
+                "loop.resume",
+                encode_action_value("loop.resume", loop_id=loop.loop_id),
+                "primary",
+            )
+        )
+    if actions:
+        card["actions"] = actions[:3]
+    return card
 
 
 def build_loop_edit_modal(
@@ -613,6 +675,7 @@ def build_loop_edit_modal(
     if message_ts:
         metadata["message_ts"] = message_ts
     modes = [
+        _option("Read-only (recommended)", "read-only", "Never asks; blocks anything that writes"),
         _option("Safe auto", "safe-auto", "Edits and read-only commands run without asking"),
         _option("Locked", "locked", "Every tool call needs approval"),
         _option("Dangerous", "dangerous", "Bypass approvals and sandbox (asks to confirm)"),
@@ -635,6 +698,17 @@ def build_loop_edit_modal(
         "submit": {"type": "plain_text", "text": "Save"},
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": [
+            {
+                "type": "alert",
+                "level": "info",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Loops run unattended. *Read-only* never waits for approval: reads run "
+                        "automatically and anything that could change state is blocked."
+                    ),
+                },
+            },
             {
                 "type": "input",
                 "block_id": "loop_mission",
@@ -678,11 +752,149 @@ def build_loop_edit_modal(
                 "type": "input",
                 "block_id": "loop_cwd",
                 "optional": True,
-                "label": {"type": "plain_text", "text": "Working directory"},
+                "label": {"type": "plain_text", "text": "Reference directory"},
+                "hint": {
+                    "type": "plain_text",
+                    "text": "The repo the loop reads. Read-only loops never change it.",
+                },
                 "element": cwd_element,
             },
         ],
     }
+
+
+def downgrade_modern_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rewrite newer Block Kit blocks into classic ones for clients or workspaces
+    that reject them, keeping every button that still makes sense."""
+    downgraded: list[dict[str, Any]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type == "card":
+            downgraded.extend(_downgrade_card(block))
+        elif block_type == "carousel":
+            for card in block.get("elements") or []:
+                downgraded.extend(_downgrade_card(card))
+        elif block_type == "markdown":
+            text = normalize_slack_mrkdwn(str(block.get("text") or ""))
+            for chunk in _split_mrkdwn(text, limit=2900)[:6]:
+                downgraded.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+        elif block_type == "task_card":
+            status = block.get("status")
+            emoji = {"complete": "✅", "error": LOOP_RUN_ERROR_EMOJI}.get(
+                str(status), LOOP_RUN_RUNNING_EMOJI
+            )
+            lines = [f"{emoji} *{_mrkdwn_escape(str(block.get('title') or ''))}*"]
+            output = _rich_text_plain(block.get("output"))
+            if output:
+                lines.append(f"_{_mrkdwn_escape(output)}_")
+            downgraded.append(
+                {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)[:2900]}}
+            )
+        elif block_type == "alert":
+            text = (block.get("text") or {}).get("text") or ""
+            downgraded.append(
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f":information_source: {text}"[:2900]}],
+                }
+            )
+        elif block_type in {"data_visualization", "context_actions"}:
+            continue
+        else:
+            downgraded.append(block)
+    return downgraded[:SLACK_MAX_MESSAGE_BLOCKS]
+
+
+def has_modern_blocks(blocks: list[dict[str, Any]] | None) -> bool:
+    # Exactly the block types downgrade_modern_blocks rewrites.
+    modern = {"card", "carousel", "markdown", "task_card", "alert", "data_visualization"}
+    return any(block.get("type") in modern | {"context_actions"} for block in blocks or [])
+
+
+def _downgrade_card(card: dict[str, Any]) -> list[dict[str, Any]]:
+    lines = [
+        str((card.get(key) or {}).get("text") or "")
+        for key in ("title", "subtitle", "body")
+        if (card.get(key) or {}).get("text")
+    ]
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            **({"block_id": card["block_id"]} if card.get("block_id") else {}),
+            "text": {"type": "mrkdwn", "text": "\n".join(lines)[:2900] or " "},
+        }
+    ]
+    actions = card.get("actions") or []
+    if actions:
+        blocks.append({"type": "actions", "elements": actions})
+    return blocks
+
+
+def _loop_chart_block(chart: LoopRunCardChart) -> dict[str, Any]:
+    return {
+        "type": "data_visualization",
+        "title": chart.title[:50],
+        "chart": {
+            "type": chart.type,
+            "series": [
+                {
+                    "name": name[:20],
+                    "data": [
+                        {"label": label, "value": value}
+                        for label, value in zip(chart.categories, values, strict=False)
+                    ],
+                }
+                for name, values in chart.series[:12]
+            ],
+            "axis_config": {"categories": list(chart.categories)},
+        },
+    }
+
+
+def _loop_feedback_block(value: dict[str, str]) -> dict[str, Any]:
+    return {
+        "type": "context_actions",
+        "block_id": f"loop.feedback.{value.get('run_id', '')}"[:255],
+        "elements": [
+            {
+                "type": "feedback_buttons",
+                "action_id": "loop.feedback",
+                "positive_button": {
+                    "text": {"type": "plain_text", "text": "Useful"},
+                    "value": encode_action_value("loop.feedback", rating="up", **value),
+                },
+                "negative_button": {
+                    "text": {"type": "plain_text", "text": "Not useful"},
+                    "value": encode_action_value("loop.feedback", rating="down", **value),
+                },
+            }
+        ],
+    }
+
+
+def _rich_text(text: str) -> dict[str, Any]:
+    return {
+        "type": "rich_text",
+        "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "text", "text": text or " "}]}
+        ],
+    }
+
+
+def _rich_text_plain(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    parts: list[str] = []
+    for element in value.get("elements") or []:
+        for inner in element.get("elements") or []:
+            if isinstance(inner, dict) and isinstance(inner.get("text"), str):
+                parts.append(inner["text"])
+    return "".join(parts)
+
+
+def _shorten_text(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _loop_state_text(loop: Loop, *, running: bool = False) -> str:
@@ -695,12 +907,7 @@ def _loop_state_text(loop: Loop, *, running: bool = False) -> str:
     return loop.status.value.replace("_", " ").capitalize()
 
 
-def _loop_panel_actions(
-    loop: Loop,
-    *,
-    running: bool,
-    remembered_approvals: int,
-) -> list[dict[str, Any]]:
+def _loop_panel_buttons(loop: Loop, *, running: bool) -> list[dict[str, Any]]:
     if loop.status not in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
         return []
     elements: list[dict[str, Any]] = []
@@ -733,11 +940,6 @@ def _loop_panel_actions(
             "✏️ Edit", "loop.edit.open", encode_action_value("loop.edit.open", loop_id=loop.loop_id)
         )
     )
-    overflow = _loop_overflow(
-        loop, include_primary=False, remembered_approvals=remembered_approvals
-    )
-    if overflow is not None:
-        elements.append(overflow)
     return elements
 
 

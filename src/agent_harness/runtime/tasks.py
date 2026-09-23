@@ -26,6 +26,9 @@ from agent_harness.loops import (
 )
 from agent_harness.models import (
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
+    LOOP_GUARD_LOG_METADATA_KEY,
+    LOOP_REFERENCE_DIR_METADATA_KEY,
+    LOOP_SCRATCH_DIR_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     AgentTask,
     AgentTaskKind,
@@ -336,6 +339,7 @@ class ManagedTaskRuntime:
             claude_binary=self.commands.claude_binary,
             claude_effort=claude_effort,
             codex_reasoning_effort=codex_reasoning_effort,
+            **_loop_guard_launch_fields(task),
         )
         process = self.process_factory(request)
         try:
@@ -1538,10 +1542,16 @@ class ManagedTaskRuntime:
             self.store.delete_managed_thread_task(completed_task.task_id)
             return
         if response.get("scope") == "session":
-            session_tools = _allowed_session_tools_for_claude_denial(denial)
-            allowed_tools = _append_allowed_tools(allowed_tools, session_tools)
             if completed_task.kind == AgentTaskKind.LOOP_RUN:
-                self._remember_loop_allowed_tools(completed_task.task_id, session_tools)
+                # A loop remembers approvals for every future unattended run, so
+                # it keeps the exact command pattern rather than widening to the
+                # whole executable the way an interactive session approval does.
+                self._remember_loop_allowed_tools(completed_task.task_id, allowed_tools)
+            else:
+                allowed_tools = _append_allowed_tools(
+                    allowed_tools,
+                    _allowed_session_tools_for_claude_denial(denial),
+                )
         self._retry_claude_permission_denial(running, completed_task, denial, allowed_tools)
 
     def _remember_loop_allowed_tools(self, task_id: str, tools: tuple[str, ...]) -> None:
@@ -1851,6 +1861,22 @@ def should_resume_managed_run(
     if age is None:
         return False
     return age <= max_age
+
+
+def _loop_guard_launch_fields(task: AgentTask) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for key, field_name in (
+        (LOOP_SCRATCH_DIR_METADATA_KEY, "loop_scratch_dir"),
+        (LOOP_GUARD_LOG_METADATA_KEY, "loop_guard_log"),
+        (LOOP_REFERENCE_DIR_METADATA_KEY, "loop_reference_dir"),
+    ):
+        value = task.metadata.get(key)
+        if isinstance(value, str) and value:
+            fields[field_name] = Path(value).expanduser()
+    run_id = task.metadata.get("loop_run_id")
+    if isinstance(run_id, str) and run_id:
+        fields["loop_run_id"] = run_id
+    return fields
 
 
 def _loop_allowed_tools(task: AgentTask) -> tuple[str, ...]:

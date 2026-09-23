@@ -3946,7 +3946,10 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
                 remembered = store.get_agent_task(task.task_id).metadata["loop_allowed_tools"]
                 self.assertEqual(remembered[0], "Bash(ls:*)")
-                self.assertGreater(len(remembered), 1)
+                self.assertIn("Bash(example-cli report --since yesterday)", remembered)
+                # Loop approvals stay command-specific; they never widen to the executable.
+                self.assertNotIn("Bash(example-cli:*)", remembered)
+                self.assertNotIn("Bash(example-cli:*)", requests[1].allowed_tools)
                 for tool in remembered:
                     self.assertIn(tool, requests[1].allowed_tools)
             finally:
