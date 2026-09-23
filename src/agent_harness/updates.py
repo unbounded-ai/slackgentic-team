@@ -39,6 +39,8 @@ DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS = 5 * 60
 DEFAULT_UPDATE_HELPER_CONFIRM_TIMEOUT_SECONDS = DEFAULT_RESTART_PENDING_TIMEOUT_SECONDS + 60
 UPDATE_HELPER_FOLLOWUP_SECONDS = 5.0
 SETTING_UPDATE_PROMPTED_VERSION = "slackgentic.update.prompted_version"
+# The most recent update prompt message, so a newer release can retire it.
+SETTING_UPDATE_PROMPT_MESSAGE = "slackgentic.update.prompt_message"
 SETTING_UPDATE_DISMISSED_VERSION = "slackgentic.update.dismissed_version"
 SETTING_UPDATE_INSTALLING_VERSION = "slackgentic.update.installing_version"
 SETTING_UPDATE_INSTALLED_VERSION = "slackgentic.update.installed_version"
@@ -636,9 +638,43 @@ class SlackgenticUpdateRunner:
             return candidate
         message_ts = self.prompt(channel_id, candidate)
         if message_ts:
+            self._retire_previous_prompt(candidate, channel_id, message_ts)
             self.store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, candidate.version)
             self.store.delete_setting(SETTING_UPDATE_LAST_ERROR)
         return candidate
+
+    def _retire_previous_prompt(
+        self,
+        candidate: UpdateCandidate,
+        channel_id: str,
+        message_ts: str,
+    ) -> None:
+        """Remove the buttons from an older update prompt once a newer one is posted."""
+        try:
+            previous = json.loads(self.store.get_setting(SETTING_UPDATE_PROMPT_MESSAGE) or "{}")
+        except json.JSONDecodeError:
+            previous = {}
+        self.store.set_setting(
+            SETTING_UPDATE_PROMPT_MESSAGE,
+            json.dumps({"version": candidate.version, "channel_id": channel_id, "ts": message_ts}),
+        )
+        old_version = previous.get("version")
+        old_ts = previous.get("ts")
+        if not old_version or not old_ts or old_ts == message_ts:
+            return
+        old_candidate = self._candidate_for_version(str(old_version))
+        if old_candidate is None:
+            old_candidate = self._fallback_candidate(str(old_version))
+        text = f"Superseded by Slackgentic {candidate.release.tag_name}; use the newer card."
+        try:
+            self.update_message(
+                str(previous.get("channel_id") or channel_id),
+                str(old_ts),
+                text,
+                self.status_blocks(old_candidate, text, False),
+            )
+        except Exception:
+            LOGGER.debug("failed to retire previous update prompt", exc_info=True)
 
     def dismiss(self, version: str, channel_id: str, message_ts: str) -> None:
         candidate = self._candidate_for_version(version)

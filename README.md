@@ -480,7 +480,7 @@ variables override stored values.
 | `SLACKGENTIC_EXTERNAL_SESSION_ALLOWED_CWD_PREFIXES` | Comma- or path-list of cwd prefixes to mirror for sessions started outside Slack, for example `/workspace/repos`. When set, sessions outside these prefixes are ignored. |
 | `SLACKGENTIC_EXTERNAL_SESSION_IGNORED_CWDS` | Comma- or path-list of cwd path segments or patterns to ignore for sessions started outside Slack. |
 | `SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS` | Seconds between scans for sessions started outside Slack, default `15`. |
-| `SLACKGENTIC_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS` | Seconds a session started outside Slack may go without messages or tool calls before it frees its agent, default `7200`. The Slack thread is kept, and the session claims an agent again when it has new activity. `0` disables this. |
+| `SLACKGENTIC_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS` | Seconds a session started outside Slack may go without messages or tool calls before it frees its agent, default `7200`. A session still open in a terminal keeps its agent however long it sits idle; when one terminal has run several sessions, only the newest counts. The Slack thread is kept, and the session claims an agent again when it has new activity. `0` disables this. |
 | `SLACKGENTIC_AGENT_AVATAR_BASE_URL` | Public HTTPS avatar directory, or `off`. |
 | `SLACKGENTIC_ALLOW_MACOS_TCC_PROTECTED_PATHS` | Allow managed tasks to start in macOS privacy-protected locations after you have granted OS access. |
 | `SLACKGENTIC_UPDATE_CHECK_ENABLED` | Enable or disable release checks, default `true`. |

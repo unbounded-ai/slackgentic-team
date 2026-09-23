@@ -398,6 +398,28 @@ class SlackGatewayTests(unittest.TestCase):
 
         self.assertEqual(gateway.client.pins, [{"channel": "C1", "timestamp": "171.000001"}])
 
+    def test_delete_message_reports_whether_slack_deleted_it(self):
+        from slack_sdk.errors import SlackApiError
+
+        class DeleteClient:
+            def __init__(self, error=None):
+                self.error = error
+                self.deletes = []
+
+            def chat_delete(self, **kwargs):
+                self.deletes.append(kwargs)
+                if self.error:
+                    raise SlackApiError("cant_delete_message", {"ok": False})
+                return {"ok": True}
+
+        for error, expected in ((None, True), ("cant_delete_message", False)):
+            with self.subTest(error=error):
+                gateway = object.__new__(SlackGateway)
+                gateway.client = DeleteClient(error)
+
+                self.assertIs(gateway.delete_message("C1", "171.000001"), expected)
+                self.assertEqual(gateway.client.deletes, [{"channel": "C1", "ts": "171.000001"}])
+
     def test_update_message_can_send_empty_blocks_to_clear_buttons(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = FakeSlackClient()

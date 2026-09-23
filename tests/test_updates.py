@@ -14,6 +14,7 @@ from agent_harness.updates import (
     SETTING_UPDATE_INSTALLED_VERSION,
     SETTING_UPDATE_INSTALLING_VERSION,
     SETTING_UPDATE_LAST_ERROR,
+    SETTING_UPDATE_PROMPT_MESSAGE,
     SETTING_UPDATE_PROMPTED_VERSION,
     SETTING_UPDATE_RESTART_HELPER,
     SETTING_UPDATE_RESTART_PENDING,
@@ -377,6 +378,57 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertEqual(runner.sync_once(), candidate)
 
                 self.assertEqual(prompts, [("C1", candidate)])
+            finally:
+                store.close()
+
+    def test_newer_prompt_retires_the_previous_prompt_buttons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                store.set_setting(
+                    SETTING_UPDATE_PROMPT_MESSAGE,
+                    json.dumps({"version": "0.1.9", "channel_id": "C1", "ts": "160"}),
+                )
+                candidate = UpdateCandidate(
+                    current_version="0.1.0",
+                    release=ReleaseInfo(version="0.2.0", tag_name="v0.2.0"),
+                    repository="example-org/example-repo",
+                )
+                updates = []
+                statuses = []
+
+                class Checker:
+                    release_source = GitHubReleaseSource("example-org/example-repo")
+
+                    def check(self):
+                        return candidate
+
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: "171",
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(
+                        (channel_id, ts, text)
+                    ),
+                    status_blocks=lambda update, status, include_actions: (
+                        statuses.append((update.version, include_actions)) or []
+                    ),
+                )
+
+                runner.sync_once()
+
+                self.assertEqual(
+                    updates,
+                    [("C1", "160", "Superseded by Slackgentic v0.2.0; use the newer card.")],
+                )
+                self.assertEqual(statuses, [("0.1.9", False)])
+                self.assertEqual(
+                    json.loads(store.get_setting(SETTING_UPDATE_PROMPT_MESSAGE)),
+                    {"version": "0.2.0", "channel_id": "C1", "ts": "171"},
+                )
             finally:
                 store.close()
 

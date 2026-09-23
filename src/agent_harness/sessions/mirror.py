@@ -213,10 +213,12 @@ class SessionMirror:
         # Occupancy changes within one sync are coalesced into a single roster
         # refresh at the end instead of one full refresh per session.
         self._occupancy_changes: set[str] | None = set()
+        self._live_process_owners: dict[Provider, dict[int, str]] | None = {}
         try:
             self._sync_once(backfill_new_sessions)
         finally:
             changed, self._occupancy_changes = self._occupancy_changes, None
+            self._live_process_owners = None
             for channel_id in sorted(changed or ()):
                 self._notify_external_session_occupancy_changed(channel_id)
 
@@ -912,7 +914,7 @@ class SessionMirror:
             if session is None:
                 continue
             provider = self._providers_by_kind.get(provider_kind)
-            if self._session_recently_active(provider, session, now):
+            if self._session_in_use(provider, session, now):
                 continue
             if self._release_idle_external_session(session, channel_id):
                 released.add(provider_kind)
@@ -933,10 +935,62 @@ class SessionMirror:
             return False
         if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             return False
-        if self._session_recently_active(provider, session, utc_now()):
+        if self._session_in_use(provider, session, utc_now()):
             return False
         self._release_idle_external_session(session, channel_id)
         return True
+
+    def _session_in_use(
+        self,
+        provider: AgentProvider | None,
+        session: AgentSession,
+        now: datetime,
+    ) -> bool:
+        # A terminal that is still open keeps its session, however long it sits
+        # at the prompt. Idle release is only for sessions nothing is running.
+        if self._session_owns_live_process(session):
+            return True
+        return self._session_recently_active(provider, session, now)
+
+    def _session_owns_live_process(self, session: AgentSession) -> bool:
+        if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
+            return False
+        owners = self._live_process_owners_for(session.provider)
+        return session.session_id in owners.values()
+
+    def _live_process_owners_for(self, provider: Provider) -> dict[int, str]:
+        """Map each running CLI process to the newest session it could be running.
+
+        One terminal resumes or restarts many sessions over its lifetime, and every
+        one of them matches the same process, so only the most recent counts.
+        """
+        cache = getattr(self, "_live_process_owners", None)
+        if cache is not None and provider in cache:
+            return cache[provider]
+        oldest = datetime.min.replace(tzinfo=UTC)
+        newest: dict[int, AgentSession] = {}
+        try:
+            candidates = self.store.list_sessions(
+                provider,
+                statuses=(SessionStatus.ACTIVE, SessionStatus.IDLE),
+            )
+            for candidate in candidates:
+                if not _session_can_use_live_target(candidate):
+                    continue
+                target = self._live_terminal_target(candidate)
+                if target is None or not _session_could_belong_to_live_target(candidate, target):
+                    continue
+                current = newest.get(target.pid)
+                seen = candidate.last_seen_at or candidate.started_at or oldest
+                if current is None or seen > (current.last_seen_at or current.started_at or oldest):
+                    newest[target.pid] = candidate
+        except Exception:
+            LOGGER.debug("failed to match sessions to live processes", exc_info=True)
+            newest = {}
+        owners = {pid: session.session_id for pid, session in newest.items()}
+        if cache is not None:
+            cache[provider] = owners
+        return owners
 
     def _release_idle_external_session(self, session: AgentSession, channel_id: str) -> bool:
         if not self._holds_external_tracking(session):
@@ -1291,15 +1345,18 @@ class SessionMirror:
         existing_ts = self.store.get_setting(setting_key)
         if not existing_ts:
             return
-        label = provider.value.title()
-        try:
-            self.gateway.update_message(
-                channel_id,
-                existing_ts,
-                f"{label} capacity for sessions started outside Slack is available now.",
-            )
-        except Exception:
-            LOGGER.debug("failed to clear external capacity notice", exc_info=True)
+        # A resolved capacity notice is just clutter, so remove it.
+        delete = getattr(self.gateway, "delete_message", None)
+        if not (callable(delete) and delete(channel_id, existing_ts)):
+            label = provider.value.title()
+            try:
+                self.gateway.update_message(
+                    channel_id,
+                    existing_ts,
+                    f"{label} capacity for sessions started outside Slack is available now.",
+                )
+            except Exception:
+                LOGGER.debug("failed to clear external capacity notice", exc_info=True)
         self.store.delete_setting(setting_key)
 
     def _sync_capacity_notices(self, channel_id: str) -> None:

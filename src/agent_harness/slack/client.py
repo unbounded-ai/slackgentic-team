@@ -238,6 +238,16 @@ class SlackGateway:
                 self._workspace_url = url if url.endswith("/") else f"{url}/"
         return getattr(self, "_workspace_url", None)
 
+    def delete_message(self, channel_id: str, message_ts: str) -> bool:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self.client.chat_delete(channel=channel_id, ts=message_ts)
+        except SlackApiError:
+            LOGGER.debug("failed to delete Slack message %s", message_ts, exc_info=True)
+            return False
+        return True
+
     def pin_message(self, channel_id: str, message_ts: str) -> None:
         from slack_sdk.errors import SlackApiError
 
