@@ -136,6 +136,9 @@ class UpdateConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     enabled: bool = Field(default=True, validation_alias="SLACKGENTIC_UPDATE_CHECK_ENABLED")
+    # Install new releases without waiting for a click. The `settings` card in
+    # Slack overrides this per install.
+    auto_install: bool = Field(default=True, validation_alias="SLACKGENTIC_UPDATE_AUTO_INSTALL")
     repository: str = Field(
         default=DEFAULT_UPDATE_REPOSITORY,
         validation_alias="SLACKGENTIC_UPDATE_REPOSITORY",
