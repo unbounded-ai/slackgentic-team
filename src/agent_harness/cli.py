@@ -329,6 +329,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Confirm archiving the Slack channel",
     )
+    slack_tokens = slack_sub.add_parser(
+        "tokens",
+        help="Show or change where the Slack tokens are stored (config file or macOS keychain)",
+    )
+    slack_tokens.add_argument(
+        "action",
+        nargs="?",
+        choices=("status", "keychain", "file"),
+        default="status",
+        help="keychain: move tokens into the login keychain; file: move them back",
+    )
+    slack_tokens.add_argument("--config-file", type=Path)
     slack_doctor = slack_sub.add_parser("doctor", help="Check local Slack E2E config")
     slack_doctor.add_argument("--config-file", type=Path)
     slack_doctor.add_argument("--db", type=Path)
@@ -457,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         from agent_harness.config import AppConfig, load_config_from_env
         from agent_harness.slack.app import run_slack_app
 
+        if args.slack_command == "tokens":
+            return _slack_tokens(args.action, args.config_file)
         if args.slack_command == "setup":
             from agent_harness.slack.setup import SlackSetupOptions, run_interactive_setup
 
@@ -980,6 +994,53 @@ def _sqlite_state_paths(path: Path) -> list[Path]:
     ]
 
 
+def _slack_tokens(action: str, config_file: Path | None) -> int:
+    from agent_harness.config import (
+        default_config_file,
+        load_stored_config,
+        move_tokens_to_file,
+        move_tokens_to_keychain,
+    )
+    from agent_harness.keychain import KeychainError, keychain_available
+
+    path = config_file or default_config_file()
+    try:
+        if action == "keychain":
+            if not keychain_available():
+                print("The macOS keychain is not available on this system.")
+                return 1
+            moved = move_tokens_to_keychain(path)
+            print(
+                f"Moved {', '.join(moved)} into the login keychain and out of {path}."
+                if moved
+                else f"No tokens left in {path}; reading them from the login keychain."
+            )
+            print("Restart the daemon to pick this up: slackgentic service restart")
+            return 0
+        if action == "file":
+            restored = move_tokens_to_file(path)
+            print(
+                f"Moved {', '.join(restored)} back into {path} and out of the keychain."
+                if restored
+                else f"Tokens are already stored in {path}."
+            )
+            print("Restart the daemon to pick this up: slackgentic service restart")
+            return 0
+    except KeychainError as exc:
+        print(f"Nothing changed: {exc}.")
+        return 1
+    print(f"Slack tokens: {_token_storage_text(load_stored_config(path), path)}")
+    return 0
+
+
+def _token_storage_text(stored: dict, path: Path) -> str:
+    from agent_harness.config import tokens_in_keychain
+
+    if tokens_in_keychain(stored):
+        return "macOS login keychain (read without prompts via /usr/bin/security)"
+    return f"config file {path}"
+
+
 def _slack_doctor(config) -> int:
     from agent_harness.runtime.power import format_power_doctor_lines, inspect_macos_power
     from agent_harness.slack.client import SlackGateway
@@ -1000,6 +1061,12 @@ def _slack_doctor(config) -> int:
         "(lets quiet loops delete your replies when clearing their run log)"
     )
     print(f"config file {config.config_file}")
+    from agent_harness.config import load_stored_config
+
+    print(
+        "token storage "
+        + _token_storage_text(load_stored_config(config.config_file), config.config_file)
+    )
     print("delivery mode socket")
     print(f"slash command {config.slack.slash_command}")
     print(f"state db {config.state_db}")

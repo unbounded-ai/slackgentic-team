@@ -43,8 +43,10 @@ slackgentic skills install              # (re)install these skills for Claude Co
 ```
 
 Configuration lives in `~/.slackgentic-team/config.json`; environment
-variables such as `SLACK_BOT_TOKEN` override it. Treat that file and the
-Slack tokens as secrets: never print, copy, or commit them.
+variables such as `SLACK_BOT_TOKEN` override it. On macOS the tokens may
+instead be in the login keychain (`slackgentic slack tokens` shows where).
+Treat that file, the keychain items, and the Slack tokens as secrets: never
+print, copy, or commit them, and never read them out of the keychain.
 
 ## Team
 

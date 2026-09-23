@@ -643,10 +643,10 @@ class UpdateRunnerTests(unittest.TestCase):
                 store.init_schema()
                 candidate = UpdateCandidate(
                     current_version="0.1.0",
-                    release=ReleaseInfo(version="0.2.0", tag_name="v0.2.0"),
+                    release=ReleaseInfo(version="99.0.0", tag_name="v99.0.0"),
                     repository="example-org/example-repo",
                 )
-                store.set_setting("slackgentic.update.candidate.0.2.0", candidate.to_json())
+                store.set_setting("slackgentic.update.candidate.99.0.0", candidate.to_json())
                 updates = []
                 restarts = []
 
@@ -671,13 +671,13 @@ class UpdateRunnerTests(unittest.TestCase):
                     restart=lambda: restarts.append(True),
                 )
 
-                thread = runner.start_upgrade("0.2.0", "C1", "171")
+                thread = runner.start_upgrade("99.0.0", "C1", "171")
                 assert thread is not None
                 thread.join(timeout=POLL_TIMEOUT_SECONDS)
 
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(restarts, [True])
-                self.assertIn("Installed Slackgentic v0.2.0", updates[-1])
+                self.assertIn("Installed Slackgentic v99.0.0", updates[-1])
                 self.assertIsNone(store.get_setting(SETTING_UPDATE_INSTALLED_VERSION))
                 # The pre-restart message should hand off the post-restart
                 # ack to the next daemon by recording where to update.
@@ -687,7 +687,7 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertEqual(payload["channel_id"], "C1")
                 self.assertIn("created_at", payload)
                 self.assertEqual(payload["message_ts"], "171")
-                self.assertEqual(payload["version"], "0.2.0")
+                self.assertEqual(payload["version"], "99.0.0")
             finally:
                 store.close()
 
@@ -754,11 +754,11 @@ class UpdateRunnerTests(unittest.TestCase):
                 store.init_schema()
                 candidate = UpdateCandidate(
                     current_version="0.1.0",
-                    release=ReleaseInfo(version="0.2.0", tag_name="v0.2.0"),
+                    release=ReleaseInfo(version="99.0.0", tag_name="v99.0.0"),
                     repository="example-org/example-repo",
                 )
-                store.set_setting("slackgentic.update.candidate.0.2.0", candidate.to_json())
-                store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, "0.2.0")
+                store.set_setting("slackgentic.update.candidate.99.0.0", candidate.to_json())
+                store.set_setting(SETTING_UPDATE_PROMPTED_VERSION, "99.0.0")
                 updates = []
                 action_flags = []
 
@@ -788,7 +788,7 @@ class UpdateRunnerTests(unittest.TestCase):
                     ),
                 )
 
-                thread = runner.start_upgrade("0.2.0", "C1", "171")
+                thread = runner.start_upgrade("99.0.0", "C1", "171")
                 assert thread is not None
                 thread.join(timeout=POLL_TIMEOUT_SECONDS)
 
