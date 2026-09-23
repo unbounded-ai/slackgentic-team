@@ -2612,6 +2612,73 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_terminals_sharing_a_directory_each_keep_their_own_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agents = build_initial_model_team(codex_count=2, claude_count=0)
+                for agent in agents:
+                    store.upsert_team_agent(agent)
+                started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+                sessions = []
+                targets = {}
+                for index, session_id in enumerate(("s1", "s2")):
+                    session_started = started + timedelta(minutes=5 * index)
+                    sessions.append(
+                        AgentSession(
+                            provider=Provider.CODEX,
+                            session_id=session_id,
+                            transcript_path=Path(tmp) / f"{session_id}.jsonl",
+                            cwd=Path(tmp),
+                            status=SessionStatus.IDLE,
+                            started_at=session_started,
+                            last_seen_at=session_started,
+                        )
+                    )
+                    store.upsert_slack_thread_for_session(
+                        Provider.CODEX,
+                        session_id,
+                        "T1",
+                        SlackThreadRef("C1", f"17{index}.000001", f"17{index}.000001"),
+                    )
+                    targets[session_id] = TerminalTarget(
+                        pid=100 + index,
+                        tty=f"ttys00{index}",
+                        cwd=Path(tmp),
+                        command="codex --remote ws://127.0.0.1:47684",
+                        started_at=session_started,
+                    )
+
+                class PerSessionNotifier(FakeTerminalNotifier):
+                    def targets_for_session(self, session):
+                        target = targets.get(session.session_id)
+                        return [target] if target else []
+
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(sessions, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=PerSessionNotifier(list(targets.values())),
+                )
+
+                mirror.sync_once()
+                mirror.sync_once()
+
+                assigned = store.list_settings("external_session_agent.codex.")
+                self.assertEqual(
+                    sorted(assigned),
+                    ["external_session_agent.codex.s1", "external_session_agent.codex.s2"],
+                )
+                self.assertEqual(len(set(assigned.values())), 2)
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s1"), "100")
+                self.assertEqual(store.get_setting("external_session_live_target.codex.s2"), "101")
+            finally:
+                store.close()
+
     def test_codex_session_can_match_terminal_by_start_time_after_cwd_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

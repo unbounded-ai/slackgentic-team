@@ -213,7 +213,7 @@ class SessionMirror:
         # Occupancy changes within one sync are coalesced into a single roster
         # refresh at the end instead of one full refresh per session.
         self._occupancy_changes: set[str] | None = set()
-        self._live_process_owners: dict[Provider, dict[int, str]] | None = {}
+        self._live_process_owners: dict[Provider, dict[int, tuple[str, datetime]]] | None = {}
         try:
             self._sync_once(backfill_new_sessions)
         finally:
@@ -810,14 +810,14 @@ class SessionMirror:
         if session.provider == Provider.CODEX:
             if not _session_could_belong_to_live_target(session, target):
                 return False
-            return _is_latest_live_session_for_cwd(self.store, session, target)
+            return self._is_newest_session_for_target(session, target)
         if session.provider != Provider.CLAUDE:
             return True
         if not _session_can_use_live_target(session):
             return False
         if not _session_could_belong_to_live_target(session, target):
             return False
-        return _is_latest_live_session_for_cwd(self.store, session, target)
+        return self._is_newest_session_for_target(session, target)
 
     def _active_external_agent_ids(
         self,
@@ -955,20 +955,38 @@ class SessionMirror:
     def _session_owns_live_process(self, session: AgentSession) -> bool:
         if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
             return False
-        owners = self._live_process_owners_for(session.provider)
-        return session.session_id in owners.values()
+        if not _session_can_use_live_target(session):
+            return False
+        target = self._live_terminal_target(session)
+        if target is None or not _session_could_belong_to_live_target(session, target):
+            return False
+        return self._is_newest_session_for_target(session, target)
 
-    def _live_process_owners_for(self, provider: Provider) -> dict[int, str]:
-        """Map each running CLI process to the newest session it could be running.
+    def _is_newest_session_for_target(self, session: AgentSession, target) -> bool:
+        """Whether this session is the newest one a running process could be running.
 
-        One terminal resumes or restarts many sessions over its lifetime, and every
-        one of them matches the same process, so only the most recent counts.
+        One terminal resumes or restarts many sessions over its lifetime, and
+        several terminals often share one directory, so ownership is decided per
+        process. The directory-wide check covers processes no session matched.
         """
+        owners = self._live_process_owners_for(session.provider)
+        owner = owners.get(target.pid)
+        if owner is None:
+            return _is_latest_live_session_for_cwd(self.store, session, target)
+        owner_id, owner_seen = owner
+        if owner_id == session.session_id:
+            return True
+        # The map can predate this sync's discovery, so trust fresher data.
+        if _session_seen_at(session) > owner_seen:
+            owners[target.pid] = (session.session_id, _session_seen_at(session))
+            return True
+        return False
+
+    def _live_process_owners_for(self, provider: Provider) -> dict[int, tuple[str, datetime]]:
         cache = getattr(self, "_live_process_owners", None)
         if cache is not None and provider in cache:
             return cache[provider]
-        oldest = datetime.min.replace(tzinfo=UTC)
-        newest: dict[int, AgentSession] = {}
+        owners: dict[int, tuple[str, datetime]] = {}
         try:
             candidates = self.store.list_sessions(
                 provider,
@@ -980,14 +998,13 @@ class SessionMirror:
                 target = self._live_terminal_target(candidate)
                 if target is None or not _session_could_belong_to_live_target(candidate, target):
                     continue
-                current = newest.get(target.pid)
-                seen = candidate.last_seen_at or candidate.started_at or oldest
-                if current is None or seen > (current.last_seen_at or current.started_at or oldest):
-                    newest[target.pid] = candidate
+                seen = _session_seen_at(candidate)
+                current = owners.get(target.pid)
+                if current is None or seen > current[1]:
+                    owners[target.pid] = (candidate.session_id, seen)
         except Exception:
             LOGGER.debug("failed to match sessions to live processes", exc_info=True)
-            newest = {}
-        owners = {pid: session.session_id for pid, session in newest.items()}
+            owners = {}
         if cache is not None:
             cache[provider] = owners
         return owners
@@ -2134,3 +2151,7 @@ def _short_path(path: Path) -> str:
         return f"~/{path.expanduser().resolve().relative_to(home).as_posix()}"
     except ValueError:
         return str(path)
+
+
+def _session_seen_at(session: AgentSession) -> datetime:
+    return session.last_seen_at or session.started_at or datetime.min.replace(tzinfo=UTC)
