@@ -161,10 +161,12 @@ class RunningTask:
     transcript_activity_path: Path | None = None
     transcript_activity_signature: TranscriptActivitySignature | None = None
     transcript_activity_checked: bool = False
-    last_transcript_activity_check_monotonic: float = 0.0
-    last_transcript_discovery_monotonic: float = 0.0
+    # None means never. Monotonic time counts from boot, so 0.0 is not "long ago"
+    # on a machine that booted moments before.
+    last_transcript_activity_check_monotonic: float | None = None
+    last_transcript_discovery_monotonic: float | None = None
     progress_warning_monotonic: float | None = None
-    last_heartbeat_monotonic: float = 0.0
+    last_heartbeat_monotonic: float | None = None
     # True once the agent has emitted a turn-ending `result` event and is idle
     # waiting for the next user turn (a managed Claude process stays alive across
     # turns). This is an intentional stop — e.g. the agent asked to be released,
@@ -1268,10 +1270,11 @@ class ManagedTaskRuntime:
     def _record_run_heartbeat(self, running: RunningTask) -> None:
         if running.turn_complete:
             return
-        if running.last_activity_monotonic <= running.last_heartbeat_monotonic:
+        last = running.last_heartbeat_monotonic
+        if last is not None and running.last_activity_monotonic <= last:
             return
         now = time.monotonic()
-        if now - running.last_heartbeat_monotonic < MANAGED_RUN_HEARTBEAT_SECONDS:
+        if not _interval_elapsed(last, now, MANAGED_RUN_HEARTBEAT_SECONDS):
             return
         running.last_heartbeat_monotonic = now
         try:
@@ -1292,12 +1295,13 @@ class ManagedTaskRuntime:
             running.transcript_activity_path = None
             running.transcript_activity_signature = None
             running.transcript_activity_checked = False
-            running.last_transcript_discovery_monotonic = 0.0
+            running.last_transcript_discovery_monotonic = None
 
         now = time.monotonic()
-        if (
-            now - running.last_transcript_activity_check_monotonic
-            < TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS
+        if not _interval_elapsed(
+            running.last_transcript_activity_check_monotonic,
+            now,
+            TRANSCRIPT_ACTIVITY_STAT_INTERVAL_SECONDS,
         ):
             return
         running.last_transcript_activity_check_monotonic = now
@@ -1311,9 +1315,10 @@ class ManagedTaskRuntime:
                 snapshot = (running.transcript_activity_path, signature)
 
         if snapshot is None:
-            if (
-                now - running.last_transcript_discovery_monotonic
-                < TRANSCRIPT_ACTIVITY_DISCOVERY_INTERVAL_SECONDS
+            if not _interval_elapsed(
+                running.last_transcript_discovery_monotonic,
+                now,
+                TRANSCRIPT_ACTIVITY_DISCOVERY_INTERVAL_SECONDS,
             ):
                 running.transcript_activity_checked = True
                 return
@@ -1914,6 +1919,10 @@ def _progress_stall_recovery_prompt(original_prompt: str, timeout: timedelta) ->
         "progress.\n\n"
         f"Original task: {original_prompt}"
     )
+
+
+def _interval_elapsed(last: float | None, now: float, interval: float) -> bool:
+    return last is None or now - last >= interval
 
 
 def _restart_resume_prompt(original_prompt: str) -> str:

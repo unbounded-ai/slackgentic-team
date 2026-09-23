@@ -78,7 +78,7 @@ from agent_harness.slack.client import PostedMessage
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team, create_agent_task
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX, parse_agent_timer_signal
-from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, shut_down_runtime
+from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, shut_down_runtime, wait_until
 
 
 def _task_notification_text(*, escaped: bool = False) -> str:
@@ -3114,7 +3114,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
                 runtime._capture_transcript_activity(running)
                 running.last_activity_monotonic = stale
-                running.last_transcript_activity_check_monotonic = 0.0
+                running.last_transcript_activity_check_monotonic = None
                 transcript.write_text("{}\n{}\n")
                 runtime._capture_transcript_activity(running)
 
@@ -3150,11 +3150,13 @@ class TaskRuntimeTests(unittest.TestCase):
                 )
 
                 runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                for _ in poll_attempts():
-                    current = store.get_agent_task(task.task_id)
-                    if current and current.status == AgentTaskStatus.CANCELLED:
-                        break
-                    time.sleep(0.01)
+                # The task is cancelled before the notice is posted, so wait for both.
+                wait_until(
+                    lambda: (
+                        gateway.replies
+                        and store.get_agent_task(task.task_id).status == AgentTaskStatus.CANCELLED
+                    )
+                )
 
                 persisted = store.get_agent_task(task.task_id)
                 assert persisted is not None
@@ -3589,11 +3591,14 @@ class TaskRuntimeTests(unittest.TestCase):
                 logging.disable(logging.CRITICAL)
                 try:
                     runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
-                    for _ in poll_attempts():
-                        current = store.get_agent_task(task.task_id)
-                        if current and current.status == AgentTaskStatus.CANCELLED:
-                            break
-                        time.sleep(0.01)
+                    # The thread task is removed after the status changes; wait for both.
+                    wait_until(
+                        lambda: (
+                            store.get_agent_task(task.task_id).status == AgentTaskStatus.CANCELLED
+                            and store.get_managed_thread_task("C1", "171.000001", agent.agent_id)
+                            is None
+                        )
+                    )
                 finally:
                     logging.disable(logging.NOTSET)
 
