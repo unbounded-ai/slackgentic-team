@@ -1689,11 +1689,9 @@ class LoopCreationFlowTests(unittest.TestCase):
             compaction_thread,
             AGENT_LOOP_COMPACT_SIGNAL_PREFIX + '{"snapshot":"automatic snapshot"}',
         )
-        self.controller.handle_runtime_task_done(
-            compaction_task,
-            compaction_agent,
-            compaction_thread,
-        )
+        # Managed Claude idles after its turn instead of exiting, so accepting the
+        # snapshot has to end the run itself.
+        self.assertIn((compaction_task.task_id, AgentTaskStatus.DONE), self.runtime.stopped)
         compacted = self.store.get_loop_run(compacting.run_id)
         assert compacted is not None
         self.assertEqual(compacted.status, LoopRunStatus.DONE)
@@ -1707,6 +1705,34 @@ class LoopCreationFlowTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_runner_closes_a_run_whose_task_has_no_process(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"run complete"}',
+        )
+        runner = LoopRunner(self.store, self.controller, poll_seconds=0.01)
+
+        # Just created and not yet started: left alone.
+        runner.sync_once()
+        self.assertEqual(self.store.get_loop_run(run.run_id).status, LoopRunStatus.RUNNING)
+
+        # A restart left the task open with nothing running it.
+        stale = self.store.get_agent_task(task.task_id)
+        self.store.upsert_agent_task(replace(stale, updated_at=utc_now() - timedelta(minutes=5)))
+        self.runtime.running_task_ids.add(task.task_id)
+        runner.sync_once()
+        self.assertEqual(self.store.get_loop_run(run.run_id).status, LoopRunStatus.RUNNING)
+
+        self.runtime.running_task_ids.clear()
+        runner.sync_once()
+        self.assertEqual(self.store.get_loop_run(run.run_id).status, LoopRunStatus.DONE)
+        self.assertEqual(self.store.get_agent_task(task.task_id).status, AgentTaskStatus.DONE)
 
     def test_loop_fetch_budget_is_durable_across_stale_task_callbacks(self):
         loop = self._activate_loop()
@@ -2634,13 +2660,6 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("thread now holds 10 quiet runs", task.prompt)
         agent = self.store.get_team_agent(loop.agent_id)
         thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
-        self.controller.handle_runtime_agent_control(
-            task,
-            agent,
-            thread,
-            AGENT_LOOP_COMPACT_SIGNAL_PREFIX
-            + json.dumps({"snapshot": "memory", "thread_summary": "Quiet week; one flake."}),
-        )
 
         class InlineThread:
             def __init__(self, target, args=(), **_):
@@ -2653,11 +2672,18 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.gateway.delete_message = lambda channel, ts, as_owner=False: (
             deleted.append((channel, ts)) or True
         )
+        # Accepting the snapshot ends the compaction run, which rolls the thread over.
         with (
             patch("agent_harness.slack.app.threading.Thread", InlineThread),
             patch("agent_harness.slack.app.LOOP_THREAD_DELETE_INTERVAL_SECONDS", 0),
         ):
-            self.controller.handle_runtime_task_done(task, agent, thread)
+            self.controller.handle_runtime_agent_control(
+                task,
+                agent,
+                thread,
+                AGENT_LOOP_COMPACT_SIGNAL_PREFIX
+                + json.dumps({"snapshot": "memory", "thread_summary": "Quiet week; one flake."}),
+            )
 
         rolled = self.store.get_loop(loop.loop_id)
         self.assertNotEqual(rolled.charter_message_ts, old_charter)
