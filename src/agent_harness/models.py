@@ -18,6 +18,12 @@ LOOP_RUN_ID_METADATA_KEY = "loop_run_id"
 LOOP_RESOLUTION_METADATA_KEY = "loop_resolution"
 LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY = "loop_resolution_original_text"
 LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY = "loop_resolution_attempts"
+# Task metadata on loop runs: tool approvals granted for the loop. The runtime
+# launches with them and appends session-scoped approvals granted mid-run.
+LOOP_ALLOWED_TOOLS_METADATA_KEY = "loop_allowed_tools"
+LOOP_SCRATCH_DIR_METADATA_KEY = "loop_scratch_dir"
+LOOP_REFERENCE_DIR_METADATA_KEY = "loop_reference_dir"
+LOOP_GUARD_LOG_METADATA_KEY = "loop_guard_log"
 MODEL_OVERRIDE_METADATA_KEY = "model_override"
 EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
 DEFERRED_WORK_DEPENDENCY_PREFIX = "deferred_work:"
@@ -33,6 +39,9 @@ class PermissionMode(StrEnum):
     LOCKED = "locked"
     SAFE_AUTO = "safe-auto"
     DANGEROUS = "dangerous"
+    # Loops only: the harness decides every tool call with the loop guard, so
+    # runs never wait on approvals and cannot change state outside scratch.
+    READ_ONLY = "read-only"
 
 
 DEFAULT_PERMISSION_MODE = PermissionMode.SAFE_AUTO

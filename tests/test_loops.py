@@ -403,6 +403,70 @@ class PureLoopLogicTests(unittest.TestCase):
         )
         self.assertIn("icon.emoji", parsed_bad_icon.error or "")
 
+    def test_summary_report_fields_parse_and_round_trip(self):
+        prefix = loop_logic.AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+        parsed = loop_logic.parse_agent_loop_summary_signal(
+            prefix
+            + json.dumps(
+                {
+                    "summary": "Calls rose.",
+                    "status": "found_issue",
+                    "headline": "  Calls   up 38%  ",
+                    "report": "*Top engine*\n• example-engine",
+                    "metrics": [{"label": "Calls", "value": 1240000, "delta": "+38%"}],
+                }
+            )
+        )
+        summary = parsed.summary
+        assert summary is not None
+        self.assertEqual(summary.headline, "Calls up 38%")
+        self.assertEqual(summary.metrics[0], loop_logic.LoopMetric("Calls", "1240000", "+38%"))
+        restored = loop_logic.loop_summary_from_json(json.dumps(summary.to_payload()))
+        self.assertEqual(restored, summary)
+
+        legacy = loop_logic.loop_summary_from_json('{"summary":"Old run.","status":"ok"}')
+        assert legacy is not None
+        self.assertIsNone(legacy.headline)
+        self.assertEqual(legacy.metrics, ())
+        self.assertIsNone(loop_logic.loop_summary_from_json("not json"))
+
+        for payload, error in (
+            ({"summary": "x", "headline": "h" * 151}, "headline must be at most 150"),
+            ({"summary": "x", "report": 7}, "report must be a string"),
+            ({"summary": "x", "metrics": {"label": "a"}}, "metrics must be a list"),
+            ({"summary": "x", "metrics": [{"value": "1"}]}, "string label"),
+            (
+                {"summary": "x", "metrics": [{"label": "a", "value": "1"}] * 9},
+                "at most 8 items",
+            ),
+        ):
+            with self.subTest(error=error):
+                result = loop_logic.parse_agent_loop_summary_signal(prefix + json.dumps(payload))
+                self.assertIn(error, result.error or "")
+
+    def test_run_prompt_routes_final_report_into_summary_signal(self):
+        loop = SimpleNamespace(
+            title="Example Watch",
+            mission="Report on example metrics.",
+            recurrence={"frequency": "daily", "time": "09:00"},
+            timezone="UTC",
+            metadata={},
+        )
+        run = SimpleNamespace(run_number=3, due_at=datetime(2026, 1, 5, 9, tzinfo=UTC))
+
+        prompt = loop_logic.build_loop_run_prompt(
+            loop,
+            run,
+            journal_rendered="(memory)",
+            now=datetime(2026, 1, 5, 9, tzinfo=UTC),
+        )
+
+        self.assertIn("becomes your report card", prompt)
+        self.assertIn("do not post the final report in the thread", prompt)
+        self.assertIn('"headline"', prompt)
+        self.assertIn('"metrics"', prompt)
+        self.assertIn("do not stop to ask questions", prompt)
+
     def test_summary_fetch_and_compaction_signal_validation(self):
         self.assertEqual(
             loop_logic.LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,
@@ -581,9 +645,19 @@ class PureLoopLogicTests(unittest.TestCase):
             loop_logic.format_loop_timestamp(self.now, "America/Los_Angeles"),
             "Sun Aug 16, 9:00 AM PDT",
         )
-        self.assertEqual(
+        self.assertRegex(
             loop_logic.describe_loop_schedule(self.loop.recurrence, self.loop.timezone),
-            "daily at 09:00 America/Los_Angeles",
+            r"^daily at 9:00 AM P[DS]T$",
+        )
+        self.assertEqual(
+            loop_logic.describe_loop_schedule(
+                {"frequency": "weekly", "time": "17:30", "weekday": 0}, "UTC"
+            ),
+            "every Monday at 5:30 PM UTC",
+        )
+        self.assertEqual(
+            loop_logic.describe_loop_schedule({"frequency": "daily", "time": "bogus"}, "UTC"),
+            "daily at bogus UTC",
         )
 
 

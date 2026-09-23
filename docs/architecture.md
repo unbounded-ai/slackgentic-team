@@ -387,7 +387,16 @@ provider session in a new thread; continuity comes from the rendered journal,
 not session reuse.
 
 Run prompts combine the standing mission with a bounded journal snapshot. The
-agent records a validated `LOOP_SUMMARY`; missing summaries receive one bounded
+agent records a validated `LOOP_SUMMARY` whose optional `headline`, `report`,
+and `metrics` fields are rendered into the run's parent message when the run
+finishes, so the report is the first thing in the channel and the thread keeps
+only working notes. Generic task headers never rewrite a loop-owned parent
+message. The pinned panel is re-rendered on every run and configuration change.
+New loops default to `read-only`: Claude runs with the loop guard
+(`agent_harness.loop_guard`) as a `PreToolUse` hook that allows reads, blocks
+writes, and sends unclassified calls to an isolated judge model; Codex runs in a
+workspace sandbox rooted at the loop scratch directory. Exact-command approvals
+granted for a loop are stored on it and preloaded into later runs; missing summaries receive one bounded
 follow-up before the harness writes a fallback entry. `LOOP_FETCH` can retrieve
 at most five earlier run threads per occurrence, from the same loop channel
 only. `LOOP_COMPACT` replaces redundant run/system memory while owner notes are

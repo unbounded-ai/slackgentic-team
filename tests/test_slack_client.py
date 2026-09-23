@@ -258,6 +258,35 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertEqual([block["type"] for block in blocks], ["table"])
         self.assertEqual(blocks[0]["rows"][1][0]["elements"][0]["elements"][0]["text"], "silas")
 
+    def test_rejected_modern_blocks_retry_as_classic_blocks_with_buttons(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = InvalidBlocksOnceClient()
+        button = {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Run now"},
+            "action_id": "loop.run_now",
+            "value": "{}",
+        }
+
+        gateway.post_message(
+            "C1",
+            "Loop",
+            blocks=[
+                {
+                    "type": "card",
+                    "title": {"type": "mrkdwn", "text": "*Loop*"},
+                    "actions": [button],
+                },
+                {"type": "markdown", "text": "**Report**"},
+                {"type": "data_visualization", "title": "x", "chart": {}},
+            ],
+        )
+
+        retried = gateway.client.calls[1]["blocks"]
+        self.assertEqual([block["type"] for block in retried], ["section", "actions", "section"])
+        self.assertEqual(retried[1]["elements"], [button])
+        self.assertEqual(retried[2]["text"]["text"], "*Report*")
+
     def test_post_thread_reply_falls_back_when_auto_table_blocks_are_invalid(self):
         gateway = object.__new__(SlackGateway)
         gateway.client = InvalidBlocksOnceClient()

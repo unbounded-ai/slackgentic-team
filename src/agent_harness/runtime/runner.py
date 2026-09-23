@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import signal
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +39,12 @@ class LaunchRequest:
     claude_binary: str = "claude"
     claude_effort: str | None = None
     codex_reasoning_effort: str | None = None
+    # Read-only loop runs: the guard's scratch directory, decision log, run id,
+    # and the reference directory the agent may read but not change.
+    loop_scratch_dir: Path | None = None
+    loop_guard_log: Path | None = None
+    loop_run_id: str | None = None
+    loop_reference_dir: Path | None = None
 
     @property
     def dangerous(self) -> bool:
@@ -80,6 +88,8 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
                     args.extend(["--sandbox", sandbox])
                     for root in extra_roots:
                         args.extend(["--add-dir", str(root)])
+        if mode == PermissionMode.READ_ONLY:
+            args.extend(["-c", "sandbox_workspace_write.network_access=true"])
         if request.model:
             args.extend(["--model", request.model])
         if request.resume_session_id:
@@ -114,6 +124,10 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             args.extend(["--resume", request.resume_session_id])
         if mode == PermissionMode.DANGEROUS:
             args.append(dangerous_flag(Provider.CLAUDE))
+        elif mode == PermissionMode.READ_ONLY:
+            args.extend(["--settings", json.dumps(loop_guard_settings(), separators=(",", ":"))])
+            if request.loop_reference_dir is not None:
+                args.extend(["--add-dir", str(request.loop_reference_dir)])
         else:
             permission_flag = claude_permission_flag(mode)
             if permission_flag:
@@ -128,6 +142,21 @@ def build_command(request: LaunchRequest) -> tuple[str, list[str]]:
             args.extend(["--worktree", request.worktree])
         return request.claude_binary, args
     raise ValueError(f"unsupported provider: {request.provider}")
+
+
+def loop_guard_settings() -> dict:
+    """Claude settings that route every tool call through the loop guard."""
+    command = f"{shlex.quote(sys.executable)} -m agent_harness.loop_guard"
+    return {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": command, "timeout": 90}],
+                },
+            ]
+        }
+    }
 
 
 def _claude_stream_json_user_turn(text: str) -> str:
@@ -196,6 +225,22 @@ class ManagedAgentProcess:
             child_env[SLACK_THREAD_TS_ENV] = self.request.slack_thread_ts
         if self.request.provider == Provider.CLAUDE:
             child_env[CLAUDE_CHANNEL_PERMISSION_MODE_ENV] = self.request.permission_mode.value
+        if self.request.permission_mode == PermissionMode.READ_ONLY:
+            from agent_harness.loop_guard import (
+                LOOP_GUARD_JUDGE_ENV,
+                LOOP_GUARD_LOG_ENV,
+                LOOP_GUARD_RUN_ENV,
+                LOOP_GUARD_SCRATCH_ENV,
+            )
+
+            if self.request.loop_scratch_dir is not None:
+                child_env[LOOP_GUARD_SCRATCH_ENV] = str(self.request.loop_scratch_dir)
+            if self.request.loop_guard_log is not None:
+                child_env[LOOP_GUARD_LOG_ENV] = str(self.request.loop_guard_log)
+            if self.request.loop_run_id:
+                child_env[LOOP_GUARD_RUN_ENV] = self.request.loop_run_id
+            if self.request.provider == Provider.CLAUDE:
+                child_env[LOOP_GUARD_JUDGE_ENV] = self.request.claude_binary
         if (
             self.request.provider == Provider.CLAUDE
             and self.request.permission_mode == PermissionMode.DANGEROUS

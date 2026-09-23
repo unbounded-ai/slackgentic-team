@@ -25,8 +25,13 @@ from agent_harness.loops import (
     LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,
 )
 from agent_harness.models import (
+    LOOP_ALLOWED_TOOLS_METADATA_KEY,
+    LOOP_GUARD_LOG_METADATA_KEY,
+    LOOP_REFERENCE_DIR_METADATA_KEY,
+    LOOP_SCRATCH_DIR_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     AgentTask,
+    AgentTaskKind,
     AgentTaskStatus,
     PermissionMode,
     Provider,
@@ -293,7 +298,7 @@ class ManagedTaskRuntime:
         )
         launch_allowed_tools = _initial_allowed_tools(
             provider,
-            allowed_tools,
+            _append_allowed_tools(allowed_tools, _loop_allowed_tools(task)),
             claude_channel=claude_channel,
         )
         mode = task_permission_mode(task)
@@ -334,6 +339,7 @@ class ManagedTaskRuntime:
             claude_binary=self.commands.claude_binary,
             claude_effort=claude_effort,
             codex_reasoning_effort=codex_reasoning_effort,
+            **_loop_guard_launch_fields(task),
         )
         process = self.process_factory(request)
         try:
@@ -1536,11 +1542,26 @@ class ManagedTaskRuntime:
             self.store.delete_managed_thread_task(completed_task.task_id)
             return
         if response.get("scope") == "session":
-            allowed_tools = _append_allowed_tools(
-                allowed_tools,
-                _allowed_session_tools_for_claude_denial(denial),
-            )
+            if completed_task.kind == AgentTaskKind.LOOP_RUN:
+                # A loop remembers approvals for every future unattended run, so
+                # it keeps the exact command pattern rather than widening to the
+                # whole executable the way an interactive session approval does.
+                self._remember_loop_allowed_tools(completed_task.task_id, allowed_tools)
+            else:
+                allowed_tools = _append_allowed_tools(
+                    allowed_tools,
+                    _allowed_session_tools_for_claude_denial(denial),
+                )
         self._retry_claude_permission_denial(running, completed_task, denial, allowed_tools)
+
+    def _remember_loop_allowed_tools(self, task_id: str, tools: tuple[str, ...]) -> None:
+        current = self.store.get_agent_task(task_id)
+        if current is None or not tools:
+            return
+        remembered = _append_allowed_tools(_loop_allowed_tools(current), tools)
+        metadata = dict(current.metadata)
+        metadata[LOOP_ALLOWED_TOOLS_METADATA_KEY] = list(remembered)
+        self.store.upsert_agent_task(replace(current, metadata=metadata, updated_at=utc_now()))
 
     def _retry_claude_permission_denial(
         self,
@@ -1593,9 +1614,12 @@ class ManagedTaskRuntime:
                 persona=running.agent,
                 icon_url=self._agent_icon_url(running.agent),
             )
+        params = _claude_denial_request_params(denial)
+        if running.task.kind == AgentTaskKind.LOOP_RUN:
+            params["session_label"] = "Always allow in this loop"
         pending = handler.create_persistent_request(
             "claude/channel/permission",
-            _claude_denial_request_params(denial),
+            params,
             running.thread,
             provider_label="Claude",
         )
@@ -1837,6 +1861,29 @@ def should_resume_managed_run(
     if age is None:
         return False
     return age <= max_age
+
+
+def _loop_guard_launch_fields(task: AgentTask) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for key, field_name in (
+        (LOOP_SCRATCH_DIR_METADATA_KEY, "loop_scratch_dir"),
+        (LOOP_GUARD_LOG_METADATA_KEY, "loop_guard_log"),
+        (LOOP_REFERENCE_DIR_METADATA_KEY, "loop_reference_dir"),
+    ):
+        value = task.metadata.get(key)
+        if isinstance(value, str) and value:
+            fields[field_name] = Path(value).expanduser()
+    run_id = task.metadata.get("loop_run_id")
+    if isinstance(run_id, str) and run_id:
+        fields["loop_run_id"] = run_id
+    return fields
+
+
+def _loop_allowed_tools(task: AgentTask) -> tuple[str, ...]:
+    raw = task.metadata.get(LOOP_ALLOWED_TOOLS_METADATA_KEY)
+    if not isinstance(raw, list):
+        return ()
+    return tuple(item for item in raw if isinstance(item, str) and item)
 
 
 def _initial_allowed_tools(

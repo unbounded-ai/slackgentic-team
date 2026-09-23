@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_harness.models import SlackThreadRef, TeamAgent, TeamAgentKind
-from agent_harness.slack import normalize_slack_mrkdwn, slack_blocks_for_markdown_table
+from agent_harness.slack import (
+    downgrade_modern_blocks,
+    has_modern_blocks,
+    normalize_slack_mrkdwn,
+    slack_blocks_for_markdown_table,
+)
 from agent_harness.team import TeamChatMessage
 
 SLACK_API_RETRY_LIMIT = 3
@@ -489,11 +494,28 @@ class SlackGateway:
         attempts = 0
         current_kwargs = dict(kwargs)
         used_plain_text_fallback = False
+        used_classic_fallback = False
         while True:
             try:
                 return call(**current_kwargs)
             except SlackApiError as exc:
                 error = exc.response.get("error")
+                if (
+                    error == "invalid_blocks"
+                    and not used_classic_fallback
+                    and has_modern_blocks(current_kwargs.get("blocks"))
+                ):
+                    # Newer Block Kit blocks (cards, charts, markdown) can be
+                    # rejected by some workspaces; keep the classic layout and
+                    # its buttons before giving up on blocks entirely.
+                    LOGGER.warning(
+                        "Slack rejected newer message blocks; retrying with classic blocks: %s",
+                        exc.response.get("errors")
+                        or exc.response.get("response_metadata", {}).get("messages"),
+                    )
+                    current_kwargs["blocks"] = downgrade_modern_blocks(current_kwargs["blocks"])
+                    used_classic_fallback = True
+                    continue
                 if error == "invalid_blocks" and "blocks" in current_kwargs:
                     if used_plain_text_fallback:
                         raise

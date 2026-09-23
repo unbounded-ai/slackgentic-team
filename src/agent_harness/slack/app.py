@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 
+from agent_harness import __version__
 from agent_harness.config import AgentCommandConfig, AppConfig, load_config_from_env
 from agent_harness.deferred import (
     DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY,
@@ -32,6 +33,7 @@ from agent_harness.deferred import (
     parse_agent_deferred_signal,
 )
 from agent_harness.internal_notifications import is_internal_task_notification_text
+from agent_harness.loop_guard import read_guard_events
 from agent_harness.loop_icons import write_loop_badge
 from agent_harness.loops import (
     AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
@@ -72,6 +74,7 @@ from agent_harness.loops import (
     looks_like_loop_create_request,
     loop_spec_from_json,
     loop_spec_to_json,
+    loop_summary_from_json,
     loop_visible_messages,
     normalize_loop_channel_name,
     parse_agent_loop_compact_signal,
@@ -87,11 +90,15 @@ from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
+    LOOP_ALLOWED_TOOLS_METADATA_KEY,
+    LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
+    LOOP_REFERENCE_DIR_METADATA_KEY,
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RESOLUTION_ORIGINAL_TEXT_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
+    LOOP_SCRATCH_DIR_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -247,7 +254,13 @@ from agent_harness.sessions.mirror import (
 )
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
+    LOOP_RUN_ERROR_EMOJI,
+    LOOP_RUN_RUNNING_EMOJI,
+    LOOP_RUN_SKIPPED_EMOJI,
     AgentRosterStatus,
+    LoopRunCardChart,
+    LoopRunCardMetric,
+    LoopRunChip,
     UnassignedExternalSessionListItem,
     build_channel_overview_blocks,
     build_external_session_capacity_blocks,
@@ -257,9 +270,13 @@ from agent_harness.slack import (
     build_loop_create_guide_blocks,
     build_loop_create_modal,
     build_loop_dangerous_confirmation_blocks,
-    build_loop_list_item_blocks,
+    build_loop_edit_modal,
+    build_loop_list_blocks,
+    build_loop_panel_blocks,
     build_loop_preview_blocks,
-    build_loop_status_blocks,
+    build_loop_run_error_blocks,
+    build_loop_run_report_blocks,
+    build_loop_run_running_blocks,
     build_loop_stop_confirmation_blocks,
     build_setup_modal,
     build_task_thread_blocks,
@@ -270,6 +287,7 @@ from agent_harness.slack import (
     encode_action_value,
     format_external_session_capacity_text,
     is_dependency_intent,
+    loop_result_style,
     parse_thread_ref,
     replace_slack_user_ids,
 )
@@ -367,9 +385,14 @@ SETTING_LOOP_IGNORED_NOTICE_PREFIX = "slack.loop_ignored_notice."
 SETTING_LOOP_SUMMARY_NUDGE_PREFIX = "slack.loop_summary_nudge."
 SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
 SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
+SETTING_LOOP_PANELS_RENDERED_VERSION = "slack.loop_panels_rendered_version"
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
 LOOP_SUMMARY_NUDGE_METADATA_KEY = "loop_summary_nudge"
 LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
+# Loop metadata: tool approvals the owner granted "for this loop"; each new run
+# launches with them so unattended runs do not stall on the same prompt again.
+LOOP_REMEMBERED_TOOLS_KEY = "allowed_tools"
+LOOP_PANEL_RECENT_RUNS = 8
 LOOP_UPDATE_OLD_VALUE_METADATA_KEY = "loop_update_old_value"
 UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE = 20
 _PM_BLOCKER_PREFIX = "pm.blocker."
@@ -581,7 +604,9 @@ class SlackTeamController:
         action = _first_action(payload)
         if action is None:
             return
-        decoded = decode_action_value(action.get("value") or "{}")
+        decoded = decode_action_value(
+            action.get("value") or (action.get("selected_option") or {}).get("value") or "{}"
+        )
         action_name = decoded["action"]
         channel_id = _payload_channel_id(payload) or self.default_channel_id
         message_ts = _payload_message_ts(payload)
@@ -645,6 +670,8 @@ class SlackTeamController:
             return self._handle_external_session_assign_submission(payload)
         if callback_id == "loop.create":
             return self._handle_loop_create_submission(payload, async_success=async_success)
+        if callback_id == "loop.edit":
+            return self._handle_loop_edit_submission(payload, async_success=async_success)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -1715,7 +1742,7 @@ class SlackTeamController:
             "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
             "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
             "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
-            "`loop permissions: locked|safe-auto|dangerous` · `loop compact now`\n"
+            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop compact now`\n"
             "`loop stop` · `loop stop archive` · `loop help`"
         )
 
@@ -1842,79 +1869,161 @@ class SlackTeamController:
         return self.gateway.post_message(loop.channel_id, text, blocks=blocks)
 
     def _post_loop_status(self, loop: Loop, *, event: dict | None = None) -> None:
-        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
-        bot_name = agent.full_name if agent is not None else loop.title
-        run_lines: list[str] = []
-        for run in self.store.list_loop_runs(loop.loop_id, limit=5):
-            target = f"run #{run.run_number}"
-            if loop.channel_id and run.thread_ts:
-                with suppress(Exception):
-                    permalink = self.gateway.permalink(loop.channel_id, run.thread_ts)
-                    if permalink:
-                        target = f"<{permalink}|run #{run.run_number}>"
-            run_lines.append(f"- {target} · {run.kind.value} · {run.status.value}")
-        entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
-        memory_chars = sum(len(entry.content) for entry in entries)
-        next_run_text = (
-            format_loop_timestamp(loop.next_run_at, loop.timezone)
-            if loop.next_run_at is not None and loop.status == LoopStatus.ACTIVE
-            else "paused"
-            if loop.status == LoopStatus.PAUSED
-            else "none"
-        )
-        schedule_text = describe_loop_schedule(loop.recurrence, loop.timezone)
-        blocks = build_loop_status_blocks(
-            loop,
-            bot_name=bot_name,
-            schedule_text=schedule_text,
-            next_run_text=next_run_text,
-            run_lines=run_lines,
-            memory_chars=memory_chars,
-        )
-        self._post_loop_surface(
-            loop,
-            f"{bot_name}: {loop.status.value}; next run {next_run_text}.",
-            blocks=blocks,
-            event=event,
-        )
+        text, blocks = self._loop_panel(loop, context="status")
+        self._post_loop_surface(loop, text, blocks=blocks, event=event)
 
-    def _post_loop_list(self, channel_id: str) -> None:
-        loops = self.store.list_loops(limit=100)
-        if not loops:
-            self.gateway.post_message(
-                channel_id,
-                "No loops yet. Create one with `loop create <recurring task>`.",
-            )
+    def _loop_panel(self, loop: Loop, *, context: str = "panel") -> tuple[str, list[dict]]:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        agent = self.store.get_team_agent(latest.agent_id, include_fired=True)
+        bot_name = agent.full_name if agent is not None else latest.title
+        runs = self._loop_history_runs(latest.loop_id)
+        running = any(run.status == LoopRunStatus.RUNNING for run in runs)
+        chips = [
+            LoopRunChip(run.run_number, self._loop_run_emoji(run), self._loop_run_url(latest, run))
+            for run in reversed(runs[:LOOP_PANEL_RECENT_RUNS])
+        ]
+        latest_headline, latest_url = self._loop_latest_headline(latest, runs)
+        next_run_text = self._loop_next_run_text(latest)
+        blocks = build_loop_panel_blocks(
+            latest,
+            bot_name=bot_name,
+            icon_emoji=agent.icon_emoji if agent is not None else None,
+            schedule_text=describe_loop_schedule(latest.recurrence, latest.timezone),
+            next_run_text=next_run_text,
+            recent_runs=chips,
+            latest_headline=latest_headline,
+            latest_url=latest_url,
+            running=running,
+            remembered_approvals=len(self._loop_remembered_tools(latest)),
+            context=context,
+        )
+        return f"{latest.title}: {latest.status.value}; next run {next_run_text}.", blocks
+
+    def refresh_loop_panels_after_upgrade(self) -> int:
+        """Re-render pinned panels once per version so older loops get the current design."""
+        if self.store.get_setting(SETTING_LOOP_PANELS_RENDERED_VERSION) == __version__:
+            return 0
+        refreshed = 0
+        for loop in self.store.list_loops(limit=1_000):
+            if loop.status in {LoopStatus.ACTIVE, LoopStatus.PAUSED} and loop.charter_message_ts:
+                try:
+                    self._refresh_loop_panel(loop)
+                    self._refresh_loop_topic(loop)
+                except Exception:
+                    LOGGER.debug("failed to refresh loop panel %s", loop.loop_id, exc_info=True)
+                    continue
+                refreshed += 1
+        self.store.set_setting(SETTING_LOOP_PANELS_RENDERED_VERSION, __version__)
+        return refreshed
+
+    def _refresh_loop_panel(self, loop: Loop) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if not latest.channel_id or not latest.charter_message_ts:
             return
-        self.gateway.post_message(channel_id, f"*Loops* · {len(loops)} total")
+        text, blocks = self._loop_panel(latest)
+        self._try_update_message(latest.channel_id, latest.charter_message_ts, text, blocks=blocks)
+
+    def _loop_history_runs(self, loop_id: str) -> list[LoopRun]:
+        return [
+            run
+            for run in self.store.list_loop_runs(loop_id, limit=LOOP_PANEL_RECENT_RUNS * 3)
+            if run.kind != LoopRunKind.COMPACTION
+        ]
+
+    def _loop_run_emoji(self, run: LoopRun) -> str:
+        if run.status == LoopRunStatus.RUNNING:
+            return LOOP_RUN_RUNNING_EMOJI
+        if run.status == LoopRunStatus.SKIPPED:
+            return LOOP_RUN_SKIPPED_EMOJI
+        if run.status == LoopRunStatus.FAILED:
+            return LOOP_RUN_ERROR_EMOJI
+        summary = loop_summary_from_json(run.summary_json)
+        return loop_result_style(summary.status if summary else "ok")[0]
+
+    def _loop_run_url(self, loop: Loop, run: LoopRun) -> str | None:
+        if not loop.channel_id or not run.thread_ts:
+            return None
+        key = (loop.channel_id, run.thread_ts)
+        cache = self.__dict__.setdefault("_loop_permalink_cache", {})
+        if key not in cache:
+            try:
+                cache[key] = self.gateway.permalink(loop.channel_id, run.thread_ts)
+            except Exception:
+                LOGGER.debug("failed to resolve loop run permalink", exc_info=True)
+                return None
+        return cache[key]
+
+    def _loop_latest_headline(
+        self,
+        loop: Loop,
+        runs: list[LoopRun],
+    ) -> tuple[str | None, str | None]:
+        for run in runs:
+            summary = loop_summary_from_json(run.summary_json)
+            if summary is not None:
+                return _loop_headline(summary), self._loop_run_url(loop, run)
+        return None, None
+
+    def _loop_next_run_text(self, loop: Loop) -> str:
+        if loop.status == LoopStatus.ACTIVE and loop.next_run_at is not None:
+            return format_loop_timestamp(loop.next_run_at, loop.timezone)
+        if loop.status == LoopStatus.PAUSED:
+            return "paused"
+        return "none"
+
+    def _loop_remembered_tools(self, loop: Loop) -> tuple[str, ...]:
+        raw = loop.metadata.get(LOOP_REMEMBERED_TOOLS_KEY)
+        if not isinstance(raw, list):
+            return ()
+        return tuple(item for item in raw if isinstance(item, str) and item)
+
+    def _loop_list_payload(self) -> tuple[str, list[dict]] | None:
+        loops = [
+            loop
+            for loop in self.store.list_loops(limit=100)
+            if loop.status in {LoopStatus.ACTIVE, LoopStatus.PAUSED}
+        ]
+        if not loops:
+            return None
+        rows = []
         for loop in loops:
             agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
-            bot_name = agent.full_name if agent is not None else loop.title
-            channel_text = (
-                f"<#{loop.channel_id}>"
-                if loop.channel_id
-                else f"`#{loop.channel_name}`"
-                if loop.channel_name
-                else "channel pending"
+            runs = self._loop_history_runs(loop.loop_id)
+            headline, _ = self._loop_latest_headline(loop, runs)
+            rows.append(
+                {
+                    "loop": loop,
+                    "icon_emoji": agent.icon_emoji if agent is not None else None,
+                    "channel_id": loop.channel_id,
+                    "channel_text": (
+                        f"<#{loop.channel_id}>"
+                        if loop.channel_id
+                        else f"`#{loop.channel_name}`"
+                        if loop.channel_name
+                        else "channel pending"
+                    ),
+                    "schedule_text": describe_loop_schedule(loop.recurrence, loop.timezone),
+                    "next_run_text": self._loop_next_run_text(loop),
+                    "running": any(run.status == LoopRunStatus.RUNNING for run in runs),
+                    "recent_runs": [
+                        LoopRunChip(run.run_number, self._loop_run_emoji(run))
+                        for run in reversed(runs[:5])
+                    ],
+                    "latest_headline": headline,
+                }
             )
-            next_run_text = (
-                format_loop_timestamp(loop.next_run_at, loop.timezone)
-                if loop.next_run_at is not None and loop.status == LoopStatus.ACTIVE
-                else loop.status.value
-            )
-            summary = self._latest_loop_summary(loop.loop_id)
-            blocks = build_loop_list_item_blocks(
-                loop,
-                bot_name=bot_name,
-                channel_text=channel_text,
-                next_run_text=next_run_text,
-                last_summary=_shorten(summary, 240) if summary else None,
-            )
+        return f"Loops · {len(loops)}", build_loop_list_blocks(rows)
+
+    def _post_loop_list(self, channel_id: str) -> None:
+        payload = self._loop_list_payload()
+        if payload is None:
             self.gateway.post_message(
                 channel_id,
-                f"{bot_name} · {loop.status.value} · {next_run_text}",
-                blocks=blocks,
+                "No active loops. Create one with `loop create`.",
             )
+            return
+        text, blocks = payload
+        self.gateway.post_message(channel_id, text, blocks=blocks)
 
     def _pause_loop(self, loop: Loop, *, event: dict | None = None) -> bool:
         if loop.status == LoopStatus.PAUSED:
@@ -1925,7 +2034,8 @@ class SlackTeamController:
             return False
         self.store.update_loop_status(loop.loop_id, LoopStatus.PAUSED)
         self._append_loop_system_entry(loop, "loop paused by owner")
-        self._post_loop_surface(loop, "⏸ Loop paused.", event=event)
+        if event is not None:
+            self._post_loop_surface(loop, "⏸ Loop paused.", event=event)
         return True
 
     def _resume_loop(self, loop: Loop, *, event: dict | None = None) -> bool:
@@ -1950,11 +2060,12 @@ class SlackTeamController:
             loop,
             f"loop resumed; next run {format_loop_timestamp(next_run_at, loop.timezone)}",
         )
-        self._post_loop_surface(
-            loop,
-            f"▶ Loop resumed. Next run {format_loop_timestamp(next_run_at, loop.timezone)}.",
-            event=event,
-        )
+        if event is not None:
+            self._post_loop_surface(
+                loop,
+                f"▶ Loop resumed. Next run {format_loop_timestamp(next_run_at, loop.timezone)}.",
+                event=event,
+            )
         return True
 
     def _rename_loop_agent(self, loop: Loop, name: str, *, event: dict | None = None) -> None:
@@ -2086,6 +2197,10 @@ class SlackTeamController:
                 created_at=utc_now(),
             )
         )
+        # System entries record owner-visible configuration changes, so the
+        # pinned panel and channel topic always reflect them.
+        self._refresh_loop_panel(loop)
+        self._refresh_loop_topic(loop)
 
     def _post_loop_help(self, loop: Loop, *, event: dict | None = None) -> None:
         self._post_loop_surface(loop, self._loop_help_text(), event=event)
@@ -2096,7 +2211,7 @@ class SlackTeamController:
             "`loop status` · `loop pause` · `loop resume` · `loop run now`\n"
             "`loop schedule: …` · `loop task: …` · `loop name: …`\n"
             "`loop icon: :emoji:|https://…|regenerate` · `loop cwd: …`\n"
-            "`loop permissions: locked|safe-auto|dangerous` · `loop compact now`\n"
+            "`loop permissions: read-only|safe-auto|locked|dangerous` · `loop compact now`\n"
             "`loop stop` · `loop stop archive` · `loop help`\n\n"
             "Only the loop owner can use these commands. Other members' messages are never "
             "shown to the loop agent."
@@ -2154,7 +2269,11 @@ class SlackTeamController:
             loop.channel_id,
             loop.owner_slack_user_id,
         )
-        old_value = schedule if kind == "schedule" else loop.mission if kind == "task" else "icon"
+        old_value = {
+            "schedule": schedule,
+            "task": loop.mission,
+            "task_schedule": f"{loop.mission} ({schedule})",
+        }.get(kind, "icon")
         metadata: dict[str, object] = {
             LOOP_RESOLUTION_METADATA_KEY: True,
             LOOP_ID_METADATA_KEY: loop.loop_id,
@@ -2197,7 +2316,32 @@ class SlackTeamController:
     ) -> bool:
         kind = task.metadata.get(LOOP_UPDATE_KIND_METADATA_KEY)
         old_value = str(task.metadata.get(LOOP_UPDATE_OLD_VALUE_METADATA_KEY) or "")
-        if kind == "schedule":
+        if kind == "task_schedule":
+            next_run_at = next_run_after(spec.recurrence, after=utc_now())
+            if next_run_at is None:
+                return self._retry_loop_update_resolution(
+                    loop,
+                    task,
+                    agent,
+                    thread,
+                    "the resolved schedule has no next occurrence",
+                )
+            self.store.update_loop_schedule(
+                loop.loop_id,
+                recurrence=spec.recurrence,
+                timezone=spec.timezone,
+                next_run_at=next_run_at,
+            )
+            self._update_loop_identity_values(loop, mission=spec.mission)
+            new_schedule = describe_loop_schedule(spec.recurrence, spec.timezone)
+            content = (
+                f"mission and schedule changed from {old_value} to {spec.mission} ({new_schedule})"
+            )
+            confirmation = (
+                f"Mission and schedule updated (*{new_schedule}*). Next run "
+                f"{format_loop_timestamp(next_run_at, spec.timezone)}."
+            )
+        elif kind == "schedule":
             next_run_at = next_run_after(spec.recurrence, after=utc_now())
             if next_run_at is None:
                 return self._retry_loop_update_resolution(
@@ -2266,9 +2410,16 @@ class SlackTeamController:
         self._append_loop_system_entry(loop, content)
         self._finish_loop_resolution_task(task)
         latest_agent = self.store.get_team_agent(loop.agent_id, include_fired=True) or agent
+        placeholder_ts = task.parent_message_ts
+        if placeholder_ts and self._try_update_message(
+            thread.channel_id,
+            placeholder_ts,
+            f"✅ {confirmation}",
+        ):
+            return True
         self.gateway.post_thread_reply(
             thread,
-            confirmation,
+            f"✅ {confirmation}",
             persona=latest_agent,
             icon_url=self._agent_icon_url(latest_agent),
         )
@@ -2526,6 +2677,80 @@ class SlackTeamController:
 
         if async_success:
             self._run_after_view_ack("loop-create", callback)
+        else:
+            callback()
+        return None
+
+    def _handle_loop_edit_submission(
+        self,
+        payload: dict,
+        *,
+        async_success: bool = False,
+    ) -> dict | None:
+        view = payload.get("view") or {}
+        metadata = _decode_loop_create_metadata(view.get("private_metadata"))
+        loop = self.store.get_loop(metadata.get("loop_id") or "")
+        if loop is None or loop.status not in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
+            return _view_errors("loop_mission", "This loop is no longer running.")
+        if (payload.get("user") or {}).get("id") != loop.owner_slack_user_id:
+            return _view_errors("loop_mission", "Only the loop owner can edit this loop.")
+        values = view.get("state", {}).get("values", {})
+        mission = (_view_plain_value(values, "loop_mission", "value") or "").strip()
+        if not mission:
+            return _view_errors("loop_mission", "Describe what the loop should do.")
+        schedule = (_view_plain_value(values, "loop_schedule", "value") or "").strip()
+        if not schedule:
+            return _view_errors("loop_schedule", "Describe when the loop should run.")
+        mode_value = _view_selected_value(values, "loop_permissions", "value")
+        try:
+            mode = PermissionMode(mode_value) if mode_value else loop.permission_mode
+        except ValueError:
+            return _view_errors("loop_permissions", "Choose a supported permission mode.")
+        cwd_value = (_view_plain_value(values, "loop_cwd", "value") or "").strip()
+        cwd = None
+        if cwd_value and cwd_value != (loop.cwd or ""):
+            cwd = _validated_repo_root(cwd_value)
+            if cwd is None:
+                return _view_errors("loop_cwd", "Use an existing local folder path.")
+        mission_changed = mission != loop.mission.strip()
+        schedule_changed = schedule != describe_loop_schedule(loop.recurrence, loop.timezone)
+
+        def callback() -> None:
+            latest = self.store.get_loop(loop.loop_id) or loop
+            if cwd is not None:
+                self._update_loop_identity_values(latest, cwd=str(cwd))
+                self._append_loop_system_entry(latest, f"working directory changed to {cwd}")
+            if mode != latest.permission_mode:
+                if mode == PermissionMode.DANGEROUS:
+                    self._post_loop_surface(
+                        latest,
+                        "Confirm dangerous permissions for future runs.",
+                        blocks=build_loop_dangerous_confirmation_blocks(latest),
+                    )
+                else:
+                    self._set_loop_permissions(latest, mode)
+            if mission_changed or schedule_changed:
+                kind = (
+                    "task_schedule"
+                    if mission_changed and schedule_changed
+                    else "task"
+                    if mission_changed
+                    else "schedule"
+                )
+                parts = []
+                if mission_changed:
+                    parts.append(f"New mission: {mission}")
+                if schedule_changed:
+                    parts.append(f"New schedule: {schedule}")
+                self._start_loop_update_resolution(
+                    self.store.get_loop(loop.loop_id) or latest,
+                    kind=kind,
+                    override_text="\n".join(parts),
+                    event=None,
+                )
+
+        if async_success:
+            self._run_after_view_ack("loop-edit", callback)
         else:
             callback()
         return None
@@ -2957,11 +3182,21 @@ class SlackTeamController:
         if agent is None or not loop.channel_id:
             return True
         try:
+            skipped_text = (
+                f"{LOOP_RUN_SKIPPED_EMOJI} Skipped this occurrence — run "
+                f"#{active_run.run_number} is still in progress."
+            )
             self.gateway.post_session_parent(
                 loop.channel_id,
-                f"⏭ Skipped this occurrence — run #{active_run.run_number} is still in progress.",
+                skipped_text,
                 persona=agent,
                 icon_url=self._agent_icon_url(agent),
+                blocks=[
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": skipped_text}],
+                    }
+                ],
             )
         except Exception as exc:
             if _slack_error_code(exc) in _PM_DEAD_THREAD_SLACK_ERRORS:
@@ -2992,21 +3227,34 @@ class SlackTeamController:
             updated_at=now,
             started_at=now,
         )
+        header_blocks: list[dict] | None = None
         if kind == LoopRunKind.COMPACTION:
             header_text = "🧹 Compacting memory"
+            header_blocks = [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": header_text}]}
+            ]
         else:
-            header_text = (
-                f"▶ Run #{run.run_number} · {format_loop_timestamp(run.due_at, loop.timezone)}"
+            previous = next(
+                (
+                    summary
+                    for item in self._loop_history_runs(loop.loop_id)
+                    if (summary := loop_summary_from_json(item.summary_json)) is not None
+                ),
+                None,
             )
-            previous_summary = self._latest_loop_summary(loop.loop_id)
-            if previous_summary:
-                header_text += f"\n_Last run: {_shorten(previous_summary, 240)}_"
+            header_text, header_blocks = build_loop_run_running_blocks(
+                title=loop.title,
+                run_number=run.run_number,
+                when_text=format_loop_timestamp(run.due_at, loop.timezone),
+                previous_headline=_shorten(_loop_headline(previous), 160) if previous else None,
+            )
         try:
             posted = self.gateway.post_session_parent(
                 loop.channel_id,
                 header_text,
                 persona=agent,
                 icon_url=self._agent_icon_url(agent),
+                blocks=header_blocks,
             )
         except Exception as exc:
             error_code = _slack_error_code(exc)
@@ -3025,6 +3273,11 @@ class SlackTeamController:
         thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
         run = replace(run, thread_ts=posted.ts)
         self.store.create_loop_run(run)
+        guard_paths = (
+            self._loop_guard_paths(loop)
+            if loop.permission_mode == PermissionMode.READ_ONLY and kind != LoopRunKind.COMPACTION
+            else None
+        )
         entries = self.store.list_loop_journal(loop.loop_id, limit=10_000)
         journal = (
             render_loop_journal(
@@ -3047,6 +3300,8 @@ class SlackTeamController:
                 journal_rendered=journal,
                 now=now,
                 bot_name=agent.full_name,
+                scratch_dir=str(guard_paths[0]) if guard_paths else None,
+                reference_dir=str(guard_paths[2]) if guard_paths and guard_paths[2] else None,
             )
         )
         task = create_agent_task(
@@ -3061,7 +3316,19 @@ class SlackTeamController:
             LOOP_RUN_ID_METADATA_KEY: run.run_id,
             PERMISSION_MODE_METADATA_KEY: loop.permission_mode.value,
         }
-        if loop.cwd:
+        remembered_tools = self._loop_remembered_tools(loop)
+        if remembered_tools:
+            metadata[LOOP_ALLOWED_TOOLS_METADATA_KEY] = list(remembered_tools)
+        if guard_paths is not None:
+            scratch_dir, guard_log, reference_dir = guard_paths
+            # Read-only runs work inside their scratch directory; the loop's
+            # configured directory is attached as a read-only reference.
+            metadata["cwd"] = str(scratch_dir)
+            metadata[LOOP_SCRATCH_DIR_METADATA_KEY] = str(scratch_dir)
+            metadata[LOOP_GUARD_LOG_METADATA_KEY] = str(guard_log)
+            if reference_dir is not None:
+                metadata[LOOP_REFERENCE_DIR_METADATA_KEY] = str(reference_dir)
+        elif loop.cwd:
             metadata["cwd"] = loop.cwd
         if loop.model:
             metadata[MODEL_OVERRIDE_METADATA_KEY] = loop.model
@@ -3074,6 +3341,8 @@ class SlackTeamController:
         self.store.upsert_agent_task(task)
         self.store.update_loop_run(run.run_id, task_id=task.task_id)
         self.store.upsert_managed_thread_task(task, thread)
+        if kind != LoopRunKind.COMPACTION:
+            self._refresh_loop_panel(loop)
         if self._start_runtime_task(task, agent, thread):
             return True
         latest_task = self.store.get_agent_task(task.task_id) or task
@@ -3081,19 +3350,6 @@ class SlackTeamController:
             self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
         self._record_loop_failure(loop, run, "the loop runtime could not start")
         return True
-
-    def _latest_loop_summary(self, loop_id: str) -> str | None:
-        for run in self.store.list_loop_runs(loop_id, limit=50):
-            if not run.summary_json:
-                continue
-            try:
-                payload = json.loads(run.summary_json)
-            except json.JSONDecodeError:
-                continue
-            summary = payload.get("summary") if isinstance(payload, dict) else None
-            if isinstance(summary, str) and summary.strip():
-                return summary.strip().replace("\n", " ")
-        return None
 
     def _pause_loop_for_dead_channel(self, loop: Loop, error: str) -> None:
         message = f"Loop channel unavailable: {error}"
@@ -3257,11 +3513,7 @@ class SlackTeamController:
                 )
                 self.store.set_setting(key, utc_now().isoformat())
             return True
-        payload = {
-            "summary": parsed.summary.summary,
-            "status": parsed.summary.status,
-            "carry": parsed.summary.carry,
-        }
+        payload = parsed.summary.to_payload()
         self.store.update_loop_run(
             run.run_id,
             summary_json=json.dumps(payload, sort_keys=True),
@@ -3348,11 +3600,13 @@ class SlackTeamController:
         if loop is None:
             return True
         current_task = self.store.get_agent_task(task.task_id) or task
+        loop = self._remember_loop_run_approvals(loop, current_task)
         if current_task.status == AgentTaskStatus.CANCELLED:
             self._record_loop_failure(
                 loop,
                 current_run,
-                current_run.error or "the managed loop task was cancelled",
+                current_run.error
+                or "The run stopped before it finished. The thread shows the last step.",
             )
             return True
         if current_run.kind == LoopRunKind.COMPACTION:
@@ -3407,7 +3661,101 @@ class SlackTeamController:
         )
         self.store.reset_loop_failures(loop.loop_id)
         self._queue_loop_compaction_if_needed(loop)
+        self._publish_loop_run_card(
+            loop, self.store.get_loop_run(current_run.run_id) or current_run
+        )
+        self._refresh_loop_panel(loop)
         return True
+
+    def _show_loop_run_progress(self, task: AgentTask, progress: str) -> None:
+        """Show the agent's latest status line inside the running task card."""
+        run = self.store.get_loop_run(str(task.metadata.get(LOOP_RUN_ID_METADATA_KEY) or ""))
+        loop = self.store.get_loop(str(task.metadata.get(LOOP_ID_METADATA_KEY) or ""))
+        if (
+            run is None
+            or loop is None
+            or run.status != LoopRunStatus.RUNNING
+            or not run.thread_ts
+            or not loop.channel_id
+        ):
+            return
+        text, blocks = build_loop_run_running_blocks(
+            title=loop.title,
+            run_number=run.run_number,
+            when_text=format_loop_timestamp(run.due_at, loop.timezone),
+            progress=_shorten(" ".join(progress.split()), 280),
+        )
+        self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
+
+    def _publish_loop_run_card(self, loop: Loop, run: LoopRun) -> None:
+        """Turn the run's parent message into the report itself."""
+        if not loop.channel_id or not run.thread_ts or run.kind == LoopRunKind.COMPACTION:
+            return
+        when_text = format_loop_timestamp(run.due_at, loop.timezone)
+        if run.status == LoopRunStatus.FAILED:
+            latest = self.store.get_loop(loop.loop_id) or loop
+            text, blocks = build_loop_run_error_blocks(
+                title=loop.title,
+                run_number=run.run_number,
+                when_text=when_text,
+                error=run.error or "unknown failure",
+                paused=latest.status == LoopStatus.PAUSED,
+            )
+        else:
+            summary = loop_summary_from_json(run.summary_json)
+            if summary is None:
+                text, blocks = build_loop_run_report_blocks(
+                    title=loop.title,
+                    run_number=run.run_number,
+                    when_text=when_text,
+                    status="ok",
+                    headline="Run finished without a report",
+                    report="The agent did not record a summary. Its notes are in the thread.",
+                    duration_text=_loop_run_duration(run),
+                    guard_note=self._loop_guard_note(loop, run),
+                )
+            else:
+                chart = summary.chart
+                text, blocks = build_loop_run_report_blocks(
+                    title=loop.title,
+                    run_number=run.run_number,
+                    when_text=when_text,
+                    status=summary.status,
+                    headline=_loop_headline(summary),
+                    report=summary.report or (summary.summary if not summary.headline else None),
+                    metrics=[
+                        LoopRunCardMetric(metric.label, metric.value, metric.delta)
+                        for metric in summary.metrics
+                    ],
+                    chart=(
+                        LoopRunCardChart(
+                            chart.type,
+                            chart.title,
+                            chart.categories,
+                            tuple((series.name, series.values) for series in chart.series),
+                        )
+                        if chart is not None
+                        else None
+                    ),
+                    duration_text=_loop_run_duration(run),
+                    guard_note=self._loop_guard_note(loop, run),
+                    feedback_value={"loop_id": loop.loop_id, "run_id": run.run_id},
+                )
+        self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
+
+    def _remember_loop_run_approvals(self, loop: Loop, task: AgentTask | None) -> Loop:
+        raw = task.metadata.get(LOOP_ALLOWED_TOOLS_METADATA_KEY) if task is not None else None
+        if not isinstance(raw, list):
+            return loop
+        latest = self.store.get_loop(loop.loop_id) or loop
+        known = list(self._loop_remembered_tools(latest))
+        added = [tool for tool in raw if isinstance(tool, str) and tool and tool not in known]
+        if not added:
+            return latest
+        metadata = dict(latest.metadata)
+        metadata[LOOP_REMEMBERED_TOOLS_KEY] = known + added
+        self.store.update_loop_metadata(latest.loop_id, metadata)
+        return self.store.get_loop(latest.loop_id) or latest
 
     def _start_loop_summary_nudge(
         self,
@@ -3535,7 +3883,13 @@ class SlackTeamController:
             )
         failures = self.store.record_loop_failure(loop.loop_id, message)
         self.store.set_setting(key, utc_now().isoformat())
+        loop = self._remember_loop_run_approvals(
+            loop,
+            self.store.get_agent_task(run.task_id) if run.task_id else None,
+        )
         if failures < LOOP_MAX_CONSECUTIVE_FAILURES:
+            self._publish_loop_run_card(loop, self.store.get_loop_run(run.run_id) or run)
+            self._refresh_loop_panel(loop)
             return
         self.store.update_loop_status(loop.loop_id, LoopStatus.PAUSED, error=message)
         pause_text = (
@@ -3547,10 +3901,12 @@ class SlackTeamController:
             content=pause_text,
             dedupe_content=pause_text,
         )
+        self._publish_loop_run_card(loop, self.store.get_loop_run(run.run_id) or run)
+        self._refresh_loop_panel(loop)
         text = (
             f"<@{loop.owner_slack_user_id}> ⏸ Paused after "
             f"{LOOP_MAX_CONSECUTIVE_FAILURES} consecutive failed runs. "
-            f"Last error: {message}. Reply `loop resume` to continue."
+            f"Last error: {message}. Use *Resume* on the pinned card when it is fixed."
         )
         try:
             if loop.channel_id:
@@ -3838,7 +4194,36 @@ class SlackTeamController:
         )
 
     def _loop_badge_path(self, loop_id: str) -> Path:
-        return (self.home or Path.home()) / ".slackgentic-team" / "loops" / loop_id / "icon.png"
+        return self._loop_dir(loop_id) / "icon.png"
+
+    def _loop_dir(self, loop_id: str) -> Path:
+        return (self.home or Path.home()) / ".slackgentic-team" / "loops" / loop_id
+
+    def _loop_guard_paths(self, loop: Loop) -> tuple[Path, Path, Path | None]:
+        """Scratch directory, guard decision log, and read-only reference dir."""
+        loop_dir = self._loop_dir(loop.loop_id)
+        scratch = loop_dir / "scratch"
+        # Runs may keep credentials here (for example a reader password file).
+        scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with suppress(OSError):
+            loop_dir.chmod(0o700)
+            scratch.chmod(0o700)
+        reference = Path(loop.cwd).expanduser() if loop.cwd else self.default_cwd
+        return scratch, loop_dir / "guard.jsonl", reference if reference.exists() else None
+
+    def _loop_guard_note(self, loop: Loop, run: LoopRun) -> str | None:
+        events = read_guard_events(self._loop_dir(loop.loop_id) / "guard.jsonl", run.run_id)
+        blocked = sum(1 for event in events if event.get("decision") == "deny")
+        judged = sum(1 for event in events if event.get("judged"))
+        unexpected = sum(1 for event in events if event.get("decision") == "undecided")
+        parts = []
+        if blocked:
+            parts.append(f"🛡️ {blocked} write{'s' if blocked != 1 else ''} blocked")
+        if unexpected:
+            parts.append(f"⚠️ {unexpected} unexpected approval{'s' if unexpected != 1 else ''}")
+        if judged and not blocked:
+            parts.append(f"🛡️ {judged} call{'s' if judged != 1 else ''} judged read-only")
+        return " · ".join(parts) or None
 
     def _handle_pm_request(self, event: dict, channel_id: str, text: str) -> bool:
         # If this message is already a reply inside an active agent thread, let
@@ -6451,13 +6836,78 @@ class SlackTeamController:
                 )
             return
         action = payload.get("action")
+        surface = _loop_action_surface(slack_payload)
         if action == "loop.pause":
             self._pause_loop(loop)
-            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts)
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
             return
         if action == "loop.resume":
             self._resume_loop(loop)
-            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts)
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
+            return
+        if action == "loop.run_now":
+            if not self.fire_loop_now(loop):
+                self.gateway.post_ephemeral(
+                    channel_id,
+                    actor,
+                    "This loop must be active before it can run.",
+                )
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
+            return
+        if action == "loop.edit.open":
+            trigger_id = slack_payload.get("trigger_id")
+            if not isinstance(trigger_id, str) or not trigger_id:
+                return
+            try:
+                self.gateway.open_view(
+                    trigger_id,
+                    build_loop_edit_modal(
+                        loop,
+                        schedule_text=describe_loop_schedule(loop.recurrence, loop.timezone),
+                        channel_id=channel_id,
+                        message_ts=message_ts,
+                    ),
+                )
+            except Exception:
+                LOGGER.warning("failed to open loop edit modal", exc_info=True)
+                self.gateway.post_ephemeral(
+                    channel_id,
+                    actor,
+                    "Slack did not open the edit form. Try again, or use `loop task:` and "
+                    "`loop schedule:` in the loop channel.",
+                )
+            return
+        if action == "loop.open":
+            return
+        if action == "loop.feedback":
+            run = self.store.get_loop_run(str(payload.get("run_id") or ""))
+            if run is None or run.loop_id != loop.loop_id:
+                return
+            useful = payload.get("rating") == "up"
+            self._record_loop_feedback(loop, run, useful=useful)
+            self.gateway.post_ephemeral(
+                channel_id,
+                actor,
+                "Thanks — noted. Future runs will keep doing this."
+                if useful
+                else "Thanks — noted. Reply in the run's thread to say what to change.",
+            )
+            return
+        if action == "loop.compact":
+            if self.request_loop_compaction(loop):
+                self._append_loop_system_entry(loop, "memory compaction requested by owner")
+                self.gateway.post_ephemeral(channel_id, actor, "🧹 Memory compaction queued.")
+            return
+        if action == "loop.approvals.reset":
+            metadata = dict(loop.metadata)
+            metadata.pop(LOOP_REMEMBERED_TOOLS_KEY, None)
+            self.store.update_loop_metadata(loop.loop_id, metadata)
+            self._append_loop_system_entry(loop, "remembered tool approvals cleared by owner")
+            self.gateway.post_ephemeral(
+                channel_id,
+                actor,
+                "Remembered approvals cleared. Future runs will ask again.",
+            )
             return
         if action == "loop.stop.request":
             self.gateway.post_message(
@@ -6521,38 +6971,40 @@ class SlackTeamController:
             return
         self._approve_loop(loop, message_ts=message_ts)
 
+    def _record_loop_feedback(self, loop: Loop, run: LoopRun, *, useful: bool) -> None:
+        verdict = "useful" if useful else "not useful"
+        self.store.add_loop_journal_entry(
+            LoopJournalEntry(
+                entry_id=f"loopjournal_{uuid.uuid4().hex[:12]}",
+                loop_id=loop.loop_id,
+                kind="owner_note",
+                content=f"Owner rated the run #{run.run_number} report {verdict}.",
+                created_at=utc_now(),
+                run_id=run.run_id,
+                thread_ts=run.thread_ts,
+            )
+        )
+
     def _refresh_loop_action_card(
         self,
         loop_id: str,
         channel_id: str,
         message_ts: str | None,
+        surface: str | None = None,
     ) -> None:
-        if not message_ts:
-            return
         loop = self.store.get_loop(loop_id)
         if loop is None:
             return
-        agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
-        bot_name = agent.full_name if agent is not None else loop.title
-        channel_text = f"<#{loop.channel_id}>" if loop.channel_id else "channel pending"
-        next_run_text = (
-            format_loop_timestamp(loop.next_run_at, loop.timezone)
-            if loop.next_run_at is not None and loop.status == LoopStatus.ACTIVE
-            else loop.status.value
-        )
-        summary = self._latest_loop_summary(loop.loop_id)
-        self._try_update_message(
-            channel_id,
-            message_ts,
-            f"{bot_name} · {loop.status.value} · {next_run_text}",
-            blocks=build_loop_list_item_blocks(
-                loop,
-                bot_name=bot_name,
-                channel_text=channel_text,
-                next_run_text=next_run_text,
-                last_summary=_shorten(summary, 240) if summary else None,
-            ),
-        )
+        self._refresh_loop_panel(loop)
+        if not message_ts or message_ts == loop.charter_message_ts:
+            return
+        if surface == "list":
+            payload = self._loop_list_payload()
+            if payload is not None:
+                self._try_update_message(channel_id, message_ts, payload[0], blocks=payload[1])
+        elif surface == "status":
+            text, blocks = self._loop_panel(loop, context="status")
+            self._try_update_message(channel_id, message_ts, text, blocks=blocks)
 
     def _stop_loop(
         self,
@@ -6579,8 +7031,8 @@ class SlackTeamController:
                 finished_at=utc_now(),
                 error="loop stopped by owner",
             )
-        self._append_loop_system_entry(loop, "loop stopped by owner")
         self.store.update_loop_status(loop.loop_id, LoopStatus.CANCELLED)
+        self._append_loop_system_entry(loop, "loop stopped by owner")
         self.store.fire_team_agent(loop.agent_id)
         text = "Loop stopped."
         if archive and loop.channel_id:
@@ -6644,16 +7096,17 @@ class SlackTeamController:
             is_private=latest.visibility != LoopVisibility.PUBLIC,
         )
         self.gateway.invite_users(channel_id, [latest.owner_slack_user_id])
-        self.gateway.set_channel_topic(
-            channel_id,
-            _shorten(self._loop_channel_topic(latest, spec), 250),
-        )
-        charter_text = self._loop_charter_text(latest, spec)
         charter = self.gateway.post_session_parent(
             channel_id,
-            charter_text,
+            f"{spec.title} — {spec.schedule_description}",
             persona=agent,
             icon_url=self._agent_icon_url(agent),
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*{spec.title}* is being set up…"},
+                }
+            ],
         )
         self.gateway.pin_message(channel_id, charter.ts)
         badge_path = self._loop_badge_path(latest.loop_id)
@@ -6680,6 +7133,8 @@ class SlackTeamController:
         self.store.update_loop_status(latest.loop_id, LoopStatus.ACTIVE)
         self.store.update_loop_pending_spec(latest.loop_id, None)
         resolved = self.store.get_loop(latest.loop_id) or latest
+        self._refresh_loop_topic(resolved)
+        self._refresh_loop_panel(resolved)
         self._rewrite_loop_preview(
             resolved,
             message_ts=message_ts,
@@ -6731,30 +7186,30 @@ class SlackTeamController:
             blocks=blocks,
         )
 
-    def _loop_channel_topic(self, loop: Loop, spec: LoopSpec) -> str:
+    def _loop_channel_topic(
+        self,
+        loop: Loop,
+        recurrence: dict[str, object],
+        timezone: str | None,
+    ) -> str:
         return (
-            f"🔁 {spec.title} — {spec.schedule_description}. "
-            f"Owner: <@{loop.owner_slack_user_id}>. This bot only takes instructions from "
-            "its owner; other messages are not shown to it."
+            f"🔁 {loop.title} · {describe_loop_schedule(recurrence, timezone)} · "
+            f"owner <@{loop.owner_slack_user_id}>. Only the owner can instruct this bot."
         )
 
-    def _loop_charter_text(self, loop: Loop, spec: LoopSpec) -> str:
-        return (
-            f"*{spec.title}*\n\n"
-            f"*Mission*\n{spec.mission}\n\n"
-            f"*Schedule:* {spec.schedule_description}\n"
-            f"*Owner:* <@{loop.owner_slack_user_id}>\n"
-            f"*Provider:* {loop.provider.value}"
-            f"{f' · model {loop.model}' if loop.model else ''}\n"
-            f"*Permissions:* {loop.permission_mode.value}\n\n"
-            "This bot only takes instructions from its owner. Messages from other people "
-            "remain visible to humans in the channel, but the harness never shows them to "
-            "the loop agent.\n\n"
-            "*Commands:* `loop status`, `loop pause`, `loop resume`, `loop run now`, "
-            "`loop schedule: …`, `loop task: …`, `loop name: …`, `loop icon: …`, "
-            "`loop cwd: …`, `loop permissions: …`, `loop compact now`, `loop stop`, "
-            "and `loop help`."
-        )
+    def _refresh_loop_topic(self, loop: Loop) -> None:
+        latest = self.store.get_loop(loop.loop_id) or loop
+        if not latest.channel_id or latest.status not in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
+            return
+        topic = _shorten(self._loop_channel_topic(latest, latest.recurrence, latest.timezone), 250)
+        # Every topic change posts a channel notice, so only set it when it changed.
+        if latest.metadata.get("channel_topic") == topic:
+            return
+        with suppress(Exception):
+            if self.gateway.set_channel_topic(latest.channel_id, topic) is not False:
+                metadata = dict(latest.metadata)
+                metadata["channel_topic"] = topic
+                self.store.update_loop_metadata(latest.loop_id, metadata)
 
     def _schedule_from_action(
         self,
@@ -8517,6 +8972,10 @@ class SlackTeamController:
                 return self._handle_loop_compact_signal(task, agent, thread, signal)
             if normalized_signal.startswith(AGENT_LOOP_FETCH_SIGNAL_PREFIX):
                 return self._handle_loop_fetch_signal(task, agent, thread, signal)
+            progress = parse_agent_roster_status_signal(signal)
+            if progress is not None:
+                self._show_loop_run_progress(task, progress)
+                return True
             if signal.strip().upper().startswith("SLACKGENTIC:"):
                 return True
         roster_summary = parse_agent_roster_status_signal(signal)
@@ -8568,7 +9027,7 @@ class SlackTeamController:
         return True
 
     def _refresh_task_thread_header(self, task: AgentTask, agent) -> None:
-        if not task.channel_id or not task.parent_message_ts:
+        if not task.channel_id or not task.parent_message_ts or _loop_owns_parent_message(task):
             return
         try:
             self.gateway.update_message(
@@ -11556,7 +12015,7 @@ class SlackTeamController:
     def _remove_task_action_buttons_if_resolved(self, task: AgentTask) -> None:
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
             return
-        if not task.parent_message_ts:
+        if not task.parent_message_ts or _loop_owns_parent_message(task):
             return
         agent = self.store.get_team_agent(task.agent_id, include_fired=True)
         if agent is None:
@@ -11579,7 +12038,7 @@ class SlackTeamController:
     def _restore_task_action_buttons_if_active(self, task: AgentTask) -> None:
         if not _task_should_show_action_buttons(task):
             return
-        if not task.parent_message_ts:
+        if not task.parent_message_ts or _loop_owns_parent_message(task):
             return
         agent = self.store.get_team_agent(task.agent_id, include_fired=True)
         if agent is None:
@@ -12593,6 +13052,7 @@ class SocketModeSlackApp:
         self.runtime.agent_icon_url = self.controller._agent_icon_url
         self.controller.cancel_orphaned_active_tasks()
         self.controller.reconcile_loop_runs()
+        self.controller.refresh_loop_panels_after_upgrade()
         self.session_mirror = SessionMirror(
             self.store,
             self.gateway,
@@ -14726,6 +15186,41 @@ def _decode_roster_work_metadata(value) -> dict[str, str]:
     if not isinstance(decoded, dict):
         return {}
     return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _loop_owns_parent_message(task: AgentTask) -> bool:
+    """Loop runs and loop resolvers render their own parent message (report card,
+    update confirmation); generic task headers must never overwrite it."""
+    return bool(task.metadata.get(LOOP_ID_METADATA_KEY))
+
+
+def _loop_action_surface(slack_payload: dict) -> str | None:
+    action = _first_action(slack_payload) or {}
+    block_id = str(action.get("block_id") or "")
+    for surface in ("list", "status", "panel"):
+        if block_id.startswith(f"loop.{surface}."):
+            return surface
+    return None
+
+
+def _loop_headline(summary) -> str:
+    if summary.headline:
+        return summary.headline
+    first = re.split(r"(?<=[.!?])\s+", summary.summary.strip(), maxsplit=1)[0]
+    return _shorten(first, 150)
+
+
+def _loop_run_duration(run: LoopRun) -> str | None:
+    if run.started_at is None or run.finished_at is None:
+        return None
+    seconds = max(0, int((run.finished_at - run.started_at).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 
 def _decode_loop_create_metadata(value) -> dict[str, str]:
