@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import tomllib
+import types
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -431,6 +432,50 @@ class UpdateRunnerTests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_newer_prompt_keeps_the_outcome_of_an_installed_or_dismissed_card(self):
+        for setting, value in (
+            (None, None),
+            ("slackgentic.update.dismissed_version", "0.1.9"),
+        ):
+            with self.subTest(setting=setting), tempfile.TemporaryDirectory() as tmp:
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    if setting:
+                        store.set_setting(setting, value)
+                    store.set_setting(
+                        SETTING_UPDATE_PROMPT_MESSAGE,
+                        json.dumps({"version": "0.1.9", "channel_id": "C1", "ts": "160"}),
+                    )
+                    # Without a dismissal the old card's release is the one running.
+                    candidate = UpdateCandidate(
+                        current_version="0.1.0" if setting else "0.1.9",
+                        release=ReleaseInfo(version="0.2.0", tag_name="v0.2.0"),
+                        repository="example-org/example-repo",
+                    )
+                    updates = []
+
+                    checker = types.SimpleNamespace(
+                        release_source=GitHubReleaseSource("example-org/example-repo"),
+                        check=lambda candidate=candidate: candidate,
+                    )
+
+                    runner = SlackgenticUpdateRunner(
+                        store=store,
+                        checker=checker,
+                        updater=object(),
+                        channel_id=lambda: "C1",
+                        prompt=lambda channel_id, update: "171",
+                        update_message=lambda *args, updates=updates: updates.append(args),
+                        status_blocks=lambda update, status, include_actions: [],
+                    )
+
+                    runner.sync_once()
+
+                    self.assertEqual(updates, [])
+                finally:
+                    store.close()
 
     def test_sync_once_reprompts_same_version_after_failed_update(self):
         with tempfile.TemporaryDirectory() as tmp:

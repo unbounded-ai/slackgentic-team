@@ -662,6 +662,13 @@ class SlackgenticUpdateRunner:
         old_ts = previous.get("ts")
         if not old_version or not old_ts or old_ts == message_ts:
             return
+        # A card whose release is now running, or that was dismissed, already
+        # shows its outcome and has no buttons left to retire.
+        if str(old_version) in {
+            candidate.current_version,
+            self.store.get_setting(SETTING_UPDATE_DISMISSED_VERSION),
+        }:
+            return
         old_candidate = self._candidate_for_version(str(old_version))
         if old_candidate is None:
             old_candidate = self._fallback_candidate(str(old_version))
