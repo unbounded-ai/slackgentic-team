@@ -169,6 +169,8 @@ class FakeGateway:
         self.uploads = []
         self.channel_infos = {}
         self.archived_channels = []
+        self.channel_members = {}
+        self.renames = []
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -197,6 +199,13 @@ class FakeGateway:
 
     def invite_users(self, channel_id, user_ids):
         self.invites.append((channel_id, user_ids))
+
+    def channel_member_ids(self, channel_id):
+        return list(self.channel_members.get(channel_id, []))
+
+    def rename_channel(self, channel_id, name):
+        self.renames.append((channel_id, name))
+        return True
 
     def post_ephemeral(self, channel_id, user_id, text):
         self.ephemerals.append((channel_id, user_id, text))
@@ -4285,7 +4294,8 @@ class SlackAppTests(unittest.TestCase):
                 self.assertNotIn("Free up this agent", dismissed_blocks)
                 self.assertIn("Finished and freed up this agent", dismissed_blocks)
                 self.assertNotIn("Continuing", dismissed_blocks)
-                self.assertTrue(
+                # The rewritten prompt already says it; no second notice in the thread.
+                self.assertFalse(
                     any(
                         reply.get("text") == "Finished and freed up this agent."
                         for reply in gateway.thread_replies
@@ -4314,7 +4324,7 @@ class SlackAppTests(unittest.TestCase):
                         for reply in gateway.thread_replies
                         if reply.get("text") == "Finished and freed up this agent."
                     ],
-                    ["Finished and freed up this agent."],
+                    [],
                 )
             finally:
                 store.close()

@@ -64,6 +64,7 @@ from agent_harness.loops import (
     LoopSpec,
     LoopStatusCommand,
     LoopStopCommand,
+    LoopSummary,
     LoopTaskCommand,
     build_loop_compaction_prompt,
     build_loop_fetch_result,
@@ -283,6 +284,7 @@ from agent_harness.slack import (
     build_loop_create_guide_blocks,
     build_loop_create_modal,
     build_loop_dangerous_confirmation_blocks,
+    build_loop_delete_confirmation_blocks,
     build_loop_edit_modal,
     build_loop_list_blocks,
     build_loop_panel_blocks,
@@ -410,6 +412,9 @@ LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
 # Loop metadata: tool approvals the owner granted "for this loop"; each new run
 # launches with them so unattended runs do not stall on the same prompt again.
 LOOP_REMEMBERED_TOOLS_KEY = "allowed_tools"
+LOOP_QUIET_CHOICE_KEY = "quiet_choice"
+# Anyone in a loop channel may run or pause it; editing and deleting stay owner-only.
+LOOP_SHARED_ACTIONS = frozenset({"loop.open", "loop.pause", "loop.resume", "loop.run_now"})
 LOOP_PANEL_RECENT_RUNS = 8
 LOOP_UPDATE_OLD_VALUE_METADATA_KEY = "loop_update_old_value"
 UNASSIGNED_EXTERNAL_SESSION_PAGE_SIZE = 20
@@ -2026,8 +2031,6 @@ class SlackTeamController:
             for loop in self.store.list_loops(limit=100)
             if loop.status in {LoopStatus.ACTIVE, LoopStatus.PAUSED}
         ]
-        if not loops:
-            return None
         rows = []
         for loop in loops:
             agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
@@ -2061,10 +2064,6 @@ class SlackTeamController:
     def _post_loop_list(self, channel_id: str) -> None:
         payload = self._loop_list_payload()
         if payload is None:
-            self.gateway.post_message(
-                channel_id,
-                "No active loops. Create one with `loop create`.",
-            )
             return
         text, blocks = payload
         self.gateway.post_message(channel_id, text, blocks=blocks)
@@ -2604,7 +2603,10 @@ class SlackTeamController:
             updated_at=now,
             visibility=request.visibility,
             model=request.model,
-            metadata={"creation_request": request.description},
+            metadata={
+                "creation_request": request.description,
+                **({LOOP_QUIET_CHOICE_KEY: request.quiet} if request.quiet is not None else {}),
+            },
         )
         prompt = build_loop_resolution_prompt(request.description, now=now)
         task = create_agent_task(
@@ -2718,7 +2720,9 @@ class SlackTeamController:
         if not trigger_id:
             self._post_loop_create_guide(channel_id)
             return
-        anchor_thread_ts = payload.get("anchor_thread_ts") or message_ts
+        # The loops list must stay intact, so creation from it starts a fresh message.
+        from_list = payload.get("source") == "list"
+        anchor_thread_ts = None if from_list else payload.get("anchor_thread_ts") or message_ts
         try:
             self.gateway.open_view(
                 trigger_id,
@@ -2727,7 +2731,7 @@ class SlackTeamController:
                     anchor_thread_ts=(
                         str(anchor_thread_ts) if isinstance(anchor_thread_ts, str) else None
                     ),
-                    guide_message_ts=message_ts,
+                    guide_message_ts=None if from_list else message_ts,
                 ),
             )
         except Exception:
@@ -2764,6 +2768,9 @@ class SlackTeamController:
         provider = _view_selected_value(values, "loop_provider", "value") or "automatic"
         if provider not in {"automatic", Provider.CODEX.value, Provider.CLAUDE.value}:
             return _view_errors("loop_provider", "Choose a supported provider.")
+        notify = _view_selected_value(values, "loop_notify", "value") or "every-run"
+        if notify not in {"every-run", "quiet"}:
+            return _view_errors("loop_notify", "Choose when the loop should post.")
         channel_id = metadata.get("channel_id") or self._configured_agent_channel_id()
         if not channel_id:
             return _view_errors("loop_mission", "No main agent channel is configured.")
@@ -2773,7 +2780,7 @@ class SlackTeamController:
 
         description = f"{mission}; Schedule: {schedule}"
         provider_option = "" if provider == "automatic" else f" provider={provider}"
-        command = f"loop create {description} #{visibility}{provider_option}"
+        command = f"loop create {description} #{visibility} #{notify}{provider_option}"
 
         def callback() -> None:
             guide_message_ts = metadata.get("guide_message_ts")
@@ -2828,11 +2835,25 @@ class SlackTeamController:
             if cwd is None:
                 return _view_errors("loop_cwd", "Use an existing local folder path.")
         quiet = "quiet" in _view_checked_values(values, "loop_quiet", "value")
+        visibility_value = _view_selected_value(values, "loop_visibility", "value")
+        try:
+            visibility = LoopVisibility(visibility_value) if visibility_value else loop.visibility
+        except ValueError:
+            return _view_errors("loop_visibility", "Choose private or public.")
+        visibility_changed = visibility != loop.visibility and bool(loop.channel_id)
+        if visibility_changed and self.store.running_loop_run(loop.loop_id) is not None:
+            return _view_errors(
+                "loop_visibility",
+                "A run is in progress. Change visibility after it finishes.",
+            )
         mission_changed = mission != loop.mission.strip()
         schedule_changed = schedule != describe_loop_schedule(loop.recurrence, loop.timezone)
 
         def callback() -> None:
             latest = self.store.get_loop(loop.loop_id) or loop
+            if visibility_changed:
+                self._move_loop_channel(latest, visibility)
+                latest = self.store.get_loop(loop.loop_id) or latest
             if quiet != _loop_is_quiet(latest):
                 self._set_loop_quiet(latest, quiet)
                 latest = self.store.get_loop(loop.loop_id) or latest
@@ -3347,6 +3368,7 @@ class SlackTeamController:
             started_at=now,
         )
         header_blocks: list[dict] | None = None
+        previous: LoopSummary | None = None
         quiet_run = (
             _loop_is_quiet(loop)
             and kind != LoopRunKind.COMPACTION
@@ -3432,6 +3454,9 @@ class SlackTeamController:
                 scratch_dir=str(guard_paths[0]) if guard_paths else None,
                 reference_dir=str(guard_paths[2]) if guard_paths and guard_paths[2] else None,
                 quiet=quiet_run,
+                previous_headline_overflow_chars=(
+                    previous.headline_overflow_chars if previous is not None else None
+                ),
             )
         )
         task = create_agent_task(
@@ -4232,6 +4257,14 @@ class SlackTeamController:
         resolution_task: AgentTask | None = None,
     ) -> None:
         current = self.store.get_loop(loop.loop_id) or loop
+        # The create form's notification choice beats the resolver's reading of the text.
+        quiet_choice = current.metadata.get(LOOP_QUIET_CHOICE_KEY)
+        if (
+            current.status == LoopStatus.RESOLVING
+            and isinstance(quiet_choice, bool)
+            and quiet_choice != spec.quiet
+        ):
+            spec = replace(spec, quiet=quiet_choice)
         self.store.update_loop_identity(
             current.loop_id,
             title=spec.title,
@@ -6954,11 +6987,17 @@ class SlackTeamController:
                 }:
                     self.store.update_agent_task_status(str(task_id), AgentTaskStatus.DONE)
                     closed_tasks.append(task)
+            # Closing rewrites an idle-release prompt into the same notice, so only
+            # post one when there was no prompt to rewrite.
+            prompt_rewritten = any(
+                closed.metadata.get(IDLE_RELEASE_PROMPT_MESSAGE_TS_METADATA_KEY)
+                for closed in closed_tasks
+            )
             if not closed_tasks and task is not None:
                 self._mark_task_complete(task, thread, include_thread=True)
             for completed_task in closed_tasks:
                 self._mark_task_complete(completed_task, thread, include_thread=True)
-            if closed_tasks and thread.thread_ts:
+            if closed_tasks and thread.thread_ts and not prompt_rewritten:
                 self.gateway.post_thread_reply(thread, "Finished and freed up this agent.")
             try:
                 self.evaluate_pending_deferred_work()
@@ -7090,7 +7129,8 @@ class SlackTeamController:
         if loop is None:
             return
         actor = (slack_payload.get("user") or {}).get("id")
-        if actor != loop.owner_slack_user_id:
+        action = payload.get("action")
+        if actor != loop.owner_slack_user_id and action not in LOOP_SHARED_ACTIONS:
             if isinstance(actor, str) and actor:
                 self.gateway.post_ephemeral(
                     channel_id,
@@ -7098,7 +7138,6 @@ class SlackTeamController:
                     "Only the loop owner can do this.",
                 )
             return
-        action = payload.get("action")
         surface = _loop_action_surface(slack_payload)
         if action == "loop.pause":
             self._pause_loop(loop)
@@ -7179,6 +7218,27 @@ class SlackTeamController:
                 blocks=build_loop_stop_confirmation_blocks(loop, archive=False),
                 thread_ts=message_ts,
             )
+            return
+        if action == "loop.delete.request":
+            self.gateway.post_message(
+                channel_id,
+                f"Confirm deleting {loop.title}.",
+                blocks=build_loop_delete_confirmation_blocks(loop),
+                thread_ts=message_ts,
+            )
+            return
+        if action == "loop.delete":
+            if surface == "list":
+                # Keep the loops list; it is refreshed below without this loop.
+                self._stop_loop(
+                    loop, archive=True, channel_id=channel_id, message_ts=None, announce=False
+                )
+                self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
+                self.gateway.post_ephemeral(
+                    channel_id, actor, f"Deleted {loop.title} and archived its channel."
+                )
+            else:
+                self._stop_loop(loop, archive=True, channel_id=channel_id, message_ts=message_ts)
             return
         if action == "loop.stop.confirm":
             self._stop_loop(
@@ -7276,6 +7336,7 @@ class SlackTeamController:
         archive: bool,
         channel_id: str,
         message_ts: str | None,
+        announce: bool = True,
     ) -> None:
         if loop.status == LoopStatus.CANCELLED:
             return
@@ -7312,11 +7373,92 @@ class SlackTeamController:
                     }
                 ],
             )
-        else:
+        elif announce:
             self.gateway.post_message(channel_id, text)
         if archive and loop.channel_id:
             with suppress(Exception):
                 self.gateway.archive_channel(loop.channel_id)
+
+    def _move_loop_channel(self, loop: Loop, visibility: LoopVisibility) -> None:
+        """Slack bots cannot flip a channel's privacy, so recreate it with the other
+        visibility, bring the members along, and archive the old one."""
+        old_channel_id = loop.channel_id
+        agent = self.store.get_team_agent(loop.agent_id)
+        if not old_channel_id or agent is None:
+            return
+        name = loop.channel_name or f"loop-{loop.loop_id[-8:]}"
+        try:
+            bot_user_id = self.gateway.bot_user_id()
+            members = [
+                member
+                for member in self.gateway.channel_member_ids(old_channel_id)
+                if member != bot_user_id
+            ]
+        except Exception:
+            LOGGER.warning("failed to list loop channel members", exc_info=True)
+            members = []
+        if loop.owner_slack_user_id not in members:
+            members.append(loop.owner_slack_user_id)
+        # Free the name first so the new channel keeps it.
+        self.gateway.rename_channel(old_channel_id, f"{name[:70]}-old-{uuid.uuid4().hex[:4]}")
+        try:
+            new_channel_id = self.gateway.create_channel(
+                name, is_private=visibility != LoopVisibility.PUBLIC
+            )
+        except Exception as exc:
+            self.gateway.rename_channel(old_channel_id, name)
+            LOGGER.warning("failed to recreate loop channel", exc_info=True)
+            self.gateway.post_ephemeral(
+                old_channel_id,
+                loop.owner_slack_user_id,
+                f"Could not create the {visibility.value} channel "
+                f"({_slack_error_code(exc) or exc}); the loop stays here.",
+            )
+            return
+        for member in members:
+            # One at a time so a single deactivated or external user does not block the rest.
+            with suppress(Exception):
+                self.gateway.invite_users(new_channel_id, [member])
+        charter = self.gateway.post_session_parent(
+            new_channel_id,
+            f"{loop.title} — moved here",
+            persona=agent,
+            icon_url=self._agent_icon_url(agent),
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*{loop.title}*"}},
+            ],
+        )
+        self.gateway.pin_message(new_channel_id, charter.ts)
+        self.store.update_loop_channel(
+            loop.loop_id,
+            channel_id=new_channel_id,
+            channel_name=name,
+            charter_message_ts=charter.ts,
+        )
+        latest = self.store.get_loop(loop.loop_id) or loop
+        self.store.update_loop_identity(
+            latest.loop_id,
+            title=latest.title,
+            mission=latest.mission,
+            channel_name=latest.channel_name,
+            visibility=visibility,
+            provider=latest.provider,
+            model=latest.model,
+            permission_mode=latest.permission_mode,
+            cwd=latest.cwd,
+        )
+        moved = self.store.get_loop(loop.loop_id) or latest
+        self._refresh_loop_topic(moved)
+        self._refresh_loop_panel(moved)
+        self._append_loop_system_entry(moved, f"channel recreated as {visibility.value}")
+        with suppress(Exception):
+            self.gateway.post_message(
+                old_channel_id,
+                f"This loop moved to a {visibility.value} channel: <#{new_channel_id}>. "
+                "This channel is archived.",
+            )
+        with suppress(Exception):
+            self.gateway.archive_channel(old_channel_id)
 
     def _cancel_loop_from_action(self, loop: Loop, message_ts: str | None) -> None:
         if loop.status not in {LoopStatus.RESOLVING, LoopStatus.AWAITING_APPROVAL}:

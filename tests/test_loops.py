@@ -434,7 +434,7 @@ class PureLoopLogicTests(unittest.TestCase):
         self.assertIsNone(loop_logic.loop_summary_from_json("not json"))
 
         for payload, error in (
-            ({"summary": "x", "headline": "h" * 151}, "headline must be at most 150"),
+            ({"summary": "x", "headline": 7}, "headline must be a string"),
             ({"summary": "x", "report": 7}, "report must be a string"),
             ({"summary": "x", "metrics": {"label": "a"}}, "metrics must be a list"),
             ({"summary": "x", "metrics": [{"value": "1"}]}, "string label"),
@@ -446,6 +446,43 @@ class PureLoopLogicTests(unittest.TestCase):
             with self.subTest(error=error):
                 result = loop_logic.parse_agent_loop_summary_signal(prefix + json.dumps(payload))
                 self.assertIn(error, result.error or "")
+
+    def test_over_long_headline_is_truncated_and_flagged_for_next_run(self):
+        prefix = loop_logic.AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+        long_headline = "Dev clean " + "x" * 200
+        parsed = loop_logic.parse_agent_loop_summary_signal(
+            prefix + json.dumps({"summary": "Kept.", "headline": long_headline, "carry": {"a": 1}})
+        )
+
+        summary = parsed.summary
+        assert summary is not None
+        self.assertIsNone(parsed.error)
+        self.assertEqual(summary.carry, {"a": 1})
+        assert summary.headline is not None
+        self.assertEqual(len(summary.headline), loop_logic.LOOP_HEADLINE_MAX_CHARS)
+        self.assertTrue(summary.headline.startswith("Dev clean xxx"))
+        self.assertTrue(summary.headline.endswith(loop_logic.LOOP_HEADLINE_TRUNCATED_MARKER))
+        self.assertEqual(summary.headline_overflow_chars, len(long_headline))
+        restored = loop_logic.loop_summary_from_json(json.dumps(summary.to_payload()))
+        self.assertEqual(restored, summary)
+
+        loop = SimpleNamespace(
+            title="Example Watch",
+            mission="Report on example metrics.",
+            recurrence={"frequency": "daily", "time": "09:00"},
+            timezone="UTC",
+            metadata={},
+        )
+        run = SimpleNamespace(run_number=4, due_at=datetime(2026, 1, 5, 9, tzinfo=UTC))
+        prompt = loop_logic.build_loop_run_prompt(
+            loop,
+            run,
+            journal_rendered="(memory)",
+            now=datetime(2026, 1, 5, 9, tzinfo=UTC),
+            previous_headline_overflow_chars=len(long_headline),
+        )
+        self.assertIn(f"previous run's headline was {len(long_headline)} characters", prompt)
+        self.assertIn("count the characters before you emit", prompt)
 
     def test_run_prompt_routes_final_report_into_summary_signal(self):
         loop = SimpleNamespace(

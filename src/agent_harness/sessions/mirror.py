@@ -734,6 +734,12 @@ class SessionMirror:
             return False
         if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             return False
+        if not _session_can_use_live_target(session):
+            # Desktop and SDK sessions never own a terminal process, so a missing
+            # process says nothing about them; the idle release frees them instead.
+            self.store.delete_setting(_external_session_live_target_key(session))
+            self.store.delete_setting(_external_session_missing_target_key(session))
+            return False
         live_target_key = _external_session_live_target_key(session)
         stored_pid = _int_setting(self.store.get_setting(live_target_key))
         was_tracked = bool(
