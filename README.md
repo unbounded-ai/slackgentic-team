@@ -185,22 +185,33 @@ name, and icon, then posts a preview with Create/Cancel controls. After approval
 it creates the channel, invites the owner, pins a control panel, and starts a
 fresh managed provider session for each due run.
 
-Each run is one top-level message in the loop channel. It shows a working
-indicator while the run is in progress, then becomes the report itself: a status
-badge, the headline answer, key metrics with their change against the baseline,
-and the full report. The run's thread holds only the agent's working notes, so
-the channel reads as a feed of results.
+Each run is one top-level message in the loop channel. While it runs, the
+message is a live task card showing the agent's latest step. When it finishes,
+the message becomes the report itself: a status badge and headline, key metrics
+with their change against the baseline, an optional native chart, and the full
+report with tables. The run's thread holds only working notes, so the channel
+reads as a feed of results. 👍/👎 on a report is saved to the loop's memory so
+later runs learn what the owner finds useful.
 
-The pinned control panel shows the mission, status, schedule, next run, and a
-strip of recent results linking to each run. Its buttons run the loop now,
-pause or resume it, open an **Edit** form for the mission, schedule,
-permissions, and working directory, and (from the overflow menu) compact
-memory, forget remembered approvals, or stop the loop.
+The pinned control panel shows status, schedule, next run, the latest result,
+and a strip of recent runs linking to each report. Its buttons run the loop now,
+pause or resume it, and open an **Edit** form for the mission, schedule,
+permissions, and reference directory; the overflow menu compacts memory, forgets
+remembered approvals, or stops the loop. `loops` in the main channel shows every
+loop as a card in one carousel.
 
-Loops run unattended, so when a run asks for a tool approval the prompt offers
-**Always allow in this loop**. Approvals granted that way are remembered and
-passed to every later run, so the next scheduled run does not stall on the same
-prompt. Use *Forget remembered approvals* on the panel to reset them.
+New loops are **read-only**. Every tool call passes through a loop guard before
+it runs: known reads run without asking, anything that could change state
+(file edits outside the loop's scratch directory, destructive shell commands,
+mutating HTTP or SQL, cloud write operations) is blocked with a reason the agent
+can act on, and calls the rules cannot classify go to an isolated judge model
+with no tools that fails closed. Runs work inside a private per-loop scratch
+directory with the configured directory attached as a read-only reference, and
+secrets are redacted from guard logs. Blocked calls are counted on the report
+card. The guard prevents accidental writes; use read-only credentials when a
+hard guarantee matters. Loops set to other permission modes that hit an approval
+prompt offer **Always allow in this loop**, which remembers that exact command
+for later runs.
 
 Run summaries and owner notes form a durable journal; older run detail is
 available through bounded retrieval, and long journals compact automatically.
@@ -220,7 +231,7 @@ prompt, journal, thread context, or history retrieval.
 | `loop name: <text>` | Rename the loop bot |
 | `loop icon: :emoji:` | Set an emoji; URLs and `regenerate` are also accepted |
 | `loop cwd: <path>` | Set the working directory for future runs |
-| `loop permissions: <mode>` | Use `locked`, `safe-auto`, or confirmed `dangerous` mode |
+| `loop permissions: <mode>` | Use `read-only` (default), `safe-auto`, `locked`, or confirmed `dangerous` |
 | `loop compact now` | Queue memory compaction |
 | `loop stop [archive]` | Stop the loop, optionally archiving its channel |
 | `loop help` | Show the in-channel command reference |
