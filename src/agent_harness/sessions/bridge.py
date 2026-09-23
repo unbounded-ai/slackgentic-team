@@ -375,10 +375,12 @@ class ExternalSessionBridge:
             return False
 
     def _mark_live_session_exited(self, session: AgentSession, thread: SlackThreadRef) -> None:
+        # Keep the thread mapping: a resumed session continues in this thread.
         self.store.clear_external_session_tracking(
             session.provider,
             session.session_id,
             channel_id=thread.channel_id,
+            preserve_history=True,
         )
         clear_managed_session(self.store, session.provider, session.session_id)
         self.store.set_setting(

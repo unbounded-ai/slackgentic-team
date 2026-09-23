@@ -758,6 +758,110 @@ class SessionMirrorTests(unittest.TestCase):
                 finally:
                     store.close()
 
+    def test_claude_session_changing_cwd_across_turns_keeps_one_thread(self):
+        # Claude reports the cwd of its latest transcript records, so a session
+        # that changes directory between turns can leave and re-enter the
+        # configured cwd filters. It must keep a single Slack thread.
+        repo_cwd = "/workspace/repos/example-project"
+        other_repo_cwd = "/workspace/repos/example-project-worktree"
+        for excluded_cwd, restart in product(
+            ("/workspace/home", "/workspace/repos/example-project/.local/run-1"),
+            (False, True),
+        ):
+            with (
+                self.subTest(excluded_cwd=excluded_cwd, restart=restart),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                state_path = Path(tmp) / "state.sqlite"
+                store = Store(state_path)
+                try:
+                    store.init_schema()
+                    _add_team(store)
+                    now = datetime.now(UTC)
+                    provider = ClaudeProvider(home=Path(tmp))
+                    path = provider.projects_root / "example-project" / "s1.jsonl"
+                    path.parent.mkdir(parents=True)
+
+                    def message(at, text, cwd):
+                        record = _external_message_record(Provider.CLAUDE, at, text)
+                        record["cwd"] = cwd
+                        return record
+
+                    records = [message(now - timedelta(minutes=5), "Turn one", repo_cwd)]
+                    _write_external_records(path, records, now - timedelta(minutes=5))
+                    gateway = FakeGateway()
+                    mirror_options = {
+                        "team_id": "T1",
+                        "channel_id": "C1",
+                        "terminal_notifier": FakeTerminalNotifier(),
+                        "home": Path(tmp),
+                        "ignored_cwd_patterns": (".local",),
+                        "allowed_cwd_prefixes": ("/workspace/repos",),
+                    }
+                    mirror = SessionMirror(
+                        store, gateway, [provider], missing_target_grace_seconds=0, **mirror_options
+                    )
+                    mirror.sync_once()
+                    thread = store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", "C1")
+                    self.assertIsNotNone(thread)
+
+                    # The turn ends after the session changed directory.
+                    records.append(message(now - timedelta(minutes=4), "Wrap up", excluded_cwd))
+                    _write_external_records(path, records, now - timedelta(minutes=4))
+                    mirror.sync_once()
+
+                    # Idle gap: the process disappears and the session retires.
+                    provider.active_within_seconds = 30
+                    with patch(
+                        "agent_harness.sessions.mirror.utc_now",
+                        return_value=now - timedelta(minutes=3),
+                    ):
+                        for _ in range(3):
+                            mirror.sync_once()
+                    self.assertEqual(
+                        store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", "C1"),
+                        thread,
+                    )
+
+                    if restart:
+                        store.close()
+                        store = Store(state_path)
+                        store.init_schema()
+                        mirror = SessionMirror(store, gateway, [provider], **mirror_options)
+                        mirror.sync_once(backfill_new_sessions=False)
+                    mirror.missing_target_grace_seconds = 300
+
+                    # Next turns resume the same session id from other cwds.
+                    for offset, (text, cwd) in enumerate(
+                        (("Turn two", other_repo_cwd), ("Turn three", repo_cwd)), start=1
+                    ):
+                        at = now + timedelta(seconds=offset)
+                        records.append(message(at, text, cwd))
+                        _write_external_records(path, records, at)
+                        mirror.sync_once()
+                        mirror.sync_once()
+
+                    self.assertEqual(len(gateway.parents), 1)
+                    self.assertEqual(
+                        store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", "C1"),
+                        thread,
+                    )
+                    self.assertTrue(all(reply[0] == thread for reply in gateway.replies))
+                    mirrored = [reply[1] for reply in gateway.replies]
+                    self.assertEqual(mirrored[0], "Turn one")
+                    self.assertEqual(mirrored[-2:], ["Turn two", "Turn three"])
+                    if not excluded_cwd.endswith(".local/run-1"):
+                        # Leaving the allowed prefixes does not stop mirroring.
+                        self.assertIn("Wrap up", mirrored)
+                    else:
+                        # Explicitly ignored cwds are still not mirrored.
+                        self.assertNotIn("Wrap up", mirrored)
+                    self.assertEqual(
+                        store.get_session_mirror_cursor(Provider.CLAUDE, "s1"), len(records)
+                    )
+                finally:
+                    store.close()
+
     def test_retired_session_resumes_original_thread_without_replaying_history(self):
         for provider_kind, restart in product(Provider, (False, True)):
             with (
@@ -967,8 +1071,11 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(ignored.status, SessionStatus.DONE)
                 self.assertIsNotNone(store.get_setting("external_session_ignored.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
-                self.assertIsNone(
-                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1")
+                # The thread survives so the session resumes there if it leaves
+                # the ignored cwd again.
+                self.assertEqual(
+                    store.get_slack_thread_for_session(Provider.CODEX, "s1", "T1", "C1"),
+                    SlackThreadRef("C1", "171.000001", "171.000001"),
                 )
             finally:
                 store.close()
@@ -997,12 +1104,6 @@ class SessionMirrorTests(unittest.TestCase):
                     )
                 ]
                 store.set_setting("external_session_agent.codex.s1", "agent-1")
-                store.upsert_slack_thread_for_session(
-                    Provider.CODEX,
-                    "s1",
-                    "T1",
-                    SlackThreadRef("C1", "171.000001", "171.000001"),
-                )
                 gateway = FakeGateway()
                 mirror = SessionMirror(
                     store,
