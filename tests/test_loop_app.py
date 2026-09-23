@@ -1768,11 +1768,10 @@ class LoopCreationFlowTests(unittest.TestCase):
         card = carousel[1]
         self.assertEqual(
             [item["action_id"] for item in card["actions"]],
-            ["loop.open", "loop.edit.open", "loop.delete"],
+            ["loop.pause", "loop.edit.open", "loop.delete"],
         )
-        self.assertEqual(
-            card["actions"][0]["url"], f"https://example.slack.com/archives/{loop.channel_id}"
-        )
+        # The channel name in the body is the way into the channel.
+        self.assertIn(f"<#{loop.channel_id}>", card["body"]["text"])
         delete = card["actions"][2]
         self.assertIn("confirm", delete)
         self.controller.handle_block_action(
@@ -1797,26 +1796,8 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertNotIn(loop.loop_id, str(list_update["blocks"]))
         self.assertIn("loop.create.open", str(list_update["blocks"]))
 
-    def test_loop_list_for_non_owner_offers_run_and_pause_but_not_edit_or_delete(self):
+    def test_panel_lets_members_run_and_pause_but_not_delete(self):
         loop = self._activate_loop()
-        posts_before = len(self.gateway.posts)
-        self.controller.handle_event(
-            {
-                "event": {
-                    "type": "message",
-                    "channel": "CMAIN",
-                    "ts": "301.000002",
-                    "user": "UOTHER",
-                    "text": "loops",
-                }
-            }
-        )
-        post = self.gateway.posts[posts_before:][0]
-        card = post["blocks"][2]["elements"][1]
-        self.assertEqual(
-            [item["action_id"] for item in card["actions"]],
-            ["loop.open", "loop.run_now", "loop.pause"],
-        )
 
         def click(action_id: str) -> None:
             self.controller.handle_block_action(
@@ -1824,12 +1805,12 @@ class LoopCreationFlowTests(unittest.TestCase):
                     "actions": [
                         {
                             "action_id": action_id,
-                            "block_id": card["block_id"],
+                            "block_id": f"loop.panel.card.{loop.loop_id}",
                             "value": encode_action_value(action_id, loop_id=loop.loop_id),
                         }
                     ],
-                    "channel": {"id": "CMAIN"},
-                    "message": {"ts": post["ts"]},
+                    "channel": {"id": loop.channel_id},
+                    "message": {"ts": loop.charter_message_ts},
                     "user": {"id": "UOTHER"},
                 }
             )

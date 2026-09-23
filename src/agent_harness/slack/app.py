@@ -777,7 +777,7 @@ class SlackTeamController:
             return
         loop_command = parse_loop_command(text)
         if isinstance(loop_command, (LoopListCommand, LoopHelpCommand)):
-            self._handle_main_loop_command(loop_command, channel_id, viewer=payload.get("user_id"))
+            self._handle_main_loop_command(loop_command, channel_id)
             return
         if looks_like_loop_create_request(text):
             request = parse_loop_create_request(text)
@@ -1026,7 +1026,7 @@ class SlackTeamController:
         )
         loop_command = parse_loop_command(text)
         if isinstance(loop_command, (LoopListCommand, LoopHelpCommand)):
-            self._handle_main_loop_command(loop_command, channel_id, viewer=event.get("user"))
+            self._handle_main_loop_command(loop_command, channel_id)
             return
         command = parse_team_command(text)
         if command:
@@ -1751,11 +1751,9 @@ class SlackTeamController:
         )
         self.store.set_setting(notice_key, now.isoformat())
 
-    def _handle_main_loop_command(
-        self, command, channel_id: str, *, viewer: str | None = None
-    ) -> None:
+    def _handle_main_loop_command(self, command, channel_id: str) -> None:
         if isinstance(command, LoopListCommand):
-            self._post_loop_list(channel_id, viewer=viewer)
+            self._post_loop_list(channel_id)
             return
         self.gateway.post_message(channel_id, self._main_loop_help_text())
 
@@ -2027,7 +2025,7 @@ class SlackTeamController:
             return ()
         return tuple(item for item in raw if isinstance(item, str) and item)
 
-    def _loop_list_payload(self, viewer: str | None = None) -> tuple[str, list[dict]] | None:
+    def _loop_list_payload(self) -> tuple[str, list[dict]] | None:
         loops = [
             loop
             for loop in self.store.list_loops(limit=100)
@@ -2043,7 +2041,6 @@ class SlackTeamController:
                     "loop": loop,
                     "icon_emoji": agent.icon_emoji if agent is not None else None,
                     "channel_id": loop.channel_id,
-                    "channel_url": self._channel_url(loop.channel_id),
                     "channel_text": (
                         f"<#{loop.channel_id}>"
                         if loop.channel_id
@@ -2060,15 +2057,12 @@ class SlackTeamController:
                     ],
                     "latest_headline": headline,
                     "quiet": _loop_is_quiet(loop),
-                    # Messages look the same to everyone, so the list is cut for the
-                    # person who asked; clicks are still checked against the owner.
-                    "can_manage": viewer == loop.owner_slack_user_id,
                 }
             )
         return f"Loops · {len(loops)}", build_loop_list_blocks(rows)
 
-    def _post_loop_list(self, channel_id: str, *, viewer: str | None = None) -> None:
-        payload = self._loop_list_payload(viewer)
+    def _post_loop_list(self, channel_id: str) -> None:
+        payload = self._loop_list_payload()
         if payload is None:
             return
         text, blocks = payload
@@ -5232,16 +5226,6 @@ class SlackTeamController:
             return thread
         return self.store.find_slack_thread_for_session_channel(provider, session_id, channel_id)
 
-    def _channel_url(self, channel_id: str | None) -> str | None:
-        channel_url = getattr(self.gateway, "channel_url", None)
-        if not channel_id or not callable(channel_url):
-            return None
-        try:
-            return channel_url(channel_id)
-        except Exception:
-            LOGGER.debug("failed to build Slack channel URL for %s", channel_id)
-            return None
-
     def _thread_permalink(self, channel_id: str, thread_ts: str | None) -> str | None:
         if not thread_ts:
             return None
@@ -7157,15 +7141,11 @@ class SlackTeamController:
         surface = _loop_action_surface(slack_payload)
         if action == "loop.pause":
             self._pause_loop(loop)
-            self._refresh_loop_action_card(
-                loop.loop_id, channel_id, message_ts, surface, viewer=actor
-            )
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
             return
         if action == "loop.resume":
             self._resume_loop(loop)
-            self._refresh_loop_action_card(
-                loop.loop_id, channel_id, message_ts, surface, viewer=actor
-            )
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
             return
         if action == "loop.run_now":
             if not self.fire_loop_now(loop):
@@ -7174,9 +7154,7 @@ class SlackTeamController:
                     actor,
                     "This loop must be active before it can run.",
                 )
-            self._refresh_loop_action_card(
-                loop.loop_id, channel_id, message_ts, surface, viewer=actor
-            )
+            self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
             return
         if action == "loop.edit.open":
             trigger_id = slack_payload.get("trigger_id")
@@ -7255,9 +7233,7 @@ class SlackTeamController:
                 self._stop_loop(
                     loop, archive=True, channel_id=channel_id, message_ts=None, announce=False
                 )
-                self._refresh_loop_action_card(
-                    loop.loop_id, channel_id, message_ts, surface, viewer=actor
-                )
+                self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
                 self.gateway.post_ephemeral(
                     channel_id, actor, f"Deleted {loop.title} and archived its channel."
                 )
@@ -7338,7 +7314,6 @@ class SlackTeamController:
         channel_id: str,
         message_ts: str | None,
         surface: str | None = None,
-        viewer: str | None = None,
     ) -> None:
         loop = self.store.get_loop(loop_id)
         if loop is None:
@@ -7347,7 +7322,7 @@ class SlackTeamController:
         if not message_ts or message_ts == loop.charter_message_ts:
             return
         if surface == "list":
-            payload = self._loop_list_payload(viewer)
+            payload = self._loop_list_payload()
             if payload is not None:
                 self._try_update_message(channel_id, message_ts, payload[0], blocks=payload[1])
         elif surface == "status":

@@ -265,9 +265,6 @@ class FakeGateway:
     def permalink(self, channel_id, message_ts):
         return f"https://example.slack.com/archives/{channel_id}/p{message_ts.replace('.', '')}"
 
-    def channel_url(self, channel_id):
-        return f"https://example.slack.com/archives/{channel_id}"
-
     def pin_message(self, channel_id, message_ts):
         self.pins.append((channel_id, message_ts))
 

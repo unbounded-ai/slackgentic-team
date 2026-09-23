@@ -687,56 +687,32 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
             "text": _shorten_text(" ".join(body_parts) or row["schedule_text"], 200),
         },
     }
-    # Cards hold at most three buttons. The owner gets Open, Edit, and Delete (Run
-    # now and Pause/Resume stay on the pinned panel); anyone else gets Open, Run
-    # now, and Pause/Resume.
+    # Cards hold at most three buttons: Pause/Resume, Edit, and Delete. The channel
+    # name in the body opens the channel; Run now lives on the pinned panel.
     actions: list[dict[str, Any]] = []
-    channel_id = row.get("channel_id")
-    if channel_id:
+    if loop.status == LoopStatus.ACTIVE:
         actions.append(
             _button(
-                "Open",
-                "loop.open",
-                encode_action_value("loop.open", loop_id=loop.loop_id),
-                url=row.get("channel_url")
-                or f"https://slack.com/app_redirect?channel={channel_id}",
+                "⏸ Pause", "loop.pause", encode_action_value("loop.pause", loop_id=loop.loop_id)
             )
         )
-    if row.get("can_manage"):
+    elif loop.status == LoopStatus.PAUSED:
         actions.append(
             _button(
-                "✏️ Edit",
-                "loop.edit.open",
-                encode_action_value("loop.edit.open", loop_id=loop.loop_id),
+                "▶ Resume",
+                "loop.resume",
+                encode_action_value("loop.resume", loop_id=loop.loop_id),
+                "primary",
             )
         )
-        actions.append(_loop_delete_button(loop))
-    else:
-        if loop.status == LoopStatus.ACTIVE and not row.get("running"):
-            actions.append(
-                _button(
-                    "▶ Run now",
-                    "loop.run_now",
-                    encode_action_value("loop.run_now", loop_id=loop.loop_id),
-                )
-            )
-        if loop.status == LoopStatus.ACTIVE:
-            actions.append(
-                _button(
-                    "⏸ Pause",
-                    "loop.pause",
-                    encode_action_value("loop.pause", loop_id=loop.loop_id),
-                )
-            )
-        elif loop.status == LoopStatus.PAUSED:
-            actions.append(
-                _button(
-                    "▶ Resume",
-                    "loop.resume",
-                    encode_action_value("loop.resume", loop_id=loop.loop_id),
-                    "primary",
-                )
-            )
+    actions.append(
+        _button(
+            "✏️ Edit",
+            "loop.edit.open",
+            encode_action_value("loop.edit.open", loop_id=loop.loop_id),
+        )
+    )
+    actions.append(_loop_delete_button(loop))
     if actions:
         card["actions"] = actions[:3]
     return card

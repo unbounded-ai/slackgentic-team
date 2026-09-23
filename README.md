@@ -213,8 +213,8 @@ pause or resume it, and open an **Edit** form for the mission, schedule,
 permissions, reference directory, and channel visibility (switching visibility
 recreates the channel with the same members and archives the old one); the
 overflow menu compacts memory, forgets remembered approvals, stops the loop, or
-deletes it (stop and archive its channel). Anyone in the channel may run, pause,
-or resume a loop; only the owner can edit or delete it. `loops` in the main
+deletes it (stop and archive its channel). Anyone in the loop's channel may run,
+pause, or resume it; only the owner can edit or delete it. `loops` in the main
 channel shows every loop as a card in one carousel, led by a **New loop** card.
 
 **Quiet loops** post nothing, and so notify nobody, on all-clear runs: they
@@ -269,8 +269,8 @@ review the preview and click Create. Agent-requested loops always start
 read-only. `slackgentic loop list` shows loops from a terminal.
 
 Use `loops` or `loop list` in the main agent channel to see every loop in one
-message, with its latest result. Your own loops get Open, Edit, and Delete;
-other people's get Open, Run now, and Pause/Resume. Loops intentionally cannot delegate to roster
+message, with its latest result and Pause/Resume, Edit, and Delete buttons; click
+the channel name to open it. Loops intentionally cannot delegate to roster
 agents, start PM initiatives, or read Slack file and attachment contents.
 
 Loop badge uploads use the optional `files:write` scope. Existing installations
