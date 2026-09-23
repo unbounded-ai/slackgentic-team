@@ -83,7 +83,9 @@ class FakeGateway:
         self.updates = []
         self.calls = []
 
-    def post_message(self, channel_id, text, blocks=None, thread_ts=None):
+    def post_message(
+        self, channel_id, text, blocks=None, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ):
         self.calls.append(("post_message", channel_id, text))
         self.posts.append((channel_id, text, blocks, thread_ts))
         ts = f"170.{len(self.posts):06d}"

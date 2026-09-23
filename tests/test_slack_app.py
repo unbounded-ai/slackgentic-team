@@ -127,6 +127,26 @@ def _task_notification_text(*, escaped: bool = False) -> str:
     )
 
 
+def roster_action_blocks(blocks):
+    """Flatten roster agent cards into per-agent action groups for assertions."""
+    flattened = []
+    for block in blocks or []:
+        if block.get("type") != "carousel":
+            flattened.append(block)
+            continue
+        for card in block.get("elements") or []:
+            agent_id = str(card.get("block_id", "")).removeprefix("team.agent.")
+            flattened.append(card)
+            flattened.append(
+                {
+                    "type": "actions",
+                    "block_id": f"team.agent.actions.{agent_id}",
+                    "elements": card.get("actions") or [],
+                }
+            )
+    return flattened
+
+
 class FakeGateway:
     bot_user_id_value = "UBOT"
 
@@ -196,7 +216,9 @@ class FakeGateway:
     def open_view(self, trigger_id, view):
         self.views.append((trigger_id, view))
 
-    def post_message(self, channel_id, text, blocks=None, thread_ts=None):
+    def post_message(
+        self, channel_id, text, blocks=None, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ):
         ts = f"1712345678.{len(self.posts):06d}"
         self.posts.append(
             {
@@ -2779,7 +2801,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIn("1 available, 1 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("*Queued:* investigate flaky tests", blocks)
+                self.assertIn("investigate flaky tests", blocks)
                 self.assertNotIn("Slack task:", blocks)
                 self.assertNotIn("<https://example.slack.com/archives/C1/p", blocks)
                 self.assertIn("'text': {'type': 'plain_text', 'text': 'Open thread'}", blocks)
@@ -3033,7 +3055,7 @@ class SlackAppTests(unittest.TestCase):
 
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn(
-                    "*Queued:* Roster UX fix: validating E2E before PR merge",
+                    "Roster UX fix: validating E2E before PR merge",
                     blocks,
                 )
                 self.assertIn("*Original Task:* rerun tests", blocks)
@@ -3065,7 +3087,7 @@ class SlackAppTests(unittest.TestCase):
 
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn(
-                    ("*Queued:* Improve roster summaries and dangerous-mode display"),
+                    ("Improve roster summaries and dangerous-mode display"),
                     blocks,
                 )
                 self.assertIn(
@@ -3099,7 +3121,7 @@ class SlackAppTests(unittest.TestCase):
                 controller.post_roster("C1")
 
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("*Queued:* currently validating the release", blocks)
+                self.assertIn("currently validating the release", blocks)
                 self.assertIn("*Original Task:* first original task description", blocks)
                 self.assertNotIn("second assignment prompt", blocks)
                 self.assertNotIn("latest follow-up prompt", blocks)
@@ -3147,7 +3169,7 @@ class SlackAppTests(unittest.TestCase):
                 first_message = gateway.thread_replies[0]
                 self.assertIn("*Original Task:* repair the status view", first_message["text"])
                 self.assertIn(
-                    "*Original Task:* repair the status view",
+                    "repair the status view",
                     str(first_message["blocks"]),
                 )
                 runtime.running_task_ids.add(task.task_id)
@@ -3188,7 +3210,7 @@ class SlackAppTests(unittest.TestCase):
                     header_updates[0]["text"],
                 )
                 self.assertIn(
-                    "*Original Task:* repair the status view",
+                    "repair the status view",
                     str(header_updates[0]["blocks"]),
                 )
                 roster_updates = [
@@ -3196,11 +3218,11 @@ class SlackAppTests(unittest.TestCase):
                 ]
                 self.assertGreaterEqual(len(roster_updates), 1)
                 self.assertIn(
-                    "*Working:* validating the release",
+                    "validating the release",
                     str(roster_updates[-1]["blocks"]),
                 )
                 self.assertIn(
-                    "*Original Task:* repair the status view",
+                    "repair the status view",
                     str(roster_updates[-1]["blocks"]),
                 )
             finally:
@@ -3563,7 +3585,7 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("*Working:* drive PR 23", blocks)
+                self.assertIn("drive PR 23", blocks)
                 self.assertNotIn("Occupied: Slack task:", blocks)
             finally:
                 store.close()
@@ -3593,8 +3615,8 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIn("0 available, 1 occupied", gateway.posts[-1]["text"])
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("*Occupied:* Open thread: waiting for follow-up", blocks)
-                self.assertNotIn("*Working:* waiting for follow-up", blocks)
+                self.assertIn("Open thread: waiting for follow-up", blocks)
+                self.assertNotIn("🔨 Working", blocks)
             finally:
                 store.close()
 
@@ -3664,9 +3686,9 @@ class SlackAppTests(unittest.TestCase):
                 controller.post_roster("C1")
 
                 blocks = str(gateway.posts[-1]["blocks"])
-                self.assertIn("*Queued:* rewrite installer", blocks)
+                self.assertIn("rewrite installer", blocks)
                 self.assertNotIn("Slack task:", blocks)
-                self.assertIn("*Mode:* :zap: Dangerous", blocks)
+                self.assertIn("⚡ dangerous", blocks)
             finally:
                 store.close()
 
@@ -3716,7 +3738,7 @@ class SlackAppTests(unittest.TestCase):
                     str(header_updates[0]["blocks"]),
                 )
                 self.assertIn(
-                    "*Original Task:* small follow-up",
+                    "small follow-up",
                     str(header_updates[0]["blocks"]),
                 )
                 roster_updates = [
@@ -3724,11 +3746,11 @@ class SlackAppTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(roster_updates), 1)
                 self.assertIn(
-                    "*Queued:* Roster UX fix: opening PR after E2E",
+                    "Roster UX fix: opening PR after E2E",
                     str(roster_updates[0]["blocks"]),
                 )
                 self.assertIn(
-                    "*Original Task:* small follow-up",
+                    "small follow-up",
                     str(roster_updates[0]["blocks"]),
                 )
                 self.assertNotIn("Slack task:", str(roster_updates[0]["blocks"]))
@@ -3788,11 +3810,11 @@ class SlackAppTests(unittest.TestCase):
                 ]
                 self.assertGreaterEqual(len(header_updates), 2)
                 self.assertIn(
-                    "<https://github.com/acme/app/pull/42|acme/app#42>",
+                    "https://github.com/acme/app/pull/42",
                     str(header_updates[-1]["blocks"]),
                 )
                 self.assertIn(
-                    "<https://github.com/acme/app/pull/43|acme/app#43>",
+                    "https://github.com/acme/app/pull/43",
                     str(header_updates[-1]["blocks"]),
                 )
                 roster_updates = [update for update in gateway.updates if update["ts"] == roster_ts]
@@ -4950,7 +4972,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("'url': 'https://example.slack.com/archives/C1/p", blocks)
                 action_block = next(
                     block
-                    for block in gateway.posts[-1]["blocks"]
+                    for block in roster_action_blocks(gateway.posts[-1]["blocks"])
                     if block.get("block_id") == f"team.agent.actions.{agents[0].agent_id}"
                 )
                 self.assertEqual(
@@ -4997,7 +5019,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("claude session outside Slack: waiting on approval", blocks)
                 action_blocks = [
                     block
-                    for block in gateway.posts[-1]["blocks"]
+                    for block in roster_action_blocks(gateway.posts[-1]["blocks"])
                     if block.get("block_id") == f"team.agent.actions.{agents[0].agent_id}"
                 ]
                 self.assertEqual(len(action_blocks), 1)
@@ -5039,7 +5061,7 @@ class SlackAppTests(unittest.TestCase):
 
                 action_blocks = [
                     block
-                    for block in gateway.posts[-1]["blocks"]
+                    for block in roster_action_blocks(gateway.posts[-1]["blocks"])
                     if block.get("block_id") == f"team.agent.actions.{agents[0].agent_id}"
                 ]
                 self.assertEqual(len(action_blocks), 1)
@@ -7529,10 +7551,7 @@ class SlackAppTests(unittest.TestCase):
                     "*:zap: Dangerous mode*",
                     gateway.thread_replies[0]["text"],
                 )
-                self.assertIn(
-                    "*:zap: Dangerous mode*",
-                    gateway.thread_replies[0]["blocks"][0]["text"]["text"],
-                )
+                self.assertIn("⚡ dangerous mode", str(gateway.thread_replies[0]["blocks"]))
             finally:
                 store.close()
 
@@ -8206,8 +8225,9 @@ class SlackAppTests(unittest.TestCase):
 
                 tasks = store.list_agent_tasks()
                 self.assertEqual(tasks[0].prompt, "review the repo")
-                rendered = gateway.thread_replies[0]["blocks"][0]["text"]["text"]
-                self.assertIn("*Original Task:* review the repo", rendered)
+                rendered = str(gateway.thread_replies[0]["blocks"])
+                self.assertIn("review the repo", rendered)
+                self.assertIn("picked up this PR review", rendered)
             finally:
                 store.close()
 

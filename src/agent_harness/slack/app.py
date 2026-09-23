@@ -5716,6 +5716,8 @@ class SlackTeamController:
             text,
             blocks=blocks,
             thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
         )
         if remember:
             self._remember_roster_message(channel_id, posted.ts)
@@ -5753,6 +5755,9 @@ class SlackTeamController:
                         roster_ts,
                         text,
                         blocks=blocks,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                        attachments=[],
                     )
                     self._remember_roster_render(channel_id, roster_ts, text, blocks)
                 except Exception:
@@ -5788,6 +5793,9 @@ class SlackTeamController:
                 message_ts,
                 text,
                 blocks=blocks,
+                unfurl_links=False,
+                unfurl_media=False,
+                attachments=[],
             )
             self._remember_roster_render(channel_id, message_ts, text, blocks)
             return message_ts
@@ -13943,7 +13951,7 @@ def _is_roster_message(message: dict) -> bool:
         if not isinstance(text_obj, dict):
             continue
         value = text_obj.get("text")
-        if isinstance(value, str) and value.startswith("*Agent team*"):
+        if isinstance(value, str) and (value.startswith(("*Agent team*", "*🤖 Agent team*"))):
             return True
     return False
 

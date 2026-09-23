@@ -35,13 +35,35 @@ THREADS = ("171.000001", "171.000002", "171.000003")
 PROPERTY_MAX_EXAMPLES = 2500
 
 
+def roster_action_blocks(blocks):
+    """Flatten roster agent cards into per-agent action groups for assertions."""
+    flattened = []
+    for block in blocks or []:
+        if block.get("type") != "carousel":
+            flattened.append(block)
+            continue
+        for card in block.get("elements") or []:
+            agent_id = str(card.get("block_id", "")).removeprefix("team.agent.")
+            flattened.append(card)
+            flattened.append(
+                {
+                    "type": "actions",
+                    "block_id": f"team.agent.actions.{agent_id}",
+                    "elements": card.get("actions") or [],
+                }
+            )
+    return flattened
+
+
 class FakeGateway:
     def __init__(self):
         self.posts = []
         self.updates = []
         self.thread_replies = []
 
-    def post_message(self, channel_id, text, blocks=None, thread_ts=None):
+    def post_message(
+        self, channel_id, text, blocks=None, thread_ts=None, unfurl_links=None, unfurl_media=None
+    ):
         ts = f"1712345678.{len(self.posts):06d}"
         self.posts.append(
             {
@@ -289,7 +311,7 @@ class PropertyTests(unittest.TestCase):
         blocks = build_team_roster_blocks(agents, statuses)
         action_blocks = [
             block
-            for block in blocks
+            for block in roster_action_blocks(blocks)
             if str(block.get("block_id", "")).startswith("team.agent.actions.")
         ]
         self.assertEqual(len(action_blocks), count)

@@ -232,11 +232,17 @@ class SlackGateway:
         text: str,
         blocks: list[dict[str, Any]] | None = None,
         thread_ts: str | None = None,
+        unfurl_links: bool | None = None,
+        unfurl_media: bool | None = None,
     ) -> PostedMessage:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
             "text": normalize_slack_mrkdwn(text),
         }
+        if unfurl_links is not None:
+            kwargs["unfurl_links"] = unfurl_links
+        if unfurl_media is not None:
+            kwargs["unfurl_media"] = unfurl_media
         rendered_blocks = blocks if blocks is not None else slack_blocks_for_markdown_table(text)
         auto_rendered_blocks = blocks is None and rendered_blocks is not None
         if rendered_blocks:
