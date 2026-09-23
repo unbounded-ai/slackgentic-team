@@ -10,7 +10,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from agent_harness.internal_notifications import is_internal_task_notification_text
@@ -31,6 +31,7 @@ from agent_harness.models import (
 from agent_harness.providers.base import AgentProvider
 from agent_harness.providers.claude import (
     CLAUDE_LOCAL_COMMAND_MARKERS,
+    CLAUDE_SYNTHETIC_RECORD_FLAGS,
     is_synthetic_claude_assistant_record,
 )
 from agent_harness.providers.codex import codex_user_submission_text, is_codex_context_message
@@ -84,6 +85,23 @@ EXTERNAL_SESSION_START_MATCH_SECONDS = 300
 # occupied forever and the dead session keeps being re-adopted and re-announced.
 EXTERNAL_SESSION_MISSING_TARGET_GRACE_SECONDS = 300
 TERMINAL_MIRROR_PREFIX = "external_session_terminal_mirror."
+# Last conversational activity seen in an observed session's transcript, with the
+# scan position and file signature it was computed from. Transcript mtimes are not
+# activity: provider apps rewrite titles, modes, and thread settings whenever they
+# list or reopen a session, long after anyone last used it.
+EXTERNAL_SESSION_ACTIVITY_PREFIX = "external_session_activity."
+# Codex response items that mean the model is working a turn.
+_CODEX_ACTIVITY_RESPONSE_ITEM_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "local_shell_call",
+        "reasoning",
+        "web_search_call",
+    }
+)
 CODEX_RESPONSE_ITEM_RECOVERY_PREFIX = "codex_response_item_recovery.v1."
 
 
@@ -116,11 +134,18 @@ class SessionMirror:
         ignored_cwd_patterns: Iterable[str] = (),
         allowed_cwd_prefixes: Iterable[str] = (),
         missing_target_grace_seconds: float = EXTERNAL_SESSION_MISSING_TARGET_GRACE_SECONDS,
+        idle_release_seconds: float | None = None,
     ):
         self.store = store
         self.gateway = gateway
         self.missing_target_grace_seconds = missing_target_grace_seconds
+        # An observed session with no conversational activity for this long stops
+        # occupying its agent. None disables idle release.
+        self.idle_release_seconds = (
+            idle_release_seconds if idle_release_seconds and idle_release_seconds > 0 else None
+        )
         self.providers = list(providers)
+        self._providers_by_kind = {provider.provider: provider for provider in self.providers}
         self.team_id = team_id
         self.channel_id = channel_id
         self.poll_seconds = poll_seconds
@@ -215,6 +240,8 @@ class SessionMirror:
                 if self._skip_internal_session(session, channel_id):
                     continue
                 if self._skip_managed_task_session(session, channel_id):
+                    continue
+                if self._skip_idle_external_session(provider, session, channel_id):
                     continue
                 if not self._should_keep_external_session(session, channel_id):
                     if revived_ignored_session:
@@ -797,6 +824,9 @@ class SessionMirror:
     ) -> set[str]:
         providers_to_refresh: set[Provider] = set()
         retained_session_keys: set[str] = set()
+        providers_to_refresh.update(
+            self._release_idle_undiscovered_sessions(active_session_keys, channel_id)
+        )
         for prefix in (
             EXTERNAL_SESSION_AGENT_PREFIX,
             PENDING_EXTERNAL_SESSION_PREFIX,
@@ -833,6 +863,151 @@ class SessionMirror:
         for provider in providers_to_refresh:
             self._update_capacity_notice_if_clear(channel_id, provider)
         return retained_session_keys
+
+    def _release_idle_undiscovered_sessions(
+        self,
+        active_session_keys: set[str],
+        channel_id: str,
+    ) -> set[Provider]:
+        """Free agents held by sessions discovery no longer returns and nobody uses.
+
+        Discovery skips transcripts untouched for a day, so a forgotten session
+        drops out of it while its thread keeps it tracked. Without this check such
+        a session would occupy its agent for as long as its transcript exists.
+        """
+        if self.idle_release_seconds is None:
+            return set()
+        released: set[Provider] = set()
+        session_keys: set[str] = set()
+        for prefix in (
+            EXTERNAL_SESSION_AGENT_PREFIX,
+            PENDING_EXTERNAL_SESSION_PREFIX,
+            EXTERNAL_SESSION_LIVE_TARGET_PREFIX,
+            EXTERNAL_SESSION_MISSING_TARGET_PREFIX,
+        ):
+            session_keys.update(
+                key.removeprefix(prefix) for key in self.store.list_settings(prefix)
+            )
+        now = utc_now()
+        for session_key in sorted(session_keys - active_session_keys):
+            parsed = _provider_session_from_external_key(session_key)
+            if parsed is None:
+                continue
+            provider_kind, session_id = parsed
+            session = self.store.get_session(provider_kind, session_id)
+            if session is None:
+                continue
+            provider = self._providers_by_kind.get(provider_kind)
+            if self._session_recently_active(provider, session, now):
+                continue
+            if self._release_idle_external_session(session, channel_id):
+                released.add(provider_kind)
+        return released
+
+    def _skip_idle_external_session(
+        self,
+        provider: AgentProvider,
+        session: AgentSession,
+        channel_id: str,
+    ) -> bool:
+        """Keep sessions nobody is using from holding or claiming an agent.
+
+        The Slack thread, summary, and delivery cursor are kept, so the session
+        continues in place once it has new activity.
+        """
+        if self.idle_release_seconds is None:
+            return False
+        if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
+            return False
+        if self._session_recently_active(provider, session, utc_now()):
+            return False
+        self._release_idle_external_session(session, channel_id)
+        return True
+
+    def _release_idle_external_session(self, session: AgentSession, channel_id: str) -> bool:
+        if not self._holds_external_tracking(session):
+            return False
+        held_agent = bool(self.store.get_setting(_external_session_agent_setting_key(session)))
+        thread = self._thread_for_session(session, channel_id) if held_agent else None
+        self._clear_external_tracking(session, channel_id, preserve_history=True)
+        if thread is not None:
+            try:
+                self.gateway.post_thread_reply(
+                    thread,
+                    (
+                        f"No activity for {_format_idle_duration(self.idle_release_seconds)}; "
+                        "freed up this agent. New activity in this session continues "
+                        "in this thread."
+                    ),
+                )
+            except Exception:
+                LOGGER.debug("failed to post idle release notice", exc_info=True)
+        return True
+
+    def _holds_external_tracking(self, session: AgentSession) -> bool:
+        suffix = _external_session_key(session.provider, session.session_id)
+        return any(
+            self.store.get_setting(f"{prefix}{suffix}")
+            for prefix in (
+                EXTERNAL_SESSION_AGENT_PREFIX,
+                PENDING_EXTERNAL_SESSION_PREFIX,
+                EXTERNAL_SESSION_LIVE_TARGET_PREFIX,
+                EXTERNAL_SESSION_MISSING_TARGET_PREFIX,
+            )
+        )
+
+    def _session_recently_active(
+        self,
+        provider: AgentProvider | None,
+        session: AgentSession,
+        now: datetime,
+    ) -> bool:
+        if self.idle_release_seconds is None:
+            return True
+        cutoff = now - timedelta(seconds=self.idle_release_seconds)
+        key = _external_session_activity_key(session.provider, session.session_id)
+        state = _load_activity_state(self.store.get_setting(key))
+        last_activity = parse_timestamp(state.get("at"))
+        if last_activity is not None and last_activity >= cutoff:
+            return True
+        try:
+            stat = session.transcript_path.stat()
+        except OSError:
+            return False
+        # Activity is always written to the transcript, so nothing can be newer
+        # than the file itself.
+        if datetime.fromtimestamp(stat.st_mtime, tz=UTC) < cutoff:
+            return False
+        signature = [stat.st_mtime_ns, stat.st_size]
+        if state.get("signature") == signature:
+            return False
+        if provider is None:
+            return True
+        after_line = state.get("line") if isinstance(state.get("line"), int) else 0
+        size = state.get("size")
+        if isinstance(size, int) and stat.st_size < size:
+            after_line = 0
+        try:
+            last_line, latest = _latest_session_activity(provider, session, after_line)
+        except OSError:
+            return False
+        except Exception:
+            LOGGER.debug("failed to scan session activity", exc_info=True)
+            return True
+        if latest is not None and (last_activity is None or latest > last_activity):
+            last_activity = latest
+        self.store.set_setting(
+            key,
+            json.dumps(
+                {
+                    "at": last_activity.isoformat() if last_activity else None,
+                    "line": max(after_line, last_line),
+                    "size": stat.st_size,
+                    "signature": signature,
+                }
+            ),
+        )
+        return last_activity is not None and last_activity >= cutoff
 
     def _inactive_external_session_still_tracked(
         self,
@@ -1260,6 +1435,117 @@ def _ignored_external_session_may_have_new_activity(
     if ignored_at is None:
         return False
     return session.last_seen_at > ignored_at
+
+
+def record_external_session_activity(
+    store: Store,
+    provider: Provider,
+    session_id: str,
+    at: datetime | None = None,
+) -> None:
+    """Count a Slack-side action on an observed session as activity.
+
+    A Slack reply or assignment reaches the transcript only after the provider
+    picks it up, so it is recorded here to keep idle release from freeing the
+    agent in between.
+    """
+    key = _external_session_activity_key(provider, session_id)
+    state = _load_activity_state(store.get_setting(key))
+    at = at or utc_now()
+    previous = parse_timestamp(state.get("at"))
+    if previous is not None and previous >= at:
+        return
+    state["at"] = at.isoformat()
+    store.set_setting(key, json.dumps(state))
+
+
+def is_session_activity_event(event: AgentEvent) -> bool:
+    """True for transcript events a person or the model produced in a turn.
+
+    Bookkeeping a provider writes on its own (titles, modes, thread settings,
+    usage, summaries, injected notifications) does not count.
+    """
+    if event.timestamp is None:
+        return False
+    if render_session_event_chunk(event) is not None:
+        return True
+    metadata = event.metadata
+    if event.provider == Provider.CLAUDE:
+        if any(metadata.get(flag) is True for flag in CLAUDE_SYNTHETIC_RECORD_FLAGS):
+            return False
+        if event.event_type == "assistant":
+            return not is_synthetic_claude_assistant_record(metadata)
+        if event.event_type == "user":
+            return event.human_authored or _is_claude_tool_result_record(metadata)
+        return False
+    if event.provider == Provider.CODEX:
+        if event.event_type != "response_item":
+            return False
+        payload = metadata.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("type") in _CODEX_ACTIVITY_RESPONSE_ITEM_TYPES:
+            return True
+        return payload.get("type") == "message" and payload.get("role") == "assistant"
+    return False
+
+
+def _is_claude_tool_result_record(record: dict) -> bool:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(item, dict) and item.get("type") == "tool_result" for item in content)
+
+
+def _latest_session_activity(
+    provider: AgentProvider,
+    session: AgentSession,
+    after_line: int,
+) -> tuple[int, datetime | None]:
+    iter_events_after = getattr(provider, "iter_events_after", None)
+    events = (
+        iter_events_after(session.transcript_path, after_line)
+        if callable(iter_events_after)
+        else provider.iter_events(session.transcript_path)
+    )
+    last_line = after_line
+    latest: datetime | None = None
+    for event in events:
+        line_number = event.line_number or 0
+        if line_number and line_number <= after_line:
+            continue
+        last_line = max(last_line, line_number)
+        if not is_session_activity_event(event):
+            continue
+        if latest is None or event.timestamp > latest:
+            latest = event.timestamp
+    return last_line, latest
+
+
+def _load_activity_state(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        state = json.loads(value)
+    except ValueError:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _external_session_activity_key(provider: Provider, session_id: str) -> str:
+    return f"{EXTERNAL_SESSION_ACTIVITY_PREFIX}{_external_session_key(provider, session_id)}"
+
+
+def _format_idle_duration(seconds: float | None) -> str:
+    seconds = int(seconds or 0)
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour" if hours == 1 else f"{hours} hours"
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
 
 
 def _pending_external_session_key(session: AgentSession) -> str:

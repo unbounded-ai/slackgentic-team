@@ -83,6 +83,9 @@ class TeamConfig(BaseModel):
     )
 
 
+DEFAULT_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS = 2 * 60 * 60.0
+
+
 class SessionConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -97,6 +100,13 @@ class SessionConfig(BaseModel):
     external_session_mirror_poll_seconds: float = Field(
         default=15.0,
         validation_alias="SLACKGENTIC_EXTERNAL_SESSION_MIRROR_POLL_SECONDS",
+    )
+    # A session started outside Slack stops occupying its agent after this long
+    # without conversational activity, and claims one again when it resumes.
+    # Zero disables idle release.
+    external_session_idle_release_seconds: float = Field(
+        default=DEFAULT_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS,
+        validation_alias="SLACKGENTIC_EXTERNAL_SESSION_IDLE_RELEASE_SECONDS",
     )
 
     @field_validator(

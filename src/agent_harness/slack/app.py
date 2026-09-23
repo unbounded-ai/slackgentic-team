@@ -251,6 +251,7 @@ from agent_harness.sessions.mirror import (
     SessionMirror,
     _is_codex_subagent_session,
     format_session_parent,
+    record_external_session_activity,
 )
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
@@ -5513,6 +5514,7 @@ class SlackTeamController:
         }
         if agent.agent_id not in assignable_agent_ids:
             return f"@{agent.handle} is not available for that session."
+        record_external_session_activity(self.store, provider, session_id)
         self.store.set_setting(_external_session_agent_setting_key(session), agent.agent_id)
         self.store.delete_setting(f"{PENDING_EXTERNAL_SESSION_PREFIX}{provider.value}.{session_id}")
         thread = self._ensure_external_session_thread(channel_id, session, agent)
@@ -7649,6 +7651,9 @@ class SlackTeamController:
         channel_id: str,
         thread_ts: str,
     ) -> bool:
+        # A reply is activity even before the session writes it to its
+        # transcript; without this, idle release could free the agent again.
+        record_external_session_activity(self.store, session.provider, session.session_id)
         setting_key = _external_session_agent_setting_key(session)
         assigned_agent_id = self.store.get_setting(setting_key)
         if assigned_agent_id:
@@ -8391,6 +8396,7 @@ class SlackTeamController:
             slack_user=requested_by_slack_user,
         )
         if sent:
+            record_external_session_activity(self.store, session.provider, session.session_id)
             self._mark_external_session_message_delivered(
                 thread.channel_id,
                 request_message_ts,
@@ -13081,6 +13087,7 @@ class SocketModeSlackApp:
             home=config.home,
             ignored_cwd_patterns=config.sessions.ignored_external_session_cwds,
             allowed_cwd_prefixes=config.sessions.allowed_external_session_cwd_prefixes,
+            idle_release_seconds=config.sessions.external_session_idle_release_seconds,
         )
         self.session_mirror.start()
         self.controller.resume_pending_work_requests_for_configured_channel()

@@ -1230,6 +1230,7 @@ class Store:
         )
         if not preserve_history:
             prefixes += (
+                "external_session_activity.",
                 "external_session_summary.",
                 "session_channel_notice.",
                 "codex_response_item_recovery.v1.",
