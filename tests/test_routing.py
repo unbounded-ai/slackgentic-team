@@ -12,6 +12,30 @@ from agent_harness.team.routing import (
 
 
 class RoutingTests(unittest.TestCase):
+    def test_parse_work_request_uses_provider_default_model_without_option(self):
+        request = parse_work_request("@riley fix the flaky test", ["riley"])
+        assert request is not None
+        self.assertIsNone(request.model)
+
+    def test_parse_work_request_extracts_explicit_model_option(self):
+        for text in (
+            "@riley model=example-model fix the flaky test",
+            "@riley fix the flaky test model=example-model",
+            "model=other @riley fix the flaky test model=example-model",
+        ):
+            with self.subTest(text=text):
+                request = parse_work_request(text, ["riley"])
+                assert request is not None
+                self.assertEqual(request.requested_handle, "riley")
+                self.assertEqual(request.model, "example-model")
+                self.assertEqual(request.prompt, "fix the flaky test")
+
+    def test_parse_work_request_ignores_embedded_model_assignments(self):
+        request = parse_work_request("@riley set config.model=example-model in the file", ["riley"])
+        assert request is not None
+        self.assertIsNone(request.model)
+        self.assertIn("config.model=example-model", request.prompt)
+
     def test_parse_anyone_request(self):
         request = parse_work_request("Somebody do update the README", ["riley"])
         self.assertIsNotNone(request)

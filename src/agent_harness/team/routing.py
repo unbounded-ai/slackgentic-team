@@ -18,28 +18,44 @@ TASK_VERBS = ("do", "handle", "take", "work on", "start", "pick up", "review")
 BOT_MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*")
 AGENT_MENTION_RE = re.compile(r"(?<![\w.-])@([a-zA-Z][a-zA-Z0-9_-]{1,31})\b")
 DANGEROUS_MODE_TAG_RE = re.compile(r"(?<![\w.-])#dangerous-mode\b", re.IGNORECASE)
+MODEL_OPTION_RE = re.compile(r"(?<!\S)model=(?P<model>[^\s`]+)(?!\S)", re.IGNORECASE)
 
 
 def parse_work_request(text: str, known_handles: list[str] | tuple[str, ...]) -> WorkRequest | None:
     stripped_text, dangerous_mode = strip_dangerous_mode_tag(text)
+    stripped_text, model = strip_model_option(stripped_text)
     cleaned = BOT_MENTION_RE.sub("", _collapse_spaces(stripped_text))
     cleaned = _unwrap_leading_handle_code(cleaned, known_handles)
     if not cleaned:
         return None
-    anyone = _parse_anyone_request(cleaned, known_handles)
-    if anyone:
-        return _with_dangerous_mode(anyone, dangerous_mode)
-    return _with_dangerous_mode(_parse_specific_request(cleaned, known_handles), dangerous_mode)
+    request = _parse_anyone_request(cleaned, known_handles)
+    if request is None:
+        request = _parse_specific_request(cleaned, known_handles)
+    if request is not None and model:
+        request = replace(request, model=model)
+    return _with_dangerous_mode(request, dangerous_mode)
 
 
 def strip_dangerous_mode_tag(text: str) -> tuple[str, bool]:
     if not DANGEROUS_MODE_TAG_RE.search(text):
         return text, False
-    stripped = DANGEROUS_MODE_TAG_RE.sub("", text)
+    return _strip_option(DANGEROUS_MODE_TAG_RE, text), True
+
+
+def strip_model_option(text: str) -> tuple[str, str | None]:
+    """Remove an explicit ``model=<name>`` option; the last one wins."""
+    matches = list(MODEL_OPTION_RE.finditer(text))
+    if not matches:
+        return text, None
+    return _strip_option(MODEL_OPTION_RE, text), matches[-1].group("model")
+
+
+def _strip_option(pattern: re.Pattern[str], text: str) -> str:
+    stripped = pattern.sub("", text)
     stripped = re.sub(r"[ \t]{2,}", " ", stripped)
     stripped = re.sub(r"[ \t]+\n", "\n", stripped)
     stripped = re.sub(r"\n[ \t]+", "\n", stripped)
-    return stripped.strip(), True
+    return stripped.strip()
 
 
 def parse_lightweight_handles(text: str) -> list[str]:

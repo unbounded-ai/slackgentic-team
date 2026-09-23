@@ -961,29 +961,34 @@ class SessionMirror:
         if not _cwd_matches_ignored_patterns(session.cwd, self.ignored_cwd_patterns):
             return False
         self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
-        self._record_ignored_session(session, channel_id, preserve_history=False)
+        # A session's cwd is read from its latest transcript records, so it
+        # moves whenever the session changes directory. Pause mirroring, but
+        # keep the thread mapping so a return reuses the original thread.
+        self._record_ignored_session(session, channel_id)
         return True
 
     def _skip_disallowed_cwd_session(self, session: AgentSession, channel_id: str) -> bool:
         if _cwd_matches_allowed_prefixes(session.cwd, self.allowed_cwd_prefixes):
             return False
+        # Allowed prefixes decide which sessions start being mirrored. A session
+        # that already has a thread keeps it when it changes directory.
+        if self._thread_for_session(session, channel_id) is not None:
+            return False
         self.store.set_setting(_ignored_external_session_key(session), utc_now().isoformat())
-        self._record_ignored_session(session, channel_id, preserve_history=False)
+        self._record_ignored_session(session, channel_id)
         return True
 
     def _record_ignored_session(
         self,
         session: AgentSession,
         channel_id: str,
-        *,
-        preserve_history: bool = True,
     ) -> None:
         if session.status in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             session = replace(session, status=SessionStatus.DONE)
         self.store.upsert_session(session)
         # Retirement releases occupancy, but the conversation and delivery cursor
         # must survive so a resumed session continues in its original thread.
-        self._clear_external_tracking(session, channel_id, preserve_history=preserve_history)
+        self._clear_external_tracking(session, channel_id, preserve_history=True)
 
     def _skip_internal_session(self, session: AgentSession, channel_id: str) -> bool:
         if not _is_codex_subagent_session(session):

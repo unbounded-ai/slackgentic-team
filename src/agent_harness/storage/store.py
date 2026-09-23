@@ -12,6 +12,7 @@ from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
     DEFAULT_PERMISSION_MODE,
     DEFAULT_TEAM_AGENT_KIND,
+    MODEL_OVERRIDE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
     AgentSession,
     AgentTask,
@@ -808,6 +809,8 @@ class Store:
             metadata[PERMISSION_MODE_METADATA_KEY] = request.permission_mode.value
         if request.dangerous_mode:
             metadata[DANGEROUS_MODE_METADATA_KEY] = True
+        if request.model:
+            metadata[MODEL_OVERRIDE_METADATA_KEY] = request.model
         pending = PendingWorkRequest(
             pending_id=f"pending_{uuid.uuid4().hex[:12]}",
             channel_id=thread.channel_id,

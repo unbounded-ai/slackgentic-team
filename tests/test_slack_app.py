@@ -20,6 +20,7 @@ from agent_harness.deferred import (
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
     DANGEROUS_MODE_METADATA_KEY,
+    MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
@@ -7958,6 +7959,72 @@ class SlackAppTests(unittest.TestCase):
                 self.assertNotEqual(task.session_id, "codex-original")
             finally:
                 store.close()
+
+    def test_same_thread_followup_keeps_only_explicit_model_override(self):
+        cases = (
+            (None, "@mina make it even better", None),
+            ("example-model", "@mina make it even better", "example-model"),
+            ("example-model", "@mina model=other-model make it even better", "other-model"),
+            (None, "@mina model=other-model make it even better", "other-model"),
+        )
+        for prior_model, text, expected_model in cases:
+            with (
+                self.subTest(prior_model=prior_model, text=text),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                runtime = DetachedRuntime()
+                try:
+                    store.init_schema()
+                    agent = next(
+                        agent
+                        for agent in build_initial_model_team(1, 1)
+                        if agent.provider_preference == Provider.CLAUDE
+                    )
+                    agent = replace(agent, handle="mina", full_name="Mina Adebayo")
+                    store.upsert_team_agent(agent)
+                    prior_task = replace(
+                        create_agent_task(
+                            agent, "make it better", "C1", requested_by_slack_user="U1"
+                        ),
+                        status=AgentTaskStatus.DONE,
+                        thread_ts="171.thread",
+                        parent_message_ts="171.mina",
+                        session_provider=Provider.CLAUDE,
+                        session_id="claude-mina",
+                        metadata=(
+                            {MODEL_OVERRIDE_METADATA_KEY: prior_model} if prior_model else {}
+                        ),
+                    )
+                    store.upsert_agent_task(prior_task)
+                    controller = SlackTeamController(
+                        store,
+                        FakeGateway(),
+                        default_channel_id="C1",
+                        runtime=runtime,
+                    )
+
+                    controller.handle_event(
+                        {
+                            "event": {
+                                "type": "message",
+                                "channel": "C1",
+                                "user": "U1",
+                                "text": text,
+                                "ts": "171.000003",
+                                "thread_ts": "171.thread",
+                            }
+                        }
+                    )
+
+                    self.assertEqual(len(runtime.started), 1)
+                    task, started_agent, _ = runtime.started[0]
+                    self.assertEqual(started_agent.handle, "mina")
+                    self.assertEqual(task.session_id, "claude-mina")
+                    self.assertEqual(task.metadata.get(MODEL_OVERRIDE_METADATA_KEY), expected_model)
+                    self.assertNotIn("model=", task.prompt)
+                finally:
+                    store.close()
 
     def test_same_thread_followup_waits_when_agent_is_busy_elsewhere(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
+    MODEL_OVERRIDE_METADATA_KEY,
     ORIGINAL_TASK_METADATA_KEY,
     PR_URLS_METADATA_KEY,
     ROSTER_SUMMARY_METADATA_KEY,
@@ -169,6 +170,30 @@ class TeamTests(unittest.TestCase):
         hired = hire_team_agents(existing, 1)
         self.assertEqual(hired[0].kind, TeamAgentKind.ENGINEER)
         self.assertFalse(hired[0].is_pm)
+
+    def test_assignment_records_model_only_when_explicitly_requested(self):
+        for model in (None, "example-model"):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as tmp:
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                    store.upsert_team_agent(agent)
+
+                    result = assign_work_request(
+                        store,
+                        WorkRequest(
+                            prompt="fix the flaky test",
+                            assignment_mode=AssignmentMode.ANYONE,
+                            model=model,
+                        ),
+                        "C1",
+                    )
+
+                    assert result is not None
+                    self.assertEqual(result.task.metadata.get(MODEL_OVERRIDE_METADATA_KEY), model)
+                finally:
+                    store.close()
 
     def test_assignment_seeds_roster_summary_from_assignment_context(self):
         with tempfile.TemporaryDirectory() as tmp:

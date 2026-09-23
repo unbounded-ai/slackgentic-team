@@ -6,6 +6,7 @@ import time
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -26,6 +27,7 @@ from agent_harness.models import (
     SlackThreadRef,
 )
 from agent_harness.pm import AGENT_PM_PLAN_SIGNAL_PREFIX
+from agent_harness.runtime.runner import build_command
 from agent_harness.runtime.tasks import (
     AGENT_REACTION_SIGNAL_PREFIX,
     AGENT_ROSTER_STATUS_SIGNAL_PREFIX,
@@ -921,6 +923,60 @@ class TaskRuntimeTests(unittest.TestCase):
                 _macos_tcc_protected_cwd_issue(Path("/Volumes/External/repo"), home=home) or "",
             )
             self.assertIsNone(_macos_tcc_protected_cwd_issue(home / "code" / "repo", home=home))
+
+    def test_runtime_launches_workers_with_provider_default_model(self):
+        for provider, override in product(Provider, (None, "example-model")):
+            with (
+                self.subTest(provider=provider, override=override),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                home = Path(tmp)
+                project = home / "repo"
+                project.mkdir()
+                store = Store(home / "state.sqlite")
+                runtime = None
+                try:
+                    store.init_schema()
+                    agent = next(
+                        agent
+                        for agent in build_initial_model_team(codex_count=1, claude_count=1)
+                        if agent.provider_preference == provider
+                    )
+                    store.upsert_team_agent(agent)
+                    task = create_agent_task(agent, "fix the flaky test", "C1")
+                    if override:
+                        task = replace(task, metadata={MODEL_OVERRIDE_METADATA_KEY: override})
+                    store.upsert_agent_task(task)
+                    launched = []
+
+                    def process_factory(request, launched=launched):
+                        launched.append(request)
+                        return OneShotProcess(request)
+
+                    runtime = ManagedTaskRuntime(
+                        store,
+                        FakeGateway(),
+                        AgentCommandConfig(default_cwd=project),
+                        process_factory=process_factory,
+                        home=home,
+                    )
+
+                    self.assertTrue(
+                        runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                    )
+                    self.assertEqual(launched[0].provider, provider)
+                    self.assertEqual(launched[0].model, override)
+                    _, args = build_command(launched[0])
+                    if override:
+                        self.assertIn("--model", args)
+                        self.assertEqual(args[args.index("--model") + 1], override)
+                    else:
+                        self.assertNotIn("--model", args)
+                    runtime.stop_all_running_tasks(status=AgentTaskStatus.CANCELLED)
+                finally:
+                    if runtime is not None:
+                        shut_down_runtime(runtime)
+                    store.close()
 
     def test_runtime_passes_task_model_override_to_launch_request(self):
         with tempfile.TemporaryDirectory() as tmp:

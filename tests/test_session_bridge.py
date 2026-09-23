@@ -246,6 +246,8 @@ class SessionBridgeTests(unittest.TestCase):
                     transcript_path=Path(tmp) / "claude.jsonl",
                     cwd=Path(tmp),
                 )
+                thread = SlackThreadRef("C1", "171", "171")
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
 
                 handled = bridge.send_to_session(session, " /exit ", SlackThreadRef("C1", "171"))
 
@@ -259,6 +261,11 @@ class SessionBridgeTests(unittest.TestCase):
                 self.assertIsNotNone(store.get_setting("external_session_ignored.claude.s1"))
                 self.assertEqual(
                     store.get_session(Provider.CLAUDE, "s1").status, SessionStatus.DONE
+                )
+                # A later resume of the same session continues in this thread.
+                self.assertEqual(
+                    store.get_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", "C1"),
+                    thread,
                 )
             finally:
                 store.close()
