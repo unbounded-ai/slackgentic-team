@@ -2352,6 +2352,7 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(task.thread_ts, loop.charter_message_ts)
         self.assertEqual(thread.thread_ts, None)
         self.assertIn("Quiet loop", task.prompt)
+        self.assertIn("Never notify twice about the same thing", task.prompt)
         self.controller.handle_runtime_agent_control(
             task,
             agent,

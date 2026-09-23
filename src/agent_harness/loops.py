@@ -872,6 +872,11 @@ def build_loop_run_prompt(
                     "normal, use status ok with a one-line headline; the harness then posts "
                     "nothing. Use found_issue (or failed) only for something worth a "
                     "notification, and then keep the report short and specific.",
+                    "Never notify twice about the same thing: keep the issues you already "
+                    "reported in carry (signature, first seen, last reported level). An "
+                    "ongoing, unchanged issue is status ok with a headline like 'still "
+                    "ongoing: …'. Notify again only when it is new, clearly worse, resolved, "
+                    "or has been ongoing for a long time without acknowledgement.",
                 ]
                 if quiet
                 else [
