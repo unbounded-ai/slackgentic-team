@@ -387,7 +387,13 @@ provider session in a new thread; continuity comes from the rendered journal,
 not session reuse.
 
 Run prompts combine the standing mission with a bounded journal snapshot. The
-agent records a validated `LOOP_SUMMARY`; missing summaries receive one bounded
+agent records a validated `LOOP_SUMMARY` whose optional `headline`, `report`,
+and `metrics` fields are rendered into the run's parent message when the run
+finishes, so the report is the first thing in the channel and the thread keeps
+only working notes. Generic task headers never rewrite a loop-owned parent
+message. The pinned panel is re-rendered on every run and configuration change.
+Session-scoped tool approvals granted during a loop run are stored on the loop
+and preloaded into later runs; missing summaries receive one bounded
 follow-up before the harness writes a fallback entry. `LOOP_FETCH` can retrieve
 at most five earlier run threads per occurrence, from the same loop channel
 only. `LOOP_COMPACT` replaces redundant run/system memory while owner notes are

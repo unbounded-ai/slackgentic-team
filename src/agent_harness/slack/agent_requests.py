@@ -519,9 +519,16 @@ def _approval_action_blocks(pending: PendingAgentRequest) -> list[dict[str, Any]
             ("Cancel Turn", "cancel", "danger"),
         ]
     elif method == "claude/channel/permission":
+        session_label = pending.params.get("session_label")
         labels = [
             ("Allow", "approve", "primary"),
-            ("Allow Session", "approve_session", None),
+            (
+                session_label
+                if isinstance(session_label, str) and session_label
+                else "Allow Session",
+                "approve_session",
+                None,
+            ),
         ]
         labels.append(("Deny", "deny", "danger"))
     elif method == "item/permissions/requestApproval":
@@ -683,7 +690,10 @@ def _resolved_text(
         return {
             "approve": f"Allowed {provider_label} {request_label} request.",
             "approve_session": (
-                f"Allowed {provider_label} {request_label} request for this session."
+                f"Allowed {provider_label} {request_label} request for this loop; later runs "
+                "will not ask again."
+                if params and params.get("session_label")
+                else f"Allowed {provider_label} {request_label} request for this session."
             ),
             "deny": f"Denied {provider_label} {request_label} request.",
             "cancel": f"Denied {provider_label} {request_label} request.",

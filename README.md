@@ -182,10 +182,28 @@ loop create check cloud billing every morning at 9am PT, report anomalies, and o
 
 Slackgentic resolves the request into a mission, recurrence, channel name, bot
 name, and icon, then posts a preview with Create/Cancel controls. After approval
-it creates the channel, invites the owner, pins a charter, and starts a fresh
-managed provider session for each due run. Run summaries and owner notes form a
-durable journal; older run detail is available through bounded retrieval, and
-long journals compact automatically.
+it creates the channel, invites the owner, pins a control panel, and starts a
+fresh managed provider session for each due run.
+
+Each run is one top-level message in the loop channel. It shows a working
+indicator while the run is in progress, then becomes the report itself: a status
+badge, the headline answer, key metrics with their change against the baseline,
+and the full report. The run's thread holds only the agent's working notes, so
+the channel reads as a feed of results.
+
+The pinned control panel shows the mission, status, schedule, next run, and a
+strip of recent results linking to each run. Its buttons run the loop now,
+pause or resume it, open an **Edit** form for the mission, schedule,
+permissions, and working directory, and (from the overflow menu) compact
+memory, forget remembered approvals, or stop the loop.
+
+Loops run unattended, so when a run asks for a tool approval the prompt offers
+**Always allow in this loop**. Approvals granted that way are remembered and
+passed to every later run, so the next scheduled run does not stall on the same
+prompt. Use *Forget remembered approvals* on the panel to reset them.
+
+Run summaries and owner notes form a durable journal; older run detail is
+available through bounded retrieval, and long journals compact automatically.
 
 Inside the loop channel, only the owner can instruct the bot. Other members'
 messages remain visible to people, but Slackgentic marks them with 🚫 and never
@@ -194,7 +212,7 @@ prompt, journal, thread context, or history retrieval.
 
 | Command | Effect |
 |---|---|
-| `loop status` | Show state, schedule, recent runs, memory size, and failures |
+| `loop status` | Show the control panel: state, schedule, recent results, and controls |
 | `loop pause` / `loop resume` | Pause or resume scheduled occurrences |
 | `loop run now` | Start a manual occurrence without changing the schedule |
 | `loop schedule: <text>` | Re-resolve only the recurrence |
@@ -207,8 +225,8 @@ prompt, journal, thread context, or history retrieval.
 | `loop stop [archive]` | Stop the loop, optionally archiving its channel |
 | `loop help` | Show the in-channel command reference |
 
-Use `loops` or `loop list` in the main agent channel to see every loop and its
-Pause/Resume/Stop controls. Loops intentionally cannot delegate to roster
+Use `loops` or `loop list` in the main agent channel to see every loop in one
+message, with its latest result and a menu to run, pause, resume, or stop it. Loops intentionally cannot delegate to roster
 agents, start PM initiatives, or read Slack file and attachment contents.
 
 Loop badge uploads use the optional `files:write` scope. Existing installations

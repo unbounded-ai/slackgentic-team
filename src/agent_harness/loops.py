@@ -51,6 +51,10 @@ LOOP_COMPACT_SNAPSHOT_MAX_CHARS = 6_000
 LOOP_FETCH_MAX_PER_RUN = 5
 LOOP_FETCH_PAYLOAD_MAX_CHARS = 8_000
 LOOP_SUMMARY_MAX_CHARS = 2_000
+LOOP_HEADLINE_MAX_CHARS = 150
+LOOP_REPORT_MAX_CHARS = 6_000
+LOOP_METRICS_MAX_ITEMS = 8
+LOOP_METRIC_FIELD_MAX_CHARS = 60
 LOOP_SUMMARY_NUDGE_ATTEMPTS = 1
 LOOP_MAX_CONSECUTIVE_FAILURES = 3
 LOOP_IGNORED_NOTICE_INTERVAL_SECONDS = 86_400
@@ -66,6 +70,16 @@ LOOP_CREATE_VERBS = (
     "loop:",
 )
 LOOP_SUMMARY_STATUSES = frozenset({"ok", "found_issue", "action_taken", "failed"})
+LOOP_SUMMARY_SIGNAL_EXAMPLE = json.dumps(
+    {
+        "status": "ok|found_issue|action_taken|failed",
+        "headline": "<the answer in one line>",
+        "metrics": [{"label": "<name>", "value": "<value>", "delta": "<change vs baseline>"}],
+        "report": "<Slack mrkdwn report>",
+        "summary": "<3-5 sentences for memory>",
+        "carry": {},
+    }
+)
 _ICON_EMOJI_RE = re.compile(r"^[a-z0-9_+-]+$")
 _LEADING_MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*[:,]?\s*", re.IGNORECASE)
 
@@ -96,10 +110,37 @@ class LoopSpecParseResult:
 
 
 @dataclass(frozen=True)
+class LoopMetric:
+    label: str
+    value: str
+    delta: str | None = None
+
+
+@dataclass(frozen=True)
 class LoopSummary:
     summary: str
     status: str = "ok"
     carry: dict[str, Any] | None = None
+    headline: str | None = None
+    report: str | None = None
+    metrics: tuple[LoopMetric, ...] = ()
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "summary": self.summary,
+            "status": self.status,
+            "carry": self.carry,
+        }
+        if self.headline:
+            payload["headline"] = self.headline
+        if self.report:
+            payload["report"] = self.report
+        if self.metrics:
+            payload["metrics"] = [
+                {"label": metric.label, "value": metric.value, "delta": metric.delta}
+                for metric in self.metrics
+            ]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -444,7 +485,101 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
         return LoopSummaryParseResult(error="loop summary carry must be an object")
     if carry is not None and len(json.dumps(carry, sort_keys=True)) > 4_000:
         return LoopSummaryParseResult(error="loop summary carry must be at most 4000 characters")
-    return LoopSummaryParseResult(summary=LoopSummary(summary, str(status), carry))
+    headline = _optional_text(payload.get("headline"), LOOP_HEADLINE_MAX_CHARS, "headline")
+    if isinstance(headline, _FieldError):
+        return LoopSummaryParseResult(error=headline.message)
+    report = _optional_text(payload.get("report"), LOOP_REPORT_MAX_CHARS, "report")
+    if isinstance(report, _FieldError):
+        return LoopSummaryParseResult(error=report.message)
+    metrics = _parse_loop_metrics(payload.get("metrics"))
+    if isinstance(metrics, str):
+        return LoopSummaryParseResult(error=metrics)
+    return LoopSummaryParseResult(
+        summary=LoopSummary(
+            summary,
+            str(status),
+            carry,
+            headline=" ".join(headline.split()) if headline else None,
+            report=report,
+            metrics=metrics,
+        )
+    )
+
+
+def loop_summary_from_json(value: str | None) -> LoopSummary | None:
+    """Rebuild a stored run summary; tolerant of older rows without report fields."""
+    if not value:
+        return None
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    status = payload.get("status")
+    carry = payload.get("carry")
+    headline = payload.get("headline")
+    report = payload.get("report")
+    metrics = _parse_loop_metrics(payload.get("metrics"))
+    return LoopSummary(
+        summary=summary.strip(),
+        status=status if status in LOOP_SUMMARY_STATUSES else "ok",
+        carry=carry if isinstance(carry, dict) else None,
+        headline=headline.strip() if isinstance(headline, str) and headline.strip() else None,
+        report=report.strip() if isinstance(report, str) and report.strip() else None,
+        metrics=metrics if isinstance(metrics, tuple) else (),
+    )
+
+
+@dataclass(frozen=True)
+class _FieldError:
+    message: str
+
+
+def _optional_text(value: object, limit: int, label: str) -> str | _FieldError | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return _FieldError(f"loop summary {label} must be a string")
+    cleaned = value.strip()
+    if len(cleaned) > limit:
+        return _FieldError(f"loop summary {label} must be at most {limit} characters")
+    return cleaned or None
+
+
+def _parse_loop_metrics(value: object) -> tuple[LoopMetric, ...] | str:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        return "loop summary metrics must be a list"
+    if len(value) > LOOP_METRICS_MAX_ITEMS:
+        return f"loop summary metrics must have at most {LOOP_METRICS_MAX_ITEMS} items"
+    metrics: list[LoopMetric] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return "each loop summary metric must be an object"
+        fields: dict[str, str | None] = {}
+        for key in ("label", "value", "delta"):
+            raw = item.get(key)
+            if raw is None and key == "delta":
+                fields[key] = None
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                raw = str(raw)
+            if not isinstance(raw, str) or (key != "delta" and not raw.strip()):
+                return f"each loop summary metric needs a string {key}"
+            cleaned = " ".join(raw.split())
+            if len(cleaned) > LOOP_METRIC_FIELD_MAX_CHARS:
+                return (
+                    f"loop summary metric {key} must be at most "
+                    f"{LOOP_METRIC_FIELD_MAX_CHARS} characters"
+                )
+            fields[key] = cleaned or None
+        metrics.append(LoopMetric(str(fields["label"]), str(fields["value"]), fields["delta"]))
+    return tuple(metrics)
 
 
 def parse_agent_loop_fetch_signal(signal: str) -> LoopFetchParseResult:
@@ -586,9 +721,25 @@ def build_loop_run_prompt(
             journal_rendered,
             "",
             "[THIS RUN]",
-            "Perform the mission now. Post your findings in this thread as you go.",
-            "When the run's work is finished, emit exactly one hidden line:",
-            f'{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{{"summary": "<3-5 sentences>", "status": "ok|found_issue|action_taken|failed", "carry": {{}}}}',
+            "Perform the mission now. Nobody is watching live: work autonomously, reuse what "
+            "earlier runs learned (see memory and carry), and do not stop to ask questions.",
+            "Slack layout: this run's top-level channel message becomes your report card, and "
+            "this thread holds working notes. Keep thread notes to a few short progress lines; "
+            "do not post the final report in the thread.",
+            "When the run's work is finished, emit exactly one hidden single-line JSON control "
+            "line (escape newlines inside strings as \\n):",
+            f"{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{LOOP_SUMMARY_SIGNAL_EXAMPLE}",
+            "- status: ok (nothing notable), found_issue (anomaly or problem the owner should "
+            "see), action_taken (you changed something), failed (you could not do the mission).",
+            f"- headline: one line, at most {LOOP_HEADLINE_MAX_CHARS} characters, that states "
+            "the answer itself (numbers and verdict), not a description of the work.",
+            f"- metrics: up to {LOOP_METRICS_MAX_ITEMS} key numbers shown as tiles; delta "
+            "compares with the baseline (for example +12% vs 7d avg).",
+            f"- report: the full report in Slack mrkdwn (*bold*, bullets, `code`, <url|links>), "
+            f"at most {LOOP_REPORT_MAX_CHARS} characters. Lead with what changed or needs "
+            "attention; skip boilerplate and methodology unless it matters.",
+            "- summary: 3-5 plain sentences for your own long-term memory; carry: small JSON "
+            "state for the next run (baselines, how you accessed data, open issues).",
             "To read an earlier run, emit one line and wait:",
             f'{AGENT_LOOP_FETCH_SIGNAL_PREFIX}{{"run": <run number>}}',
             "To replace redundant long-term memory, emit:",

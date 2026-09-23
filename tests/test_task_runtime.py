@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import patch
 
@@ -3884,6 +3885,70 @@ class TaskRuntimeTests(unittest.TestCase):
                     if gateway.replies:
                         break
                     time.sleep(0.01)
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_loop_run_remembers_approvals_granted_for_the_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            class LoopReportDeniedProcess(ClaudePermissionDeniedProcess):
+                command = "example-cli report --since yesterday"
+                description = "Build the example report"
+
+            def process_factory(request):
+                requests.append(request)
+                if len(requests) == 1:
+                    return LoopReportDeniedProcess(request)
+                return ClaudeOneShotProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = replace(
+                    create_agent_task(agent, "run the loop", "C1", kind=AgentTaskKind.LOOP_RUN),
+                    metadata={"loop_id": "loop_example", "loop_allowed_tools": ["Bash(ls:*)"]},
+                )
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+                with (
+                    patch(
+                        "agent_harness.slack.agent_requests.SlackAgentRequestHandler."
+                        "wait_for_persistent_request",
+                        return_value={"behavior": "allow", "scope": "session"},
+                    ),
+                    patch(
+                        "agent_harness.slack.agent_requests.SlackAgentRequestHandler."
+                        "create_persistent_request",
+                        return_value=SimpleNamespace(token="token-1"),
+                    ) as create_request,
+                ):
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                    for _ in poll_attempts():
+                        if len(requests) >= 2 and "Done" in gateway.replies:
+                            break
+                        time.sleep(0.01)
+
+                self.assertIn("Bash(ls:*)", requests[0].allowed_tools)
+                self.assertEqual(
+                    create_request.call_args.args[1]["session_label"],
+                    "Always allow in this loop",
+                )
+                remembered = store.get_agent_task(task.task_id).metadata["loop_allowed_tools"]
+                self.assertEqual(remembered[0], "Bash(ls:*)")
+                self.assertGreater(len(remembered), 1)
+                for tool in remembered:
+                    self.assertIn(tool, requests[1].allowed_tools)
             finally:
                 shut_down_runtime(runtime)
                 store.close()

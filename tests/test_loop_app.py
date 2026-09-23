@@ -1281,7 +1281,8 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIsNone(task.session_id)
         self.assertIn("[LOOP HARNESS: state]", task.prompt)
         self.assertEqual(self.runtime.started, [(task, agent, thread)])
-        self.assertIn("▶ Run #1", self.gateway.posts[-1]["text"])
+        self.assertIn("run #1 is working", self.gateway.posts[-1]["text"])
+        self.assertEqual(self.gateway.posts[-1]["ts"], run.thread_ts)
 
     def test_scheduled_overlap_advances_schedule_and_records_skipped_run(self):
         loop = self._activate_loop()
@@ -1727,12 +1728,14 @@ class LoopCreationFlowTests(unittest.TestCase):
 
         reply = self.gateway.thread_replies[-1]
         rendered = str(reply["blocks"])
-        self.assertIn("Billing Bot status", rendered)
+        self.assertIn("Cloud Billing Watch", rendered)
         self.assertIn("Recent runs", rendered)
-        self.assertIn("Consecutive failures", rendered)
+        self.assertIn("Running now", rendered)
+        self.assertIn("every 5 minutes", rendered)
         self.assertIn("loop.pause", rendered)
+        self.assertIn("loop.edit.open", rendered)
         self.assertIn("loop.stop.request", rendered)
-        self.assertIn("run #1", rendered)
+        self.assertIn("⏳ #1", rendered)
 
     def test_main_loop_list_posts_one_actionable_card_per_loop(self):
         loop = self._activate_loop()
@@ -1751,10 +1754,39 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
 
         posts = self.gateway.posts[posts_before:]
-        self.assertEqual(len(posts), 2)
+        self.assertEqual(len(posts), 1)
         self.assertIn("Loops", posts[0]["text"])
-        self.assertIn(f"<#{loop.channel_id}>", str(posts[1]["blocks"]))
-        self.assertIn("loop.pause", str(posts[1]["blocks"]))
+        rendered = str(posts[0]["blocks"])
+        self.assertIn(f"<#{loop.channel_id}>", rendered)
+        self.assertIn("overflow", rendered)
+        self.assertIn("loop.pause", rendered)
+
+        pause_value = next(
+            option["value"]
+            for block in posts[0]["blocks"]
+            if block.get("accessory")
+            for option in block["accessory"]["options"]
+            if "loop.pause" in option["value"]
+        )
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "action_id": "loop.more",
+                        "block_id": f"loop.list.item.{loop.loop_id}",
+                        "selected_option": {"value": pause_value},
+                    }
+                ],
+                "channel": {"id": "CMAIN"},
+                "message": {"ts": posts[0]["ts"]},
+                "user": {"id": "UOWNER"},
+            }
+        )
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+        self.assertEqual(paused.status, LoopStatus.PAUSED)
+        list_update = next(item for item in self.gateway.updates if item["ts"] == posts[0]["ts"])
+        self.assertIn("Paused", str(list_update["blocks"]))
 
     def test_pause_resume_and_run_now_commands_drive_lifecycle(self):
         loop = self._activate_loop()
@@ -1933,6 +1965,235 @@ class LoopCreationFlowTests(unittest.TestCase):
         run = self.store.list_loop_runs(loop.loop_id)[0]
         self.assertEqual(run.status, LoopRunStatus.FAILED)
         self.assertEqual(run.error, "loop stopped by owner")
+
+    def _finish_run_with_summary(self, loop, payload: dict):
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + json.dumps(payload),
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        return finished
+
+    def test_approval_pins_interactive_control_panel(self):
+        loop = self._activate_loop()
+
+        self.assertEqual(self.gateway.pins, [(loop.channel_id, loop.charter_message_ts)])
+        panel = [item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts]
+        self.assertTrue(panel)
+        rendered = str(panel[-1]["blocks"])
+        self.assertIn("Cloud Billing Watch", rendered)
+        self.assertIn("loop.run_now", rendered)
+        self.assertIn("loop.edit.open", rendered)
+        self.assertIn("<@UOWNER>", rendered)
+
+    def test_finished_run_turns_parent_message_into_report_card(self):
+        loop = self._activate_loop()
+        finished = self._finish_run_with_summary(
+            loop,
+            {
+                "status": "found_issue",
+                "headline": "External calls up 38% vs 7-day average; one engine drives it",
+                "metrics": [
+                    {"label": "External calls", "value": "1.24M", "delta": "+38% vs 7d"},
+                    {"label": "Error rate", "value": "0.4%"},
+                ],
+                "report": "*Top engine*\n• example-engine: 410k calls (+212%)",
+                "summary": "Calls rose sharply; example-engine is the driver.",
+                "carry": {"baseline": 900000},
+            },
+        )
+
+        card = [item for item in self.gateway.updates if item["ts"] == finished.thread_ts][-1]
+        rendered = str(card["blocks"])
+        self.assertIn("⚠️ *External calls up 38% vs 7-day average", rendered)
+        self.assertIn("1.24M", rendered)
+        self.assertIn("+38% vs 7d", rendered)
+        self.assertIn("example-engine: 410k calls", rendered)
+        self.assertIn("Needs attention", rendered)
+        self.assertIn("working notes in thread", rendered)
+        self.assertTrue(card["text"].startswith("⚠️ Cloud Billing Watch: External calls up"))
+        stored = json.loads(finished.summary_json)
+        self.assertEqual(stored["headline"][:14], "External calls")
+        panel = [item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts][-1]
+        self.assertIn("⚠️ #1", str(panel["blocks"]))
+        self.assertIn("External calls up 38%", str(panel["blocks"]))
+        self.assertIn("loop.run_now", str(panel["blocks"]))
+
+    def test_summary_without_report_fields_still_renders_card(self):
+        loop = self._activate_loop()
+        finished = self._finish_run_with_summary(
+            loop,
+            {"summary": "Billing looked normal. Nothing to report.", "status": "ok"},
+        )
+
+        card = [item for item in self.gateway.updates if item["ts"] == finished.thread_ts][-1]
+        self.assertIn("✅ *Billing looked normal.*", str(card["blocks"]))
+        self.assertIn("All clear", str(card["blocks"]))
+
+    def test_failed_run_card_explains_the_error(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+
+        self.controller.handle_runtime_task_done(
+            self.store.get_agent_task(task.task_id), agent, thread
+        )
+
+        card = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
+        self.assertIn("did not finish", str(card["blocks"]))
+        self.assertIn("cancelled", str(card["blocks"]))
+
+    def test_session_approvals_are_remembered_for_future_runs(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        metadata = dict(task.metadata)
+        metadata["loop_allowed_tools"] = ["Bash(example-cli report:*)"]
+        self.store.upsert_agent_task(replace(task, metadata=metadata))
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"done","status":"ok"}',
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        remembered = self.store.get_loop(loop.loop_id)
+        assert remembered is not None
+        self.assertEqual(remembered.metadata["allowed_tools"], ["Bash(example-cli report:*)"])
+        panel = [item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts][-1]
+        self.assertIn("1 remembered approval", str(panel["blocks"]))
+        self.assertIn("loop.approvals.reset", str(panel["blocks"]))
+
+        self.controller.fire_loop_now(remembered)
+        next_task, _, _, _ = self._running_task_and_run(remembered)
+        self.assertEqual(next_task.metadata["loop_allowed_tools"], ["Bash(example-cli report:*)"])
+
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "action_id": "loop.more",
+                        "block_id": f"loop.panel.actions.{loop.loop_id}",
+                        "selected_option": {
+                            "value": encode_action_value(
+                                "loop.approvals.reset", loop_id=loop.loop_id
+                            )
+                        },
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": loop.charter_message_ts},
+                "user": {"id": "UOWNER"},
+            }
+        )
+        cleared = self.store.get_loop(loop.loop_id)
+        assert cleared is not None
+        self.assertNotIn("allowed_tools", cleared.metadata)
+
+    def test_panel_run_now_button_starts_a_manual_run(self):
+        loop = self._activate_loop()
+
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "block_id": f"loop.panel.actions.{loop.loop_id}",
+                        "value": encode_action_value("loop.run_now", loop_id=loop.loop_id),
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": loop.charter_message_ts},
+                "user": {"id": "UOWNER"},
+            }
+        )
+
+        run = self.store.running_loop_run(loop.loop_id)
+        assert run is not None
+        self.assertEqual(run.kind, LoopRunKind.MANUAL)
+        panel = [item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts][-1]
+        self.assertIn("Running now", str(panel["blocks"]))
+        self.assertNotIn("loop.run_now", str(panel["blocks"]))
+
+    def test_edit_modal_opens_prefilled_and_resolves_combined_changes(self):
+        loop = self._activate_loop()
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "block_id": f"loop.panel.actions.{loop.loop_id}",
+                        "value": encode_action_value("loop.edit.open", loop_id=loop.loop_id),
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": loop.charter_message_ts},
+                "trigger_id": "trigger-edit",
+                "user": {"id": "UOWNER"},
+            }
+        )
+        trigger_id, view = self.gateway.views[-1]
+        self.assertEqual(trigger_id, "trigger-edit")
+        self.assertEqual(view["callback_id"], "loop.edit")
+        self.assertIn(loop.mission, str(view["blocks"]))
+
+        def submission(user: str):
+            return {
+                "user": {"id": user},
+                "view": {
+                    "callback_id": "loop.edit",
+                    "private_metadata": view["private_metadata"],
+                    "state": {
+                        "values": {
+                            "loop_mission": {"value": {"value": "Inspect billing daily."}},
+                            "loop_schedule": {"value": {"value": "every ten minutes"}},
+                            "loop_permissions": {"value": {"selected_option": {"value": "locked"}}},
+                            "loop_cwd": {"value": {"value": ""}},
+                        }
+                    },
+                },
+            }
+
+        rejected = self.controller.handle_view_submission(submission("UBYSTANDER"))
+        self.assertEqual(rejected["response_action"], "errors")
+
+        self.assertIsNone(self.controller.handle_view_submission(submission("UOWNER")))
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertEqual(current.permission_mode, PermissionMode.LOCKED)
+        task, agent, thread = self.runtime.started[-1]
+        self.assertEqual(task.metadata["loop_update_kind"], "task_schedule")
+        self.assertIn("New mission: Inspect billing daily.", task.prompt)
+        self.assertIn("New schedule: every ten minutes", task.prompt)
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "title": "Cloud Billing Watch",
+                    "bot_name": "Billing Bot",
+                    "mission": "Inspect billing daily and report anomalies.",
+                    "schedule": {"frequency": "interval", "interval_seconds": 600},
+                }
+            ),
+        )
+        updated = self.store.get_loop(loop.loop_id)
+        assert updated is not None
+        self.assertEqual(updated.mission, "Inspect billing daily and report anomalies.")
+        self.assertEqual(updated.recurrence["interval_seconds"], 600)
+        confirmation = [
+            item for item in self.gateway.updates if item["ts"] == task.parent_message_ts
+        ]
+        self.assertIn("Mission and schedule updated", confirmation[-1]["text"])
 
     def test_loop_help_works_through_slash_command_in_loop_channel(self):
         loop = self._activate_loop()
