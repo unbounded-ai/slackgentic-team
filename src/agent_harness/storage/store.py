@@ -23,6 +23,8 @@ from agent_harness.models import (
     DeferredWork,
     DeferredWorkStatus,
     Loop,
+    LoopCreateQueueRequest,
+    LoopCreateRequestStatus,
     LoopJournalEntry,
     LoopOverlapPolicy,
     LoopRun,
@@ -273,6 +275,21 @@ CREATE TABLE IF NOT EXISTS scheduled_timers (
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_timers_due
   ON scheduled_timers(status, due_at, created_at);
+
+CREATE TABLE IF NOT EXISTS loop_create_requests (
+  request_id TEXT NOT NULL PRIMARY KEY,
+  text TEXT NOT NULL,
+  source TEXT,
+  status TEXT NOT NULL,
+  channel_id TEXT,
+  message_ts TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_create_requests_status_created
+  ON loop_create_requests(status, created_at);
 
 CREATE TABLE IF NOT EXISTS scheduled_work_requests (
   schedule_id TEXT NOT NULL PRIMARY KEY,
@@ -1749,6 +1766,125 @@ class Store:
             )
             self.conn.commit()
         return timer
+
+    def enqueue_loop_create_request(
+        self,
+        text: str,
+        *,
+        source: str | None = None,
+    ) -> LoopCreateQueueRequest:
+        now = utc_now()
+        request = LoopCreateQueueRequest(
+            request_id=f"loopreq_{uuid.uuid4().hex[:12]}",
+            text=text,
+            status=LoopCreateRequestStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+            source=source,
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO loop_create_requests (
+                  request_id, text, source, status, channel_id, message_ts, error,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request.text,
+                    request.source,
+                    request.status.value,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            self.conn.commit()
+        return request
+
+    def get_loop_create_request(self, request_id: str) -> LoopCreateQueueRequest | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loop_create_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return _loop_create_request_from_row(row) if row else None
+
+    def count_pending_loop_create_requests(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM loop_create_requests WHERE status IN (?, ?)",
+                (
+                    LoopCreateRequestStatus.PENDING.value,
+                    LoopCreateRequestStatus.CLAIMED.value,
+                ),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def claim_pending_loop_create_requests(self, *, limit: int = 5) -> list[LoopCreateQueueRequest]:
+        claimed: list[LoopCreateQueueRequest] = []
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT request_id
+                FROM loop_create_requests
+                WHERE status = ?
+                ORDER BY created_at, request_id
+                LIMIT ?
+                """,
+                (LoopCreateRequestStatus.PENDING.value, limit),
+            ).fetchall()
+            for row in rows:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE loop_create_requests
+                    SET status = ?, updated_at = ?
+                    WHERE request_id = ? AND status = ?
+                    """,
+                    (
+                        LoopCreateRequestStatus.CLAIMED.value,
+                        utc_now().isoformat(),
+                        row["request_id"],
+                        LoopCreateRequestStatus.PENDING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                current = self.conn.execute(
+                    "SELECT * FROM loop_create_requests WHERE request_id = ?",
+                    (row["request_id"],),
+                ).fetchone()
+                if current:
+                    claimed.append(_loop_create_request_from_row(current))
+            self.conn.commit()
+        return claimed
+
+    def finish_loop_create_request(
+        self,
+        request_id: str,
+        status: LoopCreateRequestStatus,
+        *,
+        channel_id: str | None = None,
+        message_ts: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loop_create_requests
+                SET status = ?, channel_id = ?, message_ts = ?, error = ?, updated_at = ?
+                WHERE request_id = ?
+                """,
+                (
+                    status.value,
+                    channel_id,
+                    message_ts,
+                    error,
+                    utc_now().isoformat(),
+                    request_id,
+                ),
+            )
+            self.conn.commit()
 
     def list_due_scheduled_timers(self, *, now=None, limit: int = 20) -> list[ScheduledTimer]:
         reference = now or utc_now()
@@ -3564,6 +3700,20 @@ def _pending_work_request_from_row(row: sqlite3.Row) -> PendingWorkRequest:
         status=PendingWorkRequestStatus(row["status"]),
         created_at=parse_timestamp(row["created_at"]) or utc_now(),
         updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+    )
+
+
+def _loop_create_request_from_row(row: sqlite3.Row) -> LoopCreateQueueRequest:
+    return LoopCreateQueueRequest(
+        request_id=row["request_id"],
+        text=row["text"],
+        status=LoopCreateRequestStatus(row["status"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+        source=row["source"],
+        channel_id=row["channel_id"],
+        message_ts=row["message_ts"],
+        error=row["error"],
     )
 
 

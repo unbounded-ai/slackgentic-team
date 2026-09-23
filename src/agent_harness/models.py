@@ -101,6 +101,13 @@ class ScheduledTimerStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class LoopCreateRequestStatus(StrEnum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    POSTED = "posted"
+    FAILED = "failed"
+
+
 class ScheduledWorkStatus(StrEnum):
     PENDING = "pending"
     CLAIMED = "claimed"
@@ -358,6 +365,21 @@ class ScheduledTimer:
     created_at: datetime
     updated_at: datetime
     parent_message_ts: str | None = None
+
+
+@dataclass(frozen=True)
+class LoopCreateQueueRequest:
+    """A loop creation request queued by a local agent for the daemon to post."""
+
+    request_id: str
+    text: str
+    status: LoopCreateRequestStatus
+    created_at: datetime
+    updated_at: datetime
+    source: str | None = None
+    channel_id: str | None = None
+    message_ts: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
