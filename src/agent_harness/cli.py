@@ -265,6 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     slack_setup.add_argument("--serve", action="store_true")
     slack_setup.add_argument("--no-bootstrap-tools", action="store_true")
     slack_setup.add_argument(
+        "--tokens-in-file",
+        action="store_true",
+        help="Keep Slack tokens in the config file instead of the macOS login keychain",
+    )
+    slack_setup.add_argument(
         "--instance",
         help="Unique local Slack app suffix, defaulting to the current OS user",
     )
@@ -482,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
                     force=args.force,
                     bootstrap_tools=not args.no_bootstrap_tools,
                     instance=args.instance,
+                    tokens_in_keychain=not args.tokens_in_file,
                 )
             )
             if result != 0 or not args.serve:
