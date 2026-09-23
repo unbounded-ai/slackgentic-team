@@ -191,6 +191,12 @@ class SlackGateway:
     def open_view(self, trigger_id: str, view: dict[str, Any]) -> None:
         self.client.views_open(trigger_id=trigger_id, view=view)
 
+    def update_view(self, view_id: str, view: dict[str, Any], view_hash: str | None = None) -> None:
+        kwargs: dict[str, Any] = {"view_id": view_id, "view": view}
+        if view_hash:
+            kwargs["hash"] = view_hash
+        self.client.views_update(**kwargs)
+
     def auth_test(self) -> dict[str, Any]:
         response = self.client.auth_test()
         data = getattr(response, "data", response)
@@ -269,6 +275,16 @@ class SlackGateway:
             LOGGER.debug("failed to delete Slack message %s", message_ts, exc_info=True)
             return False
         return True
+
+    def unpin_message(self, channel_id: str, message_ts: str) -> None:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self.client.pins_remove(channel=channel_id, timestamp=message_ts)
+        except SlackApiError as exc:
+            if exc.response.get("error") in {"no_pin", "message_not_found"}:
+                return
+            raise
 
     def pin_message(self, channel_id: str, message_ts: str) -> None:
         from slack_sdk.errors import SlackApiError

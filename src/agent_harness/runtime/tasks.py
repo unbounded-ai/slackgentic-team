@@ -29,6 +29,7 @@ from agent_harness.models import (
     LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_REFERENCE_DIR_METADATA_KEY,
     LOOP_SCRATCH_DIR_METADATA_KEY,
+    LOOP_SILENT_OUTPUT_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     AgentTask,
     AgentTaskKind,
@@ -867,6 +868,10 @@ class ManagedTaskRuntime:
             return False
         if not running.task.session_id and running.visible_message_count <= 0:
             return False
+        if running.task.metadata.get(LOOP_SILENT_OUTPUT_METADATA_KEY) is True:
+            # Nothing a silent run writes reaches Slack, so a "no visible progress"
+            # warning would be the only thing it posts. The stall timeout still applies.
+            return False
         timeout_seconds = self.agent_progress_timeout.total_seconds()
         if timeout_seconds <= 0:
             return False
@@ -1083,6 +1088,11 @@ class ManagedTaskRuntime:
         if running.stop_requested:
             # The user explicitly released or stopped the task; pending output
             # from the child process must not reach Slack after that signal.
+            return
+        if running.task.metadata.get(LOOP_SILENT_OUTPUT_METADATA_KEY) is True:
+            running.last_activity_monotonic = time.monotonic()
+            running.progress_warning_monotonic = None
+            handle_terminal_signals()
             return
         if running.observed_agent_messages is None:
             running.observed_agent_messages = set()

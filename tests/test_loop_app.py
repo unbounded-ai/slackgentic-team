@@ -14,7 +14,11 @@ from agent_harness.loops import (
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
     AGENT_LOOP_SIGNAL_PREFIX,
     AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
+    LOOP_COMPACT_SNAPSHOT_MAX_CHARS,
     LOOP_COMPACTION_TRIGGER_CHARS,
+    LOOP_THREAD_ROLLOVER_PENDING_KEY,
+    LOOP_THREAD_ROLLOVER_RUNS_KEY,
+    LOOP_THREAD_RUN_COUNT_KEY,
     build_loop_compaction_prompt,
     build_loop_fetch_result,
     build_loop_resolution_prompt,
@@ -29,6 +33,7 @@ from agent_harness.models import (
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
+    LOOP_SILENT_OUTPUT_METADATA_KEY,
     AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
@@ -1386,11 +1391,29 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn('Carried state: {"last_invoice": "example-001"}', summaries[0].content)
         self.assertIn("https://example.slack.com/archives/", summaries[0].content)
 
-    def test_invalid_loop_summary_posts_only_one_nudge(self):
+    def test_invalid_loop_summary_is_returned_to_the_agent_not_posted(self):
         loop = self._activate_loop()
         self.controller.fire_loop_now(loop)
         task, agent, _, thread = self._running_task_and_run(loop)
         replies_before = len(self.gateway.thread_replies)
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":""}',
+        )
+
+        self.assertEqual(self.gateway.thread_replies[replies_before:], [])
+        self.assertEqual(self.runtime.sent[-1][0], task.task_id)
+        self.assertIn("rejected your LOOP_SUMMARY line", self.runtime.sent[-1][1])
+
+    def test_invalid_loop_summary_posts_only_one_nudge_without_a_live_agent(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        replies_before = len(self.gateway.thread_replies)
+        self.controller.runtime = None
 
         for _ in range(2):
             self.controller.handle_runtime_agent_control(
@@ -1403,6 +1426,32 @@ class LoopCreationFlowTests(unittest.TestCase):
         nudges = self.gateway.thread_replies[replies_before:]
         self.assertEqual(len(nudges), 1)
         self.assertIn("could not record that run summary", nudges[0]["text"])
+
+    def test_oversized_compaction_snapshot_is_returned_to_the_agent(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        replies_before = len(self.gateway.thread_replies)
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_COMPACT_SIGNAL_PREFIX
+            + json.dumps({"snapshot": "x" * (LOOP_COMPACT_SNAPSHOT_MAX_CHARS + 1)}),
+        )
+
+        self.assertEqual(self.gateway.thread_replies[replies_before:], [])
+        feedback = self.runtime.sent[-1][1]
+        self.assertIn("rejected your LOOP_COMPACT line", feedback)
+        self.assertIn(f"at most {LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters", feedback)
+        self.assertFalse(
+            any(
+                entry.kind == "compaction"
+                for entry in self.store.list_loop_journal(loop.loop_id, limit=100)
+            )
+        )
+        self.assertIn(f"at most {LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters", task.prompt)
 
     def test_failed_mission_summary_is_a_successful_harness_run(self):
         loop = self._activate_loop()
@@ -1605,6 +1654,7 @@ class LoopCreationFlowTests(unittest.TestCase):
         assert pending is not None
         self.assertTrue(pending.metadata["compaction_pending"])
         starts_before = len(self.runtime.started)
+        posts_before = len(self.gateway.posts)
 
         runner = LoopRunner(self.store, self.controller, poll_seconds=0.01)
         self.assertEqual(runner.sync_once(), 1)
@@ -1613,8 +1663,13 @@ class LoopCreationFlowTests(unittest.TestCase):
         assert compacting is not None
         self.assertEqual(compacting.kind, LoopRunKind.COMPACTION)
         self.assertEqual(len(self.runtime.started), starts_before + 1)
+        # Compaction never posts to the channel; it works silently in the panel thread.
+        self.assertEqual(self.gateway.posts[posts_before:], [])
+        self.assertIsNone(compacting.thread_ts)
         compaction_task = self.store.get_agent_task(compacting.task_id)
         assert compaction_task is not None
+        self.assertEqual(compaction_task.thread_ts, loop.charter_message_ts)
+        self.assertIs(compaction_task.metadata[LOOP_SILENT_OUTPUT_METADATA_KEY], True)
         self.assertIn("[LOOP HARNESS: memory compaction]", compaction_task.prompt)
         self.assertIn("x" * 100, compaction_task.prompt)
         current = self.store.get_loop(loop.loop_id)
@@ -1625,8 +1680,8 @@ class LoopCreationFlowTests(unittest.TestCase):
         assert compaction_agent is not None
         compaction_thread = SlackThreadRef(
             loop.channel_id,
-            compacting.thread_ts,
-            compacting.thread_ts,
+            compaction_task.thread_ts,
+            compaction_task.thread_ts,
         )
         self.controller.handle_runtime_agent_control(
             compaction_task,
@@ -2535,6 +2590,179 @@ class LoopCreationFlowTests(unittest.TestCase):
             block for block in view["blocks"] if block.get("block_id") == "loop_quiet"
         )
         self.assertEqual(quiet_block["element"]["initial_options"][0]["value"], "quiet")
+
+    def _run_quiet_loop_once(self, loop, *, status: str = "ok"):
+        self.controller.fire_loop_now(loop)
+        task, agent, run, _ = self._running_task_and_run(loop)
+        thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps({"summary": "Checked.", "headline": "All clear", "status": status}),
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+        return run
+
+    def test_quiet_loop_thread_rolls_over_into_a_summary_and_fresh_panel(self):
+        loop = self._activate_quiet_loop()
+        metadata = dict(loop.metadata)
+        metadata[LOOP_THREAD_ROLLOVER_RUNS_KEY] = 10
+        metadata[LOOP_THREAD_RUN_COUNT_KEY] = 8
+        self.store.update_loop_metadata(loop.loop_id, metadata)
+        loop = self.store.get_loop(loop.loop_id)
+        old_charter = loop.charter_message_ts
+
+        self._run_quiet_loop_once(loop)
+        after_nine = self.store.get_loop(loop.loop_id)
+        self.assertEqual(after_nine.metadata[LOOP_THREAD_RUN_COUNT_KEY], 9)
+        self.assertNotIn("compaction_pending", after_nine.metadata)
+
+        self._run_quiet_loop_once(after_nine, status="found_issue")
+        pending = self.store.get_loop(loop.loop_id)
+        self.assertTrue(pending.metadata["compaction_pending"])
+        self.assertTrue(pending.metadata[LOOP_THREAD_ROLLOVER_PENDING_KEY])
+
+        posts_before = len(self.gateway.posts)
+        LoopRunner(self.store, self.controller, poll_seconds=0.01).sync_once()
+        compacting = self.store.running_loop_run(loop.loop_id)
+        self.assertEqual(compacting.kind, LoopRunKind.COMPACTION)
+        self.assertEqual(self.gateway.posts[posts_before:], [])
+        task = self.store.get_agent_task(compacting.task_id)
+        self.assertIn('"thread_summary"', task.prompt)
+        self.assertIn("thread now holds 10 quiet runs", task.prompt)
+        agent = self.store.get_team_agent(loop.agent_id)
+        thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_COMPACT_SIGNAL_PREFIX
+            + json.dumps({"snapshot": "memory", "thread_summary": "Quiet week; one flake."}),
+        )
+
+        class InlineThread:
+            def __init__(self, target, args=(), **_):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+
+        deleted = []
+        self.gateway.delete_message = lambda channel, ts: deleted.append((channel, ts)) or True
+        with (
+            patch("agent_harness.slack.app.threading.Thread", InlineThread),
+            patch("agent_harness.slack.app.LOOP_THREAD_DELETE_INTERVAL_SECONDS", 0),
+        ):
+            self.controller.handle_runtime_task_done(task, agent, thread)
+
+        rolled = self.store.get_loop(loop.loop_id)
+        self.assertNotEqual(rolled.charter_message_ts, old_charter)
+        self.assertEqual(rolled.metadata[LOOP_THREAD_RUN_COUNT_KEY], 0)
+        self.assertNotIn(LOOP_THREAD_ROLLOVER_PENDING_KEY, rolled.metadata)
+        new_posts = self.gateway.posts[posts_before:]
+        self.assertEqual(len(new_posts), 2)
+        archive = str(new_posts[0]["blocks"])
+        self.assertIn("Run log archived", archive)
+        self.assertIn("2 quiet runs", archive)
+        self.assertIn("✅ 2 succeeded", archive)
+        self.assertIn("🔎 1 flagged", archive)
+        self.assertIn("Quiet week; one flake.", archive)
+        self.assertEqual(new_posts[1]["ts"], rolled.charter_message_ts)
+        self.assertIn((loop.channel_id, rolled.charter_message_ts), self.gateway.pins)
+        self.assertIn((loop.channel_id, old_charter), self.gateway.unpins)
+        self.assertEqual(deleted[-1], (loop.channel_id, old_charter))
+
+        # The next quiet run works in the fresh panel's thread.
+        self.controller.fire_loop_now(rolled)
+        next_task, *_ = self._running_task_and_run(rolled)
+        self.assertEqual(next_task.thread_ts, rolled.charter_message_ts)
+
+    def test_loops_that_post_every_run_never_roll_over_their_panel_thread(self):
+        loop = self._activate_loop()
+        metadata = dict(loop.metadata)
+        metadata[LOOP_THREAD_ROLLOVER_RUNS_KEY] = 10
+        metadata[LOOP_THREAD_RUN_COUNT_KEY] = 50
+        self.store.update_loop_metadata(loop.loop_id, metadata)
+
+        self._finish_run_with_summary(
+            self.store.get_loop(loop.loop_id), {"summary": "done", "status": "ok"}
+        )
+
+        current = self.store.get_loop(loop.loop_id)
+        self.assertNotIn(LOOP_THREAD_ROLLOVER_PENDING_KEY, current.metadata)
+        self.assertNotIn("compaction_pending", current.metadata)
+
+    def test_edit_modal_offers_run_log_clearing_only_for_quiet_loops(self):
+        loop = self._activate_loop()
+        loud = build_loop_edit_modal(loop, schedule_text="every hour", channel_id="C")
+        block_ids = [block.get("block_id") for block in loud["blocks"]]
+        self.assertNotIn("loop_thread_rollover", block_ids)
+        self.assertIn("loop_thread_rollover_off", block_ids)
+
+        quiet = build_loop_edit_modal(loop, schedule_text="every hour", channel_id="C", quiet=True)
+        field = next(b for b in quiet["blocks"] if b.get("block_id") == "loop_thread_rollover")
+        self.assertEqual(field["element"]["initial_value"], "120")
+
+        view = dict(quiet, id="V1", hash="h1")
+        view["state"] = {"values": {"loop_quiet": {"value": {"selected_options": []}}}}
+        self.controller.handle_block_action(
+            {
+                "type": "block_actions",
+                "user": {"id": "UOWNER"},
+                "view": view,
+                "actions": [{"block_id": "loop_quiet", "action_id": "value"}],
+            }
+        )
+        view_id, redrawn, view_hash = self.gateway.view_updates[-1]
+        self.assertEqual((view_id, view_hash), ("V1", "h1"))
+        self.assertNotIn(
+            "loop_thread_rollover", [block.get("block_id") for block in redrawn["blocks"]]
+        )
+
+    def test_edit_submission_saves_run_log_clearing_threshold(self):
+        loop = self._activate_quiet_loop()
+        view = build_loop_edit_modal(loop, schedule_text="every hour", channel_id="C")
+
+        def submit(value: str):
+            return self.controller.handle_view_submission(
+                {
+                    "user": {"id": "UOWNER"},
+                    "view": {
+                        "callback_id": "loop.edit",
+                        "private_metadata": view["private_metadata"],
+                        "state": {
+                            "values": {
+                                "loop_mission": {"value": {"value": loop.mission}},
+                                "loop_schedule": {
+                                    "value": {
+                                        "value": describe_loop_schedule(
+                                            loop.recurrence, loop.timezone
+                                        )
+                                    }
+                                },
+                                "loop_quiet": {"value": {"selected_options": [{"value": "quiet"}]}},
+                                "loop_thread_rollover": {"value": {"value": value}},
+                            }
+                        },
+                    },
+                }
+            )
+
+        self.assertEqual(submit("3")["response_action"], "errors")
+        self.assertIsNone(submit("48"))
+        current = self.store.get_loop(loop.loop_id)
+        self.assertEqual(current.metadata[LOOP_THREAD_ROLLOVER_RUNS_KEY], 48)
+
+    def test_panel_more_menu_sits_under_the_card_not_on_the_mission(self):
+        loop = self._activate_loop()
+        panel = [item for item in self.gateway.updates if item["ts"] == loop.charter_message_ts]
+        blocks = panel[-1]["blocks"]
+        self.assertEqual(blocks[0]["type"], "card")
+        self.assertEqual(blocks[1]["type"], "actions")
+        self.assertEqual(blocks[1]["elements"][0]["type"], "overflow")
+        self.assertNotIn("accessory", blocks[2])
 
     def test_loop_help_works_through_slash_command_in_loop_channel(self):
         loop = self._activate_loop()

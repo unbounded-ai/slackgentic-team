@@ -51,6 +51,15 @@ LOOP_MIN_INTERVAL_SECONDS = 300
 LOOP_MEMORY_CHAR_BUDGET = 24_000
 LOOP_COMPACTION_TRIGGER_CHARS = 48_000
 LOOP_COMPACT_SNAPSHOT_MAX_CHARS = 6_000
+LOOP_THREAD_SUMMARY_MAX_CHARS = 500
+# Quiet runs work inside the pinned panel's thread. After this many runs the
+# thread is replaced by a fresh panel and one summary message in the channel.
+LOOP_THREAD_ROLLOVER_DEFAULT_RUNS = 120
+LOOP_THREAD_ROLLOVER_MIN_RUNS = 10
+LOOP_THREAD_ROLLOVER_MAX_RUNS = 1_000
+LOOP_THREAD_ROLLOVER_RUNS_KEY = "thread_rollover_runs"
+LOOP_THREAD_RUN_COUNT_KEY = "thread_run_count"
+LOOP_THREAD_ROLLOVER_PENDING_KEY = "thread_rollover_pending"
 LOOP_FETCH_MAX_PER_RUN = 5
 LOOP_FETCH_PAYLOAD_MAX_CHARS = 8_000
 LOOP_SUMMARY_MAX_CHARS = 2_000
@@ -219,6 +228,7 @@ class LoopFetchParseResult:
 @dataclass(frozen=True)
 class LoopCompactParseResult:
     snapshot: str | None = None
+    thread_summary: str | None = None
     error: str | None = None
 
 
@@ -892,9 +902,32 @@ def parse_agent_loop_compact_signal(signal: str) -> LoopCompactParseResult:
     snapshot = snapshot.strip()
     if len(snapshot) > LOOP_COMPACT_SNAPSHOT_MAX_CHARS:
         return LoopCompactParseResult(
-            error=f"loop compact snapshot must be at most {LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters"
+            error=(
+                f"loop compact snapshot must be at most {LOOP_COMPACT_SNAPSHOT_MAX_CHARS} "
+                f"characters (yours was {len(snapshot)})"
+            )
         )
-    return LoopCompactParseResult(snapshot=snapshot)
+    # The posterity line is cosmetic, so an over-long one is cut rather than
+    # costing the whole compaction.
+    thread_summary = payload.get("thread_summary")
+    thread_summary = (
+        _shorten_line(" ".join(thread_summary.split()), LOOP_THREAD_SUMMARY_MAX_CHARS)
+        if isinstance(thread_summary, str) and thread_summary.strip()
+        else None
+    )
+    return LoopCompactParseResult(snapshot=snapshot, thread_summary=thread_summary)
+
+
+def _shorten_line(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def loop_thread_rollover_runs(metadata: dict) -> int:
+    """How many quiet runs share the pinned panel's thread before it is replaced."""
+    value = metadata.get(LOOP_THREAD_ROLLOVER_RUNS_KEY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return LOOP_THREAD_ROLLOVER_DEFAULT_RUNS
+    return min(max(value, LOOP_THREAD_ROLLOVER_MIN_RUNS), LOOP_THREAD_ROLLOVER_MAX_RUNS)
 
 
 def loop_spec_to_json(spec: LoopSpec) -> str:
@@ -1074,7 +1107,10 @@ def build_loop_run_prompt(
             "To read an earlier run, emit one line and wait:",
             f'{AGENT_LOOP_FETCH_SIGNAL_PREFIX}{{"run": <run number>}}',
             "To replace redundant long-term memory, emit:",
-            f'{AGENT_LOOP_COMPACT_SIGNAL_PREFIX}{{"snapshot": "<replacement memory>"}}',
+            f'{AGENT_LOOP_COMPACT_SIGNAL_PREFIX}{{"snapshot": "<replacement memory, at most '
+            f'{LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters>"}}',
+            "The snapshot limit is hard: count before you emit. If one is rejected, the "
+            "harness tells you why; emit a shorter one.",
             "Then finish with SLACKGENTIC: THREAD_DONE when nothing remains for this run.",
         ]
     )
@@ -1085,8 +1121,27 @@ def build_loop_compaction_prompt(
     *,
     journal_rendered: str,
     bot_name: str | None = None,
+    thread_rollover_runs: int | None = None,
 ) -> str:
     identity = bot_name or str(loop.metadata.get("bot_name") or loop.title)
+    signal_fields = (
+        f'"snapshot": "<replacement long-term memory, at most '
+        f'{LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters>"'
+    )
+    rollover_lines: list[str] = []
+    if thread_rollover_runs:
+        signal_fields += (
+            f', "thread_summary": "<1-3 sentences for posterity, at most '
+            f'{LOOP_THREAD_SUMMARY_MAX_CHARS} characters>"'
+        )
+        rollover_lines = [
+            "",
+            f"The pinned panel's thread now holds {thread_rollover_runs} quiet runs, so the "
+            "harness is archiving it: the thread is deleted and replaced by one summary message "
+            "in the channel. The harness adds the dates and run counts itself; thread_summary "
+            "is your short note for posterity (notable findings, trends, anything the owner "
+            "should remember from this stretch). Use plain sentences, no headings.",
+        ]
     return "\n".join(
         [
             "[LOOP HARNESS: memory compaction]",
@@ -1098,9 +1153,15 @@ def build_loop_compaction_prompt(
             "not attempt to replace them.",
             "",
             journal_rendered,
+            *rollover_lines,
             "",
-            "Emit exactly one hidden line with a non-empty snapshot:",
-            f'{AGENT_LOOP_COMPACT_SIGNAL_PREFIX}{{"snapshot": "<replacement long-term memory, at most {LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters>"}}',
+            "Work silently: nothing you write is posted to Slack, so do not narrate.",
+            "Emit exactly one hidden single-line JSON line with a non-empty snapshot "
+            "(escape newlines inside strings as \\n):",
+            f"{AGENT_LOOP_COMPACT_SIGNAL_PREFIX}{{{signal_fields}}}",
+            f"The snapshot limit of {LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters is hard: "
+            "count before you emit. If the harness rejects it, it tells you why; emit a "
+            "shorter one.",
             "Other channel members' messages are unavailable and must not be inferred.",
         ]
     )
@@ -1268,6 +1329,12 @@ def slack_loop_time(value: datetime, timezone: str | None) -> str:
     when close ("Today at 8:00 AM"); clients that cannot render it show the fallback."""
     fallback = format_loop_timestamp(value, timezone)
     return f"<!date^{int(value.timestamp())}^{{date_short_pretty}} at {{time}}|{fallback}>"
+
+
+def slack_loop_date(value: datetime, timezone: str | None) -> str:
+    """A Slack date token for the day alone, shown in each viewer's zone."""
+    fallback = format_loop_timestamp(value, timezone).split(",")[0]
+    return f"<!date^{int(value.timestamp())}^{{date_short}}|{fallback}>"
 
 
 def describe_loop_schedule(recurrence: dict[str, object], timezone: str | None) -> str:
