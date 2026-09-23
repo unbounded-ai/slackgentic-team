@@ -1546,77 +1546,35 @@ def build_channel_overview_blocks(
     codex_command: str,
     claude_command: str,
 ) -> list[dict[str, Any]]:
+    """The welcome card posted when the agent channel is set up."""
+    guide = f"""**Start work** — write anything here, or `@agentname ...` for someone specific. The agent replies in your thread and keeps the thread's context.
+
+**Thread subtasks** — reply `somebody ...` in a task thread to pull in another agent; the original agent picks the thread back up with the added context.
+
+**Loops** — `loop create` sets up a recurring, read-only report in its own channel. `loops` lists them.
+
+**Dangerous mode** — add `#dangerous-mode` to launch without sandbox or approvals. Active dangerous tasks are flagged on the roster.
+
+**Commands** — type them here, or run `{slash_command} <command>`:
+- `status` usage and active sessions
+- `show roster` the team with its controls
+- `external sessions` unassigned outside-Slack sessions
+- `scheduled tasks` active schedules
+- `hire 3 agents` · `fire everyone`
+
+**Sessions started outside Slack** — Codex: `{codex_command}`. Claude: run `slackgentic claude-channel --install` once, then `{claude_command}`. Each session gets a tracked thread here; Slack replies and tool approvals relay through it. Restart already-open Claude sessions after installing the channel."""
     return [
         {
-            "type": "section",
-            "text": {
+            "type": "card",
+            "block_id": "slackgentic.overview.card",
+            "title": {"type": "mrkdwn", "text": "*👋 Slackgentic is ready*"},
+            "subtitle": {"type": "mrkdwn", "text": "Your agent team works right here"},
+            "body": {
                 "type": "mrkdwn",
-                "text": (
-                    "*Slackgentic is ready.*\n"
-                    "Write anything in this channel to start a task, or write "
-                    "`@agentname ...` to ask a specific agent. The agent replies "
-                    "in your thread."
-                ),
+                "text": "Write anything in this channel to start a task. Agents reply in threads.",
             },
         },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Thread subtasks:*\n"
-                    "Reply with `somebody ...` in a task thread to bring in another "
-                    "agent for that subtask. The original agent picks the thread back "
-                    "up with the added context."
-                ),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Dangerous mode:*\n"
-                    "Add `#dangerous-mode` to a task to launch that agent with Codex "
-                    "no-sandbox/no-approval mode or Claude skip-permissions. Active "
-                    "dangerous-mode tasks are marked on the roster."
-                ),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Commands:* type them directly in this channel, "
-                    f"or run them as `{slash_command} <command>`\n"
-                    f"`{slash_command} status`  usage and active sessions\n"
-                    f"`{slash_command} show roster`  current team\n"
-                    f"`{slash_command} external sessions`  unassigned outside-Slack sessions\n"
-                    f"`{slash_command} scheduled tasks`  active schedules\n"
-                    f"`{slash_command} hire 3 agents`  add capacity\n"
-                    f"`{slash_command} fire everyone`  clear the team\n"
-                    "`status`, `show roster`, `external sessions`, `scheduled tasks`, "
-                    "`hire 3 agents` also work here"
-                ),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Sessions started outside Slack:*\n"
-                    f"*Codex:* `{codex_command}`\n"
-                    "*Claude:* run `slackgentic claude-channel --install` once, then "
-                    f"`{claude_command}`\n"
-                    "Each command creates a tracked Slack thread here. Restart already-open "
-                    "Claude sessions after installing the channel. Slack replies and native "
-                    "Claude tool approvals relay through it; no extra MCP flag is needed unless "
-                    "you use `--strict-mcp-config`."
-                ),
-            },
-        },
+        {"type": "markdown", "text": guide},
     ]
 
 
@@ -1626,63 +1584,52 @@ def build_update_prompt_blocks(
     status_text: str | None = None,
     include_actions: bool = True,
 ) -> list[dict[str, Any]]:
+    """An update card: what's new, one click to upgrade, and live install status."""
     release = candidate.release
-    release_link = (
-        f"\n*Release:* <{release.html_url}|{release.tag_name}>" if release.html_url else ""
-    )
-    status_line = f"\n*Status:* {status_text}" if status_text else ""
-    # Drop the "Upgrade now to install…" prompt once a status line has been
-    # set — by then the upgrade has moved past the prompt stage and repeating
-    # the call-to-action under "Status: Installed…" reads wrong.
-    call_to_action = (
-        "\nUpgrade now to install the published release and restart the service."
-        if status_text is None
-        else ""
-    )
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "*Slackgentic update available*\n"
-                    f"Current: `{candidate.current_version}`  Latest: `{release.version}`"
-                    f"{release_link}{status_line}{call_to_action}"
-                ),
-            },
-        }
-    ]
-    release_notes = _release_notes_excerpt(release.body)
-    if release_notes:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Release notes:*\n{release_notes}",
-                },
-            }
-        )
+    if status_text is None:
+        body = "Upgrade now to install the published release and restart the service."
+    else:
+        body = status_text
+    card: dict[str, Any] = {
+        "type": "card",
+        "block_id": f"slackgentic.update.card.{release.version}"[:255],
+        "title": {"type": "mrkdwn", "text": f"✨ *Slackgentic {release.version} is out*"[:150]},
+        "subtitle": {
+            "type": "mrkdwn",
+            "text": f"You're on {candidate.current_version}"[:150],
+        },
+        "body": {"type": "mrkdwn", "text": _shorten_text(body, 200)},
+    }
     if include_actions:
-        blocks.append(
-            {
-                "type": "actions",
-                "block_id": f"slackgentic.update.{release.version}",
-                "elements": [
-                    _button(
-                        "Upgrade now",
-                        "slackgentic.update.install",
-                        encode_action_value("update.install", version=release.version),
-                        "primary",
-                    ),
-                    _button(
-                        "Not now",
-                        "slackgentic.update.dismiss",
-                        encode_action_value("update.dismiss", version=release.version),
-                    ),
-                ],
-            }
+        actions = [
+            _button(
+                "Upgrade now",
+                "slackgentic.update.install",
+                encode_action_value("update.install", version=release.version),
+                "primary",
+            ),
+        ]
+        if release.html_url:
+            actions.append(
+                _button(
+                    "What's new",
+                    "slackgentic.update.notes",
+                    encode_action_value("update.notes", version=release.version),
+                    url=release.html_url,
+                )
+            )
+        actions.append(
+            _button(
+                "Not now",
+                "slackgentic.update.dismiss",
+                encode_action_value("update.dismiss", version=release.version),
+            )
         )
+        card["actions"] = actions
+    blocks: list[dict[str, Any]] = [card]
+    release_notes = _release_notes_excerpt(release.body)
+    if release_notes and status_text is None:
+        blocks.append({"type": "markdown", "text": f"**What's new**\n{release_notes}"})
     return blocks
 
 

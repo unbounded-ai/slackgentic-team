@@ -5860,7 +5860,7 @@ class SlackAppTests(unittest.TestCase):
                 self.assertIn("slackgentic claude-channel --install", text)
                 blocks = str(gateway.posts[-1]["blocks"])
                 self.assertIn("Write anything in this channel", blocks)
-                self.assertIn("type them directly in this channel", blocks)
+                self.assertIn("type them here", blocks)
                 self.assertIn("Thread subtasks", blocks)
                 self.assertIn("Dangerous mode", blocks)
                 self.assertIn("Sessions started outside Slack", blocks)

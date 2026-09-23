@@ -253,6 +253,7 @@ from agent_harness.sessions.mirror import (
     _is_codex_subagent_session,
     format_session_parent,
     record_external_session_activity,
+    session_parent_blocks,
 )
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
@@ -5664,6 +5665,7 @@ class SlackTeamController:
             format_session_parent(session, summary),
             agent,
             icon_url=self._agent_icon_url(agent),
+            blocks=session_parent_blocks(session, summary),
         )
         thread = SlackThreadRef(channel_id, posted.ts, posted.ts)
         self.store.upsert_slack_thread_for_session(

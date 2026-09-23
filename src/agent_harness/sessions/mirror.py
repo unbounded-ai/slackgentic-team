@@ -356,6 +356,7 @@ class SessionMirror:
             text,
             agent,
             icon_url=self._team_agent_icon_url(agent),
+            blocks=session_parent_blocks(session, self._session_summary(session), channel_notice),
         )
         thread = SlackThreadRef(
             channel_id=channel_id,
@@ -651,10 +652,12 @@ class SessionMirror:
         if not thread.message_ts:
             return
         try:
+            notice = self._session_channel_notice(session)
             self.gateway.update_message(
                 thread.channel_id,
                 thread.message_ts,
-                self._session_parent_text(session, self._session_channel_notice(session)),
+                self._session_parent_text(session, notice),
+                blocks=session_parent_blocks(session, summary, notice),
             )
         except Exception:
             LOGGER.debug("failed to update external session parent summary", exc_info=True)
@@ -1346,6 +1349,53 @@ class SessionMirror:
         summary = self._session_summary(session)
         if summary and _has_claude_local_command_block(summary):
             self.store.delete_setting(_external_session_summary_key(session))
+
+
+def session_parent_blocks(
+    session: AgentSession,
+    summary: str | None = None,
+    channel_notice: str | None = None,
+) -> list[dict]:
+    """A live task card for a session running outside Slack."""
+    label = session.provider.value.capitalize()
+    title = " ".join((summary or f"{label} session").split())
+    if len(title) > 120:
+        title = title[:119].rstrip() + "…"
+    facts = [f"👀 {label} session outside Slack"]
+    if session.cwd:
+        facts.append(f"`{_short_path(session.cwd)}`")
+    if session.git_branch and session.git_branch != "HEAD":
+        facts.append(f"`{session.git_branch}`")
+    if session.model:
+        facts.append(f"`{session.model}`")
+    blocks: list[dict] = [
+        {
+            "type": "task_card",
+            "task_id": f"{session.provider.value}-{session.session_id}"[:255],
+            "title": title,
+            "status": "in_progress",
+            "details": {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {
+                                "type": "text",
+                                "text": "Mirroring this session here. Reply in the thread to steer it.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(facts)[:2900]}]},
+    ]
+    if channel_notice:
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": channel_notice[:2900]}}
+        )
+    return blocks
 
 
 def format_session_parent(session: AgentSession, summary: str | None = None) -> str:

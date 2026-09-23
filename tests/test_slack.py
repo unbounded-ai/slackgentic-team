@@ -542,11 +542,17 @@ class SlackTests(unittest.TestCase):
         )
 
         prompt = build_update_prompt_blocks(candidate)
-        prompt_text = prompt[0]["text"]["text"]
-        self.assertIn("Upgrade now to install the published release", prompt_text)
-        self.assertNotIn("*Status:*", prompt_text)
-        self.assertIn("*Release notes:*", prompt[1]["text"]["text"])
-        release_notes = prompt[1]["text"]["text"]
+        card = prompt[0]
+        self.assertEqual(card["type"], "card")
+        self.assertIn("Slackgentic 0.1.1 is out", card["title"]["text"])
+        self.assertIn("0.1.0", card["subtitle"]["text"])
+        self.assertIn("Upgrade now to install the published release", card["body"]["text"])
+        self.assertEqual(
+            [action["text"]["text"] for action in card["actions"]],
+            ["Upgrade now", "What's new", "Not now"],
+        )
+        release_notes = prompt[1]["text"]
+        self.assertIn("What's new", release_notes)
         self.assertIn("- Adds safer update restart handling", release_notes)
         self.assertIn("- Shortens release notes in Slack", release_notes)
         self.assertNotIn("@contributor", release_notes)
@@ -558,18 +564,18 @@ class SlackTests(unittest.TestCase):
             status_text="Installing Slackgentic v0.1.1 and preparing a restart.",
             include_actions=False,
         )
-        in_progress_text = in_progress[0]["text"]["text"]
-        # Once we're past the prompt stage the call-to-action under
-        # "Status: Installing…" reads wrong, so drop it.
+        in_progress_text = str(in_progress)
+        # Once we're past the prompt stage the call-to-action reads wrong, so drop it.
         self.assertNotIn("Upgrade now to install the published release", in_progress_text)
         self.assertIn("Installing Slackgentic v0.1.1", in_progress_text)
+        self.assertNotIn("actions", in_progress[0])
 
         done = build_update_prompt_blocks(
             candidate,
             status_text=":white_check_mark: Installed Slackgentic v0.1.1 and restarted successfully.",
             include_actions=False,
         )
-        done_text = done[0]["text"]["text"]
+        done_text = str(done)
         self.assertNotIn("Upgrade now to install the published release", done_text)
         self.assertIn(":white_check_mark:", done_text)
         self.assertIn("restarted successfully", done_text)
