@@ -132,8 +132,10 @@ The roster also has an `Add work` button, and each available agent's card has an
 currently busy agent finishing its active task or external session. For
 recurring work, create a loop instead.
 
-Roster cards show each agent's face with its provider's logo in the corner, and
-task threads open with the same logo next to the agent's name.
+Each agent's face carries its provider's logo in the corner, on roster cards and
+on its messages, and task threads open with the same logo next to the agent's
+name. A task thread's header card shows the agent's latest message next to its
+spinner, with the original request in the card's details.
 
 In the main channel, write `somebody ...` to hand work to an available agent.
 Use `@agentname ...` when you want a specific agent. Inside a task thread, reply
@@ -408,9 +410,15 @@ with `--strict-mcp-config` or another custom MCP config that excludes user-level
 servers.
 
 Those commands create tracked Slack threads for sessions you started outside
-Slack. If all matching team seats are occupied, Slackgentic posts a
-provider-specific hire button and waits without advancing the transcript cursor,
+Slack. If all matching team seats are occupied, Slackgentic hires an agent for
+the session. Only when the team is at its size limit does it post a
+provider-specific hire button and wait without advancing the transcript cursor,
 so visible output is backfilled after you add capacity.
+
+The thread's header card spins while the session is mid-turn and shows the
+agent's latest message; it settles once the turn ends or the agent is freed.
+Archiving a Claude desktop app session frees its agent right away; other idle
+sessions free theirs after the idle timeout.
 
 If you revive an ended session from its Slack thread, Slackgentic uses a free
 matching Codex or Claude seat to resume that exact session. If no matching seat

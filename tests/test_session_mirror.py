@@ -18,7 +18,7 @@ from agent_harness.models import (
     SlackThreadRef,
     TeamAgentKind,
 )
-from agent_harness.providers.claude import ClaudeProvider
+from agent_harness.providers.claude import ClaudeDesktopSessionIndex, ClaudeProvider
 from agent_harness.providers.codex import CodexProvider
 from agent_harness.runtime.tasks import build_task_prompt
 from agent_harness.sessions.mirror import (
@@ -1684,7 +1684,13 @@ class SessionMirrorTests(unittest.TestCase):
                     store.get_setting("external_session_summary.codex.s1"),
                     "make the README punchier",
                 )
-                self.assertEqual(gateway.updates, [])
+                # Only the card's title follows the agent; the request stays put.
+                self.assertEqual(len(gateway.updates), 1)
+                _, _, update_text, update_blocks = gateway.updates[0]
+                self.assertNotIn("\n", update_text.split("Task: ", 1)[1])
+                self.assertEqual(
+                    update_blocks[0]["title"], "I inspected several files and found more details."
+                )
             finally:
                 store.close()
 
@@ -1756,7 +1762,11 @@ class SessionMirrorTests(unittest.TestCase):
                     store.get_setting("external_session_summary.claude.s1"),
                     "what's left on this PR?",
                 )
-                self.assertEqual(gateway.updates, [])
+                # Only the card's title follows the agent; the request stays put.
+                self.assertEqual(len(gateway.updates), 1)
+                _, _, update_text, update_blocks = gateway.updates[0]
+                self.assertNotIn("\n", update_text.split("Task: ", 1)[1])
+                self.assertEqual(update_blocks[0]["title"], "visible follow-up")
             finally:
                 store.close()
 
@@ -2074,11 +2084,16 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertIsNone(store.get_setting("external_session_pending.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
                 self.assertEqual(gateway.posts, [])
-                self.assertEqual(len(gateway.updates), 1)
+                self.assertEqual(
+                    [update[1] for update in gateway.updates], ["170.000001", "171.000001"]
+                )
                 self.assertIn(
                     "Codex capacity for sessions started outside Slack is available now.",
                     gateway.updates[0][2],
                 )
+                # The thread's card predates tracked card state, so it is refreshed
+                # once and stops spinning: nothing holds an agent for it.
+                self.assertEqual(gateway.updates[1][3][0]["status"], "complete")
             finally:
                 store.close()
 
@@ -5546,6 +5561,218 @@ class ObservedSessionIdleReleaseTests(unittest.TestCase):
                 self.assertIsNone(store.get_setting("external_session_activity.codex.s1"))
             finally:
                 store.close()
+
+    def _desktop_session(self, tmp, session_id="s1"):
+        return AgentSession(
+            provider=Provider.CLAUDE,
+            session_id=session_id,
+            transcript_path=Path(tmp) / f"{session_id}.jsonl",
+            status=SessionStatus.ACTIVE,
+            metadata={"entrypoint": "claude-desktop"},
+        )
+
+    def _write_desktop_session_file(self, home, session_id, *, archived):
+        path = (
+            home
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "claude-code-sessions"
+            / "account"
+            / "org"
+            / f"local_{session_id}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"cliSessionId": session_id, "isArchived": archived}))
+        return path
+
+    def test_archiving_desktop_session_frees_agent_and_completes_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                session = self._desktop_session(tmp)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                self._write_desktop_session_file(home, "s1", archived=False)
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [ClaudeFakeProvider(session, [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([]),
+                    home=home,
+                )
+
+                mirror.sync_once()
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"), agent.agent_id
+                )
+
+                self._write_desktop_session_file(home, "s1", archived=True)
+                mirror.sync_once()
+
+                self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
+                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(gateway.updates[-1][3][0]["status"], "complete")
+            finally:
+                store.close()
+
+    def test_session_card_spins_only_while_a_turn_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                session = self._desktop_session(tmp)
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CLAUDE, "s1", "T1", thread)
+                store.set_setting("external_session_agent.claude.s1", agent.agent_id)
+                store.set_setting("external_session_summary.claude.s1", "fix the flaky test")
+
+                def assistant(line, text, stop_reason):
+                    return AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=line,
+                        metadata={
+                            "message": {
+                                "content": [{"type": "text", "text": text}],
+                                "stop_reason": stop_reason,
+                            }
+                        },
+                    )
+
+                provider = ClaudeFakeProvider(
+                    session, [assistant(1, "**Running** the test suite now.", "tool_use")]
+                )
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [provider],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([]),
+                    home=Path(tmp),
+                )
+
+                mirror.sync_once()
+                card = gateway.updates[-1][3][0]
+                self.assertEqual(card["status"], "in_progress")
+                self.assertEqual(card["title"], "Running the test suite now.")
+                self.assertIn("fix the flaky test", json.dumps(card["details"]))
+
+                mirror.sync_once()
+                self.assertEqual(len(gateway.updates), 1)
+
+                provider.events.append(assistant(2, "All tests pass.", "end_turn"))
+                mirror.sync_once()
+                card = gateway.updates[-1][3][0]
+                self.assertEqual(card["status"], "complete")
+                self.assertEqual(card["title"], "All tests pass.")
+
+                def user(line, text):
+                    return AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="user",
+                        text=text,
+                        line_number=line,
+                        metadata={"message": {"content": text}},
+                        human_authored=True,
+                    )
+
+                provider.events.append(user(3, "<command-name>/status</command-name>"))
+                provider.events.append(user(4, "<local-command-stdout>ok</local-command-stdout>"))
+                mirror.sync_once()
+                self.assertEqual(gateway.updates[-1][3][0]["status"], "complete")
+            finally:
+                store.close()
+
+    def test_session_without_a_free_agent_hires_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                busy = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(busy)
+                store.set_setting("external_session_agent.claude.other", busy.agent_id)
+                store.upsert_session(self._desktop_session(tmp, "other"))
+                hired = []
+
+                def hire(provider):
+                    agent = replace(
+                        build_initial_model_team(codex_count=0, claude_count=2)[1],
+                        provider_preference=provider,
+                    )
+                    store.upsert_team_agent(agent)
+                    hired.append(agent)
+                    return agent
+
+                session = self._desktop_session(tmp)
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [ClaudeFakeProvider([session, self._desktop_session(tmp, "other")], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier([]),
+                    hire_agent=hire,
+                    home=Path(tmp),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(hired), 1)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.claude.s1"), hired[0].agent_id
+                )
+                self.assertIsNone(store.get_setting("external_session_pending.claude.s1"))
+                self.assertEqual(gateway.posts, [])
+            finally:
+                store.close()
+
+
+class ClaudeFakeProvider(FakeProvider):
+    provider = Provider.CLAUDE
+
+
+class ClaudeDesktopSessionIndexTests(unittest.TestCase):
+    def test_reads_archived_sessions_and_rereads_changed_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            index = ClaudeDesktopSessionIndex(home)
+            self.assertEqual(index.archived_session_ids(), frozenset())
+            root = home / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+            folder = root / "account" / "org"
+            folder.mkdir(parents=True)
+            (folder / "local_a.json").write_text(
+                json.dumps({"cliSessionId": "a", "isArchived": True})
+            )
+            (folder / "local_b.json").write_text(
+                json.dumps({"cliSessionId": "b", "isArchived": False})
+            )
+            (folder / "local_c.json").write_text("not json")
+            self.assertEqual(index.archived_session_ids(), frozenset({"a"}))
+
+            path = folder / "local_b.json"
+            path.write_text(json.dumps({"cliSessionId": "b", "isArchived": True}))
+            os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+            self.assertEqual(index.archived_session_ids(), frozenset({"a", "b"}))
 
 
 if __name__ == "__main__":

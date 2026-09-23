@@ -1436,6 +1436,26 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_hire_agent_for_external_session_hires_and_introduces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting(SETTING_ROSTER_TS, "171.000001")
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                agent = controller.hire_agent_for_external_session(Provider.CLAUDE)
+
+                self.assertIsNotNone(agent)
+                self.assertEqual(agent.provider_preference, Provider.CLAUDE)
+                self.assertEqual(store.list_team_agents(), [agent])
+                self.assertEqual(len(gateway.thread_replies), 1)
+                with patch("agent_harness.slack.app.MAX_TEAM_AGENTS", 1):
+                    self.assertIsNone(controller.hire_agent_for_external_session(Provider.CLAUDE))
+            finally:
+                store.close()
+
     def test_external_capacity_hire_button_reserves_agent_and_refreshes_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -8636,7 +8656,8 @@ class SlackAppTests(unittest.TestCase):
                 agent = store.list_team_agents()[0]
                 self.assertEqual(
                     gateway.thread_replies[0]["icon_url"],
-                    f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{agent.avatar_slug}.png",
+                    f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{agent.provider_preference.value}/"
+                    f"{agent.avatar_slug}.png",
                 )
             finally:
                 store.close()

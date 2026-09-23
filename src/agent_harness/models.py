@@ -11,6 +11,8 @@ PERMISSION_MODE_METADATA_KEY = "permission_mode"
 ASSIGNMENT_PROMPT_METADATA_KEY = "assignment_prompt"
 ORIGINAL_TASK_METADATA_KEY = "original_task"
 ROSTER_SUMMARY_METADATA_KEY = "roster_summary"
+# The agent's latest message in a task thread, shown next to the header card's spinner.
+LATEST_UPDATE_METADATA_KEY = "latest_update"
 PR_URL_METADATA_KEY = "pr_url"
 PR_URLS_METADATA_KEY = "pr_urls"
 LOOP_ID_METADATA_KEY = "loop_id"

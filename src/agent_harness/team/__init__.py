@@ -37,7 +37,7 @@ DEFAULT_AGENT_AVATAR_BASE_URL = (
 )
 DISABLED_AVATAR_BASE_VALUES = {"", "0", "false", "no", "none", "off"}
 # Avatar sets keep a copy at this size in a subdirectory, for card icons.
-AGENT_CARD_ICON_SIZE = 64
+AGENT_CARD_ICON_SIZE = 32
 PROVIDER_LOGO_BASE_URL = (
     "https://raw.githubusercontent.com/unbounded-ai/slackgentic-team/main/docs/assets/providers"
 )
@@ -793,6 +793,11 @@ def agent_identity_label(agent: TeamAgent) -> str:
 
 
 def agent_icon_url(store, agent: TeamAgent) -> str | None:
+    """The agent's avatar at full size, for message personas.
+
+    The bundled avatars ship a copy per provider with that provider's logo in
+    the top-right corner; a custom avatar set is used as it is.
+    """
     explicit = agent.metadata.get("icon_url")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
@@ -805,25 +810,35 @@ def agent_icon_url(store, agent: TeamAgent) -> str | None:
     ).strip()
     if base_url.lower() in DISABLED_AVATAR_BASE_VALUES:
         return None
-    return f"{base_url.rstrip('/')}/{agent.avatar_slug}.png"
+    return f"{_bundled_avatar_dir(base_url, agent)}/{agent.avatar_slug}.png"
 
 
 def agent_card_icon_url(store, agent: TeamAgent) -> str | None:
     """A small avatar for Block Kit card icons.
 
-    Slack crops card icons from the middle of the image at its own size, so a
-    full-size avatar shows only a nose. The bundled avatars ship a 64px copy,
-    plus one per provider with that provider's logo in the top-right corner;
-    a custom avatar set is used as it is.
+    Slack draws card icons at the image's own size and shows only the middle
+    32px, so a larger avatar loses its hair, chin, and badge. The bundled
+    avatars ship a 32px copy, with and without the provider logo; a custom
+    avatar set is used as it is.
     """
     url = agent_icon_url(store, agent)
-    bundled_prefix = f"{DEFAULT_AGENT_AVATAR_BASE_URL}/"
-    if url is None or agent.metadata.get("icon_url") or not url.startswith(bundled_prefix):
+    if url is None or agent.metadata.get("icon_url"):
         return url
-    card_dir = f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{AGENT_CARD_ICON_SIZE}"
-    if agent.provider_preference is not None:
-        card_dir = f"{card_dir}/{agent.provider_preference.value}"
-    return f"{card_dir}/{url[len(bundled_prefix) :]}"
+    if not url.startswith(f"{DEFAULT_AGENT_AVATAR_BASE_URL}/"):
+        return url
+    card_dir = _bundled_avatar_dir(
+        f"{DEFAULT_AGENT_AVATAR_BASE_URL}/{AGENT_CARD_ICON_SIZE}",
+        agent,
+    )
+    return f"{card_dir}/{agent.avatar_slug}.png"
+
+
+def _bundled_avatar_dir(base_url: str, agent: TeamAgent) -> str:
+    base_url = base_url.rstrip("/")
+    bundled = base_url.startswith(DEFAULT_AGENT_AVATAR_BASE_URL)
+    if bundled and agent.provider_preference is not None:
+        return f"{base_url}/{agent.provider_preference.value}"
+    return base_url
 
 
 def provider_logo_url(provider: Provider | None) -> str | None:

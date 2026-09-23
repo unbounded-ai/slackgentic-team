@@ -32,6 +32,7 @@ from agent_harness.providers.base import AgentProvider
 from agent_harness.providers.claude import (
     CLAUDE_LOCAL_COMMAND_MARKERS,
     CLAUDE_SYNTHETIC_RECORD_FLAGS,
+    ClaudeDesktopSessionIndex,
     is_synthetic_claude_assistant_record,
 )
 from agent_harness.providers.codex import codex_user_submission_text, is_codex_context_message
@@ -56,6 +57,7 @@ from agent_harness.sessions.native_input import (
 from agent_harness.sessions.terminal import SessionTerminalNotifier
 from agent_harness.sessions.todo_mirror import TodoMirror
 from agent_harness.slack import (
+    agent_update_line,
     build_external_session_capacity_blocks,
     format_external_session_capacity_text,
 )
@@ -103,6 +105,13 @@ _CODEX_ACTIVITY_RESPONSE_ITEM_TYPES = frozenset(
     }
 )
 CODEX_RESPONSE_ITEM_RECOVERY_PREFIX = "codex_response_item_recovery.v1."
+# What an observed session's parent card shows: whether a turn is running, the
+# agent's latest message, and what was last rendered, so the card is only
+# rewritten when it changes.
+EXTERNAL_SESSION_CARD_PREFIX = "external_session_card."
+# Cards posted before their state was tracked are refreshed a few per sync, so
+# stale spinners stop without a burst of Slack updates.
+SESSION_CARD_BACKFILL_PER_SYNC = 3
 
 
 @dataclass(frozen=True)
@@ -131,6 +140,7 @@ class SessionMirror:
         ]
         | None = None,
         home: Path | None = None,
+        hire_agent: Callable[[Provider], TeamAgent | None] | None = None,
         ignored_cwd_patterns: Iterable[str] = (),
         allowed_cwd_prefixes: Iterable[str] = (),
         missing_target_grace_seconds: float = EXTERNAL_SESSION_MISSING_TARGET_GRACE_SECONDS,
@@ -153,6 +163,9 @@ class SessionMirror:
         self.codex_app_server_url = codex_app_server_url
         self.on_external_session_occupancy_change = on_external_session_occupancy_change
         self.on_agent_message = on_agent_message
+        # Hires an agent for a session no free agent can take. Returning None
+        # (e.g. the team is full) falls back to the capacity notice.
+        self.hire_agent = hire_agent
         self.home = home or Path.home()
         self.ignored_cwd_patterns = tuple(
             pattern.strip() for pattern in ignored_cwd_patterns if pattern.strip()
@@ -162,6 +175,9 @@ class SessionMirror:
         )
         self.started_at = utc_now()
         self._todo_mirror = TodoMirror(store, gateway, home=self.home)
+        self._desktop_sessions = ClaudeDesktopSessionIndex(self.home)
+        self._archived_desktop_session_ids: frozenset[str] | None = None
+        self._session_card_backfill_done = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -214,11 +230,13 @@ class SessionMirror:
         # refresh at the end instead of one full refresh per session.
         self._occupancy_changes: set[str] | None = set()
         self._live_process_owners: dict[Provider, dict[int, tuple[str, datetime]]] | None = {}
+        self._archived_desktop_session_ids = None
         try:
             self._sync_once(backfill_new_sessions)
         finally:
             changed, self._occupancy_changes = self._occupancy_changes, None
             self._live_process_owners = None
+            self._archived_desktop_session_ids = None
             for channel_id in sorted(changed or ()):
                 self._notify_external_session_occupancy_changed(channel_id)
 
@@ -242,7 +260,9 @@ class SessionMirror:
                     continue
                 if self._skip_ignored_cwd_session(session, channel_id):
                     continue
-                if self._external_terminal_session_closed(session, channel_id):
+                if self._external_terminal_session_closed(
+                    session, channel_id
+                ) or self._desktop_session_archived(session):
                     self.store.set_setting(
                         _ignored_external_session_key(session),
                         utc_now().isoformat(),
@@ -319,6 +339,28 @@ class SessionMirror:
                 )
             self._sync_todo_mirror(session, thread)
         self._sync_capacity_notices(channel_id)
+        self._backfill_session_cards(channel_id)
+
+    def _backfill_session_cards(self, channel_id: str) -> None:
+        if self._session_card_backfill_done:
+            return
+        refreshed = 0
+        for provider, session_id, thread in self.store.list_observed_session_threads(
+            self.team_id, channel_id
+        ):
+            session = self.store.get_session(provider, session_id)
+            if session is None or self._session_card_state(session).get("rendered"):
+                continue
+            if refreshed == SESSION_CARD_BACKFILL_PER_SYNC:
+                return
+            self._refresh_session_card(session, thread)
+            if not self._session_card_state(session).get("rendered"):
+                # The update failed; mark it so one bad thread cannot stall the rest.
+                self._set_session_card_state(
+                    session, {**self._session_card_state(session), "rendered": "failed"}
+                )
+            refreshed += 1
+        self._session_card_backfill_done = True
 
     def _sync_todo_mirror(self, session: AgentSession, thread: SlackThreadRef) -> None:
         try:
@@ -364,12 +406,16 @@ class SessionMirror:
     ) -> SlackThreadRef:
         channel_notice = self._session_channel_notice(session)
         text = self._session_parent_text(session, channel_notice)
+        card = self._session_card_state(session)
         posted = self.gateway.post_session_parent(
             channel_id,
             text,
             agent,
             icon_url=self._team_agent_icon_url(agent),
-            blocks=session_parent_blocks(session, self._session_summary(session), channel_notice),
+            blocks=self._session_parent_blocks(session, channel_notice, card),
+        )
+        self._set_session_card_state(
+            session, {**card, "rendered": self._session_card_fingerprint(session, card)}
         )
         thread = SlackThreadRef(
             channel_id=channel_id,
@@ -509,6 +555,9 @@ class SessionMirror:
         )
         max_line = cursor
         chunks: list[RenderedSessionEvent] = []
+        card = self._session_card_state(session)
+        working = card.get("working")
+        latest_update = card.get("update")
         terminal_mirror_key = _terminal_mirror_key(session)
         mirror_to_terminal = bool(self.store.get_setting(terminal_mirror_key))
         iter_events_after = getattr(provider, "iter_events_after", None)
@@ -521,6 +570,9 @@ class SessionMirror:
             if line_number <= cursor:
                 continue
             max_line = max(max_line, line_number)
+            turn = _event_turn_state(event)
+            if turn is not None:
+                working = turn
             if self._skip_claude_native_input_request(session, event):
                 continue
             if _codex_event_ends_turn(event):
@@ -531,6 +583,8 @@ class SessionMirror:
             rendered = render_session_event_chunk(event)
             if rendered is None:
                 continue
+            if rendered.author == "assistant":
+                latest_update = agent_update_line(rendered.text) or latest_update
             if rendered.author == "user" and self.store.consume_session_bridge_prompt(
                 session.provider,
                 session.session_id,
@@ -549,6 +603,10 @@ class SessionMirror:
                     line_number=line_number,
                 )
                 for chunk in _slack_chunks(rendered.text)
+            )
+        if working != card.get("working") or latest_update != card.get("update"):
+            self._set_session_card_state(
+                session, {**card, "working": working, "update": latest_update}
             )
         return chunks, max_line
 
@@ -657,23 +715,74 @@ class SessionMirror:
         chunks: list[RenderedSessionEvent],
     ) -> None:
         summary = summarize_session_chunks(chunks, self._session_summary(session))
-        if not summary:
-            return
-        if summary == self._session_summary(session):
-            return
-        self.store.set_setting(_external_session_summary_key(session), summary)
+        if summary and summary != self._session_summary(session):
+            self.store.set_setting(_external_session_summary_key(session), summary)
+        self._refresh_session_card(session, thread)
+
+    def _refresh_session_card(self, session: AgentSession, thread: SlackThreadRef) -> None:
+        """Keep the parent card's spinner and latest message in step with the session.
+
+        The card spins only while the session holds an agent and a turn is
+        running; a finished turn or a freed agent marks it complete.
+        """
         if not thread.message_ts:
             return
+        card = self._session_card_state(session)
+        rendered = self._session_card_fingerprint(session, card)
+        if card.get("rendered") == rendered:
+            return
+        notice = self._session_channel_notice(session)
         try:
-            notice = self._session_channel_notice(session)
             self.gateway.update_message(
                 thread.channel_id,
                 thread.message_ts,
                 self._session_parent_text(session, notice),
-                blocks=session_parent_blocks(session, summary, notice),
+                blocks=self._session_parent_blocks(session, notice, card),
             )
         except Exception:
-            LOGGER.debug("failed to update external session parent summary", exc_info=True)
+            LOGGER.debug("failed to update external session parent card", exc_info=True)
+            return
+        self._set_session_card_state(session, {**card, "rendered": rendered})
+
+    def _session_parent_blocks(
+        self,
+        session: AgentSession,
+        channel_notice: str | None,
+        card: dict | None = None,
+    ) -> list[dict]:
+        card = self._session_card_state(session) if card is None else card
+        update = card.get("update")
+        return session_parent_blocks(
+            session,
+            self._session_summary(session),
+            channel_notice,
+            latest_update=update if isinstance(update, str) else None,
+            finished=self._session_card_finished(session, card),
+        )
+
+    def _session_card_finished(self, session: AgentSession, card: dict) -> bool:
+        held = bool(self.store.get_setting(_external_session_agent_setting_key(session)))
+        return not held or card.get("working") is False
+
+    def _session_card_fingerprint(self, session: AgentSession, card: dict) -> str:
+        return json.dumps(
+            [
+                self._session_summary(session),
+                card.get("update"),
+                self._session_card_finished(session, card),
+            ]
+        )
+
+    def _session_card_state(self, session: AgentSession) -> dict:
+        raw = self.store.get_setting(_external_session_card_key(session))
+        try:
+            state = json.loads(raw) if raw else {}
+        except ValueError:
+            state = {}
+        return state if isinstance(state, dict) else {}
+
+    def _set_session_card_state(self, session: AgentSession, state: dict) -> None:
+        self.store.set_setting(_external_session_card_key(session), json.dumps(state))
 
     def _team_agent_for_session(
         self,
@@ -697,13 +806,6 @@ class SessionMirror:
                 )
                 self._mark_session_not_pending(session)
                 return None
-        active_agents = [
-            agent for agent in self.store.list_team_agents() if agent.kind in WORKER_KINDS
-        ]
-        if not active_agents:
-            self._mark_session_pending(session)
-            self._post_or_update_capacity_notice(channel_id, session.provider)
-            return None
         assigned_agent_ids = self._active_external_agent_ids(active_session_keys, setting_key)
         idle_agents = [
             agent for agent in self.store.idle_team_agents() if agent.kind in WORKER_KINDS
@@ -714,15 +816,27 @@ class SessionMirror:
             if agent.agent_id not in assigned_agent_ids
             and agent.provider_preference == session.provider
         ]
-        if not available:
+        agent = available[0] if available else self._hire_agent_for_session(session)
+        if agent is None:
             self._mark_session_pending(session)
             self._post_or_update_capacity_notice(channel_id, session.provider)
             return None
-        agent = available[0]
         self.store.set_setting(setting_key, agent.agent_id)
         self._notify_external_session_occupancy_changed(channel_id)
         self._mark_session_not_pending(session)
         self._update_capacity_notice_if_clear(channel_id, session.provider)
+        return agent
+
+    def _hire_agent_for_session(self, session: AgentSession) -> TeamAgent | None:
+        if self.hire_agent is None:
+            return None
+        try:
+            agent = self.hire_agent(session.provider)
+        except Exception:
+            LOGGER.exception("failed to hire an agent for an external %s session", session.provider)
+            return None
+        if agent is None or agent.kind not in WORKER_KINDS:
+            return None
         return agent
 
     def _external_terminal_session_closed(
@@ -882,6 +996,9 @@ class SessionMirror:
                         thread,
                         "Session ended; freed up this agent.",
                     )
+                    session = self.store.get_session(provider, session_id)
+                    if session is not None:
+                        self._refresh_session_card(session, thread)
         for provider in providers_to_refresh:
             self._update_capacity_notice_if_clear(channel_id, provider)
         return retained_session_keys
@@ -1033,7 +1150,19 @@ class SessionMirror:
                 )
             except Exception:
                 LOGGER.debug("failed to post idle release notice", exc_info=True)
+            self._refresh_session_card(session, thread)
         return True
+
+    def _desktop_session_archived(self, session: AgentSession) -> bool:
+        if session.provider != Provider.CLAUDE:
+            return False
+        if self._archived_desktop_session_ids is None:
+            try:
+                self._archived_desktop_session_ids = self._desktop_sessions.archived_session_ids()
+            except Exception:
+                LOGGER.debug("failed to read Claude desktop sessions", exc_info=True)
+                self._archived_desktop_session_ids = frozenset()
+        return session.session_id in self._archived_desktop_session_ids
 
     def _holds_external_tracking(self, session: AgentSession) -> bool:
         suffix = _external_session_key(session.provider, session.session_id)
@@ -1450,12 +1579,21 @@ def session_parent_blocks(
     session: AgentSession,
     summary: str | None = None,
     channel_notice: str | None = None,
+    *,
+    latest_update: str | None = None,
+    finished: bool = False,
 ) -> list[dict]:
-    """A live task card for a session running outside Slack."""
+    """A live task card for a session running outside Slack.
+
+    The title next to the spinner is the agent's latest message; the request
+    that started the current work stays in the card's details.
+    """
     label = session.provider.value.capitalize()
-    title = " ".join((summary or f"{label} session").split())
+    title = " ".join((latest_update or summary or f"{label} session").split())
     if len(title) > 120:
         title = title[:119].rstrip() + "…"
+    hint = "Mirroring this session here. Reply in the thread to steer it."
+    details = f"Request: {' '.join(summary.split())[:1500]}\n\n{hint}" if summary else hint
     facts = [f"👀 {label} session outside Slack"]
     if session.cwd:
         facts.append(f"`{_short_path(session.cwd)}`")
@@ -1468,18 +1606,13 @@ def session_parent_blocks(
             "type": "task_card",
             "task_id": f"{session.provider.value}-{session.session_id}"[:255],
             "title": title,
-            "status": "in_progress",
+            "status": "complete" if finished else "in_progress",
             "details": {
                 "type": "rich_text",
                 "elements": [
                     {
                         "type": "rich_text_section",
-                        "elements": [
-                            {
-                                "type": "text",
-                                "text": "Mirroring this session here. Reply in the thread to steer it.",
-                            }
-                        ],
+                        "elements": [{"type": "text", "text": details}],
                     }
                 ],
             },
@@ -1513,7 +1646,7 @@ def summarize_session_chunks(
 ) -> str | None:
     user_texts = [chunk.text for chunk in chunks if chunk.author == "user" and chunk.text.strip()]
     if user_texts:
-        return _summary_line(user_texts[0])
+        return _summary_line(user_texts[-1])
     if existing_summary:
         return existing_summary
     assistant_texts = [
@@ -1843,6 +1976,42 @@ def _slack_message_timestamp(value: str | None) -> datetime | None:
         return datetime.fromtimestamp(float(value), tz=UTC)
     except ValueError:
         return None
+
+
+def _external_session_card_key(session: AgentSession) -> str:
+    return f"{EXTERNAL_SESSION_CARD_PREFIX}{_external_session_key(session.provider, session.session_id)}"
+
+
+def _event_turn_state(event: AgentEvent) -> bool | None:
+    """True when an event starts or continues a turn, False when it ends one."""
+    if event.provider == Provider.CLAUDE:
+        message = event.metadata.get("message")
+        if event.event_type == "assistant" and isinstance(message, dict):
+            if is_synthetic_claude_assistant_record(event.metadata):
+                return None
+            return message.get("stop_reason") != "end_turn"
+        if event.event_type == "user" and isinstance(message, dict):
+            content = message.get("content")
+            text = event.text or ""
+            if "<local-command-stdout>" in text or "<local-command-stderr>" in text:
+                # A local slash command (e.g. /status) answered without a model turn.
+                return False
+            if event.metadata.get("isMeta") or "<local-command-caveat>" in text:
+                return None
+            if event.human_authored:
+                return True
+            if isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+            ):
+                return True
+        return None
+    if event.provider == Provider.CODEX:
+        if _codex_event_ends_turn(event):
+            return False
+        payload = event.metadata.get("payload")
+        if isinstance(payload, dict) and payload.get("type") in {"task_started", "user_message"}:
+            return True
+    return None
 
 
 def _codex_event_ends_turn(event: AgentEvent) -> bool:
