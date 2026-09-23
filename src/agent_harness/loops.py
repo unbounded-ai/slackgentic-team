@@ -1081,13 +1081,24 @@ def default_loop_provider(commands) -> Provider:
 
 
 def format_loop_timestamp(value: datetime, timezone: str | None) -> str:
-    try:
-        zone = ZoneInfo(timezone or "UTC")
-    except ZoneInfoNotFoundError:
-        zone = ZoneInfo("UTC")
-    local = value.astimezone(zone)
+    """Render a loop time in its schedule's zone, or the machine's zone for interval
+    schedules, which carry none (showing UTC there reads wrong to the owner)."""
+    if timezone:
+        try:
+            local = value.astimezone(ZoneInfo(timezone))
+        except ZoneInfoNotFoundError:
+            local = value.astimezone(ZoneInfo("UTC"))
+    else:
+        local = value.astimezone()
     clock = local.strftime("%I:%M %p %Z").lstrip("0")
     return f"{local.strftime('%a %b')} {local.day}, {clock}"
+
+
+def slack_loop_time(value: datetime, timezone: str | None) -> str:
+    """A Slack date token: each viewer sees the time in their own zone, relative
+    when close ("Today at 8:00 AM"); clients that cannot render it show the fallback."""
+    fallback = format_loop_timestamp(value, timezone)
+    return f"<!date^{int(value.timestamp())}^{{date_short_pretty}} at {{time}}|{fallback}>"
 
 
 def describe_loop_schedule(recurrence: dict[str, object], timezone: str | None) -> str:

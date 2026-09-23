@@ -86,6 +86,7 @@ from agent_harness.loops import (
     parse_loop_create_request,
     provisional_loop_agent,
     render_loop_journal,
+    slack_loop_time,
 )
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
@@ -1952,7 +1953,7 @@ class SlackTeamController:
             return None
         return (
             f"{self._loop_run_emoji(finished)} last check "
-            f"{format_loop_timestamp(finished.finished_at, loop.timezone)}"
+            f"{slack_loop_time(finished.finished_at, loop.timezone)}"
         )
 
     def _loop_run_emoji(self, run: LoopRun) -> str:
@@ -1991,7 +1992,7 @@ class SlackTeamController:
 
     def _loop_next_run_text(self, loop: Loop) -> str:
         if loop.status == LoopStatus.ACTIVE and loop.next_run_at is not None:
-            return format_loop_timestamp(loop.next_run_at, loop.timezone)
+            return slack_loop_time(loop.next_run_at, loop.timezone)
         if loop.status == LoopStatus.PAUSED:
             return "paused"
         return "none"
@@ -2089,7 +2090,7 @@ class SlackTeamController:
         if event is not None:
             self._post_loop_surface(
                 loop,
-                f"▶ Loop resumed. Next run {format_loop_timestamp(next_run_at, loop.timezone)}.",
+                f"▶ Loop resumed. Next run {slack_loop_time(next_run_at, loop.timezone)}.",
                 event=event,
             )
         return True
@@ -2380,7 +2381,7 @@ class SlackTeamController:
             )
             confirmation = (
                 f"Mission and schedule updated (*{new_schedule}*). Next run "
-                f"{format_loop_timestamp(next_run_at, spec.timezone)}."
+                f"{slack_loop_time(next_run_at, spec.timezone)}."
             )
         elif kind == "schedule":
             next_run_at = next_run_after(spec.recurrence, after=utc_now())
@@ -2402,7 +2403,7 @@ class SlackTeamController:
             content = f"schedule changed from {old_value} to {new_value}"
             confirmation = (
                 f"Schedule updated to *{new_value}*. Next run "
-                f"{format_loop_timestamp(next_run_at, spec.timezone)}."
+                f"{slack_loop_time(next_run_at, spec.timezone)}."
             )
         elif kind == "task":
             self._update_loop_identity_values(loop, mission=spec.mission)
@@ -3295,7 +3296,7 @@ class SlackTeamController:
             header_text, header_blocks = build_loop_run_running_blocks(
                 title=loop.title,
                 run_number=run.run_number,
-                when_text=format_loop_timestamp(run.due_at, loop.timezone),
+                when_text=slack_loop_time(run.due_at, loop.timezone),
                 previous_headline=_shorten(_loop_headline(previous), 160) if previous else None,
             )
         try:
@@ -3738,7 +3739,7 @@ class SlackTeamController:
         text, blocks = build_loop_run_running_blocks(
             title=loop.title,
             run_number=run.run_number,
-            when_text=format_loop_timestamp(run.due_at, loop.timezone),
+            when_text=slack_loop_time(run.due_at, loop.timezone),
             progress=_shorten(" ".join(progress.split()), 280),
         )
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
@@ -3754,7 +3755,7 @@ class SlackTeamController:
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
 
     def _loop_run_card_payload(self, loop: Loop, run: LoopRun) -> tuple[str, list[dict]]:
-        when_text = format_loop_timestamp(run.due_at, loop.timezone)
+        when_text = slack_loop_time(run.due_at, loop.timezone)
         if run.status == LoopRunStatus.FAILED:
             latest = self.store.get_loop(loop.loop_id) or loop
             text, blocks = build_loop_run_error_blocks(
@@ -4201,7 +4202,7 @@ class SlackTeamController:
         blocks = build_loop_preview_blocks(
             latest,
             spec,
-            next_run_text=format_loop_timestamp(spec.next_run_at, spec.timezone),
+            next_run_text=slack_loop_time(spec.next_run_at, spec.timezone),
         )
         if latest.preview_message_ts:
             self._try_update_message(
@@ -7285,7 +7286,7 @@ class SlackTeamController:
         blocks = build_loop_preview_blocks(
             loop,
             resolved_spec,
-            next_run_text=format_loop_timestamp(
+            next_run_text=slack_loop_time(
                 resolved_spec.next_run_at,
                 resolved_spec.timezone,
             ),
