@@ -69,6 +69,28 @@ class SlackGateway:
         if user_ids:
             self.client.conversations_invite(channel=channel_id, users=",".join(user_ids))
 
+    def channel_member_ids(self, channel_id: str) -> list[str]:
+        members: list[str] = []
+        cursor: str | None = None
+        while True:
+            response = self.client.conversations_members(
+                channel=channel_id, limit=200, **({"cursor": cursor} if cursor else {})
+            )
+            members.extend(str(member) for member in response.get("members") or [])
+            cursor = (response.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                return members
+
+    def rename_channel(self, channel_id: str, name: str) -> bool:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            self.client.conversations_rename(channel=channel_id, name=name[:80])
+        except SlackApiError:
+            LOGGER.debug("failed to rename Slack channel %s", channel_id, exc_info=True)
+            return False
+        return True
+
     def archive_channel(self, channel_id: str) -> bool:
         from slack_sdk.errors import SlackApiError
 

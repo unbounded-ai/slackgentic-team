@@ -229,6 +229,8 @@ class LoopCreateRequest:
     provider: Provider | None = None
     model: str | None = None
     permission_mode: PermissionMode = PermissionMode.READ_ONLY
+    # None lets the resolver infer it from the wording; #quiet / #every-run pin it.
+    quiet: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -361,8 +363,13 @@ def parse_loop_create_request(text: str) -> LoopCreateRequest | None:
         if re.search(r"(?<!\S)#dangerous-mode\b", description, re.I)
         else PermissionMode.READ_ONLY
     )
+    quiet_match = _last_match(r"(?<!\S)#(quiet|every-run)\b", description)
+    quiet = quiet_match.group(1).lower() == "quiet" if quiet_match else None
     description = re.sub(
-        r"(?<!\S)#(?:public|private|dangerous-mode)\b", "", description, flags=re.I
+        r"(?<!\S)#(?:public|private|dangerous-mode|quiet|every-run)\b",
+        "",
+        description,
+        flags=re.I,
     )
     description = re.sub(r"(?<!\S)provider=(?:codex|claude)\b", "", description, flags=re.I)
     description = re.sub(r"(?<!\S)model=[^\s]+", "", description, flags=re.I)
@@ -373,6 +380,7 @@ def parse_loop_create_request(text: str) -> LoopCreateRequest | None:
         provider=provider,
         model=model,
         permission_mode=permission_mode,
+        quiet=quiet,
     )
 
 
