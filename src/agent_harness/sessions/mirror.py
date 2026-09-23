@@ -63,7 +63,7 @@ from agent_harness.slack import (
 )
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
-from agent_harness.team import agent_icon_url
+from agent_harness.team import agent_icon_url, provider_logo_url
 
 LOGGER = logging.getLogger(__name__)
 SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
@@ -1594,7 +1594,7 @@ def session_parent_blocks(
         title = title[:119].rstrip() + "…"
     hint = "Mirroring this session here. Reply in the thread to steer it."
     details = f"Request: {' '.join(summary.split())[:1500]}\n\n{hint}" if summary else hint
-    facts = [f"👀 {label} session outside Slack"]
+    facts = [f"{label} session outside Slack"]
     if session.cwd:
         facts.append(f"`{_short_path(session.cwd)}`")
     if session.git_branch and session.git_branch != "HEAD":
@@ -1617,7 +1617,18 @@ def session_parent_blocks(
                 ],
             },
         },
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(facts)[:2900]}]},
+        {
+            "type": "context",
+            "elements": [
+                # The provider's logo leads the byline, as on task thread headers.
+                {
+                    "type": "image",
+                    "image_url": provider_logo_url(session.provider),
+                    "alt_text": label,
+                },
+                {"type": "mrkdwn", "text": " · ".join(facts)[:2900]},
+            ],
+        },
     ]
     if channel_notice:
         blocks.append(

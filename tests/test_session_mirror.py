@@ -5673,6 +5673,10 @@ class ObservedSessionIdleReleaseTests(unittest.TestCase):
                 self.assertEqual(card["status"], "in_progress")
                 self.assertEqual(card["title"], "Running the test suite now.")
                 self.assertIn("fix the flaky test", json.dumps(card["details"]))
+                byline = gateway.updates[-1][3][1]["elements"]
+                self.assertEqual(byline[0]["type"], "image")
+                self.assertTrue(byline[0]["image_url"].endswith("/providers/claude.png"))
+                self.assertTrue(byline[1]["text"].startswith("Claude session outside Slack"))
 
                 mirror.sync_once()
                 self.assertEqual(len(gateway.updates), 1)
