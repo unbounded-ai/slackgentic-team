@@ -1,11 +1,14 @@
 import json
+import os
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from hypothesis import given
 from hypothesis import strategies as st
@@ -637,6 +640,29 @@ class PureLoopLogicTests(unittest.TestCase):
         self.assertEqual(provisional.full_name, "New Loop Bot")
         self.assertEqual(provisional.kind, TeamAgentKind.LOOP)
         self.assertEqual(provisional.handle, "loop-123456")
+
+    def test_interval_loop_timestamps_use_the_local_timezone(self):
+        value = datetime(2026, 1, 5, 17, 0, tzinfo=UTC)
+        with patch.dict(os.environ, {"TZ": "America/New_York"}):
+            time.tzset()
+            try:
+                self.assertEqual(
+                    loop_logic.format_loop_timestamp(value, None), "Mon Jan 5, 12:00 PM EST"
+                )
+            finally:
+                os.environ.pop("TZ", None)
+                time.tzset()
+        self.assertEqual(
+            loop_logic.format_loop_timestamp(value, "Asia/Tokyo"), "Tue Jan 6, 2:00 AM JST"
+        )
+
+    def test_slack_loop_time_renders_in_each_viewers_zone(self):
+        value = datetime(2026, 1, 5, 17, 0, tzinfo=UTC)
+        token = loop_logic.slack_loop_time(value, "America/Los_Angeles")
+        self.assertEqual(
+            token,
+            f"<!date^{int(value.timestamp())}^{{date_short_pretty}} at {{time}}|Mon Jan 5, 9:00 AM PST>",
+        )
 
     def test_provider_default_timestamp_and_schedule_formatting(self):
         unavailable = SimpleNamespace(claude_binary="definitely-not-an-installed-command")
