@@ -1883,6 +1883,33 @@ class SessionMirrorTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_cleared_capacity_notice_is_deleted_when_slack_allows_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                store.set_setting("external_session_capacity_notice_ts.codex", "170.000001")
+                gateway = FakeGateway()
+                deleted = []
+                gateway.delete_message = lambda channel_id, ts: (
+                    deleted.append((channel_id, ts)) or True
+                )
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider([], [])],
+                    team_id="T1",
+                    channel_id="C1",
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(deleted, [("C1", "170.000001")])
+                self.assertEqual(gateway.updates, [])
+                self.assertIsNone(store.get_setting("external_session_capacity_notice_ts.codex"))
+            finally:
+                store.close()
+
     def test_cleared_capacity_notice_is_retired_so_next_wait_gets_fresh_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
@@ -5213,6 +5240,86 @@ class ObservedSessionIdleReleaseTests(unittest.TestCase):
                         {},
                     )
                     self.assertEqual(gateway.parents, [])
+                finally:
+                    store.close()
+
+    def test_open_terminal_keeps_its_newest_session_across_idle(self):
+        for provider_kind in Provider:
+            with (
+                self.subTest(provider=provider_kind),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store, codex_count=2, claude_count=2)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(hours=3)
+                    )
+                    provider._path_index.full_scan_interval_seconds = 0
+                    agent, thread = self._seed_occupied_session(
+                        store, provider_kind, path, len(records)
+                    )
+                    # An earlier session the same terminal ran before this one.
+                    older = path.with_name("older.jsonl")
+                    older.write_text("", encoding="utf-8")
+                    os.utime(older, (0, 0))
+                    older_agent = next(
+                        candidate
+                        for candidate in store.idle_team_agents()
+                        if candidate.provider_preference == provider_kind
+                        and candidate.kind in WORKER_KINDS
+                    )
+                    store.upsert_session(
+                        AgentSession(
+                            provider=provider_kind,
+                            session_id="s0",
+                            transcript_path=older,
+                            cwd=path.parent,
+                            started_at=now - timedelta(days=2),
+                            last_seen_at=now - timedelta(days=2),
+                            status=SessionStatus.IDLE,
+                        )
+                    )
+                    store.upsert_slack_thread_for_session(
+                        provider_kind,
+                        "s0",
+                        "T1",
+                        SlackThreadRef("C1", "170.000001", "170.000001"),
+                    )
+                    older_key = f"external_session_agent.{provider_kind.value}.s0"
+                    store.set_setting(older_key, older_agent.agent_id)
+                    target = TerminalTarget(
+                        pid=4242,
+                        tty="ttys001",
+                        cwd=path.parent,
+                        command=f"{provider_kind.value} --example",
+                        started_at=now - timedelta(days=3),
+                    )
+                    gateway = FakeGateway()
+                    mirror = SessionMirror(
+                        store,
+                        gateway,
+                        [provider],
+                        team_id="T1",
+                        channel_id="C1",
+                        terminal_notifier=FakeTerminalNotifier(targets=[target]),
+                        home=Path(tmp),
+                        idle_release_seconds=self.IDLE_RELEASE_SECONDS,
+                    )
+
+                    mirror.sync_once()
+                    mirror.sync_once()
+
+                    self.assertEqual(
+                        store.get_setting(f"external_session_agent.{provider_kind.value}.s1"),
+                        agent.agent_id,
+                    )
+                    self.assertIsNone(store.get_setting(older_key))
+                    freed = [reply[0] for reply in gateway.replies if "freed up" in reply[1]]
+                    self.assertEqual(freed, [SlackThreadRef("C1", "170.000001", "170.000001")])
+                    self.assertNotIn(thread, freed)
                 finally:
                     store.close()
 

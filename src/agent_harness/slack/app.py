@@ -5704,12 +5704,15 @@ class SlackTeamController:
                 blocks=build_external_session_capacity_blocks(provider, pending_count),
             )
             return
-        label = provider.value.title()
-        self.gateway.update_message(
-            channel_id,
-            existing_ts,
-            f"{label} capacity for sessions started outside Slack is available now.",
-        )
+        # A resolved capacity notice is just clutter, so remove it.
+        delete = getattr(self.gateway, "delete_message", None)
+        if not (callable(delete) and delete(channel_id, existing_ts)):
+            label = provider.value.title()
+            self.gateway.update_message(
+                channel_id,
+                existing_ts,
+                f"{label} capacity for sessions started outside Slack is available now.",
+            )
         self.store.delete_setting(setting_key)
 
     def _refresh_external_capacity_notices(self, channel_id: str) -> None:
