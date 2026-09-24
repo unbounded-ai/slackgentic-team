@@ -23,6 +23,7 @@ from agent_harness.providers.path_index import (
     TranscriptPathIndex,
 )
 from agent_harness.storage.jsonl import iter_jsonl, last_jsonl_line_number, tail_jsonl_records
+from agent_harness.timezones import zone_for
 
 CLAUDE_LOCAL_EXIT_MARKERS = (
     "<command-name>/exit</command-name>",
@@ -358,7 +359,13 @@ class ClaudeProvider:
     def last_event_line_number(self, transcript_path: Path) -> int:
         return last_jsonl_line_number(transcript_path)
 
-    def usage_for_day(self, transcript_paths: Iterable[Path], day: str) -> list[UsageSnapshot]:
+    def usage_for_day(
+        self,
+        transcript_paths: Iterable[Path],
+        day: str,
+        timezone: str | None = None,
+    ) -> list[UsageSnapshot]:
+        zone = zone_for(timezone) or UTC
         totals: dict[str, TokenUsage] = {}
         latest: dict[str, datetime] = {}
         surfaces: dict[str, str] = {}
@@ -367,7 +374,7 @@ class ClaudeProvider:
             session_id = path.stem
             for _, record in iter_jsonl(path):
                 timestamp = parse_timestamp(record.get("timestamp"))
-                if not timestamp or timestamp.date().isoformat() != day:
+                if not timestamp or timestamp.astimezone(zone).date().isoformat() != day:
                     continue
                 session_id = str(record.get("sessionId") or session_id)
                 if record.get("entrypoint"):

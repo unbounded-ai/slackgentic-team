@@ -76,7 +76,8 @@ PM agent from a terminal with `slackgentic team hire --kind pm --provider claude
 | `hire 3 agents`, `hire 1 claude agent`, `hire 1 codex agent` | Add agents |
 | `fire @riley`, `fire everyone` | Remove agents |
 | `show repo root`, `repo root ~/code` | Show or set where agents start |
-| `settings` | Settings card: auto-update, release checks, repo root |
+| `timezone`, `timezone America/New_York` | Show or set the owner's timezone |
+| `settings` | Settings card: auto-update, release checks, repo root, timezone |
 | `auto-update on`, `auto-update off` | Switch automatic release installs |
 
 ## Sessions started outside Slack

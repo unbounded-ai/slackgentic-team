@@ -65,6 +65,7 @@ from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import runtime_personality_prompt
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
+from agent_harness.timezones import configured_timezone, timezone_prompt_lines
 
 LOGGER = logging.getLogger(__name__)
 SETTING_REPO_ROOT = "slack.repo_root"
@@ -331,7 +332,7 @@ class ManagedTaskRuntime:
         )
         request = LaunchRequest(
             provider=provider,
-            prompt=build_task_prompt(agent, task),
+            prompt=build_task_prompt(agent, task, timezone=configured_timezone(self.store)),
             cwd=cwd,
             permission_mode=mode,
             model=(
@@ -2124,7 +2125,12 @@ def _initial_allowed_tools(
     return allowed_tools
 
 
-def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
+def build_task_prompt(
+    agent: TeamAgent,
+    task: AgentTask,
+    *,
+    timezone: str | None = None,
+) -> str:
     lines = [
         runtime_personality_prompt(agent),
         "",
@@ -2159,6 +2165,7 @@ def build_task_prompt(agent: TeamAgent, task: AgentTask) -> str:
             "iterating until they are clear.` Slackgentic hides that line and resumes the "
             "same agent in this thread when the timer is due."
         ),
+        *timezone_prompt_lines(timezone),
         (
             "When a table is the clearest format, write one normal Markdown table in the "
             "message. Slackgentic renders one Markdown table per message as a native Slack "

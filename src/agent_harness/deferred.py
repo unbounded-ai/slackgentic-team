@@ -17,6 +17,7 @@ from agent_harness.models import (
     utc_now,
 )
 from agent_harness.team.routing import parse_work_request
+from agent_harness.timezones import timezone_prompt_lines
 
 AGENT_DEFERRED_SIGNAL_PREFIX = "SLACKGENTIC: DEPEND "
 DEFERRED_RESOLUTION_METADATA_KEY = "deferred_resolution"
@@ -138,6 +139,7 @@ def build_deferred_resolution_prompt(
     occupied: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
     now: datetime | None = None,
     validation_error: str | None = None,
+    timezone: str | None = None,
 ) -> str:
     reference = now or utc_now()
     handle_text = ", ".join(f"@{handle}" for handle in agent_handles) or "(no active agents)"
@@ -153,6 +155,7 @@ def build_deferred_resolution_prompt(
         "Interpret this Slack request and create exactly one Slackgentic deferred work entry.",
         "",
         f"Current UTC time: {reference.isoformat()}",
+        *timezone_prompt_lines(timezone, reference),
         f"Active Slackgentic agent handles: {handle_text}",
         "Currently occupied agents and their active task ids:",
         occupied_lines,

@@ -105,6 +105,7 @@ Useful commands:
 /slackgentic-<you> fire @riley
 /slackgentic-<you> fire everyone
 /slackgentic-<you> settings
+/slackgentic-<you> timezone America/New_York
 status
 show roster
 hire 3 agents
@@ -114,6 +115,13 @@ auto-update off
 
 A message that is not a command or a task request gets a threaded reply
 listing the commands, so a typo never goes unanswered.
+
+Slackgentic reads your timezone from your Slack profile the first time you
+message the channel (existing installs pick it up on the next start), falling
+back to this machine's zone. Schedule and deferred-task times, the status card's
+day, and loop times are shown in it, and agents are told to use it when they
+mention times and to read times you give without a zone as yours. Change it
+with `timezone Europe/London` or from the `settings` card.
 
 Start work by typing in the agent channel:
 
@@ -513,7 +521,7 @@ on its own session once the new daemon is up. While the card is waiting,
 *Install now* skips the wait.
 
 Type `settings` in the agent channel to switch auto-update or release checks
-off and on, change the repo root, or check for a release right away.
+off and on, change the repo root or timezone, or check for a release right away.
 `auto-update off` and `auto-update on` work as direct commands too. With
 auto-update off, the card waits for you:
 

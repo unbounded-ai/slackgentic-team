@@ -38,6 +38,7 @@ class FakeSlackClient:
             "user": {
                 "id": user,
                 "name": "localuser",
+                "tz": "America/Los_Angeles",
                 "profile": {
                     "display_name": "Local User",
                     "real_name": "Local",
@@ -219,6 +220,7 @@ class SlackGatewayTests(unittest.TestCase):
 
         self.assertEqual(gateway.user_display_name("U1"), "Local User")
         self.assertEqual(gateway.user_profile("U1").image_url, "https://example.com/avatar.png")
+        self.assertEqual(gateway.user_profile("U1").timezone, "America/Los_Angeles")
 
     def test_post_thread_reply_can_customize_human_username(self):
         gateway = object.__new__(SlackGateway)

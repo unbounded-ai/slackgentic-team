@@ -17,6 +17,7 @@ from agent_harness.models import (
     WorkRequest,
     utc_now,
 )
+from agent_harness.timezones import timezone_prompt_lines
 
 AGENT_PM_PLAN_SIGNAL_PREFIX = "SLACKGENTIC: PM_PLAN "
 PM_RESOLUTION_METADATA_KEY = "pm_resolution"
@@ -131,6 +132,7 @@ def build_pm_resolution_prompt(
     extension_known_ids: tuple[str, ...] = (),
     extension_context: str | None = None,
     agent_models: Mapping[str, str] | None = None,
+    timezone: str | None = None,
 ) -> str:
     reference = now or utc_now()
     handles = _format_pm_worker_handles(agent_handles, agent_models)
@@ -178,6 +180,7 @@ def build_pm_resolution_prompt(
         "",
         f"Initiative id: {initiative_id}",
         f"Current UTC time: {reference.isoformat()}",
+        *timezone_prompt_lines(timezone, reference),
         f"Available Slackgentic worker handles: {handles}",
         "",
         f"User project: {text.strip()}",

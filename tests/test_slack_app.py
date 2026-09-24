@@ -84,7 +84,7 @@ from agent_harness.slack.app import (
     _service_reinstall_environment,
     _socket_mode_connection_stale,
 )
-from agent_harness.slack.client import PostedMessage
+from agent_harness.slack.client import PostedMessage, SlackUserProfile
 from agent_harness.slack.socket_mode import SupervisedSocketModeClient
 from agent_harness.storage.store import Store
 from agent_harness.team import (
@@ -101,9 +101,11 @@ from agent_harness.team.commands import (
     RosterCommand,
     ScheduledTasksCommand,
     SettingsCommand,
+    TimezoneCommand,
     UnassignedExternalSessionsCommand,
 )
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
+from agent_harness.timezones import TIMEZONE_SOURCE_MANUAL, format_user_time, set_user_timezone
 from agent_harness.updates import SlackgenticUpdateRunner
 from tests.polling import POLL_TIMEOUT_SECONDS, shut_down_runtime, wait_until
 
@@ -169,6 +171,16 @@ def _repo_root_submission(view, value):
         "view": {
             **view,
             "state": {"values": {"repo_root": {"value": {"value": value}}}},
+        },
+    }
+
+
+def _timezone_submission(view, value):
+    return {
+        "type": "view_submission",
+        "view": {
+            **view,
+            "state": {"values": {"timezone": {"value": {"value": value}}}},
         },
     }
 
@@ -1873,6 +1885,131 @@ class SlackAppTests(unittest.TestCase):
 
                 self.assertIsNone(result)
                 self.assertEqual(store.get_setting("slack.repo_root"), str(Path(tmp).resolve()))
+                self.assertEqual(gateway.updates[-1]["ts"], "171.settings")
+            finally:
+                store.close()
+
+    def test_owner_timezone_is_inferred_from_slack_profile_at_signup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = _ProfileGateway("Asia/Tokyo")
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                self.assertIsNone(store.get_setting("slack.human_timezone"))
+
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "help",
+                            "ts": "171.help",
+                        }
+                    }
+                )
+
+                self.assertEqual(store.get_setting("slack.human_timezone"), "Asia/Tokyo")
+                self.assertEqual(store.get_setting("slack.human_timezone_source"), "slack")
+            finally:
+                store.close()
+
+    def test_existing_owner_gets_a_timezone_backfilled_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = _ProfileGateway("America/Denver")
+            try:
+                store.init_schema()
+                store.set_setting("slack.human_user_id", "U1")
+
+                SlackTeamController(store, gateway, default_channel_id="C1")
+
+                self.assertEqual(store.get_setting("slack.human_timezone"), "America/Denver")
+                self.assertEqual(gateway.profile_requests, ["U1"])
+            finally:
+                store.close()
+
+    def test_owner_chosen_timezone_survives_startup_and_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = _ProfileGateway("America/Denver")
+            try:
+                store.init_schema()
+                store.set_setting("slack.human_user_id", "U1")
+                set_user_timezone(store, "Europe/Berlin", TIMEZONE_SOURCE_MANUAL)
+
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller.handle_event(
+                    {
+                        "event": {
+                            "type": "message",
+                            "channel": "C1",
+                            "user": "U1",
+                            "text": "help",
+                            "ts": "171.help",
+                        }
+                    }
+                )
+
+                self.assertEqual(store.get_setting("slack.human_timezone"), "Europe/Berlin")
+            finally:
+                store.close()
+
+    def test_timezone_command_sets_the_zone_and_the_card_shows_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                target = SlackReplyTarget(channel_id="C1", thread_ts=None)
+
+                controller.handle_team_command(TimezoneCommand("mars"), target)
+                self.assertIn("not a timezone", gateway.posts[-1]["text"])
+
+                controller.handle_team_command(TimezoneCommand("europe/berlin"), target)
+                self.assertIn("Europe/Berlin", gateway.posts[-1]["text"])
+                self.assertEqual(store.get_setting("slack.human_timezone"), "Europe/Berlin")
+                self.assertEqual(store.get_setting("slack.human_timezone_source"), "manual")
+
+                controller.handle_team_command(SettingsCommand(), target)
+                rendered = json.dumps(gateway.posts[-1]["blocks"])
+                self.assertIn("Timezone", rendered)
+                self.assertIn("Europe/Berlin", rendered)
+                self.assertIn("Set by you.", rendered)
+            finally:
+                store.close()
+
+    def test_timezone_settings_modal_validates_saves_and_refreshes_the_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+
+                controller.handle_block_action(
+                    {
+                        "type": "block_actions",
+                        "trigger_id": "T1",
+                        "channel": {"id": "C1"},
+                        "message": {"ts": "171.settings"},
+                        "actions": [{"value": encode_action_value("settings.timezone.open")}],
+                    }
+                )
+                view = gateway.views[0][1]
+                self.assertEqual(view["callback_id"], "settings.timezone")
+
+                bad = controller.handle_view_submission(_timezone_submission(view, "Nowhere"))
+                self.assertEqual(bad["response_action"], "errors")
+
+                result = controller.handle_view_submission(
+                    _timezone_submission(view, "America/Chicago")
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(store.get_setting("slack.human_timezone"), "America/Chicago")
                 self.assertEqual(gateway.updates[-1]["ts"], "171.settings")
             finally:
                 store.close()
@@ -12393,6 +12530,7 @@ class SlackAppTests(unittest.TestCase):
                 agent = build_initial_model_team(1, 0)[0]
                 store.upsert_team_agent(agent)
                 runtime = FakeRuntime()
+                set_user_timezone(store, "America/Chicago", TIMEZONE_SOURCE_MANUAL)
                 controller = SlackTeamController(
                     store,
                     gateway,
@@ -12415,6 +12553,7 @@ class SlackAppTests(unittest.TestCase):
                 task, started_agent, thread = runtime.started[0]
                 self.assertEqual(started_agent.agent_id, agent.agent_id)
                 self.assertEqual(gateway.thread_replies[-1]["text"], f"@{agent.handle} scheduling.")
+                self.assertIn("Owner timezone: America/Chicago", task.prompt)
 
                 run_at = utc_now() + timedelta(hours=1)
                 payload = {
@@ -12444,7 +12583,7 @@ class SlackAppTests(unittest.TestCase):
                     gateway.thread_replies[-1]["text"],
                     (
                         f"Scheduled: @{agent.handle} `check CI`; tomorrow at 9am UTC; "
-                        f"next `{run_at.isoformat(timespec='minutes')}`."
+                        f"next `{format_user_time(run_at, 'America/Chicago')}`."
                     ),
                 )
             finally:
@@ -13840,6 +13979,19 @@ class RestartDrainControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, [("0.2.0", True)])
+
+
+class _ProfileGateway(FakeGateway):
+    """A gateway whose Slack user profiles carry a timezone."""
+
+    def __init__(self, timezone):
+        super().__init__()
+        self.timezone = timezone
+        self.profile_requests = []
+
+    def user_profile(self, user_id):
+        self.profile_requests.append(user_id)
+        return SlackUserProfile(display_name="Owner", timezone=self.timezone)
 
 
 if __name__ == "__main__":

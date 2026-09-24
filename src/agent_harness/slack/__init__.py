@@ -44,6 +44,7 @@ from agent_harness.team import (
     provider_logo_url,
 )
 from agent_harness.team.routing import parse_lightweight_handles
+from agent_harness.timezones import TIMEZONE_SOURCE_MANUAL, timezone_label
 from agent_harness.updates import UpdateCandidate
 
 if TYPE_CHECKING:
@@ -1878,6 +1879,8 @@ class SettingsSnapshot:
     last_checked_at: datetime | None = None
     update_available: str | None = None
     available: bool = True
+    timezone: str | None = None
+    timezone_source: str | None = None
 
 
 def build_settings_blocks(settings: SettingsSnapshot) -> list[dict[str, Any]]:
@@ -1922,6 +1925,7 @@ def build_settings_blocks(settings: SettingsSnapshot) -> list[dict[str, Any]]:
             ),
         }
     )
+    blocks.append(_settings_timezone_row(settings))
     version_parts = [f"Running Slackgentic {settings.version}"]
     if settings.update_available:
         version_parts.append(f"{settings.update_available} is available")
@@ -1970,6 +1974,70 @@ def _settings_toggle_row(
             encode_action_value("settings.toggle", setting=setting, enabled=not enabled),
             None if enabled else "primary",
         ),
+    }
+
+
+def _settings_timezone_row(settings: SettingsSnapshot) -> dict[str, Any]:
+    if settings.timezone:
+        value = f"`{timezone_label(settings.timezone)}`"
+        origin = (
+            "Set by you."
+            if settings.timezone_source == TIMEZONE_SOURCE_MANUAL
+            else "Detected automatically."
+        )
+    else:
+        value = "*Not set*"
+        origin = "Detected from your Slack profile the next time you message here."
+    return {
+        "type": "section",
+        "block_id": f"{SETTINGS_BLOCK_ID}.timezone",
+        "text": {
+            "type": "mrkdwn",
+            "text": (f"*Timezone*  {value}\nAgents and plain-text times use this zone. {origin}"),
+        },
+        "accessory": _button(
+            "Change",
+            "slackgentic.settings.timezone",
+            encode_action_value("settings.timezone.open"),
+        ),
+    }
+
+
+def build_timezone_modal(
+    timezone: str | None,
+    *,
+    channel_id: str,
+    message_ts: str | None,
+) -> dict[str, Any]:
+    element: dict[str, Any] = {
+        "type": "plain_text_input",
+        "action_id": "value",
+        "placeholder": {"type": "plain_text", "text": "America/New_York"},
+    }
+    if timezone:
+        element["initial_value"] = timezone
+    return {
+        "type": "modal",
+        "callback_id": "settings.timezone",
+        "private_metadata": json.dumps(
+            {"channel_id": channel_id, "message_ts": message_ts},
+            separators=(",", ":"),
+        ),
+        "title": {"type": "plain_text", "text": "Timezone"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "timezone",
+                "label": {"type": "plain_text", "text": "IANA timezone"},
+                "element": element,
+                "hint": {
+                    "type": "plain_text",
+                    "text": "For example America/Los_Angeles, Europe/London, Asia/Tokyo, or UTC.",
+                },
+            }
+        ],
     }
 
 
