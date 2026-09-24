@@ -106,9 +106,9 @@ from agent_harness.models import (
     DEFAULT_PERMISSION_MODE,
     LATEST_UPDATE_METADATA_KEY,
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
-    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
+    LOOP_QUIET_OUTPUT_METADATA_KEY,
     LOOP_REFERENCE_DIR_METADATA_KEY,
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
@@ -283,6 +283,7 @@ from agent_harness.sessions.mirror import (
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
     LOOP_NO_REPORT_STATUS,
+    LOOP_RESULT_STYLES,
     LOOP_RUN_ERROR_EMOJI,
     LOOP_RUN_RUNNING_EMOJI,
     LOOP_RUN_SKIPPED_EMOJI,
@@ -3726,7 +3727,7 @@ class SlackTeamController:
         if silent_run:
             metadata[LOOP_SILENT_OUTPUT_METADATA_KEY] = True
         elif quiet_run:
-            metadata[LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY] = True
+            metadata[LOOP_QUIET_OUTPUT_METADATA_KEY] = True
         remembered_tools = self._loop_remembered_tools(loop)
         if remembered_tools:
             metadata[LOOP_ALLOWED_TOOLS_METADATA_KEY] = list(remembered_tools)
@@ -4293,24 +4294,63 @@ class SlackTeamController:
             return
         summary = loop_summary_from_json(run.summary_json)
         noteworthy = run.status == LoopRunStatus.FAILED or summary is None or summary.status != "ok"
-        if not noteworthy:
-            return
         agent = self.store.get_team_agent(latest.agent_id, include_fired=True)
         if agent is None:
             return
-        text, blocks = self._loop_run_card_payload(latest, run)
+        card_ts: str | None = None
+        if noteworthy:
+            text, blocks = self._loop_run_card_payload(latest, run)
+            try:
+                posted = self.gateway.post_session_parent(
+                    latest.channel_id,
+                    text,
+                    persona=agent,
+                    icon_url=self._agent_icon_url(agent),
+                    blocks=blocks,
+                )
+            except Exception:
+                LOGGER.warning("failed to post quiet loop report", exc_info=True)
+            else:
+                card_ts = posted.ts
+                self.store.update_loop_run(run.run_id, thread_ts=posted.ts)
+        self._post_quiet_loop_run_log(latest, run, summary, agent, card_ts=card_ts)
+
+    def _post_quiet_loop_run_log(
+        self,
+        loop: Loop,
+        run: LoopRun,
+        summary: LoopSummary | None,
+        agent: TeamAgent,
+        *,
+        card_ts: str | None,
+    ) -> None:
+        """Log every quiet run as one reply in the panel thread (the run log).
+
+        The harness writes it: the agent is told to stay silent on all-clear runs."""
+        if not loop.channel_id or not loop.charter_message_ts:
+            return
+        if run.status == LoopRunStatus.FAILED:
+            emoji, line = LOOP_RUN_ERROR_EMOJI, _shorten(run.error or "run failed", 200)
+        elif summary is None:
+            emoji, line = LOOP_RESULT_STYLES[LOOP_NO_REPORT_STATUS][0], "Finished without a report"
+        else:
+            emoji = LOOP_RESULT_STYLES.get(summary.status, ("✅", ""))[0]
+            line = _loop_headline(summary)
+        text = f"{emoji} Run #{run.run_number} · {line}"
+        if card_ts is not None:
+            try:
+                text += f" · <{self.gateway.permalink(loop.channel_id, card_ts)}|report>"
+            except Exception:
+                LOGGER.warning("failed to link quiet loop report", exc_info=True)
         try:
-            posted = self.gateway.post_session_parent(
-                latest.channel_id,
+            self.gateway.post_thread_reply(
+                SlackThreadRef(loop.channel_id, loop.charter_message_ts),
                 text,
                 persona=agent,
                 icon_url=self._agent_icon_url(agent),
-                blocks=blocks,
             )
         except Exception:
-            LOGGER.warning("failed to post quiet loop report", exc_info=True)
-            return
-        self.store.update_loop_run(run.run_id, thread_ts=posted.ts)
+            LOGGER.warning("failed to log quiet loop run", exc_info=True)
 
     def _remember_loop_run_approvals(self, loop: Loop, task: AgentTask | None) -> Loop:
         raw = task.metadata.get(LOOP_ALLOWED_TOOLS_METADATA_KEY) if task is not None else None
@@ -12743,7 +12783,7 @@ class SlackTeamController:
                 LOOP_FETCH_COUNT_METADATA_KEY,
                 LOOP_SUMMARY_NUDGE_METADATA_KEY,
                 LOOP_SILENT_OUTPUT_METADATA_KEY,
-                LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
+                LOOP_QUIET_OUTPUT_METADATA_KEY,
             ):
                 if key in parent_task.metadata:
                     metadata[key] = parent_task.metadata[key]

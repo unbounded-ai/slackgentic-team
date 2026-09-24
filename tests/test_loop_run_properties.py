@@ -45,7 +45,7 @@ from agent_harness.loops import (
     parse_agent_loop_summary_signal,
 )
 from agent_harness.models import (
-    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
+    LOOP_QUIET_OUTPUT_METADATA_KEY,
     LOOP_SILENT_OUTPUT_METADATA_KEY,
     AgentTaskStatus,
     Loop,
@@ -246,15 +246,15 @@ class QuietRunOutputProperties(unittest.TestCase):
     @given(
         st.lists(PROSE, min_size=1, max_size=3),
         st.lists(st.sampled_from(SIGNALS_THAT_CLOSE_A_RUN + SIGNALS_THAT_DO_NOT), max_size=3),
-        st.sampled_from(("final_only", "silent", "normal")),
+        st.sampled_from(("quiet", "silent", "normal")),
         st.randoms(use_true_random=False),
     )
-    def test_quiet_runs_post_only_their_closing_comment(self, prose, signals, mode, rng):
+    def test_quiet_runs_post_none_of_the_agents_text(self, prose, signals, mode, rng):
         lines = [*prose, *signals]
         rng.shuffle(lines)
         chunk = "\n".join(lines)
         metadata = {
-            "final_only": {LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY: True},
+            "quiet": {LOOP_QUIET_OUTPUT_METADATA_KEY: True},
             "silent": {LOOP_SILENT_OUTPUT_METADATA_KEY: True},
             "normal": {},
         }[mode]
@@ -285,12 +285,11 @@ class QuietRunOutputProperties(unittest.TestCase):
 
             runtime._post_agent_chunk(running, chunk)
 
-            closes = any(signal in SIGNALS_THAT_CLOSE_A_RUN for signal in signals)
-            posts = {"final_only": closes, "silent": False, "normal": True}[mode]
+            posts = {"quiet": False, "silent": False, "normal": True}[mode]
             self.assertEqual(bool(gateway.replies), posts)
             for reply in gateway.replies:
                 self.assertNotIn("SLACKGENTIC", reply)
-            if mode == "final_only":
+            if mode == "quiet":
                 # Withheld narration still counts as a response, so an exit without
                 # THREAD_DONE finalizes the run instead of cancelling it as silent.
                 self.assertEqual(running.visible_message_count, 1)
@@ -591,7 +590,8 @@ class LoopLifecycle(RuleBasedStateMachine):
         return loop
 
     def _all_runs(self):
-        return self.store.list_loop_runs("loop_prop")
+        # Every run, not the store's default page: a long example outgrows it.
+        return self.store.list_loop_runs("loop_prop", limit=10_000)
 
     def _run_for_task(self, task_id: str):
         return next((run for run in self._all_runs() if run.task_id == task_id), None)
@@ -1075,19 +1075,34 @@ class LoopLifecycle(RuleBasedStateMachine):
                 assert "✅" in cards[-1], cards[-1]
 
     @invariant()
-    def quiet_threads_stay_quiet(self):
-        # The harness never writes into the thread a quiet run works in.
-        quiet_threads = set()
-        for model in self.runs.values():
-            task = self.store.get_agent_task(model.task_id) if model.task_id else None
-            if model.quiet and task is not None and task.thread_ts:
-                quiet_threads.add(task.thread_ts)
-        noisy = [
-            reply
+    def quiet_threads_hold_only_the_run_log(self):
+        # The only thing written into the panel thread quiet runs work in is the
+        # harness's run log: one line per finished run, none while it runs. A run
+        # the owner's stop cut short is failed in place, without a card or a line.
+        quiet_threads: set[str] = set()
+        logged: dict[str, int] = {}
+        for run in self._all_runs():
+            task = self.store.get_agent_task(run.task_id) if run.task_id else None
+            if run.kind == LoopRunKind.COMPACTION or task is None or not task.thread_ts:
+                continue
+            if task.thread_ts == run.thread_ts:
+                continue  # a run with a header message of its own
+            quiet_threads.add(task.thread_ts)
+            finalized = run.status == LoopRunStatus.DONE or (
+                run.status == LoopRunStatus.FAILED and run.thread_ts is not None
+            )
+            if finalized:
+                marker = f" Run #{run.run_number} "
+                logged[marker] = logged.get(marker, 0) + 1
+        replies = [
+            reply["text"]
             for reply in self.gateway.thread_replies
             if reply["thread"].thread_ts in quiet_threads
         ]
-        assert noisy == [], noisy
+        for text in replies:
+            assert any(marker in text for marker in logged), text
+        for marker, expected in logged.items():
+            assert sum(marker in text for text in replies) == expected, (marker, replies)
 
     def _record_coverage(self):
         """Report which states this example reached (see --hypothesis-show-statistics)."""
