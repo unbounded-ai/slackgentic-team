@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent_harness.models import Provider
 from agent_harness.team import normalize_handle
+from agent_harness.timezones import normalize_timezone
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,13 @@ class RepoRootCommand:
     path: Path | None = None
 
 
+@dataclass(frozen=True)
+class TimezoneCommand:
+    """Show the owner's timezone, or change it when ``timezone`` is given."""
+
+    timezone: str | None = None
+
+
 SETTING_AUTO_UPDATE = "auto_update"
 SETTING_UPDATE_CHECKS = "update_checks"
 
@@ -70,6 +78,7 @@ TeamCommand = (
     | UnassignedExternalSessionsCommand
     | HelpCommand
     | RepoRootCommand
+    | TimezoneCommand
     | SettingsCommand
 )
 
@@ -86,6 +95,7 @@ def parse_team_command(text: str) -> TeamCommand | None:
         or _parse_scheduled_tasks(cleaned)
         or _parse_roster(cleaned)
         or _parse_repo_root(cleaned)
+        or _parse_timezone(cleaned)
         or _parse_settings(cleaned)
     )
 
@@ -182,6 +192,27 @@ def _parse_repo_root(text: str) -> RepoRootCommand | None:
     if match:
         return RepoRootCommand(Path(_strip_quotes(match.group(1))).expanduser())
     return None
+
+
+_TIMEZONE_NAME = r"(?:my\s+)?(?:time[\s-]?zone|tz)"
+
+
+def _parse_timezone(text: str) -> TimezoneCommand | None:
+    if re.match(rf"^(?:(?:show|what(?:'s| is))\s+)?{_TIMEZONE_NAME}\s*\??$", text, re.IGNORECASE):
+        return TimezoneCommand()
+    match = re.match(
+        rf"^(?P<verb>(?:set|change|update)\s+)?{_TIMEZONE_NAME}\s*(?:[:=]\s*|to\s+|\s)"
+        r"(?P<timezone>[A-Za-z][A-Za-z0-9_+\-/]*)\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    value = _strip_quotes(match.group("timezone"))
+    # "timezone bug" is a remark, not a command; "set timezone bug" gets a correction.
+    if match.group("verb") is None and normalize_timezone(value) is None:
+        return None
+    return TimezoneCommand(value)
 
 
 _ON_OFF = r"(?P<state>on|off|enable|enabled|disable|disabled|true|false|yes|no)"

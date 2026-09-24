@@ -32,6 +32,7 @@ class PostedMessage:
 class SlackUserProfile:
     display_name: str | None = None
     image_url: str | None = None
+    timezone: str | None = None
 
 
 class SlackGateway:
@@ -243,7 +244,12 @@ class SlackGateway:
             if isinstance(value, str) and value.strip():
                 image_url = value.strip()
                 break
-        return SlackUserProfile(display_name=display_name, image_url=image_url)
+        timezone = user.get("tz")
+        return SlackUserProfile(
+            display_name=display_name,
+            image_url=image_url,
+            timezone=timezone.strip() if isinstance(timezone, str) and timezone.strip() else None,
+        )
 
     def user_display_name(self, user_id: str) -> str | None:
         return self.user_profile(user_id).display_name

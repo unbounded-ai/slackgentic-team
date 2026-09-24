@@ -23,6 +23,7 @@ from agent_harness.providers.path_index import (
     TranscriptPathIndex,
 )
 from agent_harness.storage.jsonl import first_jsonl_record, iter_jsonl, last_jsonl_line_number
+from agent_harness.timezones import zone_for
 
 # Codex writes an explicit event whenever a person (or the launcher of a headless
 # run) submits input: `user_message`, or on newer releases an `item_completed`
@@ -309,7 +310,13 @@ class CodexProvider:
     def last_event_line_number(self, transcript_path: Path) -> int:
         return last_jsonl_line_number(transcript_path)
 
-    def usage_for_day(self, transcript_paths: Iterable[Path], day: str) -> list[UsageSnapshot]:
+    def usage_for_day(
+        self,
+        transcript_paths: Iterable[Path],
+        day: str,
+        timezone: str | None = None,
+    ) -> list[UsageSnapshot]:
+        zone = zone_for(timezone) or UTC
         snapshots: list[UsageSnapshot] = []
         for path in transcript_paths:
             session_id = _session_id_from_filename(path) or None
@@ -322,7 +329,7 @@ class CodexProvider:
                     surface = str(originator) if originator else surface
                     continue
                 timestamp = parse_timestamp(record.get("timestamp"))
-                if not timestamp or timestamp.date().isoformat() != day:
+                if not timestamp or timestamp.astimezone(zone).date().isoformat() != day:
                     continue
                 if isinstance(payload, dict) and payload.get("type") == "token_count":
                     latest_for_session = parse_token_count(record, session_id)

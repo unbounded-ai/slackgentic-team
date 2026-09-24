@@ -64,6 +64,7 @@ from agent_harness.slack import (
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 from agent_harness.team import agent_icon_url, provider_logo_url
+from agent_harness.timezones import configured_timezone
 
 LOGGER = logging.getLogger(__name__)
 SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
@@ -1452,7 +1453,7 @@ class SessionMirror:
                 continue
             if task.session_id and task.session_id != session.session_id:
                 continue
-            if build_task_prompt(agent, task) == prompt:
+            if build_task_prompt(agent, task, timezone=configured_timezone(self.store)) == prompt:
                 return task
         return None
 

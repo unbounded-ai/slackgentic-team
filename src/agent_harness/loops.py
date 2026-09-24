@@ -33,6 +33,7 @@ from agent_harness.schedules import (
     parse_recurrence_payload,
 )
 from agent_harness.team import AGENT_CONTEXT_PLACEHOLDER, COLORS, normalize_handle
+from agent_harness.timezones import timezone_prompt_lines
 
 AGENT_LOOP_SIGNAL_PREFIX = "SLACKGENTIC: LOOP "
 AGENT_LOOP_SUMMARY_SIGNAL_PREFIX = "SLACKGENTIC: LOOP_SUMMARY "
@@ -548,6 +549,7 @@ def build_loop_resolution_prompt(
     *,
     now: datetime | None = None,
     validation_error: str | None = None,
+    timezone: str | None = None,
 ) -> str:
     reference = now or utc_now()
     example = {
@@ -578,6 +580,7 @@ def build_loop_resolution_prompt(
         "Loops cannot delegate to other agents or read Slack files and attachments.",
         "",
         f"Current UTC time: {reference.astimezone(UTC).isoformat()}",
+        *timezone_prompt_lines(timezone, reference),
         f"Owner request: {text.strip()}",
         "",
         "Rewrite the mission as a complete, self-contained standing runbook paragraph. Choose a "
@@ -587,6 +590,7 @@ def build_loop_resolution_prompt(
         "wrong (for example 'only post when there are errors or anomalies'); quiet loops post "
         "nothing and notify nobody on all-clear runs.",
         "The schedule must recur. Daily and weekly schedules require HH:MM and an IANA timezone; "
+        f"{_default_zone_clause(timezone)}"
         "weekly schedules also use weekday 0=Monday through 6=Sunday. Interval schedules use "
         f"interval_seconds and must be at least {LOOP_MIN_INTERVAL_SECONDS} seconds.",
         "",
@@ -993,6 +997,12 @@ def loop_spec_from_json(value: str) -> LoopSpec | None:
     )
 
 
+def _default_zone_clause(timezone: str | None) -> str:
+    if not timezone:
+        return ""
+    return f"When the owner names no timezone, use {timezone}; "
+
+
 def build_loop_run_prompt(
     loop: Loop,
     run: LoopRun,
@@ -1004,8 +1014,8 @@ def build_loop_run_prompt(
     reference_dir: str | None = None,
     quiet: bool = False,
     previous_headline_overflow_chars: int | None = None,
+    owner_timezone: str | None = None,
 ) -> str:
-    del now
     identity = bot_name or str(loop.metadata.get("bot_name") or loop.title)
     guard_lines: list[str] = []
     if scratch_dir:
@@ -1028,8 +1038,8 @@ def build_loop_run_prompt(
             "(python3 <script>); scripts must not spawn subprocesses. HTTP must be GET, or "
             "POST of read-only SQL. SQL must be SELECT/WITH/SHOW/DESCRIBE/EXPLAIN.",
         ]
-    due_text = format_loop_timestamp(run.due_at, loop.timezone)
-    schedule = describe_loop_schedule(loop.recurrence, loop.timezone)
+    due_text = format_loop_timestamp(run.due_at, loop.timezone or owner_timezone)
+    schedule = describe_loop_schedule(loop.recurrence, loop.timezone or owner_timezone)
     return "\n".join(
         [
             "[LOOP HARNESS: state]",
@@ -1039,6 +1049,7 @@ def build_loop_run_prompt(
             "other channel members' messages before you see anything; never speculate about or "
             "ask for them.",
             f"Schedule: {schedule}.",
+            *timezone_prompt_lines(owner_timezone, now),
             "",
             "Mission (your standing instruction):",
             loop.mission,

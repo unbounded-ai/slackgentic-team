@@ -15,24 +15,36 @@ from agent_harness.providers.quota import (
     plan_label,
     window_label,
 )
+from agent_harness.timezones import zone_for
 
 
-def day_string(value: str | None) -> str:
+def day_string(value: str | None, timezone: str | None = None) -> str:
+    """An ISO day; "today" is the current day in ``timezone`` (UTC when unset)."""
     if value in (None, "today"):
-        return datetime.now(UTC).date().isoformat()
+        return datetime.now(zone_for(timezone) or UTC).date().isoformat()
     date.fromisoformat(value)
     return value
 
 
-def collect_daily_usage(day: str, home: Path | None = None) -> list[UsageSnapshot]:
+def collect_daily_usage(
+    day: str,
+    home: Path | None = None,
+    timezone: str | None = None,
+) -> list[UsageSnapshot]:
     codex = CodexProvider(home=home)
     claude = ClaudeProvider(home=home)
     codex_paths = [session.transcript_path for session in codex.discover()]
     claude_paths = [session.transcript_path for session in claude.discover()]
-    return codex.usage_for_day(codex_paths, day) + claude.usage_for_day(claude_paths, day)
+    return codex.usage_for_day(codex_paths, day, timezone) + claude.usage_for_day(
+        claude_paths, day, timezone
+    )
 
 
-def collect_weekly_usage(day: str, home: Path | None = None) -> list[UsageSnapshot]:
+def collect_weekly_usage(
+    day: str,
+    home: Path | None = None,
+    timezone: str | None = None,
+) -> list[UsageSnapshot]:
     anchor = date.fromisoformat(day)
     start = anchor - timedelta(days=anchor.weekday())
     days = [(start + timedelta(days=offset)).isoformat() for offset in range(7)]
@@ -42,8 +54,8 @@ def collect_weekly_usage(day: str, home: Path | None = None) -> list[UsageSnapsh
     claude_paths = [session.transcript_path for session in claude.discover()]
     snapshots: list[UsageSnapshot] = []
     for usage_day in days:
-        snapshots.extend(codex.usage_for_day(codex_paths, usage_day))
-        snapshots.extend(claude.usage_for_day(claude_paths, usage_day))
+        snapshots.extend(codex.usage_for_day(codex_paths, usage_day, timezone))
+        snapshots.extend(claude.usage_for_day(claude_paths, usage_day, timezone))
     return snapshots
 
 

@@ -17,6 +17,7 @@ from agent_harness.models import (
     parse_timestamp,
     utc_now,
 )
+from agent_harness.timezones import timezone_prompt_lines
 
 AGENT_SCHEDULE_SIGNAL_PREFIX = "SLACKGENTIC: SCHEDULE "
 SCHEDULE_RESOLUTION_METADATA_KEY = "schedule_resolution"
@@ -114,6 +115,7 @@ def build_schedule_resolution_prompt(
     *,
     now: datetime | None = None,
     validation_error: str | None = None,
+    timezone: str | None = None,
 ) -> str:
     reference = now or utc_now()
     handles = ", ".join(f"@{handle}" for handle in agent_handles) or "(no active agents)"
@@ -121,13 +123,15 @@ def build_schedule_resolution_prompt(
         "Interpret this Slack scheduling request and create exactly one Slackgentic schedule.",
         "",
         f"Current UTC time: {reference.isoformat()}",
+        *timezone_prompt_lines(timezone, reference),
         f"Active Slackgentic agent handles: {handles}",
         f"User request: {text.strip()}",
         "",
         "Resolve the schedule with the LLM. Do not use local regex assumptions. If the user "
         "uses location-dependent wording such as sunset, sunrise, a city, or a local event, "
         "compute the concrete next run time before emitting the schedule. Use an IANA timezone "
-        "name whenever the request implies a location.",
+        "name whenever the request implies a location"
+        + (f", and {timezone} when it names no timezone or place." if timezone else "."),
         "",
         "Emit exactly one hidden control line on its own final line:",
         f"{AGENT_SCHEDULE_SIGNAL_PREFIX}<json>",

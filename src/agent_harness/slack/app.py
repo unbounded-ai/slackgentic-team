@@ -16,7 +16,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from agent_harness import __version__
@@ -315,6 +315,7 @@ from agent_harness.slack import (
     build_status_blocks,
     build_task_thread_blocks,
     build_team_roster_blocks,
+    build_timezone_modal,
     build_unassigned_external_session_blocks,
     build_update_prompt_blocks,
     decode_action_value,
@@ -361,6 +362,7 @@ from agent_harness.team.commands import (
     RosterCommand,
     ScheduledTasksCommand,
     SettingsCommand,
+    TimezoneCommand,
     UnassignedExternalSessionsCommand,
     parse_team_command,
 )
@@ -371,6 +373,17 @@ from agent_harness.team.routing import (
     strip_dangerous_mode_tag,
 )
 from agent_harness.timers import is_agent_timer_signal, parse_agent_timer_signal
+from agent_harness.timezones import (
+    SETTING_USER_TIMEZONE_SOURCE,
+    TIMEZONE_SOURCE_MANUAL,
+    configured_timezone,
+    format_user_time,
+    normalize_timezone,
+    remember_inferred_timezone,
+    set_user_timezone,
+    timezone_label,
+    zone_for,
+)
 from agent_harness.updates import (
     SETTING_UPDATE_AUTO_INSTALL,
     SETTING_UPDATE_CHECKS_ENABLED,
@@ -646,6 +659,7 @@ class SlackTeamController:
         self._loop_fire_lock = threading.Lock()
         self._normalize_existing_agents()
         self._backfill_loop_models()
+        self._backfill_user_timezone()
 
     def _backfill_loop_models(self) -> None:
         """Loops created before models were explicit ran on the CLI's default; pin one."""
@@ -656,6 +670,39 @@ class SlackTeamController:
                 )
             except Exception:
                 LOGGER.exception("failed to pin a model on existing %s loops", provider.value)
+
+    def _backfill_user_timezone(self) -> None:
+        """Owners who set up before timezones existed get one inferred at startup."""
+        if configured_timezone(self.store) is not None:
+            return
+        user_id = self.store.get_setting(SETTING_HUMAN_USER_ID)
+        if not user_id:
+            return
+        self._infer_user_timezone(user_id)
+
+    def _infer_user_timezone(self, user_id: str) -> None:
+        slack_timezone = None
+        try:
+            slack_timezone = self.gateway.user_profile(user_id).timezone
+        except Exception:
+            LOGGER.debug("failed to fetch the Slack user's timezone", exc_info=True)
+        self._remember_inferred_timezone(slack_timezone)
+
+    def _remember_inferred_timezone(self, slack_timezone: object) -> None:
+        try:
+            remember_inferred_timezone(self.store, slack_timezone)
+        except Exception:
+            LOGGER.exception("failed to remember the owner's timezone")
+
+    def _user_timezone(self) -> str | None:
+        return configured_timezone(self.store)
+
+    def _schedule_time(self, value: datetime) -> str:
+        return _format_schedule_timestamp(value, self._user_timezone())
+
+    def _display_timezone(self, timezone: str | None) -> str | None:
+        """A schedule's own zone when it has one, otherwise the owner's."""
+        return timezone or self._user_timezone()
 
     def set_update_runner(self, update_runner: SlackgenticUpdateRunner | None) -> None:
         self.update_runner = update_runner
@@ -755,6 +802,8 @@ class SlackTeamController:
             return self._handle_loop_edit_submission(payload, async_success=async_success)
         if callback_id == "settings.repo_root":
             return self._handle_repo_root_settings_submission(payload)
+        if callback_id == "settings.timezone":
+            return self._handle_timezone_settings_submission(payload)
         if callback_id != "setup.initial":
             return None
         values = view.get("state", {}).get("values", {})
@@ -1230,6 +1279,7 @@ class SlackTeamController:
             | UnassignedExternalSessionsCommand
             | HelpCommand
             | SettingsCommand
+            | TimezoneCommand
         ),
         target: SlackReplyTarget,
         *,
@@ -1323,6 +1373,9 @@ class SlackTeamController:
             return
         if isinstance(command, SettingsCommand):
             self._handle_settings_command(command, target)
+            return
+        if isinstance(command, TimezoneCommand):
+            self._handle_timezone_command(command, target)
             return
         self.post_roster(
             target.channel_id,
@@ -1611,7 +1664,7 @@ class SlackTeamController:
             channel_id=target.channel_id,
             limit=20,
         )
-        text = _scheduled_tasks_text(scheduled)
+        text = _scheduled_tasks_text(scheduled, timezone=self._user_timezone())
         blocks = self._scheduled_tasks_blocks(scheduled)
         if target.thread_ts:
             self.gateway.post_thread_reply(
@@ -1642,7 +1695,7 @@ class SlackTeamController:
                     "block_id": f"schedule.item.{item.schedule_id}",
                     "text": {
                         "type": "mrkdwn",
-                        "text": _scheduled_work_block_text(item),
+                        "text": _scheduled_work_block_text(item, timezone=self._user_timezone()),
                     },
                 }
             )
@@ -2043,7 +2096,7 @@ class SlackTeamController:
             return None
         return (
             f"{self._loop_run_emoji(finished)} last check "
-            f"{slack_loop_time(finished.finished_at, loop.timezone)}"
+            f"{slack_loop_time(finished.finished_at, self._display_timezone(loop.timezone))}"
         )
 
     def _loop_run_emoji(self, run: LoopRun) -> str:
@@ -2082,7 +2135,7 @@ class SlackTeamController:
 
     def _loop_next_run_text(self, loop: Loop) -> str:
         if loop.status == LoopStatus.ACTIVE and loop.next_run_at is not None:
-            return slack_loop_time(loop.next_run_at, loop.timezone)
+            return slack_loop_time(loop.next_run_at, self._display_timezone(loop.timezone))
         if loop.status == LoopStatus.PAUSED:
             return "paused"
         return "none"
@@ -2169,12 +2222,12 @@ class SlackTeamController:
         self.store.update_loop_status(loop.loop_id, LoopStatus.ACTIVE)
         self._append_loop_system_entry(
             loop,
-            f"loop resumed; next run {format_loop_timestamp(next_run_at, loop.timezone)}",
+            f"loop resumed; next run {format_loop_timestamp(next_run_at, self._display_timezone(loop.timezone))}",
         )
         if event is not None:
             self._post_loop_surface(
                 loop,
-                f"▶ Loop resumed. Next run {slack_loop_time(next_run_at, loop.timezone)}.",
+                f"▶ Loop resumed. Next run {slack_loop_time(next_run_at, self._display_timezone(loop.timezone))}.",
                 event=event,
             )
         return True
@@ -2412,7 +2465,7 @@ class SlackTeamController:
             thread = SlackThreadRef(loop.channel_id, posted.ts, posted.ts)
         task = create_agent_task(
             agent,
-            build_loop_resolution_prompt(request, now=utc_now()),
+            build_loop_resolution_prompt(request, now=utc_now(), timezone=self._user_timezone()),
             loop.channel_id,
             loop.owner_slack_user_id,
         )
@@ -2486,7 +2539,7 @@ class SlackTeamController:
             )
             confirmation = (
                 f"Mission and schedule updated (*{new_schedule}*). Next run "
-                f"{slack_loop_time(next_run_at, spec.timezone)}."
+                f"{slack_loop_time(next_run_at, self._display_timezone(spec.timezone))}."
             )
         elif kind == "schedule":
             next_run_at = next_run_after(spec.recurrence, after=utc_now())
@@ -2508,7 +2561,7 @@ class SlackTeamController:
             content = f"schedule changed from {old_value} to {new_value}"
             confirmation = (
                 f"Schedule updated to *{new_value}*. Next run "
-                f"{slack_loop_time(next_run_at, spec.timezone)}."
+                f"{slack_loop_time(next_run_at, self._display_timezone(spec.timezone))}."
             )
         elif kind == "task":
             self._update_loop_identity_values(loop, mission=spec.mission)
@@ -2599,6 +2652,7 @@ class SlackTeamController:
                 original,
                 now=utc_now(),
                 validation_error=error,
+                timezone=self._user_timezone(),
             ),
             status=AgentTaskStatus.ACTIVE,
             updated_at=utc_now(),
@@ -2698,7 +2752,9 @@ class SlackTeamController:
                 **({LOOP_QUIET_CHOICE_KEY: request.quiet} if request.quiet is not None else {}),
             },
         )
-        prompt = build_loop_resolution_prompt(request.description, now=now)
+        prompt = build_loop_resolution_prompt(
+            request.description, now=now, timezone=self._user_timezone()
+        )
         task = create_agent_task(
             agent,
             prompt,
@@ -3259,7 +3315,9 @@ class SlackTeamController:
         )
         updated = replace(
             task,
-            prompt=build_loop_resolution_prompt(request, now=utc_now()),
+            prompt=build_loop_resolution_prompt(
+                request, now=utc_now(), timezone=self._user_timezone()
+            ),
             status=AgentTaskStatus.ACTIVE,
             session_provider=None if provider_changed else task.session_provider,
             session_id=None if provider_changed else task.session_id,
@@ -3555,7 +3613,7 @@ class SlackTeamController:
             header_text, header_blocks = build_loop_run_running_blocks(
                 title=loop.title,
                 run_number=run.run_number,
-                when_text=slack_loop_time(run.due_at, loop.timezone),
+                when_text=slack_loop_time(run.due_at, self._display_timezone(loop.timezone)),
                 previous_headline=_shorten(_loop_headline(previous), 160) if previous else None,
             )
         try:
@@ -3628,6 +3686,7 @@ class SlackTeamController:
                 previous_headline_overflow_chars=(
                     previous.headline_overflow_chars if previous is not None else None
                 ),
+                owner_timezone=self._user_timezone(),
             )
         )
         task = create_agent_task(
@@ -4058,7 +4117,7 @@ class SlackTeamController:
         text, blocks = build_loop_run_running_blocks(
             title=loop.title,
             run_number=run.run_number,
-            when_text=slack_loop_time(run.due_at, loop.timezone),
+            when_text=slack_loop_time(run.due_at, self._display_timezone(loop.timezone)),
             progress=_shorten(" ".join(progress.split()), 280),
         )
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
@@ -4074,7 +4133,7 @@ class SlackTeamController:
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
 
     def _loop_run_card_payload(self, loop: Loop, run: LoopRun) -> tuple[str, list[dict]]:
-        when_text = slack_loop_time(run.due_at, loop.timezone)
+        when_text = slack_loop_time(run.due_at, self._display_timezone(loop.timezone))
         if run.status == LoopRunStatus.FAILED:
             latest = self.store.get_loop(loop.loop_id) or loop
             text, blocks = build_loop_run_error_blocks(
@@ -4227,7 +4286,7 @@ class SlackTeamController:
         summary = str(payload.get("summary") or "completed without a summary").strip()
         status = str(payload.get("status") or "ok")
         content = (
-            f"run #{run.run_number} ({format_loop_timestamp(run.due_at, loop.timezone)}): "
+            f"run #{run.run_number} ({format_loop_timestamp(run.due_at, self._display_timezone(loop.timezone))}): "
             f"[{status}] {summary}"
         )
         if loop.channel_id and run.thread_ts:
@@ -4312,7 +4371,7 @@ class SlackTeamController:
             and (started_at is None or run.created_at >= started_at)
         ]
         text, blocks = build_loop_thread_archive_blocks(
-            period_text=_loop_archive_period_text(runs, loop.timezone),
+            period_text=_loop_archive_period_text(runs, self._display_timezone(loop.timezone)),
             runs=len(runs),
             succeeded=sum(1 for run in runs if _loop_run_succeeded(run)),
             flagged=sum(1 for run in runs if _loop_run_flagged(run)),
@@ -4573,6 +4632,7 @@ class SlackTeamController:
                 original,
                 now=utc_now(),
                 validation_error=error,
+                timezone=self._user_timezone(),
             ),
             status=AgentTaskStatus.ACTIVE,
             updated_at=utc_now(),
@@ -4685,7 +4745,7 @@ class SlackTeamController:
         blocks = build_loop_preview_blocks(
             latest,
             spec,
-            next_run_text=slack_loop_time(spec.next_run_at, spec.timezone),
+            next_run_text=slack_loop_time(spec.next_run_at, self._display_timezone(spec.timezone)),
         )
         if latest.preview_message_ts:
             self._try_update_message(
@@ -4769,7 +4829,7 @@ class SlackTeamController:
             f"• Channel: `#{spec.channel_name}` ({loop.visibility.value}) · "
             f"Runs on: {describe_loop_engine(loop)}\n"
             f"• Schedule: {spec.schedule_description} "
-            f"(next run {format_loop_timestamp(spec.next_run_at, spec.timezone)})\n"
+            f"(next run {format_loop_timestamp(spec.next_run_at, self._display_timezone(spec.timezone))})\n"
             f"• Permissions: {loop.permission_mode.value}{cwd}\n"
             f"• Mission: {spec.mission}\n\n"
             "Reply to adjust, or choose Create loop / Cancel."
@@ -4913,6 +4973,7 @@ class SlackTeamController:
             initiative_id=initiative.initiative_id,
             now=utc_now(),
             agent_models=_pm_worker_model_map(available_workers),
+            timezone=self._user_timezone(),
         )
         busy_agent_ids = self._busy_agent_ids_for_assignment()
         if targeted_pm_handle:
@@ -5042,6 +5103,7 @@ class SlackTeamController:
             [agent.handle for agent in active_agents],
             occupied=[{"handle": handle, "task_id": task_id} for handle, task_id in occupied],
             now=utc_now(),
+            timezone=self._user_timezone(),
         )
         request = WorkRequest(
             prompt=resolver_prompt,
@@ -5168,7 +5230,9 @@ class SlackTeamController:
         if deferred_id is not None:
             deferred = self.store.get_deferred_work(deferred_id)
             if deferred is not None:
-                return _shorten(_deferred_work_roster_detail(deferred), 140)
+                return _shorten(
+                    _deferred_work_roster_detail(deferred, timezone=self._user_timezone()), 140
+                )
             return "deferred task"
         schedule_id = parse_scheduled_work_dependency_id(task_id)
         if schedule_id is not None:
@@ -5178,7 +5242,7 @@ class SlackTeamController:
                     (
                         f"Scheduled task: {scheduled.prompt}; "
                         f"{_format_scheduled_work_schedule(scheduled)}; "
-                        f"next run `{_format_schedule_timestamp(scheduled.next_run_at)}`"
+                        f"next run `{self._schedule_time(scheduled.next_run_at)}`"
                     ),
                     140,
                 )
@@ -5235,6 +5299,7 @@ class SlackTeamController:
             schedule_text,
             [agent.handle for agent in active_agents],
             now=utc_now(),
+            timezone=self._user_timezone(),
         )
         request = WorkRequest(
             prompt=resolver_prompt,
@@ -5444,7 +5509,7 @@ class SlackTeamController:
             if not deferred_items:
                 continue
             deferred = deferred_items[0]
-            detail = _deferred_work_roster_detail(deferred)
+            detail = _deferred_work_roster_detail(deferred, timezone=self._user_timezone())
             if len(deferred_items) > 1:
                 detail = f"{detail}; +{len(deferred_items) - 1} more"
             statuses[agent.agent_id] = AgentRosterStatus(
@@ -5464,7 +5529,7 @@ class SlackTeamController:
             detail = (
                 f"Scheduled task: {_shorten(scheduled.prompt, 110)}; "
                 f"{_format_scheduled_work_schedule(scheduled)}; "
-                f"next run `{_format_schedule_timestamp(scheduled.next_run_at)}`"
+                f"next run `{self._schedule_time(scheduled.next_run_at)}`"
             )
             if len(scheduled_items) > 1:
                 detail = f"{detail}; +{len(scheduled_items) - 1} more"
@@ -6244,7 +6309,8 @@ class SlackTeamController:
                 "`hire 3 agents` — add capacity; `hire 2 claude agents` picks the provider",
                 "`fire @handle` — release one agent; `fire everyone` clears the roster",
                 "`repo root ~/code` — set where agents work",
-                "`settings` — auto-update, release checks and repo root; "
+                "`timezone America/New_York` — the zone agents and plain-text times use",
+                "`settings` — auto-update, release checks, repo root and timezone; "
                 "`auto-update on` / `auto-update off` switches auto-update directly",
                 "`help` — this list",
                 "",
@@ -6590,7 +6656,7 @@ class SlackTeamController:
         show_loading: bool = False,
         fresh: bool = False,
     ) -> str:
-        day = day_string("today")
+        day = day_string("today", self._user_timezone())
         setting_key = f"{SETTING_USAGE_TS_PREFIX}{day}"
         ts = None if fresh else self.store.get_setting(setting_key)
         if show_loading and (
@@ -6616,8 +6682,9 @@ class SlackTeamController:
         return posted.ts
 
     def _status_payload(self, day: str) -> tuple[str, list[dict]]:
-        snapshots = collect_daily_usage(day, home=self.home)
-        weekly = collect_weekly_usage(day, home=self.home)
+        timezone = self._user_timezone()
+        snapshots = collect_daily_usage(day, home=self.home, timezone=timezone)
+        weekly = collect_weekly_usage(day, home=self.home, timezone=timezone)
         quota = self._claude_quota()
         sign_ins = read_claude_sign_ins(self.home)
         now = utc_now()
@@ -6639,8 +6706,9 @@ class SlackTeamController:
             session_label=self._usage_session_label,
             now=now,
         )
-        local_day = now.astimezone()
-        day_text = f"{local_day.strftime('%A, %b')} {local_day.day}"
+        # Name the day the usage was bucketed by, not the machine's local day.
+        usage_day = date.fromisoformat(day)
+        day_text = f"{usage_day.strftime('%A, %b')} {usage_day.day}"
         return text, build_status_blocks(accounts, day_text=day_text, updated_at=now)
 
     def _claude_quota(self) -> ClaudeQuota | None:
@@ -6870,6 +6938,8 @@ class SlackTeamController:
             last_checked_at=last_checked_at,
             update_available=update_available,
             available=runner is not None,
+            timezone=self._user_timezone(),
+            timezone_source=self.store.get_setting(SETTING_USER_TIMEZONE_SOURCE),
         )
 
     def post_settings(self, target: SlackReplyTarget) -> str:
@@ -6947,6 +7017,19 @@ class SlackTeamController:
                 "Checking for a new release. An update card appears in the channel if one is out.",
             )
             return
+        if action == "settings.timezone.open":
+            if not trigger_id:
+                self._post_text(target, "Use `timezone <IANA name>` to change the timezone.")
+                return
+            self.gateway.open_view(
+                trigger_id,
+                build_timezone_modal(
+                    self._user_timezone(),
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                ),
+            )
+            return
         if action == "settings.repo_root.open":
             if not trigger_id:
                 self._post_text(target, "Use `repo root <path>` to change the repo root.")
@@ -6960,6 +7043,46 @@ class SlackTeamController:
                     message_ts=message_ts,
                 ),
             )
+
+    def _handle_timezone_settings_submission(self, payload: dict) -> dict | None:
+        view = payload.get("view") or {}
+        values = view.get("state", {}).get("values", {})
+        timezone = normalize_timezone(_view_plain_value(values, "timezone", "value"))
+        if timezone is None:
+            return _view_errors(
+                "timezone", "Use an IANA timezone name such as America/New_York or UTC."
+            )
+        set_user_timezone(self.store, timezone, TIMEZONE_SOURCE_MANUAL)
+        try:
+            metadata = json.loads(view.get("private_metadata") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        channel_id = metadata.get("channel_id") if isinstance(metadata, dict) else None
+        message_ts = metadata.get("message_ts") if isinstance(metadata, dict) else None
+        if isinstance(channel_id, str) and isinstance(message_ts, str):
+            self._refresh_settings_message(channel_id, message_ts)
+        return None
+
+    def _handle_timezone_command(self, command: TimezoneCommand, target: SlackReplyTarget) -> None:
+        if command.timezone is None:
+            current = self._user_timezone()
+            if current is None:
+                self._post_text(
+                    target, "No timezone is set. Use `timezone America/New_York` to set one."
+                )
+            else:
+                self._post_text(target, f"Timezone: `{timezone_label(current)}`")
+            return
+        timezone = normalize_timezone(command.timezone)
+        if timezone is None:
+            self._post_text(
+                target,
+                f"`{command.timezone}` is not a timezone I know. Use an IANA name such as "
+                "`America/New_York`, `Europe/London`, or `UTC`.",
+            )
+            return
+        set_user_timezone(self.store, timezone, TIMEZONE_SOURCE_MANUAL)
+        self._post_text(target, f"Timezone set to `{timezone_label(timezone)}`.")
 
     def _handle_repo_root_settings_submission(self, payload: dict) -> dict | None:
         view = payload.get("view") or {}
@@ -7259,7 +7382,7 @@ class SlackTeamController:
                     next_run_at=run_at,
                     recurrence={},
                     timezone=None,
-                    description=f"once at {_format_schedule_timestamp(run_at)}",
+                    description=f"once at {self._schedule_time(run_at)}",
                     requested_by_slack_user=requested_by,
                 )
 
@@ -7430,7 +7553,9 @@ class SlackTeamController:
             timezone=timezone,
             requested_by_slack_user=requested_by_slack_user,
         )
-        text = _format_scheduled_work_ack(scheduled, description, request)
+        text = _format_scheduled_work_ack(
+            scheduled, description, request, timezone=self._user_timezone()
+        )
         if not self._try_update_message(thread.channel_id, thread.thread_ts, text):
             self.gateway.post_thread_reply(thread, text)
         self.refresh_or_post_roster(channel_id)
@@ -7460,6 +7585,7 @@ class SlackTeamController:
             deferred,
             deferred.description or f"after @{dependency.handle} finishes",
             request,
+            timezone=self._user_timezone(),
             dependency_labeler=self._agent_busy_dependency_label,
         )
         if not self._try_update_message(thread.channel_id, thread.thread_ts, text):
@@ -8134,7 +8260,7 @@ class SlackTeamController:
             resolved_spec,
             next_run_text=slack_loop_time(
                 resolved_spec.next_run_at,
-                resolved_spec.timezone,
+                self._display_timezone(resolved_spec.timezone),
             ),
             include_actions=False,
             footer=footer,
@@ -8216,7 +8342,12 @@ class SlackTeamController:
                 return
             self.gateway.open_view(
                 trigger_id,
-                _schedule_change_modal(scheduled, channel_id=channel_id, message_ts=message_ts),
+                _schedule_change_modal(
+                    scheduled,
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                    timezone=self._user_timezone(),
+                ),
             )
 
     def _handle_schedule_change_submission(
@@ -8282,7 +8413,7 @@ class SlackTeamController:
                 SlackThreadRef(updated.channel_id, updated.thread_ts),
                 (
                     f"Changed schedule `{schedule_id}`. "
-                    f"Next run: `{_format_schedule_timestamp(updated.next_run_at)}`."
+                    f"Next run: `{self._schedule_time(updated.next_run_at)}`."
                 ),
             )
             channel_id = metadata.get("channel_id")
@@ -8309,7 +8440,7 @@ class SlackTeamController:
             self.gateway.update_message(
                 channel_id,
                 message_ts,
-                _scheduled_tasks_text(scheduled),
+                _scheduled_tasks_text(scheduled, timezone=self._user_timezone()),
                 blocks=self._scheduled_tasks_blocks(scheduled),
             )
         except Exception:
@@ -10149,6 +10280,7 @@ class SlackTeamController:
                 scheduled,
                 parsed.schedule.description,
                 parsed.schedule.request,
+                timezone=self._user_timezone(),
             ),
             persona=agent,
             icon_url=self._agent_icon_url(agent),
@@ -10196,6 +10328,7 @@ class SlackTeamController:
             [item.handle for item in active_agents],
             now=utc_now(),
             validation_error=error,
+            timezone=self._user_timezone(),
         )
         metadata = dict(task.metadata)
         metadata[SCHEDULE_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
@@ -10256,6 +10389,7 @@ class SlackTeamController:
                 deferred,
                 parsed.deferred.description,
                 parsed.deferred.request,
+                timezone=self._user_timezone(),
                 dependency_labeler=self._agent_busy_dependency_label,
             ),
             persona=agent,
@@ -10321,6 +10455,7 @@ class SlackTeamController:
             occupied=occupied,
             now=utc_now(),
             validation_error=error,
+            timezone=self._user_timezone(),
         )
         metadata = dict(task.metadata)
         metadata[DEFERRED_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
@@ -11089,6 +11224,7 @@ class SlackTeamController:
             extension_context=extension_context,
             prior_plan_summary=prior_summary if (replan_context or extension_known_ids) else None,
             agent_models=_pm_worker_model_map(available_workers),
+            timezone=self._user_timezone(),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_ATTEMPTS_METADATA_KEY] = attempts + 1
@@ -11212,6 +11348,7 @@ class SlackTeamController:
             replan_context=replan_body or None,
             prior_plan_summary=prior_summary,
             agent_models=_pm_worker_model_map(available_workers),
+            timezone=self._user_timezone(),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_METADATA_KEY] = True
@@ -11362,6 +11499,7 @@ class SlackTeamController:
             extension_context=extension_body,
             prior_plan_summary=prior_summary,
             agent_models=_pm_worker_model_map(available_workers),
+            timezone=self._user_timezone(),
         )
         metadata = dict(task.metadata)
         metadata[PM_RESOLUTION_METADATA_KEY] = True
@@ -12008,7 +12146,7 @@ class SlackTeamController:
             promoted += 1
             self.gateway.post_thread_reply(
                 SlackThreadRef(row.channel_id, row.thread_ts),
-                _format_deferred_ready_message(updated),
+                _format_deferred_ready_message(updated, timezone=self._user_timezone()),
             )
             self._refresh_pm_status_for_deferred(row.deferred_id)
             promoted_channels.add(row.channel_id)
@@ -13065,7 +13203,10 @@ class SlackTeamController:
         self.store.set_setting(SETTING_HUMAN_USER_ID, user_id)
         display_name = _profile_display_name(profile)
         image_url = _profile_image_url(profile)
-        if display_name is None or image_url is None:
+        # First sight of the owner (setup) infers their timezone from their Slack profile.
+        needs_timezone = configured_timezone(self.store) is None
+        slack_profile = None
+        if display_name is None or image_url is None or needs_timezone:
             try:
                 slack_profile = self.gateway.user_profile(user_id)
             except Exception:
@@ -13074,6 +13215,8 @@ class SlackTeamController:
             if slack_profile:
                 display_name = display_name or slack_profile.display_name
                 image_url = image_url or slack_profile.image_url
+        if needs_timezone:
+            self._remember_inferred_timezone(getattr(slack_profile, "timezone", None))
         if display_name:
             self.store.set_setting(HUMAN_DISPLAY_NAME_SETTING, display_name)
             self.store.set_setting(_human_user_display_name_key(user_id), display_name)
@@ -15284,17 +15427,19 @@ def _format_scheduled_work_ack(
     scheduled: ScheduledWork,
     description: str,
     request: WorkRequest,
+    *,
+    timezone: str | None,
 ) -> str:
     target = "somebody"
     if request.assignment_mode == AssignmentMode.SPECIFIC and request.requested_handle:
         target = f"@{request.requested_handle}"
     return (
         f"Scheduled: {target} `{_shorten(request.prompt, 120)}`; {description}; "
-        f"next `{_format_schedule_timestamp(scheduled.next_run_at)}`."
+        f"next `{_format_schedule_timestamp(scheduled.next_run_at, timezone)}`."
     )
 
 
-def _scheduled_tasks_text(scheduled: list[ScheduledWork]) -> str:
+def _scheduled_tasks_text(scheduled: list[ScheduledWork], *, timezone: str | None) -> str:
     if not scheduled:
         return "Scheduled tasks: none."
     lines = [f"Scheduled tasks: {len(scheduled)} active"]
@@ -15302,18 +15447,18 @@ def _scheduled_tasks_text(scheduled: list[ScheduledWork]) -> str:
         lines.append(
             f"- `{item.schedule_id}` {_scheduled_work_target_text(item)} "
             f"`{_shorten(item.prompt, 80)}`; {_format_scheduled_work_schedule(item)}; "
-            f"next run `{_format_schedule_timestamp(item.next_run_at)}`"
+            f"next run `{_format_schedule_timestamp(item.next_run_at, timezone)}`"
         )
     return "\n".join(lines)
 
 
-def _scheduled_work_block_text(scheduled: ScheduledWork) -> str:
+def _scheduled_work_block_text(scheduled: ScheduledWork, *, timezone: str | None) -> str:
     return "\n".join(
         [
             f"*`{scheduled.schedule_id}`*  {_scheduled_work_target_text(scheduled)}",
             f"*Task:* {_shorten(scheduled.prompt, 220)}",
             f"*Schedule:* {_format_scheduled_work_schedule(scheduled)}",
-            f"*Next run:* `{_format_schedule_timestamp(scheduled.next_run_at)}`",
+            f"*Next run:* `{_format_schedule_timestamp(scheduled.next_run_at, timezone)}`",
             f"*Status:* {scheduled.status.value}",
         ]
     )
@@ -15345,8 +15490,15 @@ def _format_scheduled_work_schedule(scheduled: ScheduledWork) -> str:
     return "recurring"
 
 
-def _format_schedule_timestamp(value) -> str:
-    return value.isoformat(timespec="minutes")
+def _format_schedule_timestamp(value: datetime, timezone: str | None) -> str:
+    """A schedule time for people to read, in the owner's zone with its label."""
+    return format_user_time(value, timezone)
+
+
+def _schedule_input_timestamp(value: datetime, timezone: str | None) -> str:
+    """An editable ISO time in the owner's zone; its offset keeps it unambiguous."""
+    zone = zone_for(timezone) or UTC
+    return value.astimezone(zone).isoformat(timespec="minutes")
 
 
 def _work_request_from_deferred_work(deferred: DeferredWork) -> WorkRequest:
@@ -15363,10 +15515,10 @@ def _work_request_from_deferred_work(deferred: DeferredWork) -> WorkRequest:
     )
 
 
-def _deferred_work_roster_detail(deferred: DeferredWork) -> str:
+def _deferred_work_roster_detail(deferred: DeferredWork, *, timezone: str | None) -> str:
     if deferred.status == DeferredWorkStatus.READY:
         status_text = (
-            f"ready; starts `{_format_schedule_timestamp(deferred.fire_at)}`"
+            f"ready; starts `{_format_schedule_timestamp(deferred.fire_at, timezone)}`"
             if deferred.fire_at is not None
             else "ready"
         )
@@ -15385,6 +15537,7 @@ def _format_deferred_work_ack(
     description: str,
     request: WorkRequest,
     *,
+    timezone: str | None,
     dependency_labeler: Callable[[str | None], str] | None = None,
 ) -> str:
     target = "somebody"
@@ -15403,7 +15556,7 @@ def _format_deferred_work_ack(
     if deferred.after_dep_delay_seconds:
         timing = f" then wait {deferred.after_dep_delay_seconds}s"
     elif deferred.run_at is not None:
-        timing = f" then at {_format_schedule_timestamp(deferred.run_at)}"
+        timing = f" then at {_format_schedule_timestamp(deferred.run_at, timezone)}"
     return (
         f"Deferred: {target} will run `{request.prompt}` "
         f"{description}.{timing}\nWaiting on:\n{deps_text}"
@@ -15765,11 +15918,13 @@ def _pm_subtask_parent_blocks(text: str) -> list[dict]:
     ]
 
 
-def _format_deferred_ready_message(deferred: DeferredWork) -> str:
-    fire_at = _format_schedule_timestamp(deferred.fire_at) if deferred.fire_at else "shortly"
+def _format_deferred_ready_message(deferred: DeferredWork, *, timezone: str | None) -> str:
+    if deferred.fire_at is None:
+        start = "Starting shortly."
+    else:
+        start = f"Starting at `{_format_schedule_timestamp(deferred.fire_at, timezone)}`."
     return (
-        f"Dependencies for deferred task `{_shorten(deferred.prompt, 180)}` are satisfied. "
-        f"Starting at `{fire_at}` UTC."
+        f"Dependencies for deferred task `{_shorten(deferred.prompt, 180)}` are satisfied. {start}"
     )
 
 
@@ -16257,6 +16412,7 @@ def _schedule_change_modal(
     *,
     channel_id: str,
     message_ts: str | None,
+    timezone: str | None,
 ) -> dict:
     metadata = json.dumps(
         {
@@ -16285,7 +16441,7 @@ def _schedule_change_modal(
             "element": {
                 "type": "plain_text_input",
                 "action_id": "value",
-                "initial_value": _format_schedule_timestamp(scheduled.next_run_at),
+                "initial_value": _schedule_input_timestamp(scheduled.next_run_at, timezone),
                 "placeholder": {"type": "plain_text", "text": "2026-05-16T17:00:00-05:00"},
             },
         },

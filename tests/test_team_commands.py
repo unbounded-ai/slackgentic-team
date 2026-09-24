@@ -13,6 +13,7 @@ from agent_harness.team.commands import (
     RosterCommand,
     ScheduledTasksCommand,
     SettingsCommand,
+    TimezoneCommand,
     UnassignedExternalSessionsCommand,
     parse_team_command,
 )
@@ -110,6 +111,19 @@ class HelpAndSessionPhrasingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(parse_team_command(text), expected)
 
+    def test_parse_timezone(self):
+        for text, expected in (
+            ("timezone", TimezoneCommand()),
+            ("show my timezone", TimezoneCommand()),
+            ("what is my timezone?", TimezoneCommand()),
+            ("timezone America/New_York", TimezoneCommand("America/New_York")),
+            ("set timezone to Europe/Berlin", TimezoneCommand("Europe/Berlin")),
+            ("time zone: UTC", TimezoneCommand("UTC")),
+            ("set timezone mars", TimezoneCommand("mars")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_team_command(text), expected)
+
     def test_near_misses_are_not_commands(self):
         for text in (
             "helpful stuff",
@@ -118,6 +132,8 @@ class HelpAndSessionPhrasingTests(unittest.TestCase):
             "sessions are slow",
             "settings are confusing",
             "auto-update broke again",
+            "timezone bug",
+            "timezone is wrong on the dashboard",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_team_command(text))
