@@ -462,7 +462,7 @@ class PureLoopLogicTests(unittest.TestCase):
         assert summary.headline is not None
         self.assertEqual(len(summary.headline), loop_logic.LOOP_HEADLINE_MAX_CHARS)
         self.assertTrue(summary.headline.startswith("Dev clean xxx"))
-        self.assertTrue(summary.headline.endswith(loop_logic.LOOP_HEADLINE_TRUNCATED_MARKER))
+        self.assertTrue(summary.headline.endswith(loop_logic.LOOP_TRUNCATED_MARKER))
         self.assertEqual(summary.headline_overflow_chars, len(long_headline))
         restored = loop_logic.loop_summary_from_json(json.dumps(summary.to_payload()))
         self.assertEqual(restored, summary)
@@ -484,6 +484,68 @@ class PureLoopLogicTests(unittest.TestCase):
         )
         self.assertIn(f"previous run's headline was {len(long_headline)} characters", prompt)
         self.assertIn("count the characters before you emit", prompt)
+
+    def test_over_long_text_fields_are_truncated_instead_of_rejected(self):
+        prefix = loop_logic.AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+        marker = loop_logic.LOOP_TRUNCATED_MARKER
+        field_limit = loop_logic.LOOP_METRIC_FIELD_MAX_CHARS
+        parsed = loop_logic.parse_agent_loop_summary_signal(
+            prefix
+            + json.dumps(
+                {
+                    "summary": "s" * (loop_logic.LOOP_SUMMARY_MAX_CHARS + 1),
+                    "report": "r" * (loop_logic.LOOP_REPORT_MAX_CHARS + 1),
+                    "metrics": [
+                        {"label": "Calls", "value": "7", "delta": "d" * (field_limit + 1)},
+                        {"label": "l" * (field_limit + 1), "value": "8", "delta": "+1"},
+                    ],
+                }
+            )
+        )
+
+        summary = parsed.summary
+        assert summary is not None
+        self.assertIsNone(parsed.error)
+        self.assertEqual(len(summary.summary), loop_logic.LOOP_SUMMARY_MAX_CHARS)
+        self.assertTrue(summary.summary.endswith(marker))
+        assert summary.report is not None
+        self.assertEqual(len(summary.report), loop_logic.LOOP_REPORT_MAX_CHARS)
+        self.assertTrue(summary.report.endswith(marker))
+        delta = summary.metrics[0].delta
+        assert delta is not None
+        self.assertEqual(len(delta), field_limit)
+        self.assertTrue(delta.endswith(marker))
+        self.assertTrue(summary.metrics[1].label.endswith(marker))
+        self.assertEqual(summary.metrics[1].delta, "+1")
+        self.assertEqual(
+            summary.truncated_fields, ("summary", "report", "metric delta", "metric label")
+        )
+        restored = loop_logic.loop_summary_from_json(json.dumps(summary.to_payload()))
+        self.assertEqual(restored, summary)
+        exact = loop_logic.parse_agent_loop_summary_signal(
+            prefix
+            + json.dumps({"summary": "ok", "metrics": [{"label": "a", "value": "v" * field_limit}]})
+        ).summary
+        assert exact is not None
+        self.assertEqual(exact.truncated_fields, ())
+
+        loop = SimpleNamespace(
+            title="Example Watch",
+            mission="Report on example metrics.",
+            recurrence={"frequency": "daily", "time": "09:00"},
+            timezone="UTC",
+            metadata={},
+        )
+        run = SimpleNamespace(run_number=4, due_at=datetime(2026, 1, 5, 9, tzinfo=UTC))
+        prompt = loop_logic.build_loop_run_prompt(
+            loop,
+            run,
+            journal_rendered="(memory)",
+            now=datetime(2026, 1, 5, 9, tzinfo=UTC),
+            previous_truncated_fields=("metric delta",),
+        )
+        self.assertIn(f"at most {field_limit} characters each", prompt)
+        self.assertIn("marked them truncated: metric delta.", prompt)
 
     def test_over_long_carry_is_dropped_without_losing_the_summary(self):
         prefix = loop_logic.AGENT_LOOP_SUMMARY_SIGNAL_PREFIX

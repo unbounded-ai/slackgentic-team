@@ -47,6 +47,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY,
     RESTART_INTERRUPTED_NOTICE,
     RESTART_RESUMED_NOTICE,
+    ClaudeTurnText,
     ManagedTaskRuntime,
     RunningTask,
     _allowed_session_tools_for_claude_denial,
@@ -146,6 +147,46 @@ class OneShotProcess:
 
     def terminate(self):
         pass
+
+
+class ClaudeFinalWithResultProcess(OneShotProcess):
+    """A live Claude turn whose `result` event repeats the final assistant message."""
+
+    text = f'All clear.\nSLACKGENTIC: LOOP_SUMMARY {{"summary": "ok"}}\n{AGENT_THREAD_DONE_SIGNAL}'
+
+    def __init__(self, request):
+        super().__init__(request)
+        self.alive = True
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        # Counted on every call: a second read means the first batch was handled.
+        self.reads += 1
+        if self.reads == 1:
+            return (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": self.text}]},
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": self.text,
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.alive = False
 
 
 class DuplicateCodexFinalProcess(OneShotProcess):
@@ -1688,6 +1729,26 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(chunks, ["OK"])
         self.assertEqual(buffer, "")
+
+    def test_claude_result_repeating_the_final_assistant_text_is_rendered_once(self):
+        text = f"Done.\n{AGENT_THREAD_DONE_SIGNAL}"
+        assistant = json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+        )
+        result = json.dumps({"type": "result", "is_error": False, "result": text})
+        turn = ClaudeTurnText()
+
+        # The two events can arrive in separate reads; the turn state bridges them.
+        first, buffer = _process_output_chunks(Provider.CLAUDE, f"{assistant}\n", claude_turn=turn)
+        second, buffer = _process_output_chunks(
+            Provider.CLAUDE, f"{result}\n", buffer, claude_turn=turn
+        )
+
+        self.assertEqual(first, [text])
+        self.assertEqual(second, [])
+        # A result with no assistant text before it is the only copy, so it renders.
+        alone, _ = _process_output_chunks(Provider.CLAUDE, f"{result}\n", claude_turn=turn)
+        self.assertEqual(alone, [text])
 
     def test_claude_json_output_hides_permission_denial_result(self):
         line = json.dumps(
@@ -5251,6 +5312,47 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertEqual(seen, ["Final answer"])
             finally:
                 shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_handles_claude_final_control_lines_once(self):
+        # The `result` copy of a loop run's final message replayed THREAD_DONE after
+        # the harness had held it back for a summary fix, closing the run at once.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            runtime = None
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "run the loop", "C1")
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                signals = []
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=ClaudeFinalWithResultProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda task, agent, thread, signal: (
+                        signals.append(signal) or signal != AGENT_THREAD_DONE_SIGNAL
+                    ),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                running = runtime._get_running(task.task_id)
+                assert running is not None
+                self.assertTrue(wait_until(lambda: running.process.reads >= 2))
+
+                self.assertEqual(gateway.replies, ["All clear."])
+                self.assertEqual(
+                    signals,
+                    ['SLACKGENTIC: LOOP_SUMMARY {"summary": "ok"}', AGENT_THREAD_DONE_SIGNAL],
+                )
+                self.assertTrue(runtime.has_running_tasks())
+            finally:
+                if runtime is not None:
+                    shut_down_runtime(runtime)
                 store.close()
 
     def test_runtime_hides_agent_control_signal_and_notifies_callback(self):

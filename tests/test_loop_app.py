@@ -20,9 +20,11 @@ from agent_harness.loops import (
     LOOP_CARRY_MAX_CHARS,
     LOOP_COMPACT_SNAPSHOT_MAX_CHARS,
     LOOP_COMPACTION_TRIGGER_CHARS,
+    LOOP_METRIC_FIELD_MAX_CHARS,
     LOOP_THREAD_ROLLOVER_PENDING_KEY,
     LOOP_THREAD_ROLLOVER_RUNS_KEY,
     LOOP_THREAD_RUN_COUNT_KEY,
+    LOOP_TRUNCATED_MARKER,
     build_loop_compaction_prompt,
     build_loop_fetch_result,
     build_loop_resolution_prompt,
@@ -3026,6 +3028,45 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("🔕 quiet", str(panel["blocks"]))
         self.assertIn("✅ last check", str(panel["blocks"]))
         self.assertEqual([r for r in self.gateway.reactions if r[1] == loop.charter_message_ts], [])
+
+    def test_quiet_all_clear_run_with_an_over_long_field_still_posts_nothing(self):
+        loop = self._activate_quiet_loop()
+        posts_before = len(self.gateway.posts)
+        replies_before = len(self.gateway.thread_replies)
+        self.controller.fire_loop_now(loop)
+        task, agent, run, _ = self._running_task_and_run(loop)
+        thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+        sent_before = len(self.runtime.sent)
+        long_delta = "+12% vs prev h (612); 434 prober rollout probe, 232 CLI tests"
+        self.assertGreater(len(long_delta), LOOP_METRIC_FIELD_MAX_CHARS)
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "summary": "No errors.",
+                    "headline": "No errors",
+                    "status": "ok",
+                    "metrics": [{"label": "Gateway 401s", "value": "686", "delta": long_delta}],
+                }
+            ),
+        )
+        self.controller.handle_runtime_task_done(task, agent, thread)
+
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None and finished.summary_json
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        payload = json.loads(finished.summary_json)
+        self.assertTrue(payload["metrics"][0]["delta"].endswith(LOOP_TRUNCATED_MARKER))
+        self.assertEqual(payload["truncated_fields"], ["metric delta"])
+        # Nothing reaches the channel or the agent beyond an all-clear run's usual log.
+        self.assertEqual(self.gateway.posts[posts_before:], [])
+        log = self.gateway.thread_replies[replies_before:]
+        self.assertEqual([item["text"] for item in log], [f"✅ Run #{run.run_number} · No errors"])
+        self.assertEqual(self.runtime.sent[sent_before:], [])
 
     def test_quiet_loop_posts_a_single_notifying_card_when_something_is_wrong(self):
         loop = self._activate_quiet_loop()

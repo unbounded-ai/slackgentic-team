@@ -389,8 +389,8 @@ not session reuse.
 Run prompts combine the standing mission with a bounded journal snapshot. The
 agent records a validated `LOOP_SUMMARY` whose optional `headline`, `report`,
 and `metrics` fields are rendered into the run's parent message when the run
-finishes (a headline over 150 characters is cut and marked truncated rather than
-rejected, and the next run's prompt says so), so the report is the first thing in the channel and the thread keeps
+finishes (a summary, headline, report, or metric field over its limit is cut and
+marked truncated rather than rejected, and the next run's prompt says so), so the report is the first thing in the channel and the thread keeps
 only working notes. Generic task headers never rewrite a loop-owned parent
 message. The pinned panel is re-rendered on every run and configuration change.
 New loops default to `read-only`: Claude runs with the loop guard
