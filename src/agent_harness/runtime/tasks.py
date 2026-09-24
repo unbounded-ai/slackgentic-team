@@ -533,6 +533,21 @@ class ManagedTaskRuntime:
     def is_task_running(self, task_id: str) -> bool:
         return self._get_running(task_id) is not None
 
+    def task_idle_seconds(self, task_id: str) -> float | None:
+        """How long a live worker has waited for input since its turn ended.
+
+        None while the worker is working, stopping, or gone. Transcript activity,
+        such as a background command finishing, counts as work."""
+        running = self._get_running(task_id)
+        if (
+            running is None
+            or running.stop_requested
+            or not running.turn_complete
+            or not running.process.is_alive()
+        ):
+            return None
+        return max(0.0, time.monotonic() - running.last_activity_monotonic)
+
     def stop_all_running_tasks(
         self,
         status: AgentTaskStatus | None = AgentTaskStatus.CANCELLED,
