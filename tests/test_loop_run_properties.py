@@ -67,7 +67,6 @@ from agent_harness.runtime.tasks import (
 )
 from agent_harness.slack.app import (
     LOOP_RUN_STRANDED_GRACE,
-    LOOP_THREAD_DONE_DEFER_GRACE,
     SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX,
     LoopRunner,
     SlackTeamController,
@@ -888,10 +887,6 @@ class LoopLifecycle(RuleBasedStateMachine):
     def time_passes(self):
         self.runtime.let_time_pass()
         for run in self._all_runs():
-            key = f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run.run_id}"
-            if self.store.get_setting(key):
-                past = utc_now() - LOOP_THREAD_DONE_DEFER_GRACE - timedelta(seconds=1)
-                self.store.set_setting(key, past.isoformat())
             if run.status == LoopRunStatus.RUNNING and run.task_id:
                 task = self.store.get_agent_task(run.task_id)
                 if task is not None:

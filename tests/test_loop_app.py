@@ -62,8 +62,6 @@ from agent_harness.slack import build_loop_edit_modal, encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
     LOOP_RUN_IDLE_GRACE,
-    LOOP_THREAD_DONE_DEFER_GRACE,
-    SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX,
     SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
     LoopRunner,
     SlackMessageBackfill,
@@ -1748,22 +1746,21 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
         self.runtime.running_task_ids.add(task.task_id)
 
+        # The agent reads the feedback, answers nothing, and waits for input.
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds() - 1)
         self.controller.reconcile_loop_runs()
         still_waiting = self.store.get_loop_run(run.run_id)
         assert still_waiting is not None
         self.assertEqual(still_waiting.status, LoopRunStatus.RUNNING)
 
-        self.store.set_setting(
-            f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run.run_id}",
-            (utc_now() - LOOP_THREAD_DONE_DEFER_GRACE - timedelta(seconds=1)).isoformat(),
-        )
-        sent_before = len(self.runtime.sent)
+        # Once past the grace it gets one plain summary request, then the run ends.
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds())
+        self.controller.reconcile_loop_runs()
         self.controller.reconcile_loop_runs()
 
         finished = self.store.get_loop_run(run.run_id)
         assert finished is not None
         self.assertEqual(finished.status, LoopRunStatus.DONE)
-        self.assertEqual(self.runtime.sent[sent_before:], [])
 
     # Regressions found by the loop property suite (tests/test_loop_run_properties.py).
 

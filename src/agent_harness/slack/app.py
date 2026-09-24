@@ -454,8 +454,6 @@ SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
 SETTING_LOOP_SIGNAL_RETRY_PREFIX = "slack.loop_signal_retry."
 # When a loop run's THREAD_DONE was held back so the agent could answer that feedback.
 SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX = "slack.loop_thread_done_deferred."
-# How long a held-back THREAD_DONE waits for the agent's fix before the run is closed.
-LOOP_THREAD_DONE_DEFER_GRACE = timedelta(minutes=10)
 # How long a loop run's worker may wait for input after its turn ended before the
 # harness steps in. Claude idles on stdin after each turn, so a run whose agent
 # never said THREAD_DONE would otherwise stay open and skip every later run.
@@ -3916,7 +3914,7 @@ class SlackTeamController:
         the run finished without its report. The fix does not close the run by
         itself, since more control lines may follow it in the same message; the
         agent ends the run again with THREAD_DONE, and reconcile_loop_runs closes
-        it if the agent never does."""
+        it once the worker sits idle if the agent never does."""
         run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
         loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
         if self.runtime is None or not isinstance(run_id, str) or not isinstance(loop_id, str):
@@ -4682,12 +4680,6 @@ class SlackTeamController:
                 return True
             return False
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
-            deferred_at = self._loop_thread_done_deferred_at(current.run_id)
-            if deferred_at is not None and utc_now() - deferred_at >= LOOP_THREAD_DONE_DEFER_GRACE:
-                # The agent already said it was done and never answered the
-                # feedback; close the run on what it recorded.
-                self._close_loop_run_now(task)
-                return True
             if self._loop_run_worker_idle(task):
                 loop = self.store.get_loop(current.loop_id)
                 if (
