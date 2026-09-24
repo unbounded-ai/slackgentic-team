@@ -774,6 +774,31 @@ class LoopLifecycle(RuleBasedStateMachine):
         )
         self._agent_turn(task_id, summary, compact, None, order, True)
 
+    def _worker_with_feedback(self) -> str | None:
+        for task_id in reversed(self._live_workers()):
+            if any(
+                message.startswith(("[LOOP HARNESS]", "Emit only the required"))
+                for message in self.runtime.inbox.get(task_id, [])
+            ):
+                return task_id
+        return None
+
+    @precondition(lambda self: self._worker_with_feedback() is not None)
+    @rule(
+        summary=st.sampled_from(["ok", "ok", "issue", "oversized_carry", "empty"]),
+        compact=st.sampled_from([None, "valid", "valid", "oversized"]),
+        compact_first=st.booleans(),
+        thread_done=st.sampled_from([True, True, True, False]),
+    )
+    def agent_answers_feedback(self, summary, compact, compact_first, thread_done):
+        """How agents usually answer the harness: the corrected lines, then done."""
+        task_id = self._worker_with_feedback()
+        assert task_id is not None
+        order = (
+            ["compact", "summary", "fetch"] if compact_first else ["summary", "compact", "fetch"]
+        )
+        self._agent_turn(task_id, summary, compact, None, order, thread_done)
+
     @precondition(
         lambda self: any(not self.runtime.unread(task_id) for task_id in self._live_workers())
     )
