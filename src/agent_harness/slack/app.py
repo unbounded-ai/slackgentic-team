@@ -6893,7 +6893,8 @@ class SlackTeamController:
         try:
             self.gateway.update_message(channel_id, ts, text, blocks=blocks)
         except Exception:
-            LOGGER.debug("failed to update Slack message %s in %s", ts, channel_id, exc_info=True)
+            # A failed card update leaves a stale card up in Slack; keep it visible.
+            LOGGER.warning("failed to update Slack message %s in %s", ts, channel_id, exc_info=True)
             return False
         return True
 
