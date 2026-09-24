@@ -76,7 +76,9 @@ from agent_harness.loops import (
     build_loop_resolution_prompt,
     build_loop_run_prompt,
     create_loop_agent,
+    default_loop_model,
     default_loop_provider,
+    describe_loop_engine,
     describe_loop_schedule,
     format_loop_timestamp,
     looks_like_loop_create_request,
@@ -643,6 +645,17 @@ class SlackTeamController:
         self._slack_message_lock = threading.Lock()
         self._loop_fire_lock = threading.Lock()
         self._normalize_existing_agents()
+        self._backfill_loop_models()
+
+    def _backfill_loop_models(self) -> None:
+        """Loops created before models were explicit ran on the CLI's default; pin one."""
+        for provider in Provider:
+            try:
+                self.store.backfill_loop_models(
+                    provider, default_loop_model(provider, self.commands)
+                )
+            except Exception:
+                LOGGER.exception("failed to pin a model on existing %s loops", provider.value)
 
     def set_update_runner(self, update_runner: SlackgenticUpdateRunner | None) -> None:
         self.update_runner = update_runner
@@ -2299,6 +2312,27 @@ class SlackTeamController:
             cwd=cwd if cwd is not None else latest.cwd,
         )
 
+    def _set_loop_engine(self, loop: Loop, provider: Provider, model: str) -> None:
+        """Point future runs at ``provider`` and ``model``; a run in progress finishes as is."""
+        latest = self.store.get_loop(loop.loop_id) or loop
+        self.store.update_loop_identity(
+            latest.loop_id,
+            title=latest.title,
+            mission=latest.mission,
+            channel_name=latest.channel_name,
+            visibility=latest.visibility,
+            provider=provider,
+            model=model,
+            permission_mode=latest.permission_mode,
+            cwd=latest.cwd,
+        )
+        agent = self.store.get_team_agent(latest.agent_id)
+        if agent is not None and agent.provider_preference != provider:
+            self.store.upsert_team_agent(replace(agent, provider_preference=provider))
+        updated = self.store.get_loop(loop.loop_id) or latest
+        self._append_loop_system_entry(updated, f"now runs on {describe_loop_engine(updated)}")
+        self._refresh_loop_panel(updated)
+
     def _append_loop_system_entry(self, loop: Loop, content: str) -> None:
         self.store.add_loop_journal_entry(
             LoopJournalEntry(
@@ -2633,6 +2667,7 @@ class SlackTeamController:
             return True
         loop_id = f"loop_{uuid.uuid4().hex[:12]}"
         provider = request.provider or default_loop_provider(self.commands)
+        model = request.model or default_loop_model(provider, self.commands)
         existing_handles = {item.handle for item in self.store.list_team_agents(include_fired=True)}
         agent = provisional_loop_agent(
             provider=provider,
@@ -2657,7 +2692,7 @@ class SlackTeamController:
             created_at=now,
             updated_at=now,
             visibility=request.visibility,
-            model=request.model,
+            model=model,
             metadata={
                 "creation_request": request.description,
                 **({LOOP_QUIET_CHOICE_KEY: request.quiet} if request.quiet is not None else {}),
@@ -2677,9 +2712,8 @@ class SlackTeamController:
             LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY: 0,
             ASSIGNMENT_PROMPT_METADATA_KEY: request.description,
             "request_message_ts": event.get("ts"),
+            MODEL_OVERRIDE_METADATA_KEY: model,
         }
-        if request.model:
-            metadata[MODEL_OVERRIDE_METADATA_KEY] = request.model
         self.store.upsert_team_agent(agent)
         self.store.create_loop(loop)
         posted = self.gateway.post_thread_reply(thread, "🔁 Resolving your loop…")
@@ -2909,6 +2943,19 @@ class SlackTeamController:
             mode = PermissionMode(mode_value) if mode_value else loop.permission_mode
         except ValueError:
             return _view_errors("loop_permissions", "Choose a supported permission mode.")
+        provider_value = _view_selected_value(values, "loop_provider", "value")
+        try:
+            provider = Provider(provider_value) if provider_value else loop.provider
+        except ValueError:
+            return _view_errors("loop_provider", "Choose Claude or Codex.")
+        model_value = _view_plain_value(values, "loop_model", "value")
+        model = (loop.model or "") if model_value is None else model_value.strip()
+        if any(character.isspace() for character in model):
+            return _view_errors("loop_model", "Model names cannot contain whitespace.")
+        if not model or (provider != loop.provider and model == (loop.model or "")):
+            # A model name belongs to one provider, so switching picks the new default.
+            model = default_loop_model(provider, self.commands)
+        engine_changed = provider != loop.provider or model != loop.model
         cwd_value = (_view_plain_value(values, "loop_cwd", "value") or "").strip()
         cwd = None
         if cwd_value and cwd_value != (loop.cwd or ""):
@@ -2960,6 +3007,9 @@ class SlackTeamController:
                 self._append_loop_system_entry(
                     latest, f"run log now clears every {rollover_runs} quiet runs"
                 )
+                latest = self.store.get_loop(loop.loop_id) or latest
+            if engine_changed:
+                self._set_loop_engine(latest, provider, model)
                 latest = self.store.get_loop(loop.loop_id) or latest
             if cwd is not None:
                 self._update_loop_identity_values(latest, cwd=str(cwd))
@@ -3121,7 +3171,13 @@ class SlackTeamController:
                 provider = Provider(value.lower())
             except ValueError:
                 return None, "Provider must be `codex` or `claude`."
-            self._update_loop_preview_identity(loop, spec, provider=provider)
+            # A model name belongs to one provider, so switching picks the new default.
+            model = (
+                loop.model
+                if provider == loop.provider
+                else default_loop_model(provider, self.commands)
+            )
+            self._update_loop_preview_identity(loop, spec, provider=provider, model=model)
             return spec, None
         if field == "model":
             if any(character.isspace() for character in value):
@@ -4707,12 +4763,11 @@ class SlackTeamController:
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.DONE)
 
     def _format_loop_preview(self, loop: Loop, spec: LoopSpec) -> str:
-        model = f" · model `{loop.model}`" if loop.model else ""
         cwd = f"\n• Working directory: `{loop.cwd}`" if loop.cwd else ""
         return (
             f"*{spec.bot_name}* — ready to create\n"
             f"• Channel: `#{spec.channel_name}` ({loop.visibility.value}) · "
-            f"Provider: {loop.provider.value}{model}\n"
+            f"Runs on: {describe_loop_engine(loop)}\n"
             f"• Schedule: {spec.schedule_description} "
             f"(next run {format_loop_timestamp(spec.next_run_at, spec.timezone)})\n"
             f"• Permissions: {loop.permission_mode.value}{cwd}\n"

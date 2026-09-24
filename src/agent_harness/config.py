@@ -21,6 +21,9 @@ from agent_harness.updates import (
     DEFAULT_UPDATE_REPOSITORY,
 )
 
+DEFAULT_LOOP_CLAUDE_MODEL = "opus"
+DEFAULT_LOOP_CODEX_MODEL = "gpt-6-astra"
+
 
 class SlackConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -49,6 +52,13 @@ class AgentCommandConfig(BaseModel):
 
     codex_binary: str = Field(default="codex", validation_alias="SLACKGENTIC_CODEX_BINARY")
     claude_binary: str = Field(default="claude", validation_alias="SLACKGENTIC_CLAUDE_BINARY")
+    # Loops always run a named model; these fill it in when the owner does not pick one.
+    loop_claude_model: str = Field(
+        default=DEFAULT_LOOP_CLAUDE_MODEL, validation_alias="SLACKGENTIC_LOOP_CLAUDE_MODEL"
+    )
+    loop_codex_model: str = Field(
+        default=DEFAULT_LOOP_CODEX_MODEL, validation_alias="SLACKGENTIC_LOOP_CODEX_MODEL"
+    )
     codex_app_server_url: str | None = Field(
         default="ws://127.0.0.1:47684",
         validation_alias="SLACKGENTIC_CODEX_APP_SERVER_URL",

@@ -30,7 +30,9 @@ Before creating anything, make sure you know:
   (and notify) when a run finds something or fails. Default to quiet when the
   user says things like "only tell me when", "alert me if", or "ping me when".
 - Optional: `provider` (`claude` or `codex`) and `public` visibility. Loop
-  channels are private by default.
+  channels are private by default. Loops run on Claude unless the user asks for
+  Codex, and each loop is pinned to a named model (the provider's default unless
+  the request adds `model=<name>`); the owner can change either under Edit.
 
 Ask one short question only if the mission or schedule is genuinely missing.
 Do not ask about the name, channel, or emoji; Slackgentic chooses them.

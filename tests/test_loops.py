@@ -704,6 +704,9 @@ class PureLoopLogicTests(unittest.TestCase):
     def test_provider_default_timestamp_and_schedule_formatting(self):
         unavailable = SimpleNamespace(claude_binary="definitely-not-an-installed-command")
         self.assertEqual(loop_logic.default_loop_provider(unavailable), Provider.CODEX)
+        commands = SimpleNamespace(loop_claude_model="opus", loop_codex_model="example-model")
+        self.assertEqual(loop_logic.default_loop_model(Provider.CLAUDE, commands), "opus")
+        self.assertEqual(loop_logic.default_loop_model(Provider.CODEX, commands), "example-model")
         self.assertEqual(
             loop_logic.format_loop_timestamp(self.now, "America/Los_Angeles"),
             "Sun Aug 16, 9:00 AM PDT",
