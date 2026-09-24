@@ -1118,11 +1118,13 @@ def build_loop_run_prompt(
             *(
                 [
                     "Quiet loop: nothing appears in the channel unless this run needs the "
-                    "owner's attention. Do not post notes or progress at all. If everything is "
-                    "normal, use status ok with a one-line headline; the harness then posts "
-                    "nothing. Use found_issue (or failed) only for something worth a "
-                    "notification, and then keep the report short and specific. When an "
-                    "issue you reported has cleared, use status resolved, not found_issue.",
+                    "owner's attention. Nothing you write reaches Slack; the harness logs "
+                    "each run as one reply with your headline in the panel thread. If "
+                    "everything is normal, use status ok with a one-line headline; the "
+                    "harness then posts no card. Use found_issue (or failed) only for "
+                    "something worth a notification, and then keep the report short and "
+                    "specific. When an issue you reported has cleared, use status resolved, "
+                    "not found_issue.",
                     "Never notify twice about the same thing: keep the issues you already "
                     "reported in carry (signature, first seen, last reported level). An "
                     "ongoing, unchanged issue is status ok with a headline like 'still "

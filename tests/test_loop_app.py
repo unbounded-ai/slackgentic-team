@@ -33,8 +33,8 @@ from agent_harness.loops import (
     parse_agent_loop_signal,
 )
 from agent_harness.models import (
-    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
+    LOOP_QUIET_OUTPUT_METADATA_KEY,
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
@@ -2991,6 +2991,7 @@ class LoopCreationFlowTests(unittest.TestCase):
     def test_quiet_loop_all_clear_runs_post_nothing_to_the_channel(self):
         loop = self._activate_quiet_loop()
         posts_before = len(self.gateway.posts)
+        replies_before = len(self.gateway.thread_replies)
 
         self.controller.fire_loop_now(loop)
         task, agent, run, thread = self._running_task_and_run(loop)
@@ -3000,7 +3001,7 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("Quiet loop", task.prompt)
         self.assertIn("Never notify twice about the same thing", task.prompt)
         self.assertNotIn(LOOP_SILENT_OUTPUT_METADATA_KEY, task.metadata)
-        self.assertIs(task.metadata[LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY], True)
+        self.assertIs(task.metadata[LOOP_QUIET_OUTPUT_METADATA_KEY], True)
         self.controller.handle_runtime_agent_control(
             task,
             agent,
@@ -3013,6 +3014,10 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
 
         self.assertEqual(self.gateway.posts[posts_before:], [])
+        # The run log: one harness-written reply per run in the panel thread.
+        log = self.gateway.thread_replies[replies_before:]
+        self.assertEqual([item["text"] for item in log], [f"✅ Run #{run.run_number} · No errors"])
+        self.assertEqual(log[0]["thread"].thread_ts, loop.charter_message_ts)
         finished = self.store.get_loop_run(run.run_id)
         assert finished is not None
         self.assertEqual(finished.status, LoopRunStatus.DONE)
@@ -3025,6 +3030,7 @@ class LoopCreationFlowTests(unittest.TestCase):
     def test_quiet_loop_posts_a_single_notifying_card_when_something_is_wrong(self):
         loop = self._activate_quiet_loop()
         posts_before = len(self.gateway.posts)
+        replies_before = len(self.gateway.thread_replies)
         self.controller.fire_loop_now(loop)
         task, agent, run, _ = self._running_task_and_run(loop)
         thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
@@ -3052,6 +3058,14 @@ class LoopCreationFlowTests(unittest.TestCase):
         finished = self.store.get_loop_run(run.run_id)
         assert finished is not None
         self.assertEqual(finished.thread_ts, new_posts[0]["ts"])
+        log = self.gateway.thread_replies[replies_before:]
+        self.assertEqual(len(log), 1)
+        self.assertEqual(log[0]["thread"].thread_ts, loop.charter_message_ts)
+        self.assertEqual(
+            log[0]["text"],
+            f"⚠️ Run #{run.run_number} · 5xx errors up 12x in the last hour · "
+            f"<{self.gateway.permalink(loop.channel_id, new_posts[0]['ts'])}|report>",
+        )
 
     def test_quiet_loop_resolution_posts_a_check_mark_card(self):
         loop = self._activate_quiet_loop()
@@ -3068,6 +3082,7 @@ class LoopCreationFlowTests(unittest.TestCase):
     def test_quiet_loop_runtime_failures_are_reported(self):
         loop = self._activate_quiet_loop()
         posts_before = len(self.gateway.posts)
+        replies_before = len(self.gateway.thread_replies)
         self.controller.fire_loop_now(loop)
         task, agent, _, _ = self._running_task_and_run(loop)
         self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
@@ -3081,6 +3096,10 @@ class LoopCreationFlowTests(unittest.TestCase):
         new_posts = self.gateway.posts[posts_before:]
         self.assertEqual(len(new_posts), 1)
         self.assertEqual(new_posts[0]["blocks"][0]["status"], "error")
+        log = [item["text"] for item in self.gateway.thread_replies[replies_before:]]
+        self.assertEqual(len(log), 1)
+        self.assertTrue(log[0].startswith("🚫 Run #"), log[0])
+        self.assertIn("|report>", log[0])
 
     def test_quiet_mode_is_set_from_the_spec_and_shown_in_the_edit_modal(self):
         spec = parse_agent_loop_signal(

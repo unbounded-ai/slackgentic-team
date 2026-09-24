@@ -17,7 +17,7 @@ from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.loops import AGENT_LOOP_SIGNAL_PREFIX, LOOP_SIGNAL_PREFIXES_LONGEST_FIRST
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
-    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
+    LOOP_QUIET_OUTPUT_METADATA_KEY,
     LOOP_SILENT_OUTPUT_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -2499,9 +2499,9 @@ class TaskRuntimeTests(unittest.TestCase):
                 shut_down_runtime(runtime)
                 store.close()
 
-    def test_quiet_loop_runs_post_only_their_closing_comment(self):
-        # Quiet loop runs work in the pinned panel's thread: mid-run narration is
-        # withheld, but the comment sent with the closing control line is kept.
+    def test_quiet_loop_runs_post_none_of_the_agents_text(self):
+        # Quiet loop runs work in the pinned panel's thread, where the harness logs
+        # the run itself: narration is withheld, closing comment included.
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             try:
@@ -2509,7 +2509,7 @@ class TaskRuntimeTests(unittest.TestCase):
                 agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
                 store.upsert_team_agent(agent)
                 task = create_agent_task(agent, "quiet loop run", "C1")
-                task = replace(task, metadata={LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY: True})
+                task = replace(task, metadata={LOOP_QUIET_OUTPUT_METADATA_KEY: True})
                 store.upsert_agent_task(task)
                 gateway = FakeGateway()
                 runtime = ManagedTaskRuntime(
@@ -2539,7 +2539,8 @@ class TaskRuntimeTests(unittest.TestCase):
                     running,
                     'Run 21 found nothing unexpected.\nSLACKGENTIC: LOOP_SUMMARY {"summary": "ok"}',
                 )
-                self.assertEqual(gateway.replies, ["Run 21 found nothing unexpected."])
+                self.assertEqual(gateway.replies, [])
+                self.assertEqual(running.visible_message_count, 2)
             finally:
                 shut_down_runtime(runtime)
                 store.close()

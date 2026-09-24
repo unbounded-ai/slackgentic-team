@@ -22,13 +22,12 @@ from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.internal_notifications import filter_internal_task_notifications
 from agent_harness.loops import (
     AGENT_LOOP_SIGNAL_PREFIX,
-    AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
     LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,
 )
 from agent_harness.models import (
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
-    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_GUARD_LOG_METADATA_KEY,
+    LOOP_QUIET_OUTPUT_METADATA_KEY,
     LOOP_REFERENCE_DIR_METADATA_KEY,
     LOOP_SCRATCH_DIR_METADATA_KEY,
     LOOP_SILENT_OUTPUT_METADATA_KEY,
@@ -1118,12 +1117,10 @@ class ManagedTaskRuntime:
             running.progress_warning_monotonic = None
             handle_terminal_signals()
             return
-        if running.task.metadata.get(
-            LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY
-        ) is True and not _closes_loop_run(control_signals):
-            # Mid-run narration from a quiet loop run is withheld, not missing:
-            # count it so an exit without THREAD_DONE still finalizes the run
-            # instead of being cancelled as a silent exit.
+        if running.task.metadata.get(LOOP_QUIET_OUTPUT_METADATA_KEY) is True:
+            # A quiet loop run's narration is withheld, not missing (the harness
+            # logs the run itself): count it so an exit without THREAD_DONE still
+            # finalizes the run instead of being cancelled as a silent exit.
             running.visible_message_count += 1
             running.last_activity_monotonic = time.monotonic()
             running.progress_warning_monotonic = None
@@ -2515,15 +2512,6 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
 def _is_resolution_control_signal(signal: str) -> bool:
     normalized = re.sub(r"\s+", " ", signal.strip()).upper()
     return normalized.startswith((AGENT_SCHEDULE_SIGNAL_PREFIX, AGENT_LOOP_SIGNAL_PREFIX))
-
-
-def _closes_loop_run(signals: list[str]) -> bool:
-    """Whether a chunk carries the run's closing line, so its prose is the closing comment."""
-    return any(
-        signal == AGENT_THREAD_DONE_SIGNAL
-        or re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX)
-        for signal in signals
-    )
 
 
 def _is_loop_control_signal(signal: str) -> bool:
