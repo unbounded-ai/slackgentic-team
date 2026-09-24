@@ -17,6 +17,7 @@ from agent_harness.loops import (
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
     AGENT_LOOP_SIGNAL_PREFIX,
     AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
+    LOOP_CARRY_MAX_CHARS,
     LOOP_COMPACT_SNAPSHOT_MAX_CHARS,
     LOOP_COMPACTION_TRIGGER_CHARS,
     LOOP_THREAD_ROLLOVER_PENDING_KEY,
@@ -32,6 +33,7 @@ from agent_harness.loops import (
     parse_agent_loop_signal,
 )
 from agent_harness.models import (
+    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
     LOOP_RESOLUTION_ATTEMPTS_METADATA_KEY,
     LOOP_RESOLUTION_METADATA_KEY,
@@ -59,6 +61,8 @@ from agent_harness.runtime.tasks import ManagedTaskRuntime
 from agent_harness.slack import build_loop_edit_modal, encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
+    LOOP_THREAD_DONE_DEFER_GRACE,
+    SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX,
     SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
     LoopRunner,
     SlackMessageBackfill,
@@ -1622,6 +1626,287 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(finished.status, LoopRunStatus.DONE)
         entries = self.store.list_loop_journal(loop.loop_id)
         self.assertIn("completed without a summary", entries[-1].content)
+        card = [item for item in self.gateway.updates if item["ts"] == run.thread_ts][-1]
+        self.assertIn("No report", str(card["blocks"]))
+        self.assertIn("⚠️", str(card["blocks"]) + card["text"])
+        self.assertNotIn("✅", str(card["blocks"]) + card["text"])
+        self.assertEqual(self.controller._loop_run_emoji(finished), "⚠️")
+
+    def test_oversized_carry_keeps_the_report_and_asks_for_a_smaller_carry(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        carry = {"baselines": "x" * LOOP_CARRY_MAX_CHARS}
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps(
+                {
+                    "summary": "All clear.",
+                    "headline": "0 errors",
+                    "report": "- nothing unexpected",
+                    "carry": carry,
+                }
+            ),
+        )
+
+        recorded = self.store.get_loop_run(run.run_id)
+        assert recorded is not None and recorded.summary_json
+        payload = json.loads(recorded.summary_json)
+        self.assertEqual(payload["headline"], "0 errors")
+        self.assertEqual(payload["report"], "- nothing unexpected")
+        self.assertIsNone(payload["carry"])
+        self.assertEqual(payload["carry_overflow_chars"], len(json.dumps(carry)))
+        self.assertIn("dropped its carry", self.runtime.sent[-1][1])
+
+    def test_thread_done_after_rejected_summary_waits_for_the_fix(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":""}'
+        )
+
+        handled = self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+
+        self.assertFalse(handled)
+        self.assertNotIn(task.task_id, [task_id for task_id, _ in self.runtime.stopped])
+        waiting = self.store.get_loop_run(run.run_id)
+        assert waiting is not None
+        self.assertEqual(waiting.status, LoopRunStatus.RUNNING)
+
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"Fixed."}'
+        )
+        still_open = self.store.get_loop_run(run.run_id)
+        assert still_open is not None
+        self.assertEqual(still_open.status, LoopRunStatus.RUNNING)
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertIn(task.task_id, [task_id for task_id, _ in self.runtime.stopped])
+        self.assertIn("Fixed.", finished.summary_json or "")
+
+    def test_thread_done_without_summary_nudges_the_live_worker_first(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+
+        handled = self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+
+        self.assertFalse(handled)
+        self.assertNotIn(task.task_id, [task_id for task_id, _ in self.runtime.stopped])
+        self.assertIn(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX, self.runtime.sent[-1][1])
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"Late."}'
+        )
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+
+    def test_thread_done_is_held_back_only_once(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        for _ in range(2):
+            self.controller.handle_runtime_agent_control(
+                task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":""}'
+            )
+            done = self.controller.handle_runtime_agent_control(
+                task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+            )
+
+        self.assertTrue(done)
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+
+    def test_held_back_thread_done_is_closed_when_the_agent_never_answers(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":""}'
+        )
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+        self.runtime.running_task_ids.add(task.task_id)
+
+        self.controller.reconcile_loop_runs()
+        still_waiting = self.store.get_loop_run(run.run_id)
+        assert still_waiting is not None
+        self.assertEqual(still_waiting.status, LoopRunStatus.RUNNING)
+
+        self.store.set_setting(
+            f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run.run_id}",
+            (utc_now() - LOOP_THREAD_DONE_DEFER_GRACE - timedelta(seconds=1)).isoformat(),
+        )
+        sent_before = len(self.runtime.sent)
+        self.controller.reconcile_loop_runs()
+
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertEqual(self.runtime.sent[sent_before:], [])
+
+    # Regressions found by the loop property suite (tests/test_loop_run_properties.py).
+
+    def _quiet_thread(self, loop, task):
+        return SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+
+    def _finish_loop_run(self, loop, *, quiet=False, status="ok"):
+        task, agent, run, thread = self._running_task_and_run(loop)
+        if quiet:
+            thread = self._quiet_thread(loop, task)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps({"summary": f"Run {run.run_number}.", "status": status}),
+        )
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+        return task, agent, run, thread
+
+    def test_fixing_the_summary_does_not_settle_a_rejected_compaction(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            thread,
+            AGENT_LOOP_COMPACT_SIGNAL_PREFIX
+            + json.dumps({"snapshot": "x" * (LOOP_COMPACT_SNAPSHOT_MAX_CHARS + 1)}),
+        )
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"Clean."}'
+        )
+
+        handled = self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+
+        # The compaction feedback is still unread, so the run waits for it.
+        self.assertFalse(handled)
+        self.assertNotIn(task.task_id, [task_id for task_id, _ in self.runtime.stopped])
+
+    def test_a_fix_turn_keeps_every_line_it_sends(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+
+        # The answer to the nudge: a summary, then a snapshot in the same message.
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"Late."}'
+        )
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_COMPACT_SIGNAL_PREFIX + '{"snapshot":"memory"}'
+        )
+
+        self.assertTrue(
+            any(
+                entry.kind == "compaction" and entry.run_id == run.run_id
+                for entry in self.store.list_loop_journal(loop.loop_id, limit=100)
+            )
+        )
+        still_open = self.store.get_loop_run(run.run_id)
+        assert still_open is not None
+        self.assertEqual(still_open.status, LoopRunStatus.RUNNING)
+
+    def test_a_late_thread_done_from_an_old_quiet_run_spares_the_next_run(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        old_task, agent, _, thread = self._finish_loop_run(loop, quiet=True)
+        self.controller.fire_loop_now(loop)
+        new_task, _, new_run, _ = self._running_task_and_run(loop)
+        self.assertEqual(new_task.thread_ts, old_task.thread_ts)
+
+        # The old worker exits and its THREAD_DONE is replayed.
+        self.controller.handle_runtime_agent_control(
+            self.store.get_agent_task(old_task.task_id), agent, thread, "SLACKGENTIC: THREAD_DONE"
+        )
+
+        still_open = self.store.get_loop_run(new_run.run_id)
+        assert still_open is not None
+        self.assertEqual(still_open.status, LoopRunStatus.RUNNING)
+        self.assertNotIn(new_task.task_id, [task_id for task_id, _ in self.runtime.stopped])
+
+    def test_a_summary_in_a_compaction_run_is_ignored(self):
+        loop = self._activate_loop()
+        self.store.update_loop_metadata(loop.loop_id, {**loop.metadata, "compaction_pending": True})
+        LoopRunner(self.store, self.controller, poll_seconds=0.01).sync_once()
+        compacting = self.store.running_loop_run(loop.loop_id)
+        assert compacting is not None and compacting.task_id is not None
+        self.assertEqual(compacting.kind, LoopRunKind.COMPACTION)
+        task = self.store.get_agent_task(compacting.task_id)
+        agent = self.store.get_team_agent(loop.agent_id)
+        sent_before = len(self.runtime.sent)
+
+        self.controller.handle_runtime_agent_control(
+            task,
+            agent,
+            SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts),
+            AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+            + json.dumps({"summary": "Stray.", "carry": {"pad": "x" * LOOP_CARRY_MAX_CHARS}}),
+        )
+
+        self.assertEqual(self.runtime.sent[sent_before:], [])
+        unchanged = self.store.get_loop_run(compacting.run_id)
+        assert unchanged is not None
+        self.assertIsNone(unchanged.summary_json)
+
+    def test_an_owner_question_in_the_quiet_panel_thread_reaches_the_latest_run(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        self._finish_loop_run(loop, quiet=True)
+        self.controller.fire_loop_now(loop)
+        latest_task, _, _, _ = self._finish_loop_run(loop, quiet=True)
+
+        self._send_loop_command(
+            loop, "Anything new?", "400.000001", thread_ts=loop.charter_message_ts
+        )
+
+        self.assertEqual(self.runtime.sent[-1][0], latest_task.task_id)
+        self.assertIn("Anything new?", self.runtime.sent[-1][1])
+
+    def test_turning_quiet_off_mid_run_still_posts_the_runs_alert(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        _, _, run, _ = self._running_task_and_run(loop)
+        self._send_loop_command(loop, "loop quiet: off", "400.000002")
+        loud = self.store.get_loop(loop.loop_id)
+        assert loud is not None
+        self.assertFalse(loud.metadata.get("quiet"))
+        posts_before = len(self.gateway.posts)
+
+        self._finish_loop_run(loop, quiet=True, status="found_issue")
+
+        new_posts = self.gateway.posts[posts_before:]
+        self.assertEqual(len(new_posts), 1)
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.thread_ts, new_posts[0]["ts"])
 
     def test_spawn_failure_marks_run_failed(self):
         loop = self._activate_loop()
@@ -2663,6 +2948,8 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(thread.thread_ts, None)
         self.assertIn("Quiet loop", task.prompt)
         self.assertIn("Never notify twice about the same thing", task.prompt)
+        self.assertNotIn(LOOP_SILENT_OUTPUT_METADATA_KEY, task.metadata)
+        self.assertIs(task.metadata[LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY], True)
         self.controller.handle_runtime_agent_control(
             task,
             agent,

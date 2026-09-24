@@ -29,6 +29,9 @@ LOOP_GUARD_LOG_METADATA_KEY = "loop_guard_log"
 # Task metadata: the agent's visible text is dropped instead of posted to Slack
 # (memory compaction runs work without a thread of their own).
 LOOP_SILENT_OUTPUT_METADATA_KEY = "loop_silent_output"
+# Quiet loop runs post only the agent's closing comment (prose sent alongside its
+# LOOP_SUMMARY or THREAD_DONE line), never mid-run narration.
+LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY = "loop_final_output_only"
 MODEL_OVERRIDE_METADATA_KEY = "model_override"
 EXTERNAL_SESSION_DEPENDENCY_PREFIX = "external_session:"
 DEFERRED_WORK_DEPENDENCY_PREFIX = "deferred_work:"

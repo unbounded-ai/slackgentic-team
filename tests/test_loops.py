@@ -484,6 +484,58 @@ class PureLoopLogicTests(unittest.TestCase):
         self.assertIn(f"previous run's headline was {len(long_headline)} characters", prompt)
         self.assertIn("count the characters before you emit", prompt)
 
+    def test_over_long_carry_is_dropped_without_losing_the_summary(self):
+        prefix = loop_logic.AGENT_LOOP_SUMMARY_SIGNAL_PREFIX
+        carry = {"baselines": "x" * loop_logic.LOOP_CARRY_MAX_CHARS}
+        parsed = loop_logic.parse_agent_loop_summary_signal(
+            prefix
+            + json.dumps(
+                {"summary": "Kept.", "headline": "0 errors", "report": "- ok", "carry": carry}
+            )
+        )
+
+        summary = parsed.summary
+        assert summary is not None
+        self.assertIsNone(parsed.error)
+        self.assertEqual(summary.headline, "0 errors")
+        self.assertEqual(summary.report, "- ok")
+        self.assertIsNone(summary.carry)
+        self.assertEqual(summary.carry_overflow_chars, len(json.dumps(carry, sort_keys=True)))
+        self.assertEqual(summary.carry_chars, summary.carry_overflow_chars)
+        restored = loop_logic.loop_summary_from_json(json.dumps(summary.to_payload()))
+        self.assertEqual(restored, summary)
+
+    def test_run_prompt_states_the_carry_limit_and_warns_as_it_fills(self):
+        loop = SimpleNamespace(
+            title="Example Watch",
+            mission="Report on example metrics.",
+            recurrence={"frequency": "daily", "time": "09:00"},
+            timezone="UTC",
+            metadata={},
+        )
+        run = SimpleNamespace(run_number=4, due_at=datetime(2026, 1, 5, 9, tzinfo=UTC))
+        limit = loop_logic.LOOP_CARRY_MAX_CHARS
+
+        def prompt(previous_carry_chars):
+            return loop_logic.build_loop_run_prompt(
+                loop,
+                run,
+                journal_rendered="(memory)",
+                now=datetime(2026, 1, 5, 9, tzinfo=UTC),
+                previous_carry_chars=previous_carry_chars,
+            )
+
+        self.assertIn(f"at most {limit} characters as compact JSON", prompt(None))
+        self.assertNotIn("previous run's carry", prompt(None))
+        self.assertIn(f"previous run's carry was 1000 of {limit} characters.", prompt(1_000))
+        self.assertNotIn("Prune it", prompt(1_000))
+        near = int(limit * loop_logic.LOOP_CARRY_WARN_RATIO) + 1
+        self.assertIn(f"carry was {near} of {limit} characters. Prune it", prompt(near))
+        self.assertIn(
+            f"previous run's carry was {limit + 231} characters, over the {limit} limit",
+            prompt(limit + 231),
+        )
+
     def test_run_prompt_routes_final_report_into_summary_signal(self):
         loop = SimpleNamespace(
             title="Example Watch",

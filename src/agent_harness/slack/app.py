@@ -41,6 +41,7 @@ from agent_harness.loops import (
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
     AGENT_LOOP_SIGNAL_PREFIX,
     AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
+    LOOP_CARRY_MAX_CHARS,
     LOOP_COMPACTION_TRIGGER_CHARS,
     LOOP_FETCH_MAX_PER_RUN,
     LOOP_IGNORED_NOTICE_INTERVAL_SECONDS,
@@ -105,6 +106,7 @@ from agent_harness.models import (
     DEFAULT_PERMISSION_MODE,
     LATEST_UPDATE_METADATA_KEY,
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
+    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_ID_METADATA_KEY,
     LOOP_REFERENCE_DIR_METADATA_KEY,
@@ -280,6 +282,7 @@ from agent_harness.sessions.mirror import (
 )
 from agent_harness.slack import (
     IDLE_RELEASE_PROMPT_TEXT,
+    LOOP_NO_REPORT_STATUS,
     LOOP_RUN_ERROR_EMOJI,
     LOOP_RUN_RUNNING_EMOJI,
     LOOP_RUN_SKIPPED_EMOJI,
@@ -447,6 +450,12 @@ SETTING_SLACK_REACTION_PROCESSED_PREFIX = "slack.reaction.processed."
 SETTING_LOOP_IGNORED_NOTICE_PREFIX = "slack.loop_ignored_notice."
 SETTING_LOOP_SUMMARY_NUDGE_PREFIX = "slack.loop_summary_nudge."
 SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
+# Set while a loop run owes a corrected control line the harness handed back to it.
+SETTING_LOOP_SIGNAL_RETRY_PREFIX = "slack.loop_signal_retry."
+# When a loop run's THREAD_DONE was held back so the agent could answer that feedback.
+SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX = "slack.loop_thread_done_deferred."
+# How long a held-back THREAD_DONE waits for the agent's fix before the run is closed.
+LOOP_THREAD_DONE_DEFER_GRACE = timedelta(minutes=10)
 SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
 SETTING_LOOP_PANELS_RENDERED_VERSION = "slack.loop_panels_rendered_version"
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
@@ -1764,6 +1773,15 @@ class SlackTeamController:
         is_thread_reply = bool(thread_ts) and thread_ts != event.get("ts")
         if is_thread_reply and isinstance(thread_ts, str):
             task = self.store.get_original_agent_task_by_thread(loop.channel_id or "", thread_ts)
+            if task is not None:
+                # Quiet runs all work in the pinned panel's thread, so its original
+                # task is the oldest run; the owner is asking the latest one.
+                task = (
+                    self._latest_task_for_agent_thread(
+                        task.agent_id, loop.channel_id or "", thread_ts
+                    )
+                    or task
+                )
             if (
                 task is not None
                 and task.metadata.get(LOOP_ID_METADATA_KEY) == loop.loop_id
@@ -2107,7 +2125,7 @@ class SlackTeamController:
         if run.status == LoopRunStatus.FAILED:
             return LOOP_RUN_ERROR_EMOJI
         summary = loop_summary_from_json(run.summary_json)
-        return loop_result_style(summary.status if summary else "ok")[0]
+        return loop_result_style(summary.status if summary else LOOP_NO_REPORT_STATUS)[0]
 
     def _loop_run_url(self, loop: Loop, run: LoopRun) -> str | None:
         if not loop.channel_id or not run.thread_ts:
@@ -3686,6 +3704,8 @@ class SlackTeamController:
                 previous_headline_overflow_chars=(
                     previous.headline_overflow_chars if previous is not None else None
                 ),
+                previous_carry_chars=previous.carry_chars if previous is not None else None,
+                snapshot_chars=_loop_snapshot_chars(entries),
                 owner_timezone=self._user_timezone(),
             )
         )
@@ -3703,6 +3723,8 @@ class SlackTeamController:
         }
         if silent_run:
             metadata[LOOP_SILENT_OUTPUT_METADATA_KEY] = True
+        elif quiet_run:
+            metadata[LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY] = True
         remembered_tools = self._loop_remembered_tools(loop)
         if remembered_tools:
             metadata[LOOP_ALLOWED_TOOLS_METADATA_KEY] = list(remembered_tools)
@@ -3850,19 +3872,68 @@ class SlackTeamController:
         )
         return self._inject_loop_fetch_result(updated_task, payload)
 
-    def _return_loop_signal_error(self, task: AgentTask, message: str) -> bool:
+    def _return_loop_signal_error(self, task: AgentTask, line: str, message: str) -> bool:
         """Hand a rejected control line back to the running agent so it can retry.
 
         Posting the error to Slack instead left the agent unaware, so the run's
         summary or memory was silently lost."""
         if self.runtime is None:
             return False
-        feedback = f"[LOOP HARNESS]\n{message}"
-        if self.runtime.send_to_task(task.task_id, feedback):
-            return True
-        if self.runtime.interrupt_task(task.task_id):
-            return self.runtime.send_to_interrupted_task(task.task_id, feedback)
-        return False
+        feedback = (
+            f"[LOOP HARNESS]\n{message} If you had already finished the run, end it "
+            f"again with {AGENT_THREAD_DONE_SIGNAL} after the corrected line."
+        )
+        delivered = self.runtime.send_to_task(task.task_id, feedback)
+        if not delivered and self.runtime.interrupt_task(task.task_id):
+            delivered = self.runtime.send_to_interrupted_task(task.task_id, feedback)
+        run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        if delivered and isinstance(run_id, str):
+            # Tracked per control line: fixing the summary must not settle a
+            # rejected compaction the agent has not answered yet.
+            self.store.set_setting(f"{SETTING_LOOP_SIGNAL_RETRY_PREFIX}{run_id}.{line}", "pending")
+        return delivered
+
+    def _clear_loop_signal_retry(self, run_id: str, line: str) -> None:
+        self.store.delete_setting(f"{SETTING_LOOP_SIGNAL_RETRY_PREFIX}{run_id}.{line}")
+
+    def _loop_run_owes_signal_fix(self, run_id: str) -> bool:
+        return bool(self.store.list_settings(f"{SETTING_LOOP_SIGNAL_RETRY_PREFIX}{run_id}."))
+
+    def _loop_thread_done_deferred_at(self, run_id: str) -> datetime | None:
+        return parse_timestamp(
+            self.store.get_setting(f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run_id}")
+        )
+
+    def _defer_loop_thread_done(self, task: AgentTask) -> bool:
+        """Hold back a loop run's THREAD_DONE once while the agent still owes a fix.
+
+        THREAD_DONE stops the worker at once, so feedback queued for it in the same
+        turn (a rejected control line, or the missing-summary nudge) died with it and
+        the run finished without its report. The fix does not close the run by
+        itself, since more control lines may follow it in the same message; the
+        agent ends the run again with THREAD_DONE, and reconcile_loop_runs closes
+        it if the agent never does."""
+        run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
+        if self.runtime is None or not isinstance(run_id, str) or not isinstance(loop_id, str):
+            return False
+        run = self.store.get_loop_run(run_id)
+        loop = self.store.get_loop(loop_id)
+        if run is None or loop is None or run.status != LoopRunStatus.RUNNING:
+            return False
+        if self._loop_thread_done_deferred_at(run_id) is not None:
+            return False
+        owes_fix = self._loop_run_owes_signal_fix(run_id)
+        if not owes_fix:
+            if run.kind == LoopRunKind.COMPACTION or run.summary_json:
+                return False
+            current = self.store.get_agent_task(task.task_id) or task
+            if not self._start_loop_summary_nudge(loop, run, current):
+                return False
+        self.store.set_setting(
+            f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run_id}", utc_now().isoformat()
+        )
+        return True
 
     def _inject_loop_fetch_result(self, task: AgentTask, payload: str) -> bool:
         if self.runtime is None:
@@ -3899,13 +3970,16 @@ class SlackTeamController:
                 icon_url=self._agent_icon_url(agent),
             )
             return True
-        if run.status != LoopRunStatus.RUNNING:
+        if run.status != LoopRunStatus.RUNNING or run.kind == LoopRunKind.COMPACTION:
+            # A compaction run's only output is its snapshot; feedback about a stray
+            # summary would only be cut off when the snapshot ends the run.
             return True
         parsed = parse_agent_loop_summary_signal(signal)
         if parsed.summary is None:
             error = parsed.error or "invalid summary payload"
             if self._return_loop_signal_error(
                 task,
+                "summary",
                 f"The harness rejected your LOOP_SUMMARY line: {error}. Nothing was "
                 "recorded. Fix it and emit the corrected LOOP_SUMMARY line.",
             ):
@@ -3925,6 +3999,16 @@ class SlackTeamController:
             run.run_id,
             summary_json=json.dumps(payload, sort_keys=True),
         )
+        self._clear_loop_signal_retry(run.run_id, "summary")
+        if parsed.summary.carry_overflow_chars:
+            self._return_loop_signal_error(
+                task,
+                "summary",
+                "The harness recorded your LOOP_SUMMARY but dropped its carry: it was "
+                f"{parsed.summary.carry_overflow_chars} characters, over the "
+                f"{LOOP_CARRY_MAX_CHARS} limit. Emit the LOOP_SUMMARY line again with a "
+                "carry under the limit (drop resolved issues and stale detail).",
+            )
         return True
 
     def _handle_loop_compact_signal(
@@ -3957,6 +4041,7 @@ class SlackTeamController:
             error = parsed.error or "invalid compaction payload"
             if self._return_loop_signal_error(
                 task,
+                "compact",
                 f"The harness rejected your LOOP_COMPACT line: {error}. Memory was not "
                 "changed. Emit a corrected LOOP_COMPACT line (tighten the snapshot if it "
                 "was too long).",
@@ -4012,6 +4097,7 @@ class SlackTeamController:
                 thread_ts=run.thread_ts,
             )
         )
+        self._clear_loop_signal_retry(run.run_id, "compact")
         self._end_compaction_run(run, thread)
         return True
 
@@ -4022,7 +4108,7 @@ class SlackTeamController:
         would stay open and every scheduled run after it would be skipped.
         """
         if run.kind == LoopRunKind.COMPACTION:
-            self._complete_task_thread(thread.channel_id, thread.thread_ts)
+            self._complete_task_thread(thread.channel_id, thread.thread_ts, task_id=run.task_id)
 
     def finalize_loop_run(self, run: LoopRun, task: AgentTask) -> bool:
         current_run = self.store.get_loop_run(run.run_id) or run
@@ -4150,9 +4236,18 @@ class SlackTeamController:
                     title=loop.title,
                     run_number=run.run_number,
                     when_text=when_text,
-                    status="ok",
+                    status=LOOP_NO_REPORT_STATUS,
                     headline="Run finished without a report",
-                    report="The agent did not record a summary. Its notes are in the thread.",
+                    report=(
+                        "The agent did not record a summary, so this run's result is "
+                        "unknown: treat this check as missed."
+                        # A quiet run has no thread of its own to point at.
+                        + (
+                            ""
+                            if run.thread_ts is None
+                            else " Any notes it wrote are in the thread."
+                        )
+                    ),
                     duration_text=_loop_run_duration(run),
                     guard_note=self._loop_guard_note(loop, run),
                 )
@@ -4187,9 +4282,12 @@ class SlackTeamController:
         return text, blocks
 
     def _publish_quiet_loop_run(self, loop: Loop, run: LoopRun) -> None:
-        """A quiet run posts a card (and so notifies) only when it needs attention."""
+        """A quiet run posts a card (and so notifies) only when it needs attention.
+
+        The run decides, not the loop's current setting: turning quiet mode off
+        while a quiet run works must not swallow that run's alert."""
         latest = self.store.get_loop(loop.loop_id) or loop
-        if not _loop_is_quiet(latest) or not latest.channel_id:
+        if not latest.channel_id:
             return
         summary = loop_summary_from_json(run.summary_json)
         noteworthy = run.status == LoopRunStatus.FAILED or summary is None or summary.status != "ok"
@@ -4251,6 +4349,7 @@ class SlackTeamController:
                 "Emit only the required hidden loop summary line now: "
                 f'{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{{"summary": "<3-5 sentences>", '
                 '"status": "ok|found_issue|action_taken|failed", "carry": {}}}'
+                f" Then end the run with {AGENT_THREAD_DONE_SIGNAL}."
             ),
             assignment_mode=AssignmentMode.SPECIFIC,
             requested_handle=agent.handle,
@@ -4579,6 +4678,20 @@ class SlackTeamController:
                 return True
             return False
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
+            deferred_at = self._loop_thread_done_deferred_at(current.run_id)
+            if deferred_at is not None and utc_now() - deferred_at >= LOOP_THREAD_DONE_DEFER_GRACE:
+                # The agent already said it was done and never answered the
+                # feedback; close the run on what it recorded. Its worker is
+                # stopping, so a nudge now would be lost.
+                self.store.set_setting(
+                    f"{SETTING_LOOP_SUMMARY_NUDGE_PREFIX}{current.run_id}",
+                    str(LOOP_SUMMARY_NUDGE_ATTEMPTS),
+                )
+                if task.thread_ts:
+                    self._complete_task_thread(
+                        task.channel_id, task.thread_ts, task_id=task.task_id
+                    )
+                return True
             if not self._loop_run_task_stranded(task):
                 return False
             # Nothing is running the task, so nothing will ever finish the run:
@@ -10082,7 +10195,21 @@ class SlackTeamController:
         normalized_signal = re.sub(r"\s+", " ", signal.strip()).upper()
         if task.kind == AgentTaskKind.LOOP_RUN and task.metadata.get(LOOP_ID_METADATA_KEY):
             if signal == AGENT_THREAD_DONE_SIGNAL:
-                return self._complete_task_thread(thread.channel_id, thread.thread_ts)
+                if self._defer_loop_thread_done(task):
+                    # Unhandled, so the runtime keeps the signal and replays it when
+                    # the worker exits, which finalizes the run.
+                    return False
+                run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+                if isinstance(run_id, str):
+                    # The worker is stopped next, so a nudge sent while finalizing
+                    # would be lost with it.
+                    self.store.set_setting(
+                        f"{SETTING_LOOP_SUMMARY_NUDGE_PREFIX}{run_id}",
+                        str(LOOP_SUMMARY_NUDGE_ATTEMPTS),
+                    )
+                return self._complete_task_thread(
+                    thread.channel_id, thread.thread_ts, task_id=task.task_id
+                )
             if normalized_signal.startswith(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX):
                 return self._handle_loop_summary_signal(task, agent, thread, signal)
             if normalized_signal.startswith(AGENT_LOOP_COMPACT_SIGNAL_PREFIX):
@@ -12445,7 +12572,13 @@ class SlackTeamController:
         )
         return False
 
-    def _complete_task_thread(self, channel_id: str, thread_ts: str | None) -> bool:
+    def _complete_task_thread(
+        self, channel_id: str, thread_ts: str | None, *, task_id: str | None = None
+    ) -> bool:
+        """Complete the open tasks in a thread, or only ``task_id`` when given.
+
+        Loop runs pass their own task: quiet runs all share the pinned panel's
+        thread, so ending one run's thread would also end the next run."""
         if not thread_ts:
             return False
         thread = SlackThreadRef(channel_id, thread_ts)
@@ -12455,6 +12588,7 @@ class SlackTeamController:
             if (
                 thread_task.channel_id == channel_id
                 and thread_task.thread_ts == thread_ts
+                and (task_id is None or thread_task.task_id == task_id)
                 and thread_task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.ACTIVE}
             ):
                 if self.runtime:
@@ -12588,6 +12722,8 @@ class SlackTeamController:
                 MODEL_OVERRIDE_METADATA_KEY,
                 LOOP_FETCH_COUNT_METADATA_KEY,
                 LOOP_SUMMARY_NUDGE_METADATA_KEY,
+                LOOP_SILENT_OUTPUT_METADATA_KEY,
+                LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
             ):
                 if key in parent_task.metadata:
                     metadata[key] = parent_task.metadata[key]
@@ -16291,6 +16427,14 @@ def _decode_roster_work_metadata(value) -> dict[str, str]:
     if not isinstance(decoded, dict):
         return {}
     return {str(key): str(item) for key, item in decoded.items() if item is not None}
+
+
+def _loop_snapshot_chars(entries: list[LoopJournalEntry]) -> int | None:
+    """Size of the long-term memory snapshot the next run will read."""
+    snapshots = [entry for entry in entries if entry.kind == "compaction"]
+    if not snapshots:
+        return None
+    return len(max(snapshots, key=lambda entry: entry.created_at).content)
 
 
 def _loop_is_quiet(loop: Loop) -> bool:
