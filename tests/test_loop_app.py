@@ -8,7 +8,10 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.config import AgentCommandConfig
+from agent_harness.config import (
+    DEFAULT_LOOP_CLAUDE_MODEL,
+    AgentCommandConfig,
+)
 from agent_harness.loops import (
     AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
@@ -34,6 +37,7 @@ from agent_harness.models import (
     LOOP_RESOLUTION_METADATA_KEY,
     LOOP_RUN_ID_METADATA_KEY,
     LOOP_SILENT_OUTPUT_METADATA_KEY,
+    MODEL_OVERRIDE_METADATA_KEY,
     AgentTaskKind,
     AgentTaskStatus,
     AssignmentMode,
@@ -61,7 +65,7 @@ from agent_harness.slack.app import (
     SlackTeamController,
 )
 from agent_harness.storage.store import Store
-from agent_harness.team import create_agent_task, pick_idle_agent
+from agent_harness.team import create_agent_task, pick_idle_agent, provider_logo_url
 from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, shut_down_runtime
 from tests.test_slack_app import FakeGateway, FakeRuntime
 
@@ -818,6 +822,82 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(resolving.status, LoopStatus.RESOLVING)
         self.assertIn("OWNER OVERRIDE (SCHEDULE)", self.runtime.started[-1][0].prompt)
         self.assertNotIn("loop.approve", str(self.gateway.updates[-1]["blocks"]))
+
+    def test_loop_without_provider_or_model_runs_on_the_default_claude_model(self):
+        with patch("agent_harness.loops.shutil.which", return_value="/usr/local/bin/claude"):
+            loop, task, agent = self._request_loop("loop create inspect billing every hour")
+
+        self.assertEqual(loop.provider, Provider.CLAUDE)
+        self.assertEqual(loop.model, DEFAULT_LOOP_CLAUDE_MODEL)
+        self.assertEqual(agent.provider_preference, Provider.CLAUDE)
+        self.assertEqual(task.metadata[MODEL_OVERRIDE_METADATA_KEY], DEFAULT_LOOP_CLAUDE_MODEL)
+
+    def test_preview_shows_provider_logo_and_model(self):
+        loop = self._resolve_loop()
+
+        preview = self.gateway.thread_replies[-1]
+        details = next(
+            block
+            for block in preview["blocks"]
+            if block.get("block_id") == f"loop.preview.details.{loop.loop_id}"
+        )
+        self.assertIn("Runs on: Codex · `example-model`", details["text"]["text"])
+        self.assertEqual(details["accessory"]["image_url"], provider_logo_url(Provider.CODEX))
+
+    def test_preview_provider_switch_picks_that_providers_default_model(self):
+        loop = self._resolve_loop()
+        self.assertEqual(loop.model, "example-model")
+
+        def reply(text: str, ts: str) -> None:
+            self.controller.handle_event(
+                {
+                    "event": {
+                        "type": "message",
+                        "channel": "CMAIN",
+                        "thread_ts": loop.anchor_thread_ts,
+                        "ts": ts,
+                        "user": "UOWNER",
+                        "text": text,
+                    }
+                }
+            )
+
+        reply("provider: claude", "100.000020")
+        switched = self.store.get_loop(loop.loop_id)
+        assert switched is not None
+        self.assertEqual(switched.provider, Provider.CLAUDE)
+        self.assertEqual(switched.model, DEFAULT_LOOP_CLAUDE_MODEL)
+
+        reply("provider: claude", "100.000021")
+        unchanged = self.store.get_loop(loop.loop_id)
+        assert unchanged is not None
+        self.assertEqual(unchanged.model, DEFAULT_LOOP_CLAUDE_MODEL)
+
+    def test_existing_loops_without_a_model_are_pinned_to_the_provider_default(self):
+        loop = self._activate_loop()
+        self.store.update_loop_identity(
+            loop.loop_id,
+            title=loop.title,
+            mission=loop.mission,
+            channel_name=loop.channel_name,
+            visibility=loop.visibility,
+            provider=Provider.CLAUDE,
+            model=None,
+            permission_mode=loop.permission_mode,
+            cwd=loop.cwd,
+        )
+
+        SlackTeamController(
+            self.store,
+            self.gateway,
+            default_channel_id="CMAIN",
+            runtime=self.runtime,
+            home=Path(self.temp_dir.name),
+        )
+
+        pinned = self.store.get_loop(loop.loop_id)
+        assert pinned is not None
+        self.assertEqual(pinned.model, DEFAULT_LOOP_CLAUDE_MODEL)
 
     def test_si_01_foreign_content_never_enters_journal_or_fetch_results(self):
         loop = self._activate_loop()
@@ -1821,6 +1901,9 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("loop.edit.open", rendered)
         self.assertIn("loop.stop.request", rendered)
         self.assertIn("⏳ #1", rendered)
+        byline = reply["blocks"][-1]["elements"]
+        self.assertEqual(byline[0]["image_url"], provider_logo_url(Provider.CODEX))
+        self.assertTrue(byline[1]["text"].startswith("Codex · `example-model` · "))
 
     def test_main_loop_list_posts_one_actionable_card_per_loop(self):
         loop = self._activate_loop()
@@ -1853,6 +1936,8 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
         # The channel name in the body is the way into the channel.
         self.assertIn(f"<#{loop.channel_id}>", card["body"]["text"])
+        self.assertIn("Codex · `example-model`", card["body"]["text"])
+        self.assertEqual(card["icon"]["image_url"], provider_logo_url(Provider.CODEX))
         delete = card["actions"][2]
         self.assertIn("confirm", delete)
         self.controller.handle_block_action(
@@ -2313,6 +2398,60 @@ class LoopCreationFlowTests(unittest.TestCase):
             item for item in self.gateway.updates if item["ts"] == task.parent_message_ts
         ]
         self.assertIn("Mission and schedule updated", confirmation[-1]["text"])
+
+    def test_edit_modal_switches_provider_and_model_for_future_runs(self):
+        loop = self._activate_loop()
+        view = build_loop_edit_modal(loop, schedule_text="every 5 minutes", channel_id="CNEW")
+        blocks = {block.get("block_id"): block for block in view["blocks"]}
+        self.assertEqual(
+            blocks["loop_provider"]["element"]["initial_option"]["value"], Provider.CODEX.value
+        )
+        self.assertEqual(blocks["loop_model"]["element"]["initial_value"], "example-model")
+
+        def submit(provider: str, model: str) -> dict | None:
+            return self.controller.handle_view_submission(
+                {
+                    "user": {"id": "UOWNER"},
+                    "view": {
+                        "callback_id": "loop.edit",
+                        "private_metadata": view["private_metadata"],
+                        "state": {
+                            "values": {
+                                "loop_mission": {"value": {"value": loop.mission}},
+                                "loop_schedule": {"value": {"value": "every 5 minutes"}},
+                                "loop_provider": {
+                                    "value": {"selected_option": {"value": provider}}
+                                },
+                                "loop_model": {"value": {"value": model}},
+                            }
+                        },
+                    },
+                }
+            )
+
+        rejected = submit("claude", "two words")
+        assert rejected is not None
+        self.assertIn("loop_model", rejected["errors"])
+
+        # The old provider's model does not carry over to the new provider.
+        self.assertIsNone(submit("claude", "example-model"))
+        switched = self.store.get_loop(loop.loop_id)
+        assert switched is not None
+        self.assertEqual(switched.provider, Provider.CLAUDE)
+        self.assertEqual(switched.model, DEFAULT_LOOP_CLAUDE_MODEL)
+        agent = self.store.get_team_agent(loop.agent_id)
+        assert agent is not None
+        self.assertEqual(agent.provider_preference, Provider.CLAUDE)
+        journal = [entry.content for entry in self.store.list_loop_journal(loop.loop_id)]
+        self.assertIn(f"now runs on Claude · `{DEFAULT_LOOP_CLAUDE_MODEL}`", journal)
+
+        self.assertIsNone(submit("claude", "example-model-v3"))
+        pinned = self.store.get_loop(loop.loop_id)
+        assert pinned is not None
+        self.assertEqual(pinned.model, "example-model-v3")
+        self.controller.fire_loop_now(pinned)
+        task, _agent, _thread = self.runtime.started[-1]
+        self.assertEqual(task.metadata[MODEL_OVERRIDE_METADATA_KEY], "example-model-v3")
 
     def test_edit_visibility_recreates_channel_with_members_and_archives_old(self):
         loop = self._activate_loop()

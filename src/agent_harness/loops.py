@@ -1307,7 +1307,20 @@ def provisional_loop_agent(
 
 
 def default_loop_provider(commands) -> Provider:
+    """Claude runs loops unless the owner picks Codex or Claude is not installed."""
     return Provider.CLAUDE if shutil.which(commands.claude_binary) else Provider.CODEX
+
+
+def default_loop_model(provider: Provider, commands) -> str:
+    if provider == Provider.CLAUDE:
+        return commands.loop_claude_model
+    return commands.loop_codex_model
+
+
+def describe_loop_engine(loop: Loop) -> str:
+    """The provider and model a loop runs on, e.g. ``Claude · `opus```."""
+    label = loop.provider.value.capitalize()
+    return f"{label} · `{loop.model}`" if loop.model else label
 
 
 def format_loop_timestamp(value: datetime, timezone: str | None) -> str:

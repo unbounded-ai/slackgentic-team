@@ -2538,6 +2538,20 @@ class Store:
             )
             self.conn.commit()
 
+    def backfill_loop_models(self, provider: Provider, model: str) -> int:
+        """Pin ``model`` on this provider's loops that never named one."""
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE loops
+                SET model = ?, updated_at = ?
+                WHERE provider = ? AND (model IS NULL OR TRIM(model) = '')
+                """,
+                (model, utc_now().isoformat(), provider.value),
+            )
+            self.conn.commit()
+            return cursor.rowcount
+
     def update_loop_channel(
         self,
         loop_id: str,

@@ -13,6 +13,7 @@ from agent_harness.loops import (
     LOOP_THREAD_ROLLOVER_DEFAULT_RUNS,
     LOOP_THREAD_ROLLOVER_MAX_RUNS,
     LOOP_THREAD_ROLLOVER_MIN_RUNS,
+    describe_loop_engine,
 )
 from agent_harness.models import (
     ASSIGNMENT_PROMPT_METADATA_KEY,
@@ -272,8 +273,6 @@ def build_loop_preview_blocks(
     footer: str | None = None,
 ) -> list[dict[str, Any]]:
     visibility = loop.visibility.value
-    provider = loop.provider.value
-    model = f" · Model: `{loop.model}`" if loop.model else ""
     cwd = f"\n• Working directory: `{loop.cwd}`" if loop.cwd else ""
     blocks: list[dict[str, Any]] = [
         {
@@ -286,10 +285,12 @@ def build_loop_preview_blocks(
         {
             "type": "section",
             "block_id": f"loop.preview.details.{loop.loop_id}",
+            "accessory": _loop_provider_logo(loop),
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"• Channel: `#{spec.channel_name}` ({visibility}) · Provider: {provider}{model}\n"
+                    f"• Channel: `#{spec.channel_name}` ({visibility}) · "
+                    f"Runs on: {describe_loop_engine(loop)}\n"
                     f"• Schedule: {spec.schedule_description} (next run {next_run_text})\n"
                     f"• Permissions: {loop.permission_mode.value}{cwd}\n"
                     f"• Icon: :{spec.icon.emoji}:"
@@ -599,15 +600,18 @@ def build_loop_panel_blocks(
         {
             "type": "context",
             "elements": [
+                # The provider's logo leads the byline, followed by the model it runs.
+                _loop_provider_logo(loop),
                 {
                     "type": "mrkdwn",
                     "text": (
-                        f"{_mrkdwn_escape(bot_name)} · {loop.provider.value} · {permissions} · "
+                        f"{describe_loop_engine(loop)} · {_mrkdwn_escape(bot_name)} · "
+                        f"{permissions} · "
                         f"owner <@{loop.owner_slack_user_id}>. Only the owner can instruct this "
                         "bot; other messages are never shown to it. Reply in a run's thread to "
                         "follow up, or post in the channel to leave a standing note."
                     )[:2900],
-                }
+                },
             ],
         }
     )
@@ -680,7 +684,12 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
     latest = row.get("latest_headline")
     body_parts = [
         part
-        for part in (row.get("channel_text"), chips, _mrkdwn_escape(latest) if latest else None)
+        for part in (
+            row.get("channel_text"),
+            describe_loop_engine(loop),
+            chips,
+            _mrkdwn_escape(latest) if latest else None,
+        )
         if part
     ]
     state = _loop_state_text(loop, running=bool(row.get("running")))
@@ -702,6 +711,7 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
             "type": "mrkdwn",
             "text": _shorten_text(" ".join(body_parts) or row["schedule_text"], 200),
         },
+        "icon": _loop_provider_logo(loop),
     }
     # Cards hold at most three buttons: Pause/Resume, Edit, and Delete. The channel
     # name in the body opens the channel; Run now lives on the pinned panel.
@@ -732,6 +742,14 @@ def _loop_list_card(row: dict[str, Any]) -> dict[str, Any]:
     if actions:
         card["actions"] = actions[:3]
     return card
+
+
+def _loop_provider_logo(loop: Loop) -> dict[str, Any]:
+    return {
+        "type": "image",
+        "image_url": provider_logo_url(loop.provider),
+        "alt_text": describe_loop_engine(loop).replace("`", ""),
+    }
 
 
 def _loop_delete_button(loop: Loop) -> dict[str, Any]:
@@ -907,6 +925,18 @@ def build_loop_edit_modal(
         cwd_element["initial_value"] = loop.cwd
     private = _option("Private", LoopVisibility.PRIVATE.value)
     public = _option("Public", LoopVisibility.PUBLIC.value)
+    providers = [_option(provider.value.capitalize(), provider.value) for provider in Provider]
+    current_provider = next(
+        option for option in providers if option["value"] == loop.provider.value
+    )
+    model_element: dict[str, Any] = {
+        "type": "plain_text_input",
+        "action_id": "value",
+        "max_length": 100,
+        "placeholder": {"type": "plain_text", "text": "opus"},
+    }
+    if loop.model:
+        model_element["initial_value"] = loop.model
     return {
         "type": "modal",
         "callback_id": "loop.edit",
@@ -964,6 +994,30 @@ def build_loop_edit_modal(
                     "initial_option": current_mode,
                     "options": modes,
                 },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_provider",
+                "label": {"type": "plain_text", "text": "Provider"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "value",
+                    "initial_option": current_provider,
+                    "options": providers,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "loop_model",
+                "label": {"type": "plain_text", "text": "Model"},
+                "hint": {
+                    "type": "plain_text",
+                    "text": (
+                        "Every run uses this model. Switching provider without changing it "
+                        "picks that provider's default."
+                    ),
+                },
+                "element": model_element,
             },
             {
                 "type": "input",

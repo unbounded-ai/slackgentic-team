@@ -213,6 +213,14 @@ name, and icon, then posts a preview with Create/Cancel controls. After approval
 it creates the channel, invites the owner, pins a control panel, and starts a
 fresh managed provider session for each due run.
 
+Every loop runs on a named provider and model. Claude is the default provider
+(Codex is used only when Claude is not installed), and a loop that does not set
+`model=<name>` gets that provider's default: `opus` for Claude and
+`gpt-6-astra` for Codex, configurable with `SLACKGENTIC_LOOP_CLAUDE_MODEL` and
+`SLACKGENTIC_LOOP_CODEX_MODEL`. The preview, pinned panel, and `loops` cards
+show the provider's logo and the model, and **Edit** can switch either one for
+future runs.
+
 Each run is one top-level message in the loop channel. While it runs, the
 message is a live task card showing the agent's latest step. When it finishes,
 the message becomes the report itself: a status badge and headline, key metrics
@@ -224,7 +232,7 @@ later runs learn what the owner finds useful.
 The pinned control panel shows status, schedule, next run, the latest result,
 and a strip of recent runs linking to each report. Its buttons run the loop now,
 pause or resume it, and open an **Edit** form for the mission, schedule,
-permissions, reference directory, and channel visibility (switching visibility
+permissions, provider and model, reference directory, and channel visibility (switching visibility
 recreates the channel with the same members and archives the old one); the
 **⋯** menu under the card compacts memory, forgets remembered approvals, stops the loop, or
 deletes it (stop and archive its channel). Anyone in the loop's channel may run,
@@ -577,6 +585,8 @@ where they are stored.
 | `SLACKGENTIC_HOME` | Alternate home directory for transcript discovery. |
 | `SLACKGENTIC_CODEX_BINARY` | Codex executable path. |
 | `SLACKGENTIC_CLAUDE_BINARY` | Claude executable path. |
+| `SLACKGENTIC_LOOP_CLAUDE_MODEL` | Model for Claude loops that do not name one, default `opus`. |
+| `SLACKGENTIC_LOOP_CODEX_MODEL` | Model for Codex loops that do not name one, default `gpt-6-astra`. |
 | `SLACKGENTIC_CODEX_APP_SERVER_URL` | Codex app-server URL. |
 | `SLACKGENTIC_CODEX_AGENTS` | Default initial Codex count. |
 | `SLACKGENTIC_CLAUDE_AGENTS` | Default initial Claude count. |
