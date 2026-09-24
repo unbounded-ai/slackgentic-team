@@ -304,6 +304,19 @@ class LoopGuardTests(unittest.TestCase):
             UNDECIDED,
         )
 
+    def test_talos_is_always_allowed(self):
+        for command in (
+            'talos memory recall "How are loops scheduled?"',
+            "talos memory feedback r_ab12 --none cannot_reconcile --remember --text 'x'",
+            "cd /tmp && /usr/local/bin/talos memory inspect c_ab12",
+        ):
+            with self.subTest(command=command):
+                self.assertDecision(command, ALLOW)
+        self.assertEqual(
+            evaluate_tool_call("mcp__talos__instructions", {}, context=self.context).decision,
+            ALLOW,
+        )
+
     def test_symlinked_scratch_escape_is_denied(self):
         outside = Path(self.temp_dir.name) / "outside"
         outside.mkdir()
