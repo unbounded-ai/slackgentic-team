@@ -7,7 +7,7 @@ agent may need escalation to run them.
 ## Loops
 
 ```sh
-slackgentic loop create "<task and schedule>" [--provider claude|codex] [--public]
+slackgentic loop create "<task and schedule>" [--every-run] [--provider claude|codex] [--public]
 slackgentic loop create "<task and schedule>" --no-wait   # queue and return immediately
 slackgentic loop request-status <request-id>
 slackgentic loop list [--all] [--json]
@@ -15,7 +15,7 @@ slackgentic loop list [--all] [--json]
 
 `loop create` queues a request for the running service, which posts it in the
 agent channel. The owner must approve the preview in Slack. Agent requests
-always start read-only.
+always start read-only and quiet; `--every-run` posts every run's card instead.
 
 ## Service
 

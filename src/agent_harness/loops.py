@@ -138,9 +138,9 @@ class LoopSpec:
     next_run_at: datetime
     schedule_description: str
     icon: LoopIconSpec
-    # Quiet loops post nothing (and so notify nobody) unless a run finds
-    # something that needs attention.
-    quiet: bool = False
+    # Quiet runs log silently in the pinned panel's thread; only a run that
+    # needs attention posts a (notifying) card to the channel.
+    quiet: bool = True
 
 
 @dataclass(frozen=True)
@@ -461,6 +461,7 @@ def prepare_agent_loop_create_command(
     *,
     provider: Provider | str | None = None,
     visibility: LoopVisibility | str | None = None,
+    quiet: bool | None = None,
 ) -> AgentLoopRequestResult:
     """Normalize a local agent's loop request into a `loop create ...` command."""
 
@@ -484,9 +485,15 @@ def prepare_agent_loop_create_command(
         except ValueError:
             return AgentLoopRequestResult(error="visibility must be private or public")
         command = f"{command} #{visibility_value.value}"
+    if quiet is not None:
+        command = f"{command} #{'quiet' if quiet else 'every-run'}"
     parsed = parse_loop_create_request(command)
     if parsed is None or not parsed.description:
         return AgentLoopRequestResult(error="describe the loop's task and schedule")
+    # Pin the mode instead of letting the resolver infer it: inferring it from
+    # wording like "silent update" created a loop in the mode the owner did not want.
+    if parsed.quiet is None:
+        command = f"{command} #quiet"
     if parsed.permission_mode != PermissionMode.READ_ONLY:
         return AgentLoopRequestResult(
             error=(
@@ -503,9 +510,12 @@ def enqueue_agent_loop_create_request(
     *,
     provider: Provider | str | None = None,
     visibility: LoopVisibility | str | None = None,
+    quiet: bool | None = None,
     source: str | None = None,
 ) -> AgentLoopRequestResult:
-    prepared = prepare_agent_loop_create_command(text, provider=provider, visibility=visibility)
+    prepared = prepare_agent_loop_create_command(
+        text, provider=provider, visibility=visibility, quiet=quiet
+    )
     if prepared.command is None:
         return prepared
     if store.count_pending_loop_create_requests() >= AGENT_LOOP_REQUEST_MAX_PENDING:
@@ -546,19 +556,33 @@ def wait_for_agent_loop_create_request(
 def describe_agent_loop_create_request(request: LoopCreateQueueRequest | None) -> str:
     if request is None:
         return "The loop request could not be found."
+    if request.status == LoopCreateRequestStatus.FAILED:
+        return f"Slackgentic could not post the loop request: {request.error or 'unknown error'}"
     if request.status == LoopCreateRequestStatus.POSTED:
-        return (
+        text = (
             "Slackgentic posted the loop request in the agent channel and is resolving it "
             "into a preview. The owner must review the preview and click Create in Slack; "
             "the loop channel appears after that."
         )
-    if request.status == LoopCreateRequestStatus.FAILED:
-        return f"Slackgentic could not post the loop request: {request.error or 'unknown error'}"
-    return (
-        f"The loop request {request.request_id} is queued, but the Slackgentic service has "
-        "not picked it up yet. It will post as soon as the service is running; check with "
-        "`slackgentic service status`."
-    )
+    else:
+        text = (
+            f"The loop request {request.request_id} is queued, but the Slackgentic service has "
+            "not picked it up yet. It will post as soon as the service is running; check with "
+            "`slackgentic service status`."
+        )
+    parsed = parse_loop_create_request(request.text)
+    if parsed is not None and parsed.quiet is not None:
+        text = f"{text} {_loop_notification_sentence(parsed.quiet)}"
+    return text
+
+
+def _loop_notification_sentence(quiet: bool) -> str:
+    if quiet:
+        return (
+            "Notifications: quiet. All-clear runs are logged silently in the pinned panel's "
+            "thread; a card posts to the channel and notifies only when a run needs attention."
+        )
+    return "Notifications: every run. Each run posts its report card to the channel."
 
 
 def build_loop_resolution_prompt(
@@ -588,7 +612,7 @@ def build_loop_resolution_prompt(
                 "shape": "circle",
             },
         },
-        "quiet": False,
+        "quiet": True,
     }
     lines = [
         "Resolve this recurring Slackgentic loop into one implementation-ready specification.",
@@ -603,9 +627,11 @@ def build_loop_resolution_prompt(
         "Rewrite the mission as a complete, self-contained standing runbook paragraph. Choose a "
         "short bot name (ending in Bot when natural), a lowercase-dash channel name prefixed "
         "with loop-, and a standard Slack emoji name without surrounding colons.",
-        "Set quiet to true when the owner wants to hear from the loop only when something is "
-        "wrong (for example 'only post when there are errors or anomalies'); quiet loops post "
-        "nothing and notify nobody on all-clear runs.",
+        "Quiet is the default: quiet runs log their result silently in the pinned panel's "
+        "thread and post a notifying card only when a run needs attention, which covers "
+        "'a silent loop', 'only post when there are errors', and 'a silent status update "
+        "when all is well'. Set quiet to false only when the owner explicitly wants every "
+        "run's report card posted to the channel.",
         "The schedule must recur. Daily and weekly schedules require HH:MM and an IANA timezone; "
         f"{_default_zone_clause(timezone)}"
         "weekly schedules also use weekday 0=Monday through 6=Sunday. Interval schedules use "
@@ -665,7 +691,7 @@ def parse_agent_loop_signal(
     icon_result = _parse_loop_icon(payload.get("icon"))
     if isinstance(icon_result, str):
         return LoopSpecParseResult(error=icon_result)
-    quiet = payload.get("quiet", False)
+    quiet = payload.get("quiet", True)
     if not isinstance(quiet, bool):
         return LoopSpecParseResult(error="loop quiet must be true or false")
     return LoopSpecParseResult(

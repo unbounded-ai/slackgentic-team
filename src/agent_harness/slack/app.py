@@ -2933,7 +2933,7 @@ class SlackTeamController:
         provider = _view_selected_value(values, "loop_provider", "value") or "automatic"
         if provider not in {"automatic", Provider.CODEX.value, Provider.CLAUDE.value}:
             return _view_errors("loop_provider", "Choose a supported provider.")
-        notify = _view_selected_value(values, "loop_notify", "value") or "every-run"
+        notify = _view_selected_value(values, "loop_notify", "value") or "quiet"
         if notify not in {"every-run", "quiet"}:
             return _view_errors("loop_notify", "Choose when the loop should post.")
         channel_id = metadata.get("channel_id") or self._configured_agent_channel_id()

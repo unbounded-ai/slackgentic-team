@@ -107,6 +107,21 @@ def main(argv: list[str] | None = None) -> int:
     loop_visibility.add_argument(
         "--private", dest="visibility", action="store_const", const="private"
     )
+    loop_notify = loop_create.add_mutually_exclusive_group()
+    loop_notify.add_argument(
+        "--quiet",
+        dest="quiet",
+        action="store_const",
+        const=True,
+        help="Log all-clear runs silently in the panel thread (default)",
+    )
+    loop_notify.add_argument(
+        "--every-run",
+        dest="quiet",
+        action="store_const",
+        const=False,
+        help="Post every run's report card to the channel",
+    )
     loop_create.add_argument(
         "--no-wait",
         action="store_true",
@@ -752,6 +767,7 @@ def _loop(args: argparse.Namespace) -> int:
                 " ".join(args.text),
                 provider=args.provider,
                 visibility=args.visibility,
+                quiet=args.quiet,
                 source="cli",
             )
             if result.request is None:

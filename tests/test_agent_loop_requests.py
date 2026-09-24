@@ -15,6 +15,7 @@ from agent_harness.loops import (
     AGENT_LOOP_REQUEST_MAX_PENDING,
     describe_agent_loop_create_request,
     enqueue_agent_loop_create_request,
+    parse_loop_create_request,
     prepare_agent_loop_create_command,
     wait_for_agent_loop_create_request,
 )
@@ -31,7 +32,12 @@ from agent_harness.sessions.claude_channel import (
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
 )
-from agent_harness.slack.app import SETTING_HUMAN_USER_ID, LoopRunner, SlackTeamController
+from agent_harness.slack.app import (
+    LOOP_QUIET_CHOICE_KEY,
+    SETTING_HUMAN_USER_ID,
+    LoopRunner,
+    SlackTeamController,
+)
 from agent_harness.storage.store import Store
 from tests.test_slack_app import FakeGateway, FakeRuntime
 
@@ -39,25 +45,49 @@ from tests.test_slack_app import FakeGateway, FakeRuntime
 class PrepareAgentLoopCreateCommandTests(unittest.TestCase):
     def test_plain_request_becomes_loop_create_command(self):
         result = prepare_agent_loop_create_command(
-            "  every weekday at 9am America/New_York   check CI  "
+            "  every weekday at 9am America/New_York   check CI  ", quiet=True
         )
 
         self.assertIsNone(result.error)
         self.assertEqual(
-            result.command, "loop create every weekday at 9am America/New_York check CI"
+            result.command, "loop create every weekday at 9am America/New_York check CI #quiet"
         )
 
     def test_existing_create_verb_is_kept(self):
-        result = prepare_agent_loop_create_command("create a loop to check CI every hour")
+        result = prepare_agent_loop_create_command(
+            "create a loop to check CI every hour", quiet=False
+        )
 
-        self.assertEqual(result.command, "create a loop to check CI every hour")
+        self.assertEqual(result.command, "create a loop to check CI every hour #every-run")
 
     def test_provider_and_visibility_become_command_options(self):
         result = prepare_agent_loop_create_command(
-            "check CI every hour", provider="Claude", visibility=LoopVisibility.PUBLIC
+            "check CI every hour", provider="Claude", visibility=LoopVisibility.PUBLIC, quiet=True
         )
 
-        self.assertEqual(result.command, "loop create check CI every hour provider=claude #public")
+        self.assertEqual(
+            result.command, "loop create check CI every hour provider=claude #public #quiet"
+        )
+
+    def test_defaults_to_quiet(self):
+        result = prepare_agent_loop_create_command(
+            "check deploys every 30 minutes; post a silent status update when all is well"
+        )
+
+        self.assertIsNone(result.error)
+        self.assertTrue((result.command or "").endswith(" #quiet"))
+
+    def test_notification_tag_in_the_text_counts_as_explicit(self):
+        result = prepare_agent_loop_create_command("check CI hourly #every-run")
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.command, "loop create check CI hourly #every-run")
+
+    def test_quiet_argument_overrides_a_conflicting_tag(self):
+        result = prepare_agent_loop_create_command("check CI hourly #every-run", quiet=True)
+
+        command = result.command or ""
+        self.assertTrue(parse_loop_create_request(command).quiet)
 
     def test_rejects_missing_description_and_bad_options(self):
         self.assertIsNotNone(prepare_agent_loop_create_command("   ").error)
@@ -91,11 +121,13 @@ class LoopCreateQueueTests(unittest.TestCase):
 
     def test_enqueue_claim_and_finish_round_trip(self):
         result = enqueue_agent_loop_create_request(
-            self.store, "check CI every hour", provider=Provider.CODEX, source="cli"
+            self.store, "check CI every hour", provider=Provider.CODEX, quiet=True, source="cli"
         )
         assert result.request is not None
         self.assertEqual(result.request.status, LoopCreateRequestStatus.PENDING)
-        self.assertEqual(result.request.text, "loop create check CI every hour provider=codex")
+        self.assertEqual(
+            result.request.text, "loop create check CI every hour provider=codex #quiet"
+        )
 
         claimed = self.store.claim_pending_loop_create_requests()
         self.assertEqual([item.request_id for item in claimed], [result.request.request_id])
@@ -112,15 +144,22 @@ class LoopCreateQueueTests(unittest.TestCase):
         assert finished is not None
         self.assertEqual(finished.status, LoopCreateRequestStatus.POSTED)
         self.assertEqual(finished.message_ts, "100.000001")
-        self.assertIn("click Create", describe_agent_loop_create_request(finished))
+        described = describe_agent_loop_create_request(finished)
+        self.assertIn("click Create", described)
+        self.assertIn("Notifications: quiet", described)
+        self.assertIn("pinned panel's thread", described)
 
     def test_enqueue_refuses_when_too_many_requests_are_waiting(self):
         for index in range(AGENT_LOOP_REQUEST_MAX_PENDING):
             self.assertIsNotNone(
-                enqueue_agent_loop_create_request(self.store, f"check job {index} hourly").request
+                enqueue_agent_loop_create_request(
+                    self.store, f"check job {index} hourly", quiet=True
+                ).request
             )
 
-        result = enqueue_agent_loop_create_request(self.store, "check one more job hourly")
+        result = enqueue_agent_loop_create_request(
+            self.store, "check one more job hourly", quiet=True
+        )
 
         self.assertIsNone(result.request)
         self.assertIn("service status", result.error or "")
@@ -171,7 +210,7 @@ class QueuedLoopRequestControllerTests(unittest.TestCase):
     def test_loop_runner_posts_queued_request_and_starts_resolver_for_owner(self):
         self.store.set_setting(SETTING_HUMAN_USER_ID, "UOWNER")
         request = enqueue_agent_loop_create_request(
-            self.store, "inspect cloud billing every morning at 9am America/Chicago"
+            self.store, "inspect cloud billing every morning at 9am America/Chicago", quiet=True
         ).request
         assert request is not None
 
@@ -192,9 +231,12 @@ class QueuedLoopRequestControllerTests(unittest.TestCase):
         assert finished is not None
         self.assertEqual(finished.status, LoopCreateRequestStatus.POSTED)
         self.assertEqual(finished.message_ts, request_post["ts"])
+        self.assertIs(loops[0].metadata.get(LOOP_QUIET_CHOICE_KEY), True)
 
     def test_queued_request_fails_before_setup_knows_the_owner(self):
-        request = enqueue_agent_loop_create_request(self.store, "check CI hourly").request
+        request = enqueue_agent_loop_create_request(
+            self.store, "check CI hourly", quiet=False
+        ).request
         assert request is not None
 
         self.assertEqual(self.controller.process_queued_loop_create_requests(), 1)
@@ -235,9 +277,11 @@ class CreateLoopMcpToolTests(unittest.TestCase):
                 self.assertIn("create_loop", CODEX_MCP_INSTRUCTIONS)
                 self.assertNotIn("isError", result)
                 self.assertIn("queued", result["content"][0]["text"])
+                self.assertIn("Notifications: quiet", result["content"][0]["text"])
                 queued = store.claim_pending_loop_create_requests()
                 self.assertEqual(
-                    [item.text for item in queued], ["loop create check CI every hour #public"]
+                    [item.text for item in queued],
+                    ["loop create check CI every hour #public #quiet"],
                 )
             finally:
                 store.close()
@@ -271,6 +315,7 @@ class LoopCliTests(unittest.TestCase):
                         "CI every hour",
                         "--provider",
                         "codex",
+                        "--every-run",
                         "--no-wait",
                         "--json",
                         "--db",
@@ -280,7 +325,9 @@ class LoopCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["status"], "pending")
-            self.assertEqual(payload["text"], "loop create check CI every hour provider=codex")
+            self.assertEqual(
+                payload["text"], "loop create check CI every hour provider=codex #every-run"
+            )
 
             status_output = io.StringIO()
             with redirect_stdout(status_output):
@@ -300,10 +347,29 @@ class LoopCliTests(unittest.TestCase):
             errors = io.StringIO()
             with redirect_stderr(errors):
                 code = main(
-                    ["loop", "create", "restart prod hourly #dangerous-mode", "--db", str(db)]
+                    [
+                        "loop",
+                        "create",
+                        "restart prod hourly #dangerous-mode",
+                        "--db",
+                        str(db),
+                    ]
                 )
             self.assertEqual(code, 2)
             self.assertIn("read-only", errors.getvalue())
+
+    def test_loop_create_defaults_to_quiet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(
+                    ["loop", "create", "check CI hourly", "--no-wait", "--json", "--db", str(db)]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                json.loads(output.getvalue())["text"], "loop create check CI hourly #quiet"
+            )
 
 
 class AgentSkillsTests(unittest.TestCase):

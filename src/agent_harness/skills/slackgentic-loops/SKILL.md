@@ -26,9 +26,15 @@ Before creating anything, make sure you know:
 - **Schedule**: it must recur. Daily or weekly needs a time and a timezone
   (ask for the timezone if the user's location is unknown); intervals must be
   at least 5 minutes.
-- **Quiet or not**: quiet loops post nothing on all-clear runs and only post
-  (and notify) when a run finds something or fails. Default to quiet when the
-  user says things like "only tell me when", "alert me if", or "ping me when".
+- **Quiet (default) or every run**:
+  - **Quiet**: each all-clear run is logged silently in the pinned panel's
+    thread (the run log), which notifies nobody. A run that finds something or
+    fails posts a report card to the channel, which notifies. This covers
+    "silent loop", "only tell me when", "alert me if", "only raise blockers",
+    and "a silent status update when all is well".
+  - **Every run**: every run posts its report card to the channel. Pick it only
+    when the user explicitly asks for each run's card in the channel. A request
+    for a status update on normal runs is not that; the quiet run log holds it.
 - Optional: `provider` (`claude` or `codex`) and `public` visibility. Loop
   channels are private by default. Loops run on Claude unless the user asks for
   Codex, and each loop is pinned to a named model (the provider's default unless
@@ -46,15 +52,19 @@ mission, then the reporting rule. Example:
 > example-org/example-repo, list failing workflows with the failing step and a
 > likely cause, and only post when something is failing
 
+Loops are quiet unless you opt out with the argument below; the request text
+alone does not change the mode.
+
 Then use the first mechanism that is available:
 
 1. **MCP tool** (preferred): call Slackgentic's `create_loop` tool
    (`mcp__slackgentic__create_loop` in Claude Code) with
-   `{"request": "<request>"}`, plus optional `"provider"` and `"visibility"`.
+   `{"request": "<request>"}`, plus optional `"quiet": false` (every run),
+   `"provider"`, and `"visibility"`.
 2. **CLI**: run
 
    ```sh
-   slackgentic loop create "<request>"
+   slackgentic loop create "<request>"   # add --every-run to post every run
    ```
 
    Add `--provider claude|codex` or `--public` when asked. The command waits
@@ -62,7 +72,8 @@ Then use the first mechanism that is available:
    sandbox blocks the command from writing Slackgentic's local state, request
    escalation for that one command or use the MCP tool.
 3. **No tool or CLI access**: tell the user to type this in the Slackgentic
-   agent channel: `loop create <request>`.
+   agent channel: `loop create <request>` (add `#every-run` to post every
+   run; typed requests are quiet by default too).
 
 Never try to create the loop channel yourself, post to Slack directly, or edit
 Slackgentic's database.
@@ -76,6 +87,8 @@ channel, schedule, next run, emoji), and waits. The user must click
 owner, pins the control panel, and runs on schedule. Say this plainly, for
 example: "I've sent the loop request to Slackgentic. Approve the preview in
 your agent channel and it will create #loop-... and start at the next run."
+Repeat the `Notifications:` line from the tool result word for word, and tell
+the user to check that the preview shows the same mode before clicking Create.
 
 If the result says the request is still queued, the Slackgentic service is not
 running. Suggest `slackgentic service status` and `slackgentic service start`;
@@ -128,7 +141,7 @@ exact text to send, in the **loop's channel**:
 | `loop icon: :emoji:` | Change the emoji (a URL or `regenerate` also works) |
 | `loop cwd: <path>` | Set the directory future runs read |
 | `loop permissions: <mode>` | `read-only` (default), `safe-auto`, `locked`, or `dangerous` (asks for confirmation) |
-| `loop quiet: on` / `loop quiet: off` | Only post when a run needs attention, or post every run |
+| `loop quiet: on` / `loop quiet: off` | Log all-clear runs silently in the panel thread and post only when a run needs attention, or post every run's card |
 | `loop compact now` | Compact the loop's memory |
 | `loop stop` / `loop stop archive` | Stop the loop, optionally archiving its channel |
 | `loop help` | Show the in-channel command reference |
