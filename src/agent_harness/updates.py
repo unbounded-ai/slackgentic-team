@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import zip_longest
 from pathlib import Path
@@ -171,7 +171,26 @@ class GitHubReleaseSource:
         self.timeout_seconds = timeout_seconds
 
     def latest_release(self) -> ReleaseInfo | None:
-        url = f"https://api.github.com/repos/{self.repository}/releases/latest"
+        payload = self._get("releases/latest")
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise UpdateCheckError("GitHub release response was not an object")
+        return _release_from_payload(payload)
+
+    def releases(self) -> list[ReleaseInfo]:
+        """Recent published releases, newest first."""
+        payload = self._get("releases?per_page=100")
+        if not isinstance(payload, list):
+            raise UpdateCheckError("GitHub releases response was not a list")
+        return [
+            _release_from_payload(item)
+            for item in payload
+            if isinstance(item, dict) and not item.get("draft") and not item.get("prerelease")
+        ]
+
+    def _get(self, path: str) -> Any:
+        url = f"https://api.github.com/repos/{self.repository}/{path}"
         request = urllib.request.Request(
             url,
             headers={
@@ -188,20 +207,22 @@ class GitHubReleaseSource:
             raise UpdateCheckError(f"GitHub release check failed with HTTP {exc.code}") from exc
         except OSError as exc:
             raise UpdateCheckError(f"GitHub release check failed: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise UpdateCheckError("GitHub release response was not an object")
-        tag_name = payload.get("tag_name")
-        if not isinstance(tag_name, str) or not tag_name:
-            raise UpdateCheckError("GitHub release response did not include a tag name")
-        return ReleaseInfo(
-            version=version_from_tag(tag_name),
-            tag_name=tag_name,
-            html_url=_optional_string(payload.get("html_url")),
-            tarball_url=_optional_string(payload.get("tarball_url")),
-            name=_optional_string(payload.get("name")),
-            published_at=_optional_string(payload.get("published_at")),
-            body=_optional_string(payload.get("body")),
-        )
+        return payload
+
+
+def _release_from_payload(payload: dict[str, Any]) -> ReleaseInfo:
+    tag_name = payload.get("tag_name")
+    if not isinstance(tag_name, str) or not tag_name:
+        raise UpdateCheckError("GitHub release response did not include a tag name")
+    return ReleaseInfo(
+        version=version_from_tag(tag_name),
+        tag_name=tag_name,
+        html_url=_optional_string(payload.get("html_url")),
+        tarball_url=_optional_string(payload.get("tarball_url")),
+        name=_optional_string(payload.get("name")),
+        published_at=_optional_string(payload.get("published_at")),
+        body=_optional_string(payload.get("body")),
+    )
 
 
 def current_package_version() -> str:
@@ -225,6 +246,17 @@ class UpdateChecker:
         current = self.current_version()
         if not is_newer_version(release.version, current):
             return None
+        # Each release notes only its own changes; collect every release the
+        # upgrade spans so the card lists all of them.
+        notes = [
+            item.body
+            for item in self.release_source.releases()
+            if item.body
+            and is_newer_version(item.version, current)
+            and not is_newer_version(item.version, release.version)
+        ]
+        if notes:
+            release = replace(release, body="\n\n".join(notes))
         return UpdateCandidate(
             current_version=current,
             release=release,
@@ -794,6 +826,23 @@ class SlackgenticUpdateRunner:
             message_ts,
             text,
             self.status_blocks(candidate, text, False),
+        )
+
+    def show_changes(
+        self,
+        version: str,
+        channel_id: str,
+        message_ts: str,
+        status_text: str,
+        show: bool,
+    ) -> None:
+        """Expand or collapse the change list on a finished update card."""
+        candidate = self._candidate_for_version(version) or self._fallback_candidate(version)
+        self.update_message(
+            channel_id,
+            message_ts,
+            status_text,
+            self.status_blocks(candidate, status_text, False, show_changes=show),
         )
 
     def start_upgrade(

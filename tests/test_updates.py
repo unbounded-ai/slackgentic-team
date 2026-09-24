@@ -30,6 +30,7 @@ from agent_harness.updates import (
     SelfUpdater,
     SlackgenticUpdateRunner,
     UpdateCandidate,
+    UpdateChecker,
     UpgradePlan,
     UpgradeResult,
     finalize_restart_pending,
@@ -91,6 +92,28 @@ class GitHubReleaseSourceTests(unittest.TestCase):
         self.assertEqual(release.tag_name, "v0.2.0")
         self.assertEqual(release.tarball_url, payload["tarball_url"])
         self.assertEqual(release.body, payload["body"])
+
+
+class UpdateCheckerTests(unittest.TestCase):
+    def test_check_collects_notes_from_every_release_the_upgrade_spans(self):
+        def release(version):
+            return ReleaseInfo(
+                version=version, tag_name=f"v{version}", body=f"- Change in {version}"
+            )
+
+        class Source:
+            repository = "example-org/example-repo"
+
+            def latest_release(self):
+                return release("0.4.0")
+
+            def releases(self):
+                return [release(v) for v in ("0.4.0", "0.3.0", "0.2.0", "0.1.0")]
+
+        candidate = UpdateChecker(Source(), current_version=lambda: "0.2.0").check()
+
+        assert candidate is not None
+        self.assertEqual(candidate.release.body, "- Change in 0.4.0\n\n- Change in 0.3.0")
 
 
 class SelfUpdaterTests(unittest.TestCase):
