@@ -5,8 +5,8 @@ call itself instead of asking the owner. Claude runs this module as a
 ``PreToolUse`` hook. Each call is either:
 
 * allowed — known read-only work (reads, searches, GET requests, read-only SQL,
-  describe/list/get cloud calls) and file writes inside the loop's scratch
-  directory;
+  describe/list/get cloud calls), file writes inside the loop's scratch
+  directory, and every Talos memory command;
 * denied — anything that can change state (file edits outside scratch,
   destructive shell commands, mutating HTTP methods, mutating SQL, cloud write
   operations). The reason goes back to the agent so it can find a read-only
@@ -229,6 +229,8 @@ def evaluate_tool_call(
         return GuardDecision(ALLOW, "read-only tool")
     if tool_name.startswith("mcp__slackgentic__"):
         return GuardDecision(ALLOW, "Slackgentic channel tool")
+    if tool_name.startswith("mcp__talos__"):
+        return GuardDecision(ALLOW, "Talos memory tool")
     if tool_name in _FILE_WRITE_TOOLS:
         path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
         if context.in_scratch(path):
@@ -309,6 +311,9 @@ def _evaluate_argv(
         return _deny(f"loops are read-only; `{executable}` can change state")
     if executable in _READ_ONLY_EXECUTABLES:
         return GuardDecision(ALLOW, "read-only command")
+    # Talos writes only to its own memory store; loops recall and send feedback.
+    if executable == "talos":
+        return GuardDecision(ALLOW, "Talos memory command")
     handler = _EXECUTABLE_HANDLERS.get(executable)
     if handler is not None:
         return handler(args, stdin_text, context)
