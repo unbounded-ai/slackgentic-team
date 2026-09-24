@@ -61,6 +61,7 @@ from agent_harness.runtime.tasks import ManagedTaskRuntime
 from agent_harness.slack import build_loop_edit_modal, encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
+    LOOP_QUIET_CHOICE_KEY,
     LOOP_RUN_IDLE_GRACE,
     SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
     LoopRunner,
@@ -139,6 +140,7 @@ class LoopCreationFlowTests(unittest.TestCase):
                         "shape": "circle",
                     },
                 },
+                "quiet": False,
             }
         )
         handled = self.controller.handle_runtime_agent_control(
@@ -496,6 +498,7 @@ class LoopCreationFlowTests(unittest.TestCase):
             loop.mission,
             "Inspect deployment health; Schedule: Every weekday at 9am PT",
         )
+        self.assertIs(loop.metadata.get(LOOP_QUIET_CHOICE_KEY), True)
         self.assertIn("Inspect deployment health", self.runtime.started[-1][0].prompt)
         self.assertIn("Every weekday at 9am PT", self.runtime.started[-1][0].prompt)
         self.assertEqual(self.gateway.updates[-1]["ts"], "101.000002")

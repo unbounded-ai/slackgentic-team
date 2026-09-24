@@ -71,8 +71,8 @@ CHANNEL_INSTRUCTIONS = (
     "`read_thread` MCP tool; it only reads links from the configured Slackgentic "
     "channel. When the user asks you to create a Slackgentic loop, a recurring "
     "report or check that runs in its own Slack channel, call the `create_loop` "
-    "tool with the task and schedule; the owner approves the resulting preview in "
-    "Slack."
+    "tool with the task and schedule; loops are quiet unless you pass `quiet: false`. "
+    "The owner approves the resulting preview in Slack."
 )
 CODEX_MCP_INSTRUCTIONS = (
     "Slackgentic provides MCP tools for Slack-mediated workflows. When opening a "
@@ -82,8 +82,9 @@ CODEX_MCP_INSTRUCTIONS = (
     "contents of another Slackgentic thread from a Slack link, use `read_thread`; it "
     "only reads links from the configured Slackgentic channel. When the user asks "
     "you to create a Slackgentic loop, a recurring report or check that runs in "
-    "its own Slack channel, call `create_loop` with the task and schedule; the "
-    "owner approves the resulting preview in Slack."
+    "its own Slack channel, call `create_loop` with the task and schedule; loops are "
+    "quiet unless you pass `quiet: false`. The owner approves the resulting preview in "
+    "Slack."
 )
 SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__create_loop",
@@ -263,6 +264,7 @@ class ClaudeChannelServer:
             _string_arg(arguments, "request"),
             provider=_string_arg(arguments, "provider") or None,
             visibility=_string_arg(arguments, "visibility") or None,
+            quiet=arguments.get("quiet") if isinstance(arguments.get("quiet"), bool) else None,
             source="mcp",
         )
         if result.request is None:
@@ -1059,8 +1061,8 @@ def _tools() -> list[dict[str, Any]]:
                 "Request a Slackgentic loop: a recurring, read-only task that runs on a "
                 "schedule and reports in its own Slack channel. Slackgentic posts the request "
                 "in the agent channel, resolves it into a preview, and the owner clicks Create "
-                "in Slack to make the channel. Describe the task, the schedule, what to report, "
-                "and whether it should stay quiet on all-clear runs."
+                "in Slack to make the channel. Describe the task, the schedule, and what to "
+                "report. Loops are quiet unless quiet is false."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1072,6 +1074,15 @@ def _tools() -> list[dict[str, Any]]:
                             "language, for example 'every weekday at 9am America/New_York, "
                             "check CI on main in example-org/example-repo and report failures; "
                             "only post when something fails'."
+                        ),
+                    },
+                    "quiet": {
+                        "type": "boolean",
+                        "description": (
+                            "Defaults to true: all-clear runs are logged silently in the "
+                            "pinned panel's thread and a notifying card posts only when a run "
+                            "needs attention. Pass false only when the owner explicitly wants "
+                            "every run's card posted to the channel."
                         ),
                     },
                     "provider": {

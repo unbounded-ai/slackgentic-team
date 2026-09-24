@@ -365,6 +365,7 @@ class PureLoopLogicTests(unittest.TestCase):
         assert parsed.spec is not None
         self.assertEqual(parsed.spec.channel_name, "loop-aws-billing")
         self.assertEqual(parsed.spec.next_run_at, datetime(2026, 8, 17, 16, 0, tzinfo=UTC))
+        self.assertTrue(parsed.spec.quiet, "a spec without quiet defaults to quiet")
         self.assertEqual(
             parsed.spec.icon.badge,
             LoopBadgeSpec("#0B6E4F", "$", "#F4FFF9", "circle"),

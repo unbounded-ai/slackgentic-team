@@ -247,12 +247,12 @@ deletes it (stop and archive its channel). Anyone in the loop's channel may run,
 pause, or resume it; only the owner can edit or delete it. `loops` in the main
 channel shows every loop as a card in one carousel, led by a **New loop** card.
 
-**Quiet loops** post nothing, and so notify nobody, on all-clear runs: they
-work silently in the pinned panel's thread and only tick the panel's "last check"
-line. A run that finds something (or fails) posts one report card, so a
-notification always means real signal. Ask for it when creating the loop ("only
-post when there are errors"), tick *Only post when a run needs attention* in
-**Edit**, or use `loop quiet: on`. So the panel's thread does not grow forever,
+**Quiet loops** post no card, and so notify nobody, on all-clear runs: each run
+is logged silently in the pinned panel's thread (the run log) and ticks the
+panel's "last check" line. A run that finds something (or fails) posts one report card, so a
+notification always means real signal. New loops are quiet by default; ask for
+"post every run" when creating one, untick *Only post when a run needs attention*
+in **Edit**, or use `loop quiet: off` to post every run instead. So the panel's thread does not grow forever,
 a quiet loop clears it every 120 runs (change it under **Edit** → *Clear the run
 log every*): the old panel and its thread are deleted, one message in the channel
 records the dates, run counts, and the agent's short note on the period, and a
@@ -296,16 +296,17 @@ prompt, journal, thread context, or history retrieval.
 | `loop icon: :emoji:` | Set an emoji; URLs and `regenerate` are also accepted |
 | `loop cwd: <path>` | Set the working directory for future runs |
 | `loop permissions: <mode>` | Use `read-only` (default), `safe-auto`, `locked`, or confirmed `dangerous` |
-| `loop quiet: on\|off` | Post only when a run needs attention, or every run |
+| `loop quiet: on\|off` | Log all-clear runs silently in the panel thread and post only when a run needs attention, or post every run's card |
 | `loop compact now` | Queue memory compaction |
 | `loop stop [archive]` | Stop the loop, optionally archiving its channel |
 | `loop help` | Show the in-channel command reference |
 
 Agents can request loops too. When you ask a Codex or Claude session to create
 a loop, it calls Slackgentic's `create_loop` MCP tool (or runs
-`slackgentic loop create "<task and schedule>"`). The running service posts the
-request in the agent channel as if you had typed `loop create`, and you still
-review the preview and click Create. Agent-requested loops always start
+`slackgentic loop create "<task and schedule>"`). Agent-requested loops are quiet
+unless the agent passes `quiet: false` or `--every-run`; the reply states the
+mode. The running service posts the request in the agent channel as if you had typed
+`loop create`, and you still review the preview and click Create. Agent-requested loops always start
 read-only. `slackgentic loop list` shows loops from a terminal.
 
 Use `loops` or `loop list` in the main agent channel to see every loop in one

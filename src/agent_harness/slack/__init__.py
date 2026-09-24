@@ -173,7 +173,7 @@ def build_loop_create_modal(
     quiet = _option(
         "Only when attention is needed",
         "quiet",
-        "All-clear runs stay silent and only update the pinned panel",
+        "All-clear runs are logged silently in the pinned panel's thread",
     )
     return {
         "type": "modal",
@@ -230,8 +230,8 @@ def build_loop_create_modal(
                 "element": {
                     "type": "radio_buttons",
                     "action_id": "value",
-                    "initial_option": every_run,
-                    "options": [every_run, quiet],
+                    "initial_option": quiet,
+                    "options": [quiet, every_run],
                 },
             },
             {
@@ -920,7 +920,7 @@ def build_loop_edit_modal(
     quiet_option = _option(
         "Only post when a run needs attention",
         "quiet",
-        "All-clear runs stay silent and only update the pinned panel",
+        "All-clear runs are logged silently in the pinned panel's thread",
     )
     cwd_element: dict[str, Any] = {
         "type": "plain_text_input",
