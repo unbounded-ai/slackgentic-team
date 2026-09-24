@@ -630,7 +630,10 @@ class SlackTests(unittest.TestCase):
         # Once we're past the prompt stage the call-to-action reads wrong, so drop it.
         self.assertNotIn("Upgrade now to install the published release", in_progress_text)
         self.assertIn("Installing Slackgentic v0.1.1", in_progress_text)
-        self.assertNotIn("actions", in_progress[0])
+        self.assertEqual(
+            [action["text"]["text"] for action in in_progress[0]["actions"]],
+            ["Show changes (2)"],
+        )
 
         done = build_update_prompt_blocks(
             candidate,
@@ -641,6 +644,23 @@ class SlackTests(unittest.TestCase):
         self.assertNotIn("Upgrade now to install the published release", done_text)
         self.assertIn(":white_check_mark:", done_text)
         self.assertIn("restarted successfully", done_text)
+        # The change list stays on the finished card, collapsed behind a toggle.
+        self.assertEqual(len(done), 1)
+        self.assertEqual(
+            [action["text"]["text"] for action in done[0]["actions"]], ["Show changes (2)"]
+        )
+        self.assertIn("update.changes", done[0]["actions"][0]["value"])
+        expanded = build_update_prompt_blocks(
+            candidate,
+            status_text=":white_check_mark: Installed Slackgentic v0.1.1 and restarted successfully.",
+            include_actions=False,
+            show_changes=True,
+        )
+        self.assertEqual(
+            [action["text"]["text"] for action in expanded[0]["actions"]], ["Hide changes"]
+        )
+        self.assertIn("What changed", expanded[1]["text"])
+        self.assertIn("- Shortens release notes in Slack", expanded[1]["text"])
 
         draining_text = update_draining_text(600)
         self.assertLessEqual(len(draining_text), 200)

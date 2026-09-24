@@ -7270,6 +7270,14 @@ class SlackTeamController:
             update_runner.start_upgrade(version, channel_id, message_ts, force=True)
         elif action == "update.dismiss":
             update_runner.dismiss(version, channel_id, message_ts)
+        elif action == "update.changes":
+            update_runner.show_changes(
+                version,
+                channel_id,
+                message_ts,
+                str(payload.get("status") or ""),
+                bool(payload.get("show")),
+            )
 
     def _hire_from_action(
         self,

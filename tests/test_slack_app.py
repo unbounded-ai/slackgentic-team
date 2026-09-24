@@ -62,7 +62,7 @@ from agent_harness.schedules import (
     SCHEDULE_RESOLUTION_ATTEMPTS_METADATA_KEY,
     SCHEDULE_RESOLUTION_METADATA_KEY,
 )
-from agent_harness.slack import encode_action_value
+from agent_harness.slack import build_update_prompt_blocks, encode_action_value
 from agent_harness.slack.app import (
     AUTO_ALLOWED_CLAUDE_PERMISSION_TEXT,
     CLAUDE_CHANNEL_PERMISSION_METHOD,
@@ -106,7 +106,7 @@ from agent_harness.team.commands import (
 )
 from agent_harness.timers import AGENT_TIMER_SIGNAL_PREFIX
 from agent_harness.timezones import TIMEZONE_SOURCE_MANUAL, format_user_time, set_user_timezone
-from agent_harness.updates import SlackgenticUpdateRunner
+from agent_harness.updates import ReleaseInfo, SlackgenticUpdateRunner, UpdateCandidate
 from tests.polling import POLL_TIMEOUT_SECONDS, shut_down_runtime, wait_until
 
 
@@ -2207,6 +2207,65 @@ class SlackAppTests(unittest.TestCase):
                 )
 
                 self.assertEqual(calls, [("0.2.0", "C1", "171.000001")])
+            finally:
+                store.close()
+
+    def test_changes_toggle_expands_and_collapses_the_finished_update_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            candidate = UpdateCandidate(
+                current_version="0.1.0",
+                release=ReleaseInfo(
+                    version="0.2.0", tag_name="v0.2.0", body="- First change\n- Second change"
+                ),
+                repository="example-org/example-repo",
+            )
+            updates = []
+
+            class Checker:
+                release_source = types.SimpleNamespace(repository="example-org/example-repo")
+
+                def check(self):
+                    return candidate
+
+            def status_blocks(update, status, include_actions, **options):
+                return build_update_prompt_blocks(
+                    update, status_text=status, include_actions=include_actions, **options
+                )
+
+            try:
+                store.init_schema()
+                runner = SlackgenticUpdateRunner(
+                    store=store,
+                    checker=Checker(),
+                    updater=object(),
+                    channel_id=lambda: "C1",
+                    prompt=lambda channel_id, update: None,
+                    update_message=lambda channel_id, ts, text, blocks: updates.append(blocks),
+                    status_blocks=status_blocks,
+                )
+                controller = SlackTeamController(store, gateway, default_channel_id="C1")
+                controller.set_update_runner(runner)
+                blocks = status_blocks(candidate, "Installed and restarted.", False)
+
+                for expected_label, expected_blocks in (
+                    ("Hide changes", 2),
+                    ("Show changes (2)", 1),
+                ):
+                    controller.handle_block_action(
+                        {
+                            "type": "block_actions",
+                            "channel": {"id": "C1"},
+                            "message": {"ts": "171.000001"},
+                            "actions": [{"value": blocks[0]["actions"][0]["value"]}],
+                        }
+                    )
+                    blocks = updates[-1]
+                    self.assertEqual(blocks[0]["body"]["text"], "Installed and restarted.")
+                    self.assertEqual(blocks[0]["actions"][0]["text"]["text"], expected_label)
+                    self.assertEqual(len(blocks), expected_blocks)
+                self.assertIn("- Second change", str(updates[0][1]))
             finally:
                 store.close()
 

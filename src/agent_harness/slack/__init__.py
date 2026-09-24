@@ -2087,11 +2087,13 @@ def build_update_prompt_blocks(
     status_text: str | None = None,
     include_actions: bool = True,
     draining: bool = False,
+    show_changes: bool = False,
 ) -> list[dict[str, Any]]:
     """An update card: what's new, one click to upgrade, and live install status.
 
     While the upgrade waits for running agents (`draining`), the card offers to
-    install right away instead of waiting.
+    install right away instead of waiting. Once the card only reports status, the
+    change list collapses behind a toggle (`show_changes`) so it stays on record.
     """
     release = candidate.release
     if status_text is None:
@@ -2142,10 +2144,26 @@ def build_update_prompt_blocks(
                 )
             )
         card["actions"] = actions
-    blocks: list[dict[str, Any]] = [card]
     release_notes = _release_notes_excerpt(release.body)
+    if release_notes and status_text is not None and not include_actions:
+        count = release_notes.count("\n") + 1
+        card["actions"] = [
+            _button(
+                "Hide changes" if show_changes else f"Show changes ({count})",
+                "slackgentic.update.changes",
+                encode_action_value(
+                    "update.changes",
+                    version=release.version,
+                    show=not show_changes,
+                    status=_shorten_text(body, 200),
+                ),
+            )
+        ]
+    blocks: list[dict[str, Any]] = [card]
     if release_notes and status_text is None:
         blocks.append({"type": "markdown", "text": f"**What's new**\n{release_notes}"})
+    elif release_notes and show_changes:
+        blocks.append({"type": "markdown", "text": f"**What changed**\n{release_notes}"})
     return blocks
 
 
@@ -2187,7 +2205,9 @@ def _release_note_headlines(body: str) -> list[str]:
             saw_changes_header = saw_changes_header or in_changes
             continue
         if line.lower().startswith("**full changelog**"):
-            break
+            # Notes may join several releases, each ending with its own link.
+            in_changes = False
+            continue
         if saw_changes_header and not in_changes:
             continue
         match = re.match(r"^(?:[-*+]|\d+\.)\s+(?P<headline>.+)$", line)
