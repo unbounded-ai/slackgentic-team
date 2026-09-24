@@ -4350,7 +4350,7 @@ class SlackTeamController:
             prompt=(
                 "Emit only the required hidden loop summary line now: "
                 f'{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{{"summary": "<3-5 sentences>", '
-                '"status": "ok|found_issue|action_taken|failed", "carry": {}}}'
+                '"status": "ok|found_issue|resolved|action_taken|failed", "carry": {}}}'
                 f" Then end the run with {AGENT_THREAD_DONE_SIGNAL}."
             ),
             assignment_mode=AssignmentMode.SPECIFIC,

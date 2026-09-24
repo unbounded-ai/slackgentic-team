@@ -361,6 +361,7 @@ LOOP_NO_REPORT_STATUS = "no_report"
 LOOP_RESULT_STYLES: dict[str, tuple[str, str]] = {
     "ok": ("✅", "All clear"),
     "found_issue": ("⚠️", "Needs attention"),
+    "resolved": ("✅", "Resolved"),
     "action_taken": ("🛠️", "Action taken"),
     "failed": ("❌", "Mission failed"),
     LOOP_NO_REPORT_STATUS: ("⚠️", "No report"),

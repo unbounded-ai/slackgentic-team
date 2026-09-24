@@ -3050,6 +3050,18 @@ class LoopCreationFlowTests(unittest.TestCase):
         assert finished is not None
         self.assertEqual(finished.thread_ts, new_posts[0]["ts"])
 
+    def test_quiet_loop_resolution_posts_a_check_mark_card(self):
+        loop = self._activate_quiet_loop()
+        posts_before = len(self.gateway.posts)
+        self._run_quiet_loop_once(loop, status="resolved")
+
+        new_posts = self.gateway.posts[posts_before:]
+        self.assertEqual(len(new_posts), 1)
+        rendered = str(new_posts[0]["blocks"])
+        self.assertIn("✅ *All clear*", rendered)
+        self.assertIn("Resolved", rendered)
+        self.assertNotIn("⚠️", rendered)
+
     def test_quiet_loop_runtime_failures_are_reported(self):
         loop = self._activate_quiet_loop()
         posts_before = len(self.gateway.posts)
