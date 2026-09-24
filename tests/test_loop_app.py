@@ -61,8 +61,7 @@ from agent_harness.runtime.tasks import ManagedTaskRuntime
 from agent_harness.slack import build_loop_edit_modal, encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
-    LOOP_THREAD_DONE_DEFER_GRACE,
-    SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX,
+    LOOP_RUN_IDLE_GRACE,
     SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
     LoopRunner,
     SlackMessageBackfill,
@@ -1747,22 +1746,21 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
         self.runtime.running_task_ids.add(task.task_id)
 
+        # The agent reads the feedback, answers nothing, and waits for input.
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds() - 1)
         self.controller.reconcile_loop_runs()
         still_waiting = self.store.get_loop_run(run.run_id)
         assert still_waiting is not None
         self.assertEqual(still_waiting.status, LoopRunStatus.RUNNING)
 
-        self.store.set_setting(
-            f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run.run_id}",
-            (utc_now() - LOOP_THREAD_DONE_DEFER_GRACE - timedelta(seconds=1)).isoformat(),
-        )
-        sent_before = len(self.runtime.sent)
+        # Once past the grace it gets one plain summary request, then the run ends.
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds())
+        self.controller.reconcile_loop_runs()
         self.controller.reconcile_loop_runs()
 
         finished = self.store.get_loop_run(run.run_id)
         assert finished is not None
         self.assertEqual(finished.status, LoopRunStatus.DONE)
-        self.assertEqual(self.runtime.sent[sent_before:], [])
 
     # Regressions found by the loop property suite (tests/test_loop_run_properties.py).
 
@@ -1907,6 +1905,56 @@ class LoopCreationFlowTests(unittest.TestCase):
         finished = self.store.get_loop_run(run.run_id)
         assert finished is not None
         self.assertEqual(finished.thread_ts, new_posts[0]["ts"])
+
+    def _idle_for(self, seconds):
+        self.runtime.task_idle_seconds = lambda task_id: seconds
+
+    def test_an_idle_run_that_recorded_a_summary_is_closed(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, run, thread = self._running_task_and_run(loop)
+        # The agent reports, then ends its turn without THREAD_DONE.
+        self.controller.handle_runtime_agent_control(
+            task, agent, thread, AGENT_LOOP_SUMMARY_SIGNAL_PREFIX + '{"summary":"All clear."}'
+        )
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds() - 1)
+        self.controller.reconcile_loop_runs()
+        waiting = self.store.get_loop_run(run.run_id)
+        assert waiting is not None
+        self.assertEqual(waiting.status, LoopRunStatus.RUNNING)
+
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds())
+        self.controller.reconcile_loop_runs()
+
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertIn("All clear.", finished.summary_json or "")
+        self.assertIn(task.task_id, [task_id for task_id, _ in self.runtime.stopped])
+
+    def test_an_idle_run_without_a_summary_is_asked_once_then_closed(self):
+        loop = self._activate_loop()
+        self.controller.fire_loop_now(loop)
+        task, _, run, _ = self._running_task_and_run(loop)
+        self._idle_for(LOOP_RUN_IDLE_GRACE.total_seconds())
+
+        self.controller.reconcile_loop_runs()
+
+        asked = self.store.get_loop_run(run.run_id)
+        assert asked is not None
+        self.assertEqual(asked.status, LoopRunStatus.RUNNING)
+        self.assertEqual(self.runtime.sent[-1][0], task.task_id)
+        self.assertIn(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX, self.runtime.sent[-1][1])
+        sent_before = len(self.runtime.sent)
+
+        # The agent answered nothing useful and went idle again.
+        self.controller.reconcile_loop_runs()
+
+        finished = self.store.get_loop_run(run.run_id)
+        assert finished is not None
+        self.assertEqual(finished.status, LoopRunStatus.DONE)
+        self.assertEqual(self.runtime.sent[sent_before:], [])
+        self.assertEqual(self.controller._loop_run_emoji(finished), "⚠️")
 
     def test_spawn_failure_marks_run_failed(self):
         loop = self._activate_loop()

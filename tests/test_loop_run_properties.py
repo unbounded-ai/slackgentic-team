@@ -67,7 +67,6 @@ from agent_harness.runtime.tasks import (
 )
 from agent_harness.slack.app import (
     LOOP_RUN_STRANDED_GRACE,
-    LOOP_THREAD_DONE_DEFER_GRACE,
     SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX,
     LoopRunner,
     SlackTeamController,
@@ -338,6 +337,27 @@ class WorkerRuntime(FakeRuntime):
         # mid-turn, but an interrupt lets the next message through.
         self.codex_next = False
         self.codex: set[str] = set()
+        # Workers whose turn ended and who wait for input, and those of them that
+        # have waited past the harness's idle grace.
+        self.idle: set[str] = set()
+        self.idle_long: set[str] = set()
+
+    def _wake(self, task_id):
+        self.idle.discard(task_id)
+        self.idle_long.discard(task_id)
+
+    def end_turn(self, task_id):
+        # With input already queued, Claude starts its next turn right away.
+        if task_id in self.alive and task_id not in self.stopping and not self.unread(task_id):
+            self.idle.add(task_id)
+
+    def let_time_pass(self):
+        self.idle_long |= self.idle
+
+    def task_idle_seconds(self, task_id):
+        if task_id not in self.alive or task_id in self.stopping or task_id not in self.idle:
+            return None
+        return 10**6 if task_id in self.idle_long else 0.0
 
     def start_task(self, task, agent, thread):
         super().start_task(task, agent, thread)
@@ -347,6 +367,7 @@ class WorkerRuntime(FakeRuntime):
         self.alive.add(task.task_id)
         self.stopping.discard(task.task_id)
         self.inbox[task.task_id] = []
+        self._wake(task.task_id)
         if self.codex_next:
             self.codex.add(task.task_id)
         else:
@@ -366,6 +387,7 @@ class WorkerRuntime(FakeRuntime):
         if task_id in self.alive:
             self.sent.append((task_id, message))
             self.inbox.setdefault(task_id, []).append(message)
+            self._wake(task_id)
             return True
         return False
 
@@ -385,6 +407,7 @@ class WorkerRuntime(FakeRuntime):
                 (message, self.excused(task_id, message)) for message in self.inbox.pop(task_id, [])
             )
             self.stopping.add(task_id)
+            self._wake(task_id)
         return True
 
     def read_inbox(self, task_id) -> list[str]:
@@ -397,12 +420,14 @@ class WorkerRuntime(FakeRuntime):
         assert not self.unread(task_id), "a worker with unread input takes another turn"
         self.alive.discard(task_id)
         self.stopping.discard(task_id)
+        self._wake(task_id)
 
     def crash(self, task_id):
         # A crash loses queued input through no fault of the harness.
         self.inbox.pop(task_id, None)
         self.alive.discard(task_id)
         self.stopping.discard(task_id)
+        self._wake(task_id)
 
     def kill_all(self):
         for task_id in list(self.alive):
@@ -701,6 +726,13 @@ class LoopLifecycle(RuleBasedStateMachine):
         self._agent_turn(task_id, summary, compact, fetch, order, thread_done)
 
     def _agent_turn(self, task_id, summary, compact, fetch, order, thread_done):
+        self.runtime._wake(task_id)
+        try:
+            self._agent_turn_lines(task_id, summary, compact, fetch, order, thread_done)
+        finally:
+            self.runtime.end_turn(task_id)
+
+    def _agent_turn_lines(self, task_id, summary, compact, fetch, order, thread_done):
         # A new turn reads everything queued before it.
         self.runtime.read_inbox(task_id)
         run = self._run_for_task(task_id)
@@ -853,11 +885,8 @@ class LoopLifecycle(RuleBasedStateMachine):
 
     @rule()
     def time_passes(self):
+        self.runtime.let_time_pass()
         for run in self._all_runs():
-            key = f"{SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX}{run.run_id}"
-            if self.store.get_setting(key):
-                past = utc_now() - LOOP_THREAD_DONE_DEFER_GRACE - timedelta(seconds=1)
-                self.store.set_setting(key, past.isoformat())
             if run.status == LoopRunStatus.RUNNING and run.task_id:
                 task = self.store.get_agent_task(run.task_id)
                 if task is not None:
@@ -1089,21 +1118,19 @@ class LoopLifecycle(RuleBasedStateMachine):
         try:
             if self.loop_id is None:
                 return
-            # Liveness. Queued input gets a turn (worst case: the agent answers with
-            # nothing). An agent that said THREAD_DONE may then idle forever, as
-            # managed Claude does; otherwise its worker eventually exits. Either
-            # way the run must end once time passes.
+            # Liveness. A worker still in its turn ends it, and queued input gets
+            # a turn; in the worst case the agent answers with nothing and then
+            # idles forever, as managed Claude does. The run must still end once
+            # time passes, whether or not the agent ever said THREAD_DONE.
             for _ in range(8):
                 running = [run for run in self._all_runs() if run.status == LoopRunStatus.RUNNING]
                 if not running:
                     break
                 run = running[0]
-                model = self.runs[run.run_id]
                 task_id = run.task_id
-                if task_id in self.runtime.alive and self.runtime.unread(task_id):
+                working = task_id not in self.runtime.idle and task_id not in self.runtime.stopping
+                if task_id in self.runtime.alive and working:
                     self._agent_turn(task_id, None, None, None, [], False)
-                elif task_id in self.runtime.alive and not model.said_done:
-                    self._exit_worker(task_id)
                 self.time_passes()
             open_runs = [run for run in self._all_runs() if run.status == LoopRunStatus.RUNNING]
             assert open_runs == [], f"a run never finished: {open_runs}"

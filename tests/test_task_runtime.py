@@ -2544,6 +2544,50 @@ class TaskRuntimeTests(unittest.TestCase):
                 shut_down_runtime(runtime)
                 store.close()
 
+    def test_idle_seconds_count_only_a_live_worker_waiting_after_its_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "loop run", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+                alive = [True]
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=SimpleNamespace(is_alive=lambda: alive[0], send=lambda _: None),
+                    thread=SlackThreadRef("C1", "171.panel"),
+                    worker=threading.Thread(),
+                )
+                with patch.object(runtime, "_get_running", return_value=running):
+                    # Still working on its turn.
+                    self.assertIsNone(runtime.task_idle_seconds(task.task_id))
+                    running.turn_complete = True
+                    running.last_activity_monotonic = time.monotonic() - 120
+                    self.assertGreaterEqual(runtime.task_idle_seconds(task.task_id), 120)
+                    # A background command finishing counts as activity.
+                    running.last_activity_monotonic = time.monotonic()
+                    self.assertLess(runtime.task_idle_seconds(task.task_id), 5)
+                    running.stop_requested = True
+                    self.assertIsNone(runtime.task_idle_seconds(task.task_id))
+                    running.stop_requested = False
+                    alive[0] = False
+                    self.assertIsNone(runtime.task_idle_seconds(task.task_id))
+                with patch.object(runtime, "_get_running", return_value=None):
+                    self.assertIsNone(runtime.task_idle_seconds(task.task_id))
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
     def test_send_to_a_stopping_task_fails_instead_of_losing_the_message(self):
         # A loop run lost its summary feedback, and an owner's question could be
         # lost the same way, because a send to a worker that was being stopped

@@ -454,8 +454,10 @@ SETTING_LOOP_INVALID_SUMMARY_PREFIX = "slack.loop_invalid_summary."
 SETTING_LOOP_SIGNAL_RETRY_PREFIX = "slack.loop_signal_retry."
 # When a loop run's THREAD_DONE was held back so the agent could answer that feedback.
 SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX = "slack.loop_thread_done_deferred."
-# How long a held-back THREAD_DONE waits for the agent's fix before the run is closed.
-LOOP_THREAD_DONE_DEFER_GRACE = timedelta(minutes=10)
+# How long a loop run's worker may wait for input after its turn ended before the
+# harness steps in. Claude idles on stdin after each turn, so a run whose agent
+# never said THREAD_DONE would otherwise stay open and skip every later run.
+LOOP_RUN_IDLE_GRACE = timedelta(minutes=15)
 SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
 SETTING_LOOP_PANELS_RENDERED_VERSION = "slack.loop_panels_rendered_version"
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
@@ -3912,7 +3914,7 @@ class SlackTeamController:
         the run finished without its report. The fix does not close the run by
         itself, since more control lines may follow it in the same message; the
         agent ends the run again with THREAD_DONE, and reconcile_loop_runs closes
-        it if the agent never does."""
+        it once the worker sits idle if the agent never does."""
         run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
         loop_id = task.metadata.get(LOOP_ID_METADATA_KEY)
         if self.runtime is None or not isinstance(run_id, str) or not isinstance(loop_id, str):
@@ -4678,19 +4680,18 @@ class SlackTeamController:
                 return True
             return False
         if task.status not in {AgentTaskStatus.DONE, AgentTaskStatus.CANCELLED}:
-            deferred_at = self._loop_thread_done_deferred_at(current.run_id)
-            if deferred_at is not None and utc_now() - deferred_at >= LOOP_THREAD_DONE_DEFER_GRACE:
-                # The agent already said it was done and never answered the
-                # feedback; close the run on what it recorded. Its worker is
-                # stopping, so a nudge now would be lost.
-                self.store.set_setting(
-                    f"{SETTING_LOOP_SUMMARY_NUDGE_PREFIX}{current.run_id}",
-                    str(LOOP_SUMMARY_NUDGE_ATTEMPTS),
-                )
-                if task.thread_ts:
-                    self._complete_task_thread(
-                        task.channel_id, task.thread_ts, task_id=task.task_id
-                    )
+            if self._loop_run_worker_idle(task):
+                loop = self.store.get_loop(current.loop_id)
+                if (
+                    loop is not None
+                    and current.kind != LoopRunKind.COMPACTION
+                    and not current.summary_json
+                    and self._start_loop_summary_nudge(loop, current, task)
+                ):
+                    # The agent stopped without a summary; its worker is waiting
+                    # for input, so ask once before giving up on the report.
+                    return False
+                self._close_loop_run_now(task)
                 return True
             if not self._loop_run_task_stranded(task):
                 return False
@@ -4701,6 +4702,26 @@ class SlackTeamController:
             task = self.store.get_agent_task(task.task_id) or task
         self.finalize_loop_run(current, task)
         return True
+
+    def _loop_run_worker_idle(self, task: AgentTask) -> bool:
+        """Whether a loop run's worker ended its turn and has waited past the grace."""
+        idle_seconds = getattr(self.runtime, "task_idle_seconds", None)
+        if not callable(idle_seconds):
+            return False
+        idle = idle_seconds(task.task_id)
+        return idle is not None and idle >= LOOP_RUN_IDLE_GRACE.total_seconds()
+
+    def _close_loop_run_now(self, task: AgentTask) -> bool:
+        """Stop a loop run's worker and finalize the run on what it recorded."""
+        run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        if isinstance(run_id, str):
+            # The worker is stopped next, so a nudge sent while finalizing would
+            # be lost with it.
+            self.store.set_setting(
+                f"{SETTING_LOOP_SUMMARY_NUDGE_PREFIX}{run_id}",
+                str(LOOP_SUMMARY_NUDGE_ATTEMPTS),
+            )
+        return self._complete_task_thread(task.channel_id, task.thread_ts, task_id=task.task_id)
 
     def _loop_run_task_stranded(self, task: AgentTask) -> bool:
         """Whether an open loop run's task has no process left to finish it.
@@ -10199,17 +10220,7 @@ class SlackTeamController:
                     # Unhandled, so the runtime keeps the signal and replays it when
                     # the worker exits, which finalizes the run.
                     return False
-                run_id = task.metadata.get(LOOP_RUN_ID_METADATA_KEY)
-                if isinstance(run_id, str):
-                    # The worker is stopped next, so a nudge sent while finalizing
-                    # would be lost with it.
-                    self.store.set_setting(
-                        f"{SETTING_LOOP_SUMMARY_NUDGE_PREFIX}{run_id}",
-                        str(LOOP_SUMMARY_NUDGE_ATTEMPTS),
-                    )
-                return self._complete_task_thread(
-                    thread.channel_id, thread.thread_ts, task_id=task.task_id
-                )
+                return self._close_loop_run_now(task)
             if normalized_signal.startswith(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX):
                 return self._handle_loop_summary_signal(task, agent, thread, signal)
             if normalized_signal.startswith(AGENT_LOOP_COMPACT_SIGNAL_PREFIX):
