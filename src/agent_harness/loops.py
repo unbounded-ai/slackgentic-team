@@ -69,7 +69,7 @@ LOOP_CARRY_MAX_CHARS = LOOP_COMPACT_SNAPSHOT_MAX_CHARS
 # Memory at this share of its limit gets a prune warning in the next run's prompt.
 LOOP_CARRY_WARN_RATIO = 0.8
 LOOP_HEADLINE_MAX_CHARS = 150
-LOOP_HEADLINE_TRUNCATED_MARKER = "… (truncated)"
+LOOP_TRUNCATED_MARKER = "… (truncated)"
 LOOP_REPORT_MAX_CHARS = 6_000
 LOOP_METRICS_MAX_ITEMS = 8
 LOOP_METRIC_FIELD_MAX_CHARS = 60
@@ -191,6 +191,8 @@ class LoopSummary:
     headline_overflow_chars: int | None = None
     # Length of the agent's carry when it ran over the limit and was dropped.
     carry_overflow_chars: int | None = None
+    # Other text fields that ran over their limits and were cut, e.g. "metric delta".
+    truncated_fields: tuple[str, ...] = ()
 
     @property
     def carry_chars(self) -> int | None:
@@ -213,6 +215,8 @@ class LoopSummary:
             payload["headline_overflow_chars"] = self.headline_overflow_chars
         if self.carry_overflow_chars:
             payload["carry_overflow_chars"] = self.carry_overflow_chars
+        if self.truncated_fields:
+            payload["truncated_fields"] = list(self.truncated_fields)
         if self.report:
             payload["report"] = self.report
         if self.metrics:
@@ -720,11 +724,10 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
     summary = payload.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         return LoopSummaryParseResult(error="loop summary must include a non-empty summary")
-    summary = summary.strip()
-    if len(summary) > LOOP_SUMMARY_MAX_CHARS:
-        return LoopSummaryParseResult(
-            error=f"loop summary must be at most {LOOP_SUMMARY_MAX_CHARS} characters"
-        )
+    # Over-long text is cut and marked, and an over-long carry dropped, rather than
+    # rejected: rejecting it would throw away the whole run summary and report.
+    truncated: list[str] = []
+    summary = _truncate_loop_field(summary.strip(), LOOP_SUMMARY_MAX_CHARS, "summary", truncated)
     status = payload.get("status", "ok")
     if status not in LOOP_SUMMARY_STATUSES:
         return LoopSummaryParseResult(
@@ -733,13 +736,11 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
     carry = payload.get("carry")
     if carry is not None and not isinstance(carry, dict):
         return LoopSummaryParseResult(error="loop summary carry must be an object")
-    # An over-long carry or headline is dropped or cut rather than rejected: rejecting
-    # it would throw away the whole run summary and report with it.
     carry_overflow_chars = None
     if carry is not None and len(json.dumps(carry, sort_keys=True)) > LOOP_CARRY_MAX_CHARS:
         carry_overflow_chars = len(json.dumps(carry, sort_keys=True))
         carry = None
-    headline = _optional_text(payload.get("headline"), None, "headline")
+    headline = _optional_text(payload.get("headline"), "headline")
     if isinstance(headline, _FieldError):
         return LoopSummaryParseResult(error=headline.message)
     headline = " ".join(headline.split()) if headline else None
@@ -747,10 +748,12 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
     if headline and len(headline) > LOOP_HEADLINE_MAX_CHARS:
         headline_overflow_chars = len(headline)
         headline = truncate_loop_headline(headline)
-    report = _optional_text(payload.get("report"), LOOP_REPORT_MAX_CHARS, "report")
+    report = _optional_text(payload.get("report"), "report")
     if isinstance(report, _FieldError):
         return LoopSummaryParseResult(error=report.message)
-    metrics = _parse_loop_metrics(payload.get("metrics"))
+    if report:
+        report = _truncate_loop_field(report, LOOP_REPORT_MAX_CHARS, "report", truncated)
+    metrics = _parse_loop_metrics(payload.get("metrics"), truncated)
     if isinstance(metrics, str):
         return LoopSummaryParseResult(error=metrics)
     chart = parse_loop_chart(payload.get("chart"))
@@ -767,13 +770,25 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
             chart=chart,
             headline_overflow_chars=headline_overflow_chars,
             carry_overflow_chars=carry_overflow_chars,
+            truncated_fields=tuple(dict.fromkeys(truncated)),
         )
     )
 
 
 def truncate_loop_headline(headline: str) -> str:
-    keep = LOOP_HEADLINE_MAX_CHARS - len(LOOP_HEADLINE_TRUNCATED_MARKER)
-    return headline[:keep].rstrip() + LOOP_HEADLINE_TRUNCATED_MARKER
+    return _truncate_loop_text(headline, LOOP_HEADLINE_MAX_CHARS)
+
+
+def _truncate_loop_text(text: str, limit: int) -> str:
+    keep = limit - len(LOOP_TRUNCATED_MARKER)
+    return text[:keep].rstrip() + LOOP_TRUNCATED_MARKER
+
+
+def _truncate_loop_field(text: str, limit: int, label: str, truncated: list[str]) -> str:
+    if len(text) <= limit:
+        return text
+    truncated.append(label)
+    return _truncate_loop_text(text, limit)
 
 
 def loop_summary_from_json(value: str | None) -> LoopSummary | None:
@@ -797,6 +812,7 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
     chart = parse_loop_chart(payload.get("chart"))
     overflow = payload.get("headline_overflow_chars")
     carry_overflow = payload.get("carry_overflow_chars")
+    truncated = payload.get("truncated_fields")
     return LoopSummary(
         summary=summary.strip(),
         status=status if status in LOOP_SUMMARY_STATUSES else "ok",
@@ -812,6 +828,11 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
             carry_overflow
             if isinstance(carry_overflow, int) and not isinstance(carry_overflow, bool)
             else None
+        ),
+        truncated_fields=(
+            tuple(item for item in truncated if isinstance(item, str))
+            if isinstance(truncated, list)
+            else ()
         ),
     )
 
@@ -871,18 +892,17 @@ class _FieldError:
     message: str
 
 
-def _optional_text(value: object, limit: int | None, label: str) -> str | _FieldError | None:
+def _optional_text(value: object, label: str) -> str | _FieldError | None:
     if value is None:
         return None
     if not isinstance(value, str):
         return _FieldError(f"loop summary {label} must be a string")
-    cleaned = value.strip()
-    if limit is not None and len(cleaned) > limit:
-        return _FieldError(f"loop summary {label} must be at most {limit} characters")
-    return cleaned or None
+    return value.strip() or None
 
 
-def _parse_loop_metrics(value: object) -> tuple[LoopMetric, ...] | str:
+def _parse_loop_metrics(
+    value: object, truncated: list[str] | None = None
+) -> tuple[LoopMetric, ...] | str:
     if value is None:
         return ()
     if not isinstance(value, list):
@@ -903,12 +923,12 @@ def _parse_loop_metrics(value: object) -> tuple[LoopMetric, ...] | str:
                 raw = str(raw)
             if not isinstance(raw, str) or (key != "delta" and not raw.strip()):
                 return f"each loop summary metric needs a string {key}"
-            cleaned = " ".join(raw.split())
-            if len(cleaned) > LOOP_METRIC_FIELD_MAX_CHARS:
-                return (
-                    f"loop summary metric {key} must be at most "
-                    f"{LOOP_METRIC_FIELD_MAX_CHARS} characters"
-                )
+            cleaned = _truncate_loop_field(
+                " ".join(raw.split()),
+                LOOP_METRIC_FIELD_MAX_CHARS,
+                f"metric {key}",
+                truncated if truncated is not None else [],
+            )
             fields[key] = cleaned or None
         metrics.append(LoopMetric(str(fields["label"]), str(fields["value"]), fields["delta"]))
     return tuple(metrics)
@@ -1066,6 +1086,7 @@ def build_loop_run_prompt(
     reference_dir: str | None = None,
     quiet: bool = False,
     previous_headline_overflow_chars: int | None = None,
+    previous_truncated_fields: tuple[str, ...] = (),
     previous_carry_chars: int | None = None,
     snapshot_chars: int | None = None,
     owner_timezone: str | None = None,
@@ -1162,7 +1183,19 @@ def build_loop_run_prompt(
                 else []
             ),
             f"- metrics: up to {LOOP_METRICS_MAX_ITEMS} key numbers shown as tiles; delta "
-            "compares with the baseline (for example +12% vs 7d avg).",
+            "compares with the baseline (for example +12% vs 7d avg). label, value, and "
+            f"delta are at most {LOOP_METRIC_FIELD_MAX_CHARS} characters each; put "
+            "explanations in report.",
+            *(
+                [
+                    "- Your previous run's summary had fields over their limits, so the "
+                    "harness cut them and marked them truncated: "
+                    + ", ".join(previous_truncated_fields)
+                    + ". Keep every field within its limit."
+                ]
+                if previous_truncated_fields
+                else []
+            ),
             f"- report: the full report in GitHub-flavored markdown (## headings, **bold**, "
             f"bullets, `code`, [links](url), and pipe tables for rankings), at most "
             f"{LOOP_REPORT_MAX_CHARS} characters. Lead with what changed or needs attention; "

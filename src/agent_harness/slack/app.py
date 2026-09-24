@@ -3707,6 +3707,9 @@ class SlackTeamController:
                 previous_headline_overflow_chars=(
                     previous.headline_overflow_chars if previous is not None else None
                 ),
+                previous_truncated_fields=(
+                    previous.truncated_fields if previous is not None else ()
+                ),
                 previous_carry_chars=previous.carry_chars if previous is not None else None,
                 snapshot_chars=_loop_snapshot_chars(entries),
                 owner_timezone=self._user_timezone(),

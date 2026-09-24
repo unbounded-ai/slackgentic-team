@@ -128,6 +128,18 @@ TranscriptActivitySnapshot = tuple[Path, TranscriptActivitySignature]
 
 
 @dataclass
+class ClaudeTurnText:
+    """The latest assistant text of the Claude turn in progress.
+
+    A turn's `result` event repeats the turn's final assistant message. Rendering
+    both handled that message's control lines twice: a loop run's THREAD_DONE,
+    held back while the agent fixed a rejected summary, came back from the
+    `result` copy and closed the run before the agent could answer."""
+
+    last_assistant: str | None = None
+
+
+@dataclass
 class RunningTask:
     task: AgentTask
     agent: TeamAgent
@@ -137,6 +149,7 @@ class RunningTask:
     resume_session_id: str | None = None
     allowed_tools: tuple[str, ...] = ()
     output_buffer: str = ""
+    claude_turn_text: ClaudeTurnText = field(default_factory=ClaudeTurnText)
     session_buffer: str = ""
     turn_buffer: str = ""
     permission_buffer: str = ""
@@ -733,6 +746,7 @@ class ManagedTaskRuntime:
                     _provider_for_running(running),
                     output,
                     running.output_buffer,
+                    claude_turn=running.claude_turn_text,
                 )
             for chunk in chunks:
                 self._post_or_capture_agent_chunk(running, chunk)
@@ -776,6 +790,7 @@ class ManagedTaskRuntime:
                         tail,
                         running.output_buffer,
                         final=True,
+                        claude_turn=running.claude_turn_text,
                     )
                 for chunk in chunks:
                     self._post_or_capture_agent_chunk(running, chunk)
@@ -2548,10 +2563,11 @@ def _process_output_chunks(
     text: str,
     buffer: str = "",
     final: bool = False,
+    claude_turn: ClaudeTurnText | None = None,
 ) -> tuple[list[str], str]:
     if provider == Provider.CODEX:
         return _codex_exec_chunks(text, buffer, final=final)
-    return _claude_json_chunks(text, buffer, final=final)
+    return _claude_json_chunks(text, buffer, final=final, turn=claude_turn)
 
 
 def _claude_permission_denials(
@@ -3320,10 +3336,13 @@ def _claude_json_chunks(
     buffer: str = "",
     final: bool = False,
     limit: int = 2800,
+    turn: ClaudeTurnText | None = None,
 ) -> tuple[list[str], str]:
     combined = buffer + text
     if not combined:
         return [], buffer
+    if turn is None:
+        turn = ClaudeTurnText()
 
     lines = combined.splitlines(keepends=True)
     next_buffer = ""
@@ -3332,10 +3351,27 @@ def _claude_json_chunks(
 
     rendered: list[str] = []
     for line in lines:
-        message = _render_claude_json_line(line.strip())
-        if message:
-            rendered.extend(_chunks_preserving_control_signals(message, limit=limit))
+        stripped = line.strip()
+        message = _render_claude_json_line(stripped)
+        if not message:
+            continue
+        event_type = _claude_event_type(stripped)
+        if event_type == "assistant":
+            turn.last_assistant = message
+        elif event_type == "result":
+            last_assistant, turn.last_assistant = turn.last_assistant, None
+            if last_assistant is not None and last_assistant.endswith(message):
+                continue
+        rendered.extend(_chunks_preserving_control_signals(message, limit=limit))
     return rendered, next_buffer
+
+
+def _claude_event_type(line: str) -> str | None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return event.get("type") if isinstance(event, dict) else None
 
 
 _SIGNAL_LINE_PREFIXES: tuple[str, ...] = (
