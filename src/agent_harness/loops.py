@@ -64,6 +64,10 @@ LOOP_THREAD_ROLLOVER_PENDING_KEY = "thread_rollover_pending"
 LOOP_FETCH_MAX_PER_RUN = 5
 LOOP_FETCH_PAYLOAD_MAX_CHARS = 8_000
 LOOP_SUMMARY_MAX_CHARS = 2_000
+# Carry shares the snapshot's budget: both are memory the next run reads in full.
+LOOP_CARRY_MAX_CHARS = LOOP_COMPACT_SNAPSHOT_MAX_CHARS
+# Memory at this share of its limit gets a prune warning in the next run's prompt.
+LOOP_CARRY_WARN_RATIO = 0.8
 LOOP_HEADLINE_MAX_CHARS = 150
 LOOP_HEADLINE_TRUNCATED_MARKER = "… (truncated)"
 LOOP_REPORT_MAX_CHARS = 6_000
@@ -185,6 +189,17 @@ class LoopSummary:
     chart: LoopChart | None = None
     # Length of the agent's headline when it ran over the limit and was cut.
     headline_overflow_chars: int | None = None
+    # Length of the agent's carry when it ran over the limit and was dropped.
+    carry_overflow_chars: int | None = None
+
+    @property
+    def carry_chars(self) -> int | None:
+        """Size of the carry the agent sent, counted the way the limit counts it."""
+        if self.carry_overflow_chars:
+            return self.carry_overflow_chars
+        if not self.carry:
+            return None
+        return len(json.dumps(self.carry, sort_keys=True))
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -196,6 +211,8 @@ class LoopSummary:
             payload["headline"] = self.headline
         if self.headline_overflow_chars:
             payload["headline_overflow_chars"] = self.headline_overflow_chars
+        if self.carry_overflow_chars:
+            payload["carry_overflow_chars"] = self.carry_overflow_chars
         if self.report:
             payload["report"] = self.report
         if self.metrics:
@@ -690,10 +707,12 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
     carry = payload.get("carry")
     if carry is not None and not isinstance(carry, dict):
         return LoopSummaryParseResult(error="loop summary carry must be an object")
-    if carry is not None and len(json.dumps(carry, sort_keys=True)) > 4_000:
-        return LoopSummaryParseResult(error="loop summary carry must be at most 4000 characters")
-    # An over-long headline is cut rather than rejected: dropping it would throw away
-    # the whole run summary, report and carry with it.
+    # An over-long carry or headline is dropped or cut rather than rejected: rejecting
+    # it would throw away the whole run summary and report with it.
+    carry_overflow_chars = None
+    if carry is not None and len(json.dumps(carry, sort_keys=True)) > LOOP_CARRY_MAX_CHARS:
+        carry_overflow_chars = len(json.dumps(carry, sort_keys=True))
+        carry = None
     headline = _optional_text(payload.get("headline"), None, "headline")
     if isinstance(headline, _FieldError):
         return LoopSummaryParseResult(error=headline.message)
@@ -721,6 +740,7 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
             metrics=metrics,
             chart=chart,
             headline_overflow_chars=headline_overflow_chars,
+            carry_overflow_chars=carry_overflow_chars,
         )
     )
 
@@ -750,6 +770,7 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
     metrics = _parse_loop_metrics(payload.get("metrics"))
     chart = parse_loop_chart(payload.get("chart"))
     overflow = payload.get("headline_overflow_chars")
+    carry_overflow = payload.get("carry_overflow_chars")
     return LoopSummary(
         summary=summary.strip(),
         status=status if status in LOOP_SUMMARY_STATUSES else "ok",
@@ -760,6 +781,11 @@ def loop_summary_from_json(value: str | None) -> LoopSummary | None:
         chart=chart if isinstance(chart, LoopChart) else None,
         headline_overflow_chars=(
             overflow if isinstance(overflow, int) and not isinstance(overflow, bool) else None
+        ),
+        carry_overflow_chars=(
+            carry_overflow
+            if isinstance(carry_overflow, int) and not isinstance(carry_overflow, bool)
+            else None
         ),
     )
 
@@ -1014,6 +1040,8 @@ def build_loop_run_prompt(
     reference_dir: str | None = None,
     quiet: bool = False,
     previous_headline_overflow_chars: int | None = None,
+    previous_carry_chars: int | None = None,
+    snapshot_chars: int | None = None,
     owner_timezone: str | None = None,
 ) -> str:
     identity = bot_name or str(loop.metadata.get("bot_name") or loop.title)
@@ -1114,7 +1142,13 @@ def build_loop_run_prompt(
             f"{LOOP_CHART_MAX_POINTS} categories and {LOOP_CHART_MAX_SERIES} series; labels "
             f"at most {LOOP_CHART_LABEL_MAX_CHARS} characters; one number per category.",
             "- summary: 3-5 plain sentences for your own long-term memory; carry: small JSON "
-            "state for the next run (baselines, how you accessed data, open issues).",
+            "state only the next run needs (open and already-reported issues, cursors, the "
+            f"latest counts), at most {LOOP_CARRY_MAX_CHARS} characters as compact JSON. Keep "
+            "durable knowledge (how you access data, schemas, settled baselines) in the "
+            "LOOP_COMPACT snapshot instead of repeating it in carry. The carry limit is hard: "
+            "a larger carry is dropped and the next run starts without it, so prune resolved "
+            "issues and stale detail every run.",
+            *_memory_size_lines(previous_carry_chars, snapshot_chars),
             "To read an earlier run, emit one line and wait:",
             f'{AGENT_LOOP_FETCH_SIGNAL_PREFIX}{{"run": <run number>}}',
             "To replace redundant long-term memory, emit:",
@@ -1125,6 +1159,37 @@ def build_loop_run_prompt(
             "Then finish with SLACKGENTIC: THREAD_DONE when nothing remains for this run.",
         ]
     )
+
+
+def _memory_size_lines(previous_carry_chars: int | None, snapshot_chars: int | None) -> list[str]:
+    """Show the agent how full its memory is, so it prunes before hitting a limit."""
+    lines: list[str] = []
+    if previous_carry_chars and previous_carry_chars > LOOP_CARRY_MAX_CHARS:
+        lines.append(
+            f"- Your previous run's carry was {previous_carry_chars} characters, over the "
+            f"{LOOP_CARRY_MAX_CHARS} limit, so it was dropped. Rebuild it from memory under "
+            "the limit."
+        )
+    elif previous_carry_chars:
+        line = (
+            f"- Your previous run's carry was {previous_carry_chars} of "
+            f"{LOOP_CARRY_MAX_CHARS} characters."
+        )
+        if previous_carry_chars >= LOOP_CARRY_MAX_CHARS * LOOP_CARRY_WARN_RATIO:
+            line += " Prune it this run so it stays well under the limit."
+        lines.append(line)
+    if snapshot_chars:
+        line = (
+            f"- Your long-term memory snapshot is {snapshot_chars} of "
+            f"{LOOP_COMPACT_SNAPSHOT_MAX_CHARS} characters."
+        )
+        if snapshot_chars >= LOOP_COMPACT_SNAPSHOT_MAX_CHARS * LOOP_CARRY_WARN_RATIO:
+            line += (
+                " When you next compact, drop resolved and stale detail so it stays well "
+                "under the limit."
+            )
+        lines.append(line)
+    return lines
 
 
 def build_loop_compaction_prompt(

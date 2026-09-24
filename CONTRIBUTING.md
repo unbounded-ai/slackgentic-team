@@ -27,6 +27,20 @@ The test suite is written with `unittest` and run through `pytest` in CI so
 `pytest-xdist` can split tests across workers. It should not require network
 access.
 
+`tests/test_loop_run_properties.py` is a heavy Hypothesis suite that fuzzes
+whole loop lifecycles (agent output, owner actions, the scheduler, daemon
+restarts). CI skips it. Run it when you change how loop runs end, report, or
+remember:
+
+```sh
+SLACKGENTIC_PROPERTY_TESTS=1 PYTHONPATH=src python -m pytest tests/test_loop_run_properties.py
+```
+
+It uses a fixed seed by default. Set `SLACKGENTIC_LOOP_PROPERTY_SEEDED=0` to
+explore new cases and `SLACKGENTIC_LOOP_PROPERTY_MAX_EXAMPLES` to search deeper.
+When it finds a bug, add a fast deterministic regression test for it to the
+regular suite.
+
 CI runners are slow and stall unpredictably, so tests that observe background
 threads must not depend on timing:
 

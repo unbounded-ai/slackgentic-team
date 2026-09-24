@@ -22,10 +22,12 @@ from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.internal_notifications import filter_internal_task_notifications
 from agent_harness.loops import (
     AGENT_LOOP_SIGNAL_PREFIX,
+    AGENT_LOOP_SUMMARY_SIGNAL_PREFIX,
     LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,
 )
 from agent_harness.models import (
     LOOP_ALLOWED_TOOLS_METADATA_KEY,
+    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_GUARD_LOG_METADATA_KEY,
     LOOP_REFERENCE_DIR_METADATA_KEY,
     LOOP_SCRATCH_DIR_METADATA_KEY,
@@ -429,6 +431,10 @@ class ManagedTaskRuntime:
     def _send_to_running_task(self, task_id: str, message: str, *, allow_cli: bool) -> bool:
         running = self._get_running(task_id)
         if running is None:
+            return False
+        if running.stop_requested:
+            # The worker is being stopped: a write to its stdin would "succeed" and
+            # never be read. Report failure so the caller resumes the session instead.
             return False
         provider = _provider_for_running(running)
         # Codex --print closes stdin after the initial prompt, so a live send
@@ -1093,6 +1099,17 @@ class ManagedTaskRuntime:
             # from the child process must not reach Slack after that signal.
             return
         if running.task.metadata.get(LOOP_SILENT_OUTPUT_METADATA_KEY) is True:
+            running.last_activity_monotonic = time.monotonic()
+            running.progress_warning_monotonic = None
+            handle_terminal_signals()
+            return
+        if running.task.metadata.get(
+            LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY
+        ) is True and not _closes_loop_run(control_signals):
+            # Mid-run narration from a quiet loop run is withheld, not missing:
+            # count it so an exit without THREAD_DONE still finalizes the run
+            # instead of being cancelled as a silent exit.
+            running.visible_message_count += 1
             running.last_activity_monotonic = time.monotonic()
             running.progress_warning_monotonic = None
             handle_terminal_signals()
@@ -2483,6 +2500,15 @@ def _extract_agent_control_signals(text: str) -> tuple[str, list[str]]:
 def _is_resolution_control_signal(signal: str) -> bool:
     normalized = re.sub(r"\s+", " ", signal.strip()).upper()
     return normalized.startswith((AGENT_SCHEDULE_SIGNAL_PREFIX, AGENT_LOOP_SIGNAL_PREFIX))
+
+
+def _closes_loop_run(signals: list[str]) -> bool:
+    """Whether a chunk carries the run's closing line, so its prose is the closing comment."""
+    return any(
+        signal == AGENT_THREAD_DONE_SIGNAL
+        or re.sub(r"\s+", " ", signal.strip()).upper().startswith(AGENT_LOOP_SUMMARY_SIGNAL_PREFIX)
+        for signal in signals
+    )
 
 
 def _is_loop_control_signal(signal: str) -> bool:

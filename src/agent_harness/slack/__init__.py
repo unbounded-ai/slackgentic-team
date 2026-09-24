@@ -355,11 +355,15 @@ def build_loop_preview_blocks(
     return blocks
 
 
+# Set by the harness, never by an agent: the run ended without recording a
+# summary, so its result is unknown and must not read as all clear.
+LOOP_NO_REPORT_STATUS = "no_report"
 LOOP_RESULT_STYLES: dict[str, tuple[str, str]] = {
     "ok": ("✅", "All clear"),
     "found_issue": ("⚠️", "Needs attention"),
     "action_taken": ("🛠️", "Action taken"),
     "failed": ("❌", "Mission failed"),
+    LOOP_NO_REPORT_STATUS: ("⚠️", "No report"),
 }
 LOOP_RUN_ERROR_EMOJI = "🚫"
 LOOP_RUN_SKIPPED_EMOJI = "⏭️"

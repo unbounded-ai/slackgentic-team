@@ -17,6 +17,7 @@ from agent_harness.deferred import AGENT_DEFERRED_SIGNAL_PREFIX
 from agent_harness.loops import AGENT_LOOP_SIGNAL_PREFIX, LOOP_SIGNAL_PREFIXES_LONGEST_FIRST
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
+    LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY,
     LOOP_SILENT_OUTPUT_METADATA_KEY,
     MODEL_OVERRIDE_METADATA_KEY,
     PERMISSION_MODE_METADATA_KEY,
@@ -2494,6 +2495,89 @@ class TaskRuntimeTests(unittest.TestCase):
                     gateway.replies,
                     ["before release", "release cleared — posts again"],
                 )
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_quiet_loop_runs_post_only_their_closing_comment(self):
+        # Quiet loop runs work in the pinned panel's thread: mid-run narration is
+        # withheld, but the comment sent with the closing control line is kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "quiet loop run", "C1")
+                task = replace(task, metadata={LOOP_FINAL_OUTPUT_ONLY_METADATA_KEY: True})
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda *args: True,
+                )
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=OneShotProcess(None),
+                    thread=SlackThreadRef("C1", "171.panel"),
+                    worker=threading.Thread(),
+                )
+
+                runtime._post_agent_chunk(
+                    running, "Now checking the log jump.\nSLACKGENTIC: ROSTER Checking (2/4)"
+                )
+                self.assertEqual(gateway.replies, [])
+                # Withheld, not missing: an exit without THREAD_DONE still finalizes.
+                self.assertEqual(running.visible_message_count, 1)
+
+                runtime._post_agent_chunk(
+                    running,
+                    'Run 21 found nothing unexpected.\nSLACKGENTIC: LOOP_SUMMARY {"summary": "ok"}',
+                )
+                self.assertEqual(gateway.replies, ["Run 21 found nothing unexpected."])
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_send_to_a_stopping_task_fails_instead_of_losing_the_message(self):
+        # A loop run lost its summary feedback, and an owner's question could be
+        # lost the same way, because a send to a worker that was being stopped
+        # reported success. Nothing ever read it.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "loop run", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+                sent = []
+                process = SimpleNamespace(send=sent.append)
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=process,
+                    thread=SlackThreadRef("C1", "171.panel"),
+                    worker=threading.Thread(),
+                )
+                with patch.object(runtime, "_get_running", return_value=running):
+                    self.assertTrue(runtime.send_to_task(task.task_id, "first"))
+                    running.stop_requested = True
+                    self.assertFalse(runtime.send_to_task(task.task_id, "second"))
+                    self.assertFalse(runtime.send_to_interrupted_task(task.task_id, "third"))
+                self.assertEqual(sent, ["first"])
             finally:
                 shut_down_runtime(runtime)
                 store.close()
