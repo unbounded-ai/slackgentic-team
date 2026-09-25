@@ -1,5 +1,7 @@
 import json
+import os
 import signal
+import socket
 import tempfile
 import threading
 import unittest
@@ -24,9 +26,62 @@ from agent_harness.sessions.bridge import (
 )
 from agent_harness.sessions.terminal import TerminalTarget
 from agent_harness.storage.store import Store
-from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts
+from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, wait_until
 
 BRIDGE_THREAD_TIMEOUT_SECONDS = POLL_TIMEOUT_SECONDS
+
+
+def _serve_peer_inbox(socket_path: Path, received: list) -> socket.socket:
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    server.listen(4)
+    server.settimeout(POLL_TIMEOUT_SECONDS)
+
+    def run():
+        try:
+            while True:
+                connection, _ = server.accept()
+                with connection:
+                    data = b""
+                    while chunk := connection.recv(4096):
+                        data += chunk
+                received.append(data.decode("utf-8"))
+        except OSError:
+            return
+
+    threading.Thread(target=run, daemon=True).start()
+    return server
+
+
+def _register_peer_inbox(home: Path, session_id: str, socket_path: Path) -> None:
+    sessions = home / ".claude" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / f"{os.getpid()}.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "sessionId": session_id,
+                "entrypoint": "claude-desktop",
+                "messagingSocketPath": str(socket_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _peer_inbox_session(home: Path) -> AgentSession:
+    transcript = home / "claude.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    return AgentSession(
+        provider=Provider.CLAUDE,
+        session_id="s1",
+        transcript_path=transcript,
+        cwd=home,
+        status=SessionStatus.ACTIVE,
+        started_at=datetime(2026, 4, 27, 12, 30, tzinfo=UTC),
+        last_seen_at=datetime.now(UTC),
+        metadata={"entrypoint": "claude-desktop"},
+    )
 
 
 class FakeGateway:
@@ -641,6 +696,114 @@ class SessionBridgeTests(unittest.TestCase):
                     store.consume_session_bridge_prompt(Provider.CLAUDE, "s1", "continue")
                 )
             finally:
+                store.close()
+
+    def test_send_to_claude_session_uses_peer_inbox_when_process_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            calls = []
+            received = []
+            server = _serve_peer_inbox(home / "inbox.sock", received)
+            gateway = FakeGateway()
+
+            def runner(args, **kwargs):
+                calls.append(args)
+                return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            try:
+                store.init_schema()
+                _register_peer_inbox(home, "s1", home / "inbox.sock")
+                session = _peer_inbox_session(home)
+                store.upsert_session(session)
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(claude_binary="claude-bin", default_cwd=home),
+                    command_runner=runner,
+                    terminal_notifier=FakeTerminalNotifier(),
+                    home=home,
+                    peer_delivery_confirm_seconds=POLL_TIMEOUT_SECONDS,
+                    peer_delivery_poll_seconds=0.01,
+                )
+
+                handled = bridge.send_to_session(session, "continue", SlackThreadRef("C1", "171"))
+
+                self.assertTrue(handled)
+                self.assertTrue(wait_until(lambda: received))
+                frame = json.loads(received[0])
+                self.assertEqual(frame["type"], "user")
+                self.assertEqual(frame["priority"], "now")
+                self.assertIn("\ncontinue\n", frame["message"]["content"])
+                with session.transcript_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "isMeta": True,
+                                "message": {"role": "user", "content": frame["message"]["content"]},
+                            }
+                        )
+                        + "\n"
+                    )
+                for thread in bridge.peer_confirmation_threads:
+                    thread.join(timeout=BRIDGE_THREAD_TIMEOUT_SECONDS)
+                    self.assertFalse(thread.is_alive())
+                self.assertEqual(calls, [])
+                self.assertEqual(gateway.replies, [])
+                self.assertIsNone(store.get_setting("external_session_peer_inbox_failed.claude.s1"))
+            finally:
+                server.close()
+                store.close()
+
+    def test_unconfirmed_peer_inbox_delivery_warns_once_and_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = Store(home / "state.sqlite")
+            calls = []
+            received = []
+            server = _serve_peer_inbox(home / "inbox.sock", received)
+            gateway = FakeGateway()
+
+            def runner(args, **kwargs):
+                calls.append(args)
+                return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            try:
+                store.init_schema()
+                _register_peer_inbox(home, "s1", home / "inbox.sock")
+                session = _peer_inbox_session(home)
+                store.upsert_session(session)
+                bridge = ExternalSessionBridge(
+                    store,
+                    gateway,
+                    AgentCommandConfig(claude_binary="claude-bin", default_cwd=home),
+                    command_runner=runner,
+                    terminal_notifier=FakeTerminalNotifier(),
+                    home=home,
+                    peer_delivery_confirm_seconds=0.05,
+                    peer_delivery_poll_seconds=0.01,
+                )
+                thread = SlackThreadRef("C1", "171")
+
+                self.assertTrue(bridge.send_to_session(session, "continue", thread))
+
+                self.assertTrue(wait_until(lambda: len(calls) == 1))
+                self.assertIn("--resume", calls[0])
+                self.assertEqual(len(received), 1)
+                self.assertEqual(len(gateway.replies), 1)
+                self.assertIn("not reaching this live Claude session", gateway.replies[0][1])
+                self.assertIsNotNone(
+                    store.get_setting("external_session_peer_inbox_failed.claude.s1")
+                )
+
+                self.assertTrue(bridge.send_to_session(session, "again", thread))
+
+                self.assertTrue(wait_until(lambda: len(calls) == 2))
+                self.assertEqual(len(received), 1)
+                self.assertEqual(len(gateway.replies), 1)
+            finally:
+                server.close()
                 store.close()
 
     def test_idle_claude_session_with_matching_live_channel_uses_channel(self):

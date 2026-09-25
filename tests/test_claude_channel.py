@@ -25,6 +25,7 @@ from agent_harness.sessions.claude_channel import (
     SLACK_THREAD_TS_ENV,
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
+    ensure_claude_cross_session_inbound,
     ensure_claude_mcp_permissions,
     ensure_claude_native_input_hook,
     ensure_codex_mcp_server_registered,
@@ -1552,6 +1553,38 @@ class ClaudeChannelTests(unittest.TestCase):
             for permission in SLACKGENTIC_MCP_PERMISSION_ALLOW:
                 self.assertIn(permission, config["permissions"]["allow"])
             self.assertIn("Bash(ls:*)", config["permissions"]["allow"])
+
+    def test_install_accepts_cross_session_inbound_in_user_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+
+            written = ensure_claude_cross_session_inbound(home)
+
+            self.assertEqual(written, settings)
+            config = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(config, {"crossSessionInbound": "accept", "model": "opus"})
+
+    def test_install_keeps_a_chosen_cross_session_inbound_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text(json.dumps({"crossSessionInbound": "hold"}), encoding="utf-8")
+
+            ensure_claude_cross_session_inbound(home)
+
+            config = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(config, {"crossSessionInbound": "hold"})
+
+            missing_home = home / "fresh"
+            written = ensure_claude_cross_session_inbound(missing_home)
+            self.assertEqual(
+                json.loads(written.read_text(encoding="utf-8")),
+                {"crossSessionInbound": "accept"},
+            )
 
     def test_install_registers_native_input_hook(self):
         with tempfile.TemporaryDirectory() as tmp:

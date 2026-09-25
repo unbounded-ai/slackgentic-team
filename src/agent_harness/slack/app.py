@@ -14340,6 +14340,7 @@ class SocketModeSlackApp:
             self.gateway,
             config.commands,
             codex_app_server_url=codex_app_server_url,
+            home=config.home,
         )
         self.controller = SlackTeamController(
             self.store,

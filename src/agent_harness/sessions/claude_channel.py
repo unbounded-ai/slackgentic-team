@@ -98,6 +98,7 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
 CREATE_PULL_REQUEST_TIMEOUT_SECONDS = 120
 NATIVE_INPUT_HOOK_MARKER = "slackgentic.native_input.v1"
+CLAUDE_CROSS_SESSION_INBOUND_SETTING = "crossSessionInbound"
 
 
 class PullRequestHeadPreparation(NamedTuple):
@@ -690,6 +691,7 @@ def install_claude_mcp_server(command: str | None = None, home: Path | None = No
             )
     ensure_claude_mcp_permissions(home)
     ensure_claude_native_input_hook(resolved, home, args=command_args)
+    ensure_claude_cross_session_inbound(home)
 
 
 def install_codex_mcp_server(
@@ -801,6 +803,30 @@ def ensure_claude_mcp_permissions(home: Path | None = None) -> Path:
             changed = True
     if changed or not path.exists():
         path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def ensure_claude_cross_session_inbound(home: Path | None = None) -> Path:
+    """Let sessions that run without asking accept Slackgentic's peer messages.
+
+    Claude Code parks a message from an unattributed local sender when the
+    session bypasses permissions, and the desktop app runs its sessions that
+    way, so without this a Slack reply never reaches them. A value the person
+    already chose is kept.
+    """
+    home = home or Path.home()
+    path = home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    if value.get(CLAUDE_CROSS_SESSION_INBOUND_SETTING) is not None:
+        return path
+    value[CLAUDE_CROSS_SESSION_INBOUND_SETTING] = "accept"
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 

@@ -27,6 +27,7 @@ from agent_harness.sessions.mirror import (
     _cwd_matches_ignored_patterns,
     record_external_session_activity,
     render_session_event,
+    render_session_event_chunk,
 )
 from agent_harness.sessions.native_input import claude_native_input_setting_key
 from agent_harness.sessions.terminal import TerminalTarget
@@ -4251,6 +4252,86 @@ class SessionMirrorTests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_claude_desktop_parent_skips_channel_warning_for_terminal_in_same_directory(self):
+        # A desktop session never owns a terminal, so a terminal running in the
+        # same directory without the channel flag says nothing about it.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                _add_team(store)
+                session = AgentSession(
+                    provider=Provider.CLAUDE,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "claude.jsonl",
+                    cwd=Path(tmp),
+                    status=SessionStatus.ACTIVE,
+                    metadata={"entrypoint": "claude-desktop"},
+                )
+                session.transcript_path.write_text("")
+                events = [
+                    AgentEvent(
+                        provider=Provider.CLAUDE,
+                        session_id="s1",
+                        timestamp=None,
+                        event_type="assistant",
+                        line_number=1,
+                        metadata={"message": {"content": [{"type": "text", "text": "visible"}]}},
+                    )
+                ]
+                gateway = FakeGateway()
+                mirror = SessionMirror(
+                    store,
+                    gateway,
+                    [FakeProvider(session, events)],
+                    team_id="T1",
+                    channel_id="C1",
+                    terminal_notifier=FakeTerminalNotifier(
+                        [
+                            TerminalTarget(
+                                pid=123,
+                                tty="ttys001",
+                                cwd=Path(tmp),
+                                command="claude --dangerously-load-development-channels server:other",
+                            )
+                        ]
+                    ),
+                )
+
+                mirror.sync_once()
+
+                self.assertEqual(len(gateway.parents), 1)
+                self.assertNotIn("Slackgentic's Claude channel", gateway.parents[0][1])
+                self.assertFalse(
+                    any("Slackgentic's Claude channel" in reply[1] for reply in gateway.replies)
+                )
+            finally:
+                store.close()
+
+    def test_render_skips_user_turn_carrying_a_cross_session_message(self):
+        def user_event(content):
+            return AgentEvent(
+                provider=Provider.CLAUDE,
+                session_id="s1",
+                timestamp=None,
+                event_type="user",
+                line_number=1,
+                metadata={"message": {"role": "user", "content": content}},
+                human_authored=True,
+            )
+
+        self.assertIsNone(
+            render_session_event_chunk(
+                user_event(
+                    '<cross-session-message from="uds:slackgentic" from-name="Slackgentic">\n'
+                    "continue\n"
+                    "</cross-session-message>"
+                )
+            )
+        )
+        rendered = render_session_event_chunk(user_event("continue"))
+        self.assertEqual((rendered.text, rendered.author), ("continue", "user"))
 
     def test_claude_parent_skips_warning_when_channel_launch_flag_is_present(self):
         with tempfile.TemporaryDirectory() as tmp:
