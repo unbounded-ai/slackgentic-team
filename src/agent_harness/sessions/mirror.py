@@ -71,6 +71,10 @@ SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
     r"<channel\b(?=[^>]*\bsource=[\"']slackgentic[\"'])[^>]*>.*?</channel>",
     flags=re.IGNORECASE | re.DOTALL,
 )
+CROSS_SESSION_MESSAGE_BLOCK_RE = re.compile(
+    r"<cross-session-message\b[^>]*>.*?</cross-session-message>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 HUMAN_DISPLAY_NAME_SETTING = "slack.human_display_name"
 HUMAN_IMAGE_URL_SETTING = "slack.human_image_url"
 EXTERNAL_SESSION_AGENT_PREFIX = "external_session_agent."
@@ -446,6 +450,11 @@ class SessionMirror:
         return text
 
     def _session_channel_notice(self, session: AgentSession) -> str | None:
+        if not _session_can_use_live_target(session):
+            # Desktop and SDK sessions never own a terminal, so a terminal in
+            # the same directory says nothing about them; their replies go
+            # through the session's peer inbox or a background resume.
+            return None
         targets = self.terminal_notifier.targets_for_session(session)
         if not targets:
             return None
@@ -2132,6 +2141,8 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
         return None
     if event.event_type == "user" and _has_slackgentic_channel_block(text):
         return None
+    if event.event_type == "user" and _has_cross_session_message_block(text):
+        return None
     if event.event_type == "assistant":
         text = _remove_slackgentic_channel_blocks(text)
         if not text:
@@ -2319,6 +2330,10 @@ def _clean_text(text: str) -> str:
 
 def _has_slackgentic_channel_block(text: str) -> bool:
     return bool(SLACKGENTIC_CHANNEL_BLOCK_RE.search(html.unescape(text)))
+
+
+def _has_cross_session_message_block(text: str) -> bool:
+    return bool(CROSS_SESSION_MESSAGE_BLOCK_RE.search(html.unescape(text)))
 
 
 def _remove_slackgentic_channel_blocks(text: str) -> str:

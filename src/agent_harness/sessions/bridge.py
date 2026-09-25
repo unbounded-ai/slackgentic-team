@@ -35,6 +35,13 @@ from agent_harness.sessions.managed_session import (
     clear_managed_session,
     managed_session_is_dangerous,
 )
+from agent_harness.sessions.peer_inbox import (
+    find_claude_peer_inbox,
+    peer_message_line,
+    send_peer_message,
+    transcript_shows_prompt,
+    transcript_size,
+)
 from agent_harness.sessions.terminal import SessionTerminalNotifier, TerminalTarget
 from agent_harness.slack import dangerous_flag
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
@@ -45,6 +52,13 @@ LOGGER = logging.getLogger(__name__)
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ProcessKiller = Callable[[int, int], None]
 SESSION_EXIT_COMMAND = "/exit"
+PEER_INBOX_FAILED_PREFIX = "external_session_peer_inbox_failed."
+PEER_INBOX_WARNING = (
+    "Slack replies are not reaching this live Claude session as expected ({reason}). "
+    "Replies to it now run through a background resume instead. A session that bypasses "
+    'permissions only takes them with `crossSessionInbound: "accept"` in '
+    "`~/.claude/settings.json`, which `slackgentic claude-channel --install` sets."
+)
 
 
 class CodexLiveClient(Protocol):
@@ -83,8 +97,15 @@ class ExternalSessionBridge:
         agent_request_handler: SlackAgentRequestHandler | None = None,
         process_killer: ProcessKiller | None = None,
         live_exit_grace_seconds: float = 5.0,
+        home: Path | None = None,
+        peer_delivery_confirm_seconds: float = 20.0,
+        peer_delivery_poll_seconds: float = 0.5,
     ):
         self.store = store
+        self.home = home or Path.home()
+        self.peer_delivery_confirm_seconds = peer_delivery_confirm_seconds
+        self.peer_delivery_poll_seconds = peer_delivery_poll_seconds
+        self.peer_confirmation_threads: list[threading.Thread] = []
         self.gateway = gateway
         self.commands = commands
         self.command_runner = command_runner or subprocess.run
@@ -160,7 +181,9 @@ class ExternalSessionBridge:
     ) -> bool:
         if self._send_to_codex_app_server(session, prompt, thread):
             return True
-        return self._send_to_claude_channel(session, text, thread, slack_user)
+        if self._send_to_claude_channel(session, text, thread, slack_user):
+            return True
+        return self._send_to_claude_peer_inbox(session, text, prompt, thread)
 
     def handle_agent_request_block_action(
         self,
@@ -328,6 +351,78 @@ class ExternalSessionBridge:
             time.sleep(0.05)
         self.store.cancel_claude_channel_message(message_id)
         return False
+
+    def _send_to_claude_peer_inbox(
+        self,
+        session: AgentSession,
+        text: str,
+        prompt: str,
+        thread: SlackThreadRef,
+    ) -> bool:
+        """Write the reply to the socket of the process running this session.
+
+        This is how the Claude desktop app's sessions, which cannot load the
+        channel, get a reply while their process is alive. Delivery is
+        confirmed from the transcript; a reply that never shows up warns the
+        thread once and goes through the background resume like before.
+        """
+        if session.provider != Provider.CLAUDE:
+            return False
+        if self.store.get_setting(_peer_inbox_failed_key(session)):
+            return False
+        inbox = find_claude_peer_inbox(session.session_id, self.home)
+        if inbox is None:
+            return False
+        offset = transcript_size(session.transcript_path)
+        try:
+            send_peer_message(inbox.socket_path, peer_message_line(prompt))
+        except OSError as exc:
+            self._peer_inbox_delivery_failed(session, thread, f"its inbox socket refused: {exc}")
+            return False
+        send = BridgeSend(session=session, prompt=prompt, slack_text=text, thread=thread)
+        worker = threading.Thread(
+            target=self._confirm_peer_inbox_delivery,
+            args=(send, offset),
+            daemon=True,
+            name=f"slackgentic-peer-inbox-{session.session_id}",
+        )
+        self.peer_confirmation_threads = [
+            thread for thread in self.peer_confirmation_threads if thread.is_alive()
+        ]
+        self.peer_confirmation_threads.append(worker)
+        worker.start()
+        return True
+
+    def _confirm_peer_inbox_delivery(self, send: BridgeSend, offset: int) -> None:
+        deadline = time.monotonic() + self.peer_delivery_confirm_seconds
+        while True:
+            if transcript_shows_prompt(send.session.transcript_path, offset, send.prompt):
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.peer_delivery_poll_seconds)
+        self._peer_inbox_delivery_failed(
+            send.session, send.thread, "the message never showed up in its transcript"
+        )
+        self._run_send(send)
+
+    def _peer_inbox_delivery_failed(
+        self,
+        session: AgentSession,
+        thread: SlackThreadRef,
+        reason: str,
+    ) -> None:
+        LOGGER.warning(
+            "peer inbox delivery failed for %s session %s: %s",
+            session.provider.value,
+            session.session_id,
+            reason,
+        )
+        key = _peer_inbox_failed_key(session)
+        if self.store.get_setting(key):
+            return
+        self.store.set_setting(key, utc_now().isoformat())
+        self.gateway.post_thread_reply(thread, PEER_INBOX_WARNING.format(reason=reason))
 
     def _channel_target_for_session(self, session: AgentSession) -> TerminalTarget | None:
         if not _session_can_use_live_target(session):
@@ -506,6 +601,10 @@ class ExternalSessionBridge:
         restore_keyboard_mode = getattr(self.terminal_notifier, "restore_keyboard_mode", None)
         if callable(restore_keyboard_mode):
             restore_keyboard_mode(target)
+
+
+def _peer_inbox_failed_key(session: AgentSession) -> str:
+    return f"{PEER_INBOX_FAILED_PREFIX}{session.provider.value}.{session.session_id}"
 
 
 def build_external_session_prompt(text: str, slack_user: str | None = None) -> str:

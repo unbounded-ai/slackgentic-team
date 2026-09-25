@@ -449,6 +449,16 @@ agent's latest message; it settles once the turn ends or the agent is freed.
 Archiving a Claude desktop app session frees its agent right away; other idle
 sessions free theirs after the idle timeout.
 
+Sessions in the Claude desktop app cannot load the channel. While the app keeps
+a session's process alive, Slackgentic writes Slack replies to the peer inbox
+that every Claude Code session registers under `~/.claude/sessions`, so the
+reply lands in the app's live transcript; otherwise the reply runs through a
+background resume. A session that bypasses permissions only takes those
+messages with `crossSessionInbound` set to `accept` in `~/.claude/settings.json`,
+which `slackgentic claude-channel --install` sets when the key is absent. If
+inbox delivery stops working, the thread gets one short warning and that
+session's replies go through the background resume.
+
 If you revive an ended session from its Slack thread, Slackgentic uses a free
 matching Codex or Claude seat to resume that exact session. If no matching seat
 is free, hire or free that provider; `somebody ...` can still start a new
