@@ -7,6 +7,7 @@ import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from agent_harness.models import (
     DANGEROUS_MODE_METADATA_KEY,
@@ -468,6 +469,11 @@ CREATE INDEX IF NOT EXISTS idx_pm_subtasks_deferred
 """
 
 
+class _ThreadConnection(NamedTuple):
+    thread: threading.Thread
+    connection: sqlite3.Connection
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -475,7 +481,7 @@ class Store:
         self._lock = threading.RLock()
         self._connection_lock = threading.RLock()
         self._local = threading.local()
-        self._connections: dict[int, sqlite3.Connection] = {}
+        self._connections: dict[int, _ThreadConnection] = {}
         self._closed = False
         # In-memory on purpose: a restarted daemon always starts accepting work.
         self._new_assignments_paused = False
@@ -495,6 +501,9 @@ class Store:
             existing = getattr(self._local, "conn", None)
             if existing is not None:
                 return existing
+        # A thread that never called release_thread_connection() leaves its
+        # connection behind when it exits. Sweep those before adding another.
+        self._close_dead_thread_connections()
         connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
@@ -508,16 +517,50 @@ class Store:
             if self._closed:
                 connection.close()
                 raise sqlite3.ProgrammingError("Cannot operate on a closed Store")
-            self._connections[id(connection)] = connection
+            self._connections[id(connection)] = _ThreadConnection(
+                threading.current_thread(), connection
+            )
             self._local.conn = connection
         return connection
+
+    def release_thread_connection(self) -> None:
+        """Close the calling thread's connection, if it opened one.
+
+        Each connection keeps the database and its WAL file open, and only
+        close() would otherwise release it. A short-lived thread such as a task
+        worker calls this on its way out so a long-running daemon does not run
+        out of file descriptors.
+        """
+        with self._connection_lock:
+            connection = getattr(self._local, "conn", None)
+            if connection is not None:
+                delattr(self._local, "conn")
+                self._connections.pop(id(connection), None)
+        if connection is not None:
+            with suppress(sqlite3.Error):
+                connection.close()
+        self._close_dead_thread_connections()
+
+    def open_connection_count(self) -> int:
+        with self._connection_lock:
+            return len(self._connections)
+
+    def _close_dead_thread_connections(self) -> None:
+        with self._connection_lock:
+            finished = [
+                key for key, owned in self._connections.items() if not owned.thread.is_alive()
+            ]
+            connections = [self._connections.pop(key).connection for key in finished]
+        for connection in connections:
+            with suppress(sqlite3.Error):
+                connection.close()
 
     def close(self) -> None:
         with self._connection_lock:
             if self._closed:
                 return
             self._closed = True
-            connections = list(self._connections.values())
+            connections = [owned.connection for owned in self._connections.values()]
             self._connections.clear()
         for connection in connections:
             with suppress(sqlite3.Error):
