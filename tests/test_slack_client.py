@@ -19,6 +19,8 @@ class FakeSlackClient:
         self.topics = []
         self.uploads = []
         self.channel_infos = []
+        self.renames = []
+        self.taken_channel_names = set()
 
     def auth_test(self):
         return type("SlackResponse", (), {"data": {"ok": True, "bot_id": "B1"}})()
@@ -46,6 +48,12 @@ class FakeSlackClient:
                 },
             },
         }
+
+    def conversations_rename(self, channel, name):
+        if name in self.taken_channel_names:
+            raise SlackApiError("name_taken", {"ok": False, "error": "name_taken"})
+        self.renames.append((channel, name))
+        return {"ok": True}
 
     def conversations_archive(self, channel):
         self.archived_channels.append(channel)
@@ -363,6 +371,35 @@ class SlackGatewayTests(unittest.TestCase):
         self.assertTrue(gateway.archive_channel("C1"))
 
         self.assertEqual(gateway.client.archived_channels, ["C1"])
+
+    def test_deprecate_channel_takes_the_first_free_deprecated_name(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+        gateway.client.taken_channel_names = {"loop-x-deprecated", "loop-x-deprecated-2"}
+
+        self.assertEqual(gateway.deprecate_channel("C1", "loop-x"), "loop-x-deprecated-3")
+
+        self.assertEqual(gateway.client.renames, [("C1", "loop-x-deprecated-3")])
+
+    def test_deprecate_channel_keeps_names_within_slack_limit(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = FakeSlackClient()
+
+        renamed = gateway.deprecate_channel("C1", "l" * 80)
+
+        assert renamed is not None
+        self.assertEqual(len(renamed), 80)
+        self.assertTrue(renamed.endswith("-deprecated"))
+
+    def test_deprecate_channel_gives_up_on_other_slack_errors(self):
+        class NotAuthorizedClient(FakeSlackClient):
+            def conversations_rename(self, channel, name):
+                raise SlackApiError("not_authorized", {"ok": False, "error": "not_authorized"})
+
+        gateway = object.__new__(SlackGateway)
+        gateway.client = NotAuthorizedClient()
+
+        self.assertIsNone(gateway.deprecate_channel("C1", "loop-x"))
 
     def test_loop_gateway_wrappers_call_slack_apis(self):
         gateway = object.__new__(SlackGateway)

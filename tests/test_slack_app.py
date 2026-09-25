@@ -211,6 +211,7 @@ class FakeGateway:
         self.archived_channels = []
         self.channel_members = {}
         self.renames = []
+        self.taken_channel_names = set()
 
     def bot_user_id(self):
         return self.bot_user_id_value
@@ -246,6 +247,16 @@ class FakeGateway:
     def rename_channel(self, channel_id, name):
         self.renames.append((channel_id, name))
         return True
+
+    def deprecate_channel(self, channel_id, name):
+        attempt = 0
+        while True:
+            attempt += 1
+            candidate = f"{name}-deprecated" if attempt == 1 else f"{name}-deprecated-{attempt}"
+            if candidate not in self.taken_channel_names:
+                self.taken_channel_names.add(candidate)
+                self.renames.append((channel_id, candidate))
+                return candidate
 
     def post_ephemeral(self, channel_id, user_id, text):
         self.ephemerals.append((channel_id, user_id, text))

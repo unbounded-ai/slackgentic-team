@@ -8244,6 +8244,12 @@ class SlackTeamController:
         elif announce:
             self.gateway.post_message(channel_id, text)
         if archive and loop.channel_id:
+            # Free the name first so a new loop can take it; the archived channel
+            # lives on as <name>-deprecated (or -deprecated-2, -3, ...).
+            with suppress(Exception):
+                self.gateway.deprecate_channel(
+                    loop.channel_id, loop.channel_name or f"loop-{loop.loop_id[-8:]}"
+                )
             with suppress(Exception):
                 self.gateway.archive_channel(loop.channel_id)
 

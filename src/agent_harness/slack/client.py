@@ -19,6 +19,9 @@ from agent_harness.team import TeamChatMessage
 
 SLACK_API_RETRY_LIMIT = 3
 LOGGER = logging.getLogger(__name__)
+# Slack channel names are at most 80 characters.
+_CHANNEL_NAME_MAX_CHARS = 80
+_DEPRECATED_NAME_ATTEMPTS = 100
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,26 @@ class SlackGateway:
             LOGGER.debug("failed to rename Slack channel %s", channel_id, exc_info=True)
             return False
         return True
+
+    def deprecate_channel(self, channel_id: str, name: str) -> str | None:
+        """Rename a channel that is about to be archived to ``<name>-deprecated``
+        (then ``-deprecated-2``, ``-deprecated-3`` and so on while Slack reports the
+        name taken) so the name is free for a new loop. Returns the name Slack
+        accepted, or None when it refused every candidate."""
+        from slack_sdk.errors import SlackApiError
+
+        for attempt in range(1, _DEPRECATED_NAME_ATTEMPTS + 1):
+            suffix = "-deprecated" if attempt == 1 else f"-deprecated-{attempt}"
+            candidate = f"{name[: _CHANNEL_NAME_MAX_CHARS - len(suffix)]}{suffix}"
+            try:
+                self.client.conversations_rename(channel=channel_id, name=candidate)
+            except SlackApiError as exc:
+                if exc.response.get("error") == "name_taken":
+                    continue
+                LOGGER.debug("failed to rename Slack channel %s", channel_id, exc_info=True)
+                return None
+            return candidate
+        return None
 
     def archive_channel(self, channel_id: str) -> bool:
         from slack_sdk.errors import SlackApiError
