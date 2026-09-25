@@ -1655,6 +1655,45 @@ class ClaudeChannelTests(unittest.TestCase):
                 "/opt/slackgentic claude-channel --native-input-hook",
             )
 
+    def test_install_replaces_copies_claude_stripped_the_marker_from(self):
+        # Claude Code drops unknown keys when it rewrites settings.json, so the
+        # marker cannot be the only way to recognise an installed copy.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = home / ".claude" / "settings.local.json"
+            settings.parent.mkdir()
+            stripped = {
+                "matcher": "AskUserQuestion",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/old/place/slackgentic claude-channel --native-input-hook",
+                    }
+                ],
+            }
+            user_entry = {"matcher": "Bash", "hooks": [{"type": "command", "command": "user"}]}
+            settings.write_text(
+                json.dumps({"hooks": {"PreToolUse": [stripped, stripped, user_entry, stripped]}}),
+                encoding="utf-8",
+            )
+
+            ensure_claude_native_input_hook("/opt/slackgentic", home)
+
+            config = json.loads(settings.read_text(encoding="utf-8"))
+            pre_tool_use = config["hooks"]["PreToolUse"]
+            self.assertEqual(
+                [entry["matcher"] for entry in pre_tool_use], ["Bash", "AskUserQuestion"]
+            )
+            self.assertEqual(pre_tool_use[0], user_entry)
+            self.assertEqual(
+                pre_tool_use[1]["hooks"][0]["command"],
+                "/opt/slackgentic claude-channel --native-input-hook",
+            )
+
+            before = settings.stat().st_mtime_ns
+            ensure_claude_native_input_hook("/opt/slackgentic", home)
+            self.assertEqual(settings.stat().st_mtime_ns, before)
+
     def test_native_input_hook_posts_slack_request_and_returns_updated_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
