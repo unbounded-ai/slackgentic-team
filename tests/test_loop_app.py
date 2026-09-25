@@ -2295,6 +2295,7 @@ class LoopCreationFlowTests(unittest.TestCase):
         deleted = self.store.get_loop(loop.loop_id)
         assert deleted is not None
         self.assertEqual(deleted.status, LoopStatus.CANCELLED)
+        self.assertIn((loop.channel_id, f"{loop.channel_name}-deprecated"), self.gateway.renames)
         self.assertIn(loop.channel_id, self.gateway.archived_channels)
         list_update = next(item for item in self.gateway.updates if item["ts"] == posts[0]["ts"])
         self.assertNotIn(loop.loop_id, str(list_update["blocks"]))
@@ -2503,10 +2504,42 @@ class LoopCreationFlowTests(unittest.TestCase):
         assert stopped is not None and agent is not None
         self.assertEqual(stopped.status, LoopStatus.CANCELLED)
         self.assertEqual(agent.status, TeamAgentStatus.FIRED)
+        self.assertEqual(
+            self.gateway.renames, [(loop.channel_id, f"{loop.channel_name}-deprecated")]
+        )
         self.assertEqual(self.gateway.archived_channels, [loop.channel_id])
         run = self.store.list_loop_runs(loop.loop_id)[0]
         self.assertEqual(run.status, LoopRunStatus.FAILED)
         self.assertEqual(run.error, "loop stopped by owner")
+
+    def test_stop_archive_numbers_the_deprecated_name_when_taken(self):
+        loop = self._activate_loop()
+        self.gateway.taken_channel_names = {
+            f"{loop.channel_name}-deprecated",
+            f"{loop.channel_name}-deprecated-2",
+        }
+
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "value": encode_action_value(
+                            "loop.stop.confirm",
+                            loop_id=loop.loop_id,
+                            archive=True,
+                        )
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": "306.000002"},
+                "user": {"id": "UOWNER"},
+            }
+        )
+
+        self.assertEqual(
+            self.gateway.renames, [(loop.channel_id, f"{loop.channel_name}-deprecated-3")]
+        )
+        self.assertEqual(self.gateway.archived_channels, [loop.channel_id])
 
     def _finish_run_with_summary(self, loop, payload: dict):
         self.controller.fire_loop_now(loop)

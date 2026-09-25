@@ -243,7 +243,9 @@ pause or resume it, and open an **Edit** form for the mission, schedule,
 permissions, provider and model, reference directory, and channel visibility (switching visibility
 recreates the channel with the same members and archives the old one); the
 **⋯** menu under the card compacts memory, forgets remembered approvals, stops the loop, or
-deletes it (stop and archive its channel). Anyone in the loop's channel may run,
+deletes it (stop and archive its channel, renamed to `<name>-deprecated`, or
+`-deprecated-2`, `-deprecated-3` and so on, so the name is free for a new loop).
+Anyone in the loop's channel may run,
 pause, or resume it; only the owner can edit or delete it. `loops` in the main
 channel shows every loop as a card in one carousel, led by a **New loop** card.
 
