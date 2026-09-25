@@ -33,12 +33,13 @@ Recommended — installs `slackgentic` on `PATH` globally via
 [uv](https://docs.astral.sh/uv/) so the command works in any shell:
 
 ```sh
-uv tool install --with pip git+https://github.com/unbounded-ai/slackgentic-team.git
+uv tool install --python 3.13 --with pip git+https://github.com/unbounded-ai/slackgentic-team.git
 slackgentic slack setup
 slackgentic service install && slackgentic service status
 ```
 
-`--with pip` lets the in-app updater apply new releases in place.
+`--with pip` lets the in-app updater apply new releases in place. `--python
+3.13` keeps the managed services off Homebrew's Python 3.14 (see Requirements).
 
 Alternatively, install from a source checkout — needed if you want to track
 `main` or hack on the code:
@@ -61,6 +62,21 @@ Requirements: Python 3.11+, permission to create a Slack app, and `codex` or
 `claude` on `PATH`. On macOS, install managed Slackgentic services from Python
 3.11-3.13 so Homebrew `python3` drift cannot put long-running agents behind a
 new TCC prompt identity.
+
+If `slackgentic service install` refuses to run because the CLI is on Python
+3.14, reinstall it on Python 3.13 and rerun the install:
+
+```sh
+uv tool install --python 3.13 --reinstall --with pip git+https://github.com/unbounded-ai/slackgentic-team.git
+slackgentic service install && slackgentic claude-channel --install
+```
+
+From a source checkout, recreate the venv instead:
+
+```sh
+rm -rf .venv && python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .
+slackgentic service install && slackgentic claude-channel --install
+```
 
 ## Setup Notes
 
