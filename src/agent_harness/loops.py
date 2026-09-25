@@ -1110,6 +1110,10 @@ def build_loop_run_prompt(
             "This loop is read-only. The harness checks every tool call before it runs, "
             "allows reads automatically, and blocks anything that could change state, "
             "telling you why. Nobody will approve anything, so choose a read-only route.",
+            "When the harness blocks a tool call, do not retry it or work around the block: "
+            "carry on without that tool and note in your report that having it would have "
+            "helped. If the mission truly cannot be done without it, stop and finish with "
+            "status failed, naming the tool.",
             f"Your working directory is the scratch directory {scratch_dir}; it is the only "
             "place you may write. Always use absolute paths inside it for files and "
             "redirects.",

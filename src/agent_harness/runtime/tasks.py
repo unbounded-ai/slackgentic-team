@@ -1403,6 +1403,10 @@ class ManagedTaskRuntime:
             return False
         if running.process.request.dangerous:
             return False
+        if running.process.request.permission_mode == PermissionMode.READ_ONLY:
+            # The loop guard hook decides every call and hands the reason back to
+            # the agent; a denial is an answer to act on, not a request to approve.
+            return False
         denials, running.permission_buffer = _claude_permission_denials(
             output,
             running.permission_buffer,
