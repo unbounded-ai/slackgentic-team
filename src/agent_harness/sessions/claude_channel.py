@@ -830,9 +830,10 @@ def _ensure_claude_native_input_hook_at_path(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        original = path.read_text(encoding="utf-8")
+        value = json.loads(original)
     except (OSError, json.JSONDecodeError):
-        value = {}
+        original, value = "", {}
     if not isinstance(value, dict):
         value = {}
     hooks = value.get("hooks")
@@ -854,24 +855,39 @@ def _ensure_claude_native_input_hook_at_path(
             }
         ],
     }
-    first_wildcard_index = _first_wildcard_hook_index(pre_tool_use)
-    for index, candidate in enumerate(pre_tool_use):
-        if not isinstance(candidate, dict):
-            continue
-        candidate_hooks = candidate.get("hooks")
-        if not isinstance(candidate_hooks, list):
-            continue
-        if any(
-            isinstance(hook, dict) and hook.get("_slackgentic") == NATIVE_INPUT_HOOK_MARKER
-            for hook in candidate_hooks
-        ):
-            pre_tool_use.pop(index)
-            insert_index = _first_wildcard_hook_index(pre_tool_use)
-            pre_tool_use.insert(insert_index, entry)
-            break
-    else:
-        pre_tool_use.insert(first_wildcard_index, entry)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # Drop every earlier copy before inserting one. Claude Code strips unknown
+    # keys such as the marker when it rewrites the file, so a copy is
+    # recognised by its command as well; matching only the marker appended a
+    # fresh entry on every daemon start.
+    remaining: list[object] = []
+    for candidate in pre_tool_use:
+        if isinstance(candidate, dict) and isinstance(candidate.get("hooks"), list):
+            kept = [hook for hook in candidate["hooks"] if not _is_native_input_hook(hook)]
+            if len(kept) != len(candidate["hooks"]):
+                if not kept:
+                    continue
+                candidate = {**candidate, "hooks": kept}
+        remaining.append(candidate)
+    pre_tool_use[:] = remaining
+    pre_tool_use.insert(_first_wildcard_hook_index(pre_tool_use), entry)
+    rendered = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    if rendered != original:
+        path.write_text(rendered, encoding="utf-8")
+
+
+def _is_native_input_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    if hook.get("_slackgentic") == NATIVE_INPUT_HOOK_MARKER:
+        return True
+    command = hook.get("command")
+    if not isinstance(command, str):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return words[-2:] == ["claude-channel", "--native-input-hook"]
 
 
 def _first_wildcard_hook_index(pre_tool_use: list[object]) -> int:
