@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.cli import _raise_open_file_limit, _slack_doctor, main
+from agent_harness.cli import _installed_with_uv_tool, _raise_open_file_limit, _slack_doctor, main
 from agent_harness.config import AgentCommandConfig, AppConfig, SlackConfig
 from agent_harness.models import (
     Loop,
@@ -353,12 +353,39 @@ class CliTests(unittest.TestCase):
         with (
             patch("sys.version_info", (3, 14, 0)),
             patch("agent_harness.cli.platform.system", return_value="Darwin"),
+            patch("agent_harness.cli._installed_with_uv_tool", return_value=False),
             redirect_stdout(output),
         ):
             code = main(["slack", "serve"])
 
         self.assertEqual(code, 2)
-        self.assertIn("Python 3.14+ on macOS", output.getvalue())
+        text = output.getvalue()
+        self.assertIn("Python 3.14+ on macOS", text)
+        self.assertIn("python3.13 -m venv .venv", text)
+        self.assertIn("uv tool install --python 3.13 --reinstall", text)
+        self.assertIn("slackgentic claude-channel --install", text)
+
+    def test_service_install_refusal_leads_with_uv_reinstall_for_uv_tool_installs(self):
+        output = io.StringIO()
+        with (
+            patch("sys.version_info", (3, 14, 0)),
+            patch("agent_harness.cli.platform.system", return_value="Darwin"),
+            patch("agent_harness.cli._installed_with_uv_tool", return_value=True),
+            redirect_stdout(output),
+        ):
+            code = main(["service", "install"])
+
+        self.assertEqual(code, 2)
+        text = output.getvalue()
+        self.assertIn("Python 3.14+ on macOS", text)
+        self.assertIn("uv tool install --python 3.13 --reinstall", text)
+        self.assertNotIn("python3.13 -m venv", text)
+
+    def test_installed_with_uv_tool_detects_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.prefix", tmp):
+            self.assertFalse(_installed_with_uv_tool())
+            (Path(tmp) / "uv-receipt.toml").write_text("[tool]\n")
+            self.assertTrue(_installed_with_uv_tool())
 
     def test_slack_serve_passes_ignored_external_session_cwd_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -450,7 +477,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 2)
         install.assert_not_called()
-        self.assertIn("reinstall the service", output.getvalue())
+        self.assertIn("slackgentic service install", output.getvalue())
 
     def test_service_install_installs_codex_app_server_and_daemon(self):
         output = io.StringIO()

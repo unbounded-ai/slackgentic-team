@@ -39,6 +39,13 @@ from agent_harness.team import (
 from agent_harness.team.assignment import assign_channel_work_request
 
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
+UV_TOOL_REINSTALL_COMMAND = (
+    "uv tool install --python 3.13 --reinstall --with pip "
+    "git+https://github.com/unbounded-ai/slackgentic-team.git"
+)
+SOURCE_VENV_RECREATE_COMMAND = (
+    "rm -rf .venv && python3.13 -m venv .venv && source .venv/bin/activate && pip install -e ."
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -620,13 +627,33 @@ def _managed_runtime_python_issue(args: argparse.Namespace) -> str | None:
     version = tuple(sys.version_info[:2])
     if platform.system().lower() != "darwin" or version < SUPPORTED_PYTHON_MAX_EXCLUSIVE:
         return None
+    if _installed_with_uv_tool():
+        fix = (
+            "This copy was installed with `uv tool install`; reinstall it on Python 3.13:\n\n"
+            f"  {UV_TOOL_REINSTALL_COMMAND}\n"
+        )
+    else:
+        fix = (
+            "From a source checkout, recreate the venv on Python 3.13:\n\n"
+            f"  {SOURCE_VENV_RECREATE_COMMAND}\n\n"
+            "If this copy was installed with `uv tool install` instead:\n\n"
+            f"  {UV_TOOL_REINSTALL_COMMAND}\n"
+        )
     return (
-        "Refusing to run Slackgentic managed services under Python 3.14+ on macOS. "
-        "Homebrew framework Python 3.14 is shown in TCC privacy prompts as "
-        '"Python 3.14", which can block unattended Slackgentic agents. Recreate '
-        "the Slackgentic venv with Python 3.11-3.13, then reinstall the service "
-        "and Claude channel."
+        "Refusing to run Slackgentic managed services under Python 3.14+ on macOS "
+        f"(this command is running under Python {version[0]}.{version[1]} "
+        f"at {sys.executable}). Homebrew framework Python 3.14 is shown in TCC "
+        'privacy prompts as "Python 3.14", which can block unattended Slackgentic '
+        "agents.\n\n"
+        f"{fix}\n"
+        "Then run `slackgentic service install` and "
+        "`slackgentic claude-channel --install` again."
     )
+
+
+def _installed_with_uv_tool() -> bool:
+    """uv writes a receipt into every tool environment it manages."""
+    return (Path(sys.prefix) / "uv-receipt.toml").is_file()
 
 
 def _command_starts_managed_runtime(args: argparse.Namespace) -> bool:
