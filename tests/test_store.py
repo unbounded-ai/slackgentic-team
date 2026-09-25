@@ -735,6 +735,72 @@ class StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_release_thread_connection_closes_only_the_calling_threads_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                counts: list[int] = []
+
+                def worker() -> None:
+                    store.set_setting("worker", "1")
+                    counts.append(store.open_connection_count())
+                    store.release_thread_connection()
+                    counts.append(store.open_connection_count())
+                    # Releasing is idempotent and a later call opens a fresh one.
+                    store.release_thread_connection()
+                    counts.append(store.get_setting("worker") == "1")
+                    store.release_thread_connection()
+
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join()
+
+                self.assertEqual(counts, [2, 1, True])
+                self.assertEqual(store.open_connection_count(), 1)
+                self.assertEqual(store.get_setting("worker"), "1")
+            finally:
+                store.close()
+
+    def test_connections_of_finished_threads_are_closed_when_another_thread_connects(self):
+        # A thread that exits without releasing its connection must not pin
+        # the database and WAL files open for the life of the daemon.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+
+                # Hold the leaky workers alive together so none of them sweeps
+                # another; the count must reflect three abandoned connections.
+                connected = threading.Barrier(3)
+
+                def leaky_worker(index: int) -> None:
+                    store.set_setting(f"leaky.{index}", "1")
+                    connected.wait()
+
+                threads = [threading.Thread(target=leaky_worker, args=(i,)) for i in range(3)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                self.assertEqual(store.open_connection_count(), 4)
+
+                seen: list[int] = []
+
+                def tidy_worker() -> None:
+                    store.get_setting("leaky.0")
+                    seen.append(store.open_connection_count())
+                    store.release_thread_connection()
+
+                thread = threading.Thread(target=tidy_worker)
+                thread.start()
+                thread.join()
+
+                self.assertEqual(seen, [2])
+                self.assertEqual(store.open_connection_count(), 1)
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

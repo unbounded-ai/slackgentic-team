@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_harness.cli import _slack_doctor, main
+from agent_harness.cli import _raise_open_file_limit, _slack_doctor, main
 from agent_harness.config import AgentCommandConfig, AppConfig, SlackConfig
 from agent_harness.models import (
     Loop,
@@ -22,6 +22,45 @@ from agent_harness.service import UnsafeServiceRestartError
 from agent_harness.slack.app import SETTING_CHANNEL_ID, SETTING_ROSTER_TS
 from agent_harness.storage.store import Store
 from agent_harness.team import build_initial_model_team
+
+
+class OpenFileLimitTests(unittest.TestCase):
+    def test_raises_soft_limit_to_target_when_hard_limit_allows(self):
+        import resource
+
+        calls = []
+        with (
+            patch("resource.getrlimit", return_value=(256, resource.RLIM_INFINITY)),
+            patch("resource.setrlimit", side_effect=lambda *args: calls.append(args)),
+        ):
+            self.assertEqual(_raise_open_file_limit(4096), 4096)
+        self.assertEqual(calls, [(resource.RLIMIT_NOFILE, (4096, resource.RLIM_INFINITY))])
+
+    def test_caps_soft_limit_at_hard_limit(self):
+        import resource
+
+        calls = []
+        with (
+            patch("resource.getrlimit", return_value=(256, 1024)),
+            patch("resource.setrlimit", side_effect=lambda *args: calls.append(args)),
+        ):
+            self.assertEqual(_raise_open_file_limit(4096), 1024)
+        self.assertEqual(calls, [(resource.RLIMIT_NOFILE, (1024, 1024))])
+
+    def test_leaves_a_sufficient_limit_alone(self):
+        with (
+            patch("resource.getrlimit", return_value=(8192, 8192)),
+            patch("resource.setrlimit") as setrlimit,
+        ):
+            self.assertEqual(_raise_open_file_limit(4096), 8192)
+        setrlimit.assert_not_called()
+
+    def test_keeps_serving_when_the_limit_cannot_be_raised(self):
+        with (
+            patch("resource.getrlimit", return_value=(256, 1024)),
+            patch("resource.setrlimit", side_effect=OSError("not permitted")),
+        ):
+            self.assertEqual(_raise_open_file_limit(4096), 256)
 
 
 class CliTests(unittest.TestCase):

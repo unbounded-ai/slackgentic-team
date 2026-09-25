@@ -726,6 +726,8 @@ class SlackTeamController:
                 callback()
             except Exception:
                 LOGGER.exception("failed to complete Slack view submission: %s", label)
+            finally:
+                self.store.release_thread_connection()
 
         threading.Thread(
             target=run,

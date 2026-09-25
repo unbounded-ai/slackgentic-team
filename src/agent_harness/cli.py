@@ -565,11 +565,44 @@ def main(argv: list[str] | None = None) -> int:
             return _slack_doctor(config)
         if args.slack_command == "serve":
             _enable_stack_dumps()
+            _raise_open_file_limit()
             return run_slack_app(config)
         if args.slack_command == "setup" and args.serve:
             _enable_stack_dumps()
+            _raise_open_file_limit()
             return run_slack_app(config)
     raise AssertionError(args.command)
+
+
+DAEMON_OPEN_FILE_TARGET = 4096
+
+
+def _raise_open_file_limit(target: int = DAEMON_OPEN_FILE_TARGET) -> int | None:
+    """Lift the daemon's soft open-file limit toward ``target``.
+
+    launchd starts services with a 256-descriptor soft limit. Every managed
+    task needs pipes to its agent process plus a SQLite connection, so a busy
+    daemon can exhaust that budget. Returns the soft limit left in effect, or
+    None when the platform does not expose it.
+    """
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - non-POSIX platform
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return None
+    if soft == resource.RLIM_INFINITY or soft >= target:
+        return soft
+    wanted = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    if wanted <= soft:
+        return soft
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    except (OSError, ValueError):
+        return soft
+    return wanted
 
 
 def _enable_stack_dumps() -> None:

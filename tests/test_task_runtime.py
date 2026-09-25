@@ -4871,6 +4871,32 @@ class TaskRuntimeTests(unittest.TestCase):
                 shut_down_runtime(runtime)
                 store.close()
 
+    def test_finished_task_worker_releases_its_store_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "fix the flaky test", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                self.assertTrue(wait_until(lambda: runtime.join_workers(0.0)))
+
+                # Only this thread's connection remains once the worker exits.
+                self.assertEqual(store.open_connection_count(), 1)
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
     def test_runtime_lets_read_only_claude_finish_after_a_guard_denial(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

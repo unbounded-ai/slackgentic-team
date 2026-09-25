@@ -709,6 +709,7 @@ class ManagedTaskRuntime:
             running = self._get_running(task_id)
             if running is not None and running.worker is threading.current_thread():
                 self._remove_running_task(task_id, running)
+            self.store.release_thread_connection()
             with self._lock:
                 self._workers.discard(threading.current_thread())
 
