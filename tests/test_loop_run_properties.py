@@ -439,6 +439,14 @@ SUMMARY_LINES = {
         True,
         {"summary": "Error spike.", "status": "found_issue", "headline": "5xx up 12x"},
     ),
+    "positive": (
+        True,
+        {"summary": "Release landed.", "status": "notable_positive", "headline": "v2 is live"},
+    ),
+    "severe": (
+        True,
+        {"summary": "Outage.", "status": "found_very_severe_issue", "headline": "prod is down"},
+    ),
     "resolved": (True, {"summary": "Spike cleared.", "status": "resolved"}),
     "action": (True, {"summary": "Restarted it.", "status": "action_taken"}),
     "failed": (True, {"summary": "Could not reach telemetry.", "status": "failed"}),

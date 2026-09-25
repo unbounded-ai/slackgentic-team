@@ -48,6 +48,7 @@ from agent_harness.loops import (
     LOOP_MAX_CONSECUTIVE_FAILURES,
     LOOP_RUNNER_POLL_FLOOR_SECONDS,
     LOOP_SUMMARY_NUDGE_ATTEMPTS,
+    LOOP_SUMMARY_STATUS_CHOICES,
     LOOP_THREAD_ROLLOVER_MAX_RUNS,
     LOOP_THREAD_ROLLOVER_MIN_RUNS,
     LOOP_THREAD_ROLLOVER_PENDING_KEY,
@@ -4393,7 +4394,7 @@ class SlackTeamController:
             prompt=(
                 "Emit only the required hidden loop summary line now: "
                 f'{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{{"summary": "<3-5 sentences>", '
-                '"status": "ok|found_issue|resolved|action_taken|failed", "carry": {}}}'
+                f'"status": "{LOOP_SUMMARY_STATUS_CHOICES}", "carry": {{}}}}'
                 f" Then end the run with {AGENT_THREAD_DONE_SIGNAL}."
             ),
             assignment_mode=AssignmentMode.SPECIFIC,
@@ -16525,7 +16526,7 @@ def _loop_run_flagged(run: LoopRun) -> bool:
     return (
         run.status == LoopRunStatus.DONE
         and summary is not None
-        and summary.status in {"found_issue", "action_taken"}
+        and summary.status in {"found_issue", "found_very_severe_issue", "action_taken"}
     )
 
 

@@ -3166,6 +3166,28 @@ class LoopCreationFlowTests(unittest.TestCase):
         )
         self.assertEqual(quiet_block["element"]["initial_options"][0]["value"], "quiet")
 
+    def test_quiet_loop_good_news_and_urgent_runs_post_cards_in_their_own_style(self):
+        loop = self._activate_quiet_loop()
+        for status, emoji, label in (
+            ("notable_positive", "🎉", "Good news"),
+            ("found_very_severe_issue", "🚨", "Urgent"),
+        ):
+            with self.subTest(status=status):
+                posts_before = len(self.gateway.posts)
+                replies_before = len(self.gateway.thread_replies)
+
+                run = self._run_quiet_loop_once(loop, status=status)
+
+                new_posts = self.gateway.posts[posts_before:]
+                self.assertEqual(len(new_posts), 1)
+                self.assertTrue(new_posts[0]["text"].startswith(f"{emoji} "))
+                rendered = str(new_posts[0]["blocks"])
+                self.assertIn(f"*{label}*", rendered)
+                self.assertNotIn("Needs attention", rendered)
+                log = self.gateway.thread_replies[replies_before:]
+                self.assertEqual(len(log), 1)
+                self.assertTrue(log[0]["text"].startswith(f"{emoji} Run #{run.run_number} · "))
+
     def _run_quiet_loop_once(self, loop, *, status: str = "ok"):
         self.controller.fire_loop_now(loop)
         task, agent, run, _ = self._running_task_and_run(loop)

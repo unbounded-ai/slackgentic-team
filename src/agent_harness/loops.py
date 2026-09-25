@@ -92,7 +92,17 @@ LOOP_CREATE_VERBS = (
 AGENT_LOOP_REQUEST_MAX_CHARS = 4_000
 AGENT_LOOP_REQUEST_MAX_PENDING = 5
 AGENT_LOOP_REQUEST_WAIT_SECONDS = 20.0
-LOOP_SUMMARY_STATUSES = frozenset({"ok", "found_issue", "resolved", "action_taken", "failed"})
+LOOP_SUMMARY_STATUS_ORDER = (
+    "ok",
+    "notable_positive",
+    "found_issue",
+    "found_very_severe_issue",
+    "resolved",
+    "action_taken",
+    "failed",
+)
+LOOP_SUMMARY_STATUSES = frozenset(LOOP_SUMMARY_STATUS_ORDER)
+LOOP_SUMMARY_STATUS_CHOICES = "|".join(LOOP_SUMMARY_STATUS_ORDER)
 LOOP_CHART_TYPES = frozenset({"line", "bar", "area"})
 LOOP_CHART_MAX_POINTS = 20
 LOOP_CHART_MAX_SERIES = 6
@@ -108,7 +118,7 @@ LOOP_CHART_SIGNAL_EXAMPLE = json.dumps(
 )
 LOOP_SUMMARY_SIGNAL_EXAMPLE = json.dumps(
     {
-        "status": "ok|found_issue|resolved|action_taken|failed",
+        "status": LOOP_SUMMARY_STATUS_CHOICES,
         "headline": f"<the answer in one line, at most {LOOP_HEADLINE_MAX_CHARS} characters>",
         "metrics": [{"label": "<name>", "value": "<value>", "delta": "<change vs baseline>"}],
         "report": "<markdown report>",
@@ -731,7 +741,7 @@ def parse_agent_loop_summary_signal(signal: str) -> LoopSummaryParseResult:
     status = payload.get("status", "ok")
     if status not in LOOP_SUMMARY_STATUSES:
         return LoopSummaryParseResult(
-            error="loop summary status must be ok, found_issue, resolved, action_taken, or failed"
+            error=f"loop summary status must be one of {', '.join(LOOP_SUMMARY_STATUS_ORDER)}"
         )
     carry = payload.get("carry")
     if carry is not None and not isinstance(carry, dict):
@@ -1142,10 +1152,12 @@ def build_loop_run_prompt(
                     "owner's attention. Nothing you write reaches Slack; the harness logs "
                     "each run as one reply with your headline in the panel thread. If "
                     "everything is normal, use status ok with a one-line headline; the "
-                    "harness then posts no card. Use found_issue (or failed) only for "
-                    "something worth a notification, and then keep the report short and "
-                    "specific. When an issue you reported has cleared, use status resolved, "
-                    "not found_issue.",
+                    "harness then posts no card. Every other status posts a card, so use "
+                    "one only for something worth a notification, and then keep the report "
+                    "short and specific: notable_positive for good news, found_issue for a "
+                    "problem, found_very_severe_issue only when the owner should drop "
+                    "everything now. When an issue you reported has cleared, use status "
+                    "resolved, not found_issue.",
                     "Never notify twice about the same thing: keep the issues you already "
                     "reported in carry (signature, first seen, last reported level). An "
                     "ongoing, unchanged issue is status ok with a headline like 'still "
@@ -1165,9 +1177,11 @@ def build_loop_run_prompt(
             "When the run's work is finished, emit exactly one hidden single-line JSON control "
             "line (escape newlines inside strings as \\n):",
             f"{AGENT_LOOP_SUMMARY_SIGNAL_PREFIX}{LOOP_SUMMARY_SIGNAL_EXAMPLE}",
-            "- status: ok (nothing notable), found_issue (anomaly or problem the owner should "
-            "see), resolved (an issue reported earlier has cleared), action_taken (you changed "
-            "something), failed (you could not do the mission).",
+            "- status: ok (nothing notable), notable_positive (good news worth a card, such "
+            "as a release reaching production), found_issue (anomaly or problem the owner "
+            "should see), found_very_severe_issue (drop everything now: an outage or data "
+            "loss in progress), resolved (an issue reported earlier has cleared), "
+            "action_taken (you changed something), failed (you could not do the mission).",
             f"- headline: one line, at most {LOOP_HEADLINE_MAX_CHARS} characters, that states "
             "the answer itself (numbers and verdict), not a description of the work. This is a "
             "hard limit: count the characters before you emit, and if it is over, cut it down "
