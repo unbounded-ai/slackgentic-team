@@ -28,8 +28,8 @@ Before creating anything, make sure you know:
   at least 5 minutes.
 - **Quiet (default) or every run**:
   - **Quiet**: each all-clear run is logged silently in the pinned panel's
-    thread (the run log), which notifies nobody. A run that finds something or
-    fails posts a report card to the channel, which notifies. This covers
+    thread (the run log), which notifies nobody. A run that finds something, has
+    good news, or fails posts a report card to the channel, which notifies. This covers
     "silent loop", "only tell me when", "alert me if", "only raise blockers",
     and "a silent status update when all is well".
   - **Every run**: every run posts its report card to the channel. Pick it only

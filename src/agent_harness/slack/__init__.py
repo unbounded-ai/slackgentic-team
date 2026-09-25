@@ -360,7 +360,9 @@ def build_loop_preview_blocks(
 LOOP_NO_REPORT_STATUS = "no_report"
 LOOP_RESULT_STYLES: dict[str, tuple[str, str]] = {
     "ok": ("✅", "All clear"),
+    "notable_positive": ("🎉", "Good news"),
     "found_issue": ("⚠️", "Needs attention"),
+    "found_very_severe_issue": ("🚨", "Urgent"),
     "resolved": ("✅", "Resolved"),
     "action_taken": ("🛠️", "Action taken"),
     "failed": ("❌", "Mission failed"),

@@ -249,7 +249,7 @@ channel shows every loop as a card in one carousel, led by a **New loop** card.
 
 **Quiet loops** post no card, and so notify nobody, on all-clear runs: each run
 leaves one reply with its headline in the pinned panel's thread (the run log) and
-ticks the panel's "last check" line. A run that finds something (or fails) posts one report card, so a
+ticks the panel's "last check" line. A run that finds something, has good news, or fails posts one report card, so a
 notification always means real signal. New loops are quiet by default; ask for
 "post every run" when creating one, untick *Only post when a run needs attention*
 in **Edit**, or use `loop quiet: off` to post every run instead. So the panel's thread does not grow forever,
