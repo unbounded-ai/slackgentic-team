@@ -622,6 +622,31 @@ class PureLoopLogicTests(unittest.TestCase):
         self.assertIn('"metrics"', prompt)
         self.assertIn("do not stop to ask questions", prompt)
 
+    def test_run_prompt_tells_a_guarded_run_to_carry_on_after_a_block(self):
+        loop = SimpleNamespace(
+            title="Example Watch",
+            mission="Report on example metrics.",
+            recurrence={"frequency": "daily", "time": "09:00"},
+            timezone="UTC",
+            metadata={},
+        )
+        run = SimpleNamespace(run_number=3, due_at=datetime(2026, 1, 5, 9, tzinfo=UTC))
+
+        def prompt(scratch_dir):
+            return loop_logic.build_loop_run_prompt(
+                loop,
+                run,
+                journal_rendered="(memory)",
+                now=datetime(2026, 1, 5, 9, tzinfo=UTC),
+                scratch_dir=scratch_dir,
+            )
+
+        guarded = prompt("/workspace/loops/example/scratch")
+        self.assertIn("do not retry it or work around the block", guarded)
+        self.assertIn("note in your report that having it would have helped", guarded)
+        self.assertIn("finish with status failed, naming the tool", guarded)
+        self.assertNotIn("work around the block", prompt(None))
+
     def test_summary_fetch_and_compaction_signal_validation(self):
         self.assertEqual(
             loop_logic.LOOP_SIGNAL_PREFIXES_LONGEST_FIRST,

@@ -470,6 +470,75 @@ EOF
     description = "Commit codex parity"
 
 
+class ClaudeGuardDeniedThenDoneProcess(OneShotProcess):
+    """A read-only loop run: the guard hook denies one call and the turn still finishes."""
+
+    session_id = "claude-guard-denied-session"
+
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            assistant = {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_stop",
+                            "name": "TaskStop",
+                            "input": {"task_id": "monitor-1"},
+                        }
+                    ]
+                },
+            }
+            denied = {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_stop",
+                            "content": (
+                                "PreToolUse hook denied this call: loops are read-only; "
+                                "the safety judge blocked this."
+                            ),
+                            "is_error": True,
+                        }
+                    ]
+                },
+            }
+            final = {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Done"}]},
+            }
+            result = {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "Done",
+                "permission_denials": [
+                    {
+                        "tool_name": "TaskStop",
+                        "tool_use_id": "toolu_stop",
+                        "tool_input": {"task_id": "monitor-1"},
+                    }
+                ],
+                "session_id": self.session_id,
+            }
+            return (
+                f'{{"type":"system","session_id":"{self.session_id}"}}\n'
+                + json.dumps(assistant)
+                + "\n"
+                + json.dumps(denied)
+                + "\n"
+                + json.dumps(final)
+                + "\n"
+                + json.dumps(result)
+                + "\n"
+            )
+        return ""
+
+
 class ClaudeMissingResumeProcess(OneShotProcess):
     def read_available(self, max_reads=20, timeout=0.05):
         if self.reads == 0:
@@ -4793,6 +4862,47 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertIn(
                     "Bash(git -C /workspace/repos/sample-app commit:*)",
                     requests[1].allowed_tools,
+                )
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("claude/channel/permission"),
+                    [],
+                )
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_lets_read_only_claude_finish_after_a_guard_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeGuardDeniedThenDoneProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "check the deployment pipeline", "C1")
+                task = _with_permission_mode(task, PermissionMode.READ_ONLY)
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "171.000001"))
+                self.assertTrue(wait_until(lambda: not runtime.has_running_tasks()))
+
+                self.assertEqual(gateway.replies, ["Done"])
+                self.assertEqual(len(requests), 1)
+                self.assertNotEqual(
+                    store.get_agent_task(task.task_id).status, AgentTaskStatus.CANCELLED
                 )
                 self.assertEqual(
                     store.list_pending_slack_agent_requests("claude/channel/permission"),
