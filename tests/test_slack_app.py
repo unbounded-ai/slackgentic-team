@@ -9681,7 +9681,7 @@ class SlackAppTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_inactive_external_session_thread_reply_waits_without_matching_agent(self):
+    def test_inactive_external_session_thread_reply_hires_matching_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -9720,14 +9720,73 @@ class SlackAppTests(unittest.TestCase):
                     }
                 )
 
+                self.assertEqual(len(bridge.sent), 1)
+                self.assertEqual(bridge.sent[0][0].session_id, "s1")
+                hired = [
+                    agent
+                    for agent in store.list_team_agents()
+                    if agent.provider_preference == Provider.CODEX
+                ]
+                self.assertEqual(len(hired), 1)
+                self.assertEqual(len(store.list_team_agents()), 2)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.s1"),
+                    hired[0].agent_id,
+                )
+                self.assertIn(f"hired @{hired[0].handle}", gateway.thread_replies[-1]["text"])
+            finally:
+                store.close()
+
+    def test_inactive_external_session_thread_reply_waits_when_team_is_full(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            bridge = FakeSessionBridge()
+            try:
+                store.init_schema()
+                for agent in build_initial_model_team(0, 1):
+                    store.upsert_team_agent(agent)
+                session = AgentSession(
+                    provider=Provider.CODEX,
+                    session_id="s1",
+                    transcript_path=Path(tmp) / "codex.jsonl",
+                    status=SessionStatus.DONE,
+                )
+                thread = SlackThreadRef("C1", "171.000001", "171.000001")
+                store.upsert_session(session)
+                store.upsert_slack_thread_for_session(Provider.CODEX, "s1", "T1", thread)
+                controller = SlackTeamController(
+                    store,
+                    gateway,
+                    default_channel_id="C1",
+                    session_bridge=bridge,
+                    team_id="T1",
+                )
+
+                with patch("agent_harness.slack.app.MAX_TEAM_AGENTS", 1):
+                    controller.handle_event(
+                        {
+                            "event": {
+                                "type": "message",
+                                "channel": "C1",
+                                "user": "U1",
+                                "text": "revive this session",
+                                "ts": "171.000002",
+                                "thread_ts": thread.thread_ts,
+                            }
+                        }
+                    )
+
                 self.assertEqual(bridge.sent, [])
+                self.assertEqual(len(store.list_team_agents()), 1)
                 self.assertIn("No available codex agent", gateway.thread_replies[-1]["text"])
+                self.assertIn("size limit", gateway.thread_replies[-1]["text"])
                 self.assertIn("somebody ...", gateway.thread_replies[-1]["text"])
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
             finally:
                 store.close()
 
-    def test_inactive_external_session_thread_reply_does_not_steal_busy_external_agent(self):
+    def test_inactive_external_session_thread_reply_hires_instead_of_stealing_busy_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
             gateway = FakeGateway()
@@ -9774,9 +9833,14 @@ class SlackAppTests(unittest.TestCase):
                     }
                 )
 
-                self.assertEqual(bridge.sent, [])
-                self.assertIsNone(store.get_setting("external_session_agent.codex.ended"))
-                self.assertIn("No available codex agent", gateway.thread_replies[-1]["text"])
+                self.assertEqual(len(bridge.sent), 1)
+                self.assertEqual(
+                    store.get_setting("external_session_agent.codex.active"), agent.agent_id
+                )
+                assigned = store.get_setting("external_session_agent.codex.ended")
+                self.assertIsNotNone(assigned)
+                self.assertNotEqual(assigned, agent.agent_id)
+                self.assertEqual(len(store.list_team_agents()), 2)
             finally:
                 store.close()
 
