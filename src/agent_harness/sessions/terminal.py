@@ -13,7 +13,9 @@ from pathlib import Path
 
 from agent_harness.models import AgentSession, Provider
 
-ProcessLister = Callable[[], list[str]]
+# None means the processes could not be listed at all; an empty list means
+# nothing was running.
+ProcessLister = Callable[[], list[str] | None]
 CwdResolver = Callable[[int], Path | None]
 StartResolver = Callable[[int], datetime | None]
 LogWriter = Callable[[Path, str], None]
@@ -32,6 +34,13 @@ class TerminalTarget:
     started_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class _ProcessFacts:
+    command: str
+    cwd: Path | None
+    started_at: datetime | None
+
+
 class SessionTerminalNotifier:
     def __init__(
         self,
@@ -44,6 +53,7 @@ class SessionTerminalNotifier:
         write_tui_notice: bool = False,
         write_user_tui_notice: bool = False,
         process_cache_seconds: float = 5.0,
+        stale_scan_seconds: float = 300.0,
         clock: Clock = time.monotonic,
     ):
         # Process discovery is retained for diagnostics, but notifications are
@@ -61,6 +71,16 @@ class SessionTerminalNotifier:
         self.clock = clock
         self._process_cache: dict[Provider, tuple[float, list[TerminalTarget]]] = {}
         self._process_cache_lock = threading.RLock()
+        # How long a failed process listing may fall back to the previous one.
+        self.stale_scan_seconds = max(0.0, stale_scan_seconds)
+        # Resolving a process's cwd and start time runs `lsof` and `ps` once per
+        # pid, and both time out under load. A process's start time never
+        # changes and provider processes do not change directory, so whatever
+        # resolved once is remembered and used when a later lookup fails, instead
+        # of dropping the process from the scan and making its session look
+        # ended or idle.
+        self._process_facts: dict[int, _ProcessFacts] = {}
+        self._last_good_scan: dict[Provider, tuple[float, list[TerminalTarget]]] = {}
 
     def notify_user_message(
         self,
@@ -198,20 +218,40 @@ class SessionTerminalNotifier:
         return list(targets)
 
     def _scan_provider_processes(self, provider: Provider) -> list[TerminalTarget]:
+        rows = self.process_lister()
+        if rows is None:
+            return self._last_good_targets(provider)
         targets: list[TerminalTarget] = []
-        for row in self.process_lister():
+        seen_pids: set[int] = set()
+        for row in rows:
             parsed = _parse_process_row(row)
             if parsed is None:
                 continue
             pid, tty, command = parsed
             if not _is_provider_process(provider, command):
                 continue
-            cwd = self.cwd_resolver(pid)
+            seen_pids.add(pid)
+            with self._process_cache_lock:
+                remembered = self._process_facts.get(pid)
+            if remembered is not None and remembered.command != command:
+                # The pid now belongs to another process.
+                remembered = None
+            try:
+                cwd = self.cwd_resolver(pid)
+            except Exception:
+                LOGGER.debug("failed to resolve session process cwd", exc_info=True)
+                cwd = None
+            if cwd is None and remembered is not None:
+                cwd = remembered.cwd
             try:
                 started_at = self.start_resolver(pid)
             except Exception:
                 LOGGER.debug("failed to resolve session process start time", exc_info=True)
                 started_at = None
+            if started_at is None and remembered is not None:
+                started_at = remembered.started_at
+            with self._process_cache_lock:
+                self._process_facts[pid] = _ProcessFacts(command, cwd, started_at)
             targets.append(
                 TerminalTarget(
                     pid=pid,
@@ -221,7 +261,24 @@ class SessionTerminalNotifier:
                     started_at=started_at,
                 )
             )
+        with self._process_cache_lock:
+            for pid, facts in list(self._process_facts.items()):
+                if pid not in seen_pids and _is_provider_process(provider, facts.command):
+                    del self._process_facts[pid]
+            self._last_good_scan[provider] = (self.clock(), list(targets))
         return targets
+
+    def _last_good_targets(self, provider: Provider) -> list[TerminalTarget]:
+        with self._process_cache_lock:
+            last = self._last_good_scan.get(provider)
+        if last is None:
+            return []
+        scanned_at, targets = last
+        age = self.clock() - scanned_at
+        if age > self.stale_scan_seconds:
+            return []
+        LOGGER.debug("process listing failed; reusing the scan from %.0fs ago", age)
+        return list(targets)
 
 
 def _terminal_message(
@@ -317,7 +374,7 @@ def _same_path(left: Path, right: Path) -> bool:
         return left.expanduser() == right.expanduser()
 
 
-def _list_process_rows() -> list[str]:
+def _list_process_rows() -> list[str] | None:
     try:
         completed = subprocess.run(
             ["ps", "-axo", "pid=,tty=,command="],
@@ -327,9 +384,9 @@ def _list_process_rows() -> list[str]:
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if completed.returncode != 0:
-        return []
+        return None
     return completed.stdout.splitlines()
 
 
