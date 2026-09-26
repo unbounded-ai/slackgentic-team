@@ -5550,6 +5550,75 @@ class ObservedSessionIdleReleaseTests(unittest.TestCase):
                 finally:
                     store.close()
 
+    def test_intermittent_process_match_does_not_repeat_idle_release(self):
+        for provider_kind in Provider:
+            with (
+                self.subTest(provider=provider_kind),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                store = Store(Path(tmp) / "state.sqlite")
+                try:
+                    store.init_schema()
+                    _add_team(store, codex_count=2, claude_count=2)
+                    now = datetime.now(UTC)
+                    provider, path, records = _external_transcript(
+                        Path(tmp), provider_kind, now - timedelta(hours=3)
+                    )
+                    provider._path_index.full_scan_interval_seconds = 0
+                    agent, thread = self._seed_occupied_session(
+                        store, provider_kind, path, len(records)
+                    )
+                    agent_key = f"external_session_agent.{provider_kind.value}.s1"
+                    target = TerminalTarget(
+                        pid=4242,
+                        tty="ttys001",
+                        cwd=path.parent,
+                        command=f"{provider_kind.value} --example",
+                        started_at=now - timedelta(hours=4),
+                    )
+                    notifier = FakeTerminalNotifier(targets=[target])
+                    gateway = FakeGateway()
+                    mirror = SessionMirror(
+                        store,
+                        gateway,
+                        [provider],
+                        team_id="T1",
+                        channel_id="C1",
+                        terminal_notifier=notifier,
+                        home=Path(tmp),
+                        idle_release_seconds=self.IDLE_RELEASE_SECONDS,
+                    )
+
+                    # The open terminal keeps its seat while its process matches.
+                    mirror.sync_once()
+                    self.assertEqual(store.get_setting(agent_key), agent.agent_id)
+
+                    # Several sessions share a directory and `lsof` or `ps` can
+                    # time out, so the process match comes and goes between syncs.
+                    for _ in range(3):
+                        notifier.targets = []
+                        mirror.sync_once()
+                        notifier.targets = [target]
+                        mirror.sync_once()
+
+                    freed = [reply for reply in gateway.replies if "freed up" in reply[1]]
+                    self.assertEqual(len(freed), 1)
+                    self.assertEqual(freed[0][0], thread)
+                    self.assertIsNone(store.get_setting(agent_key))
+                    self.assertEqual(gateway.parents, [])
+
+                    # New activity brings the session back in its thread.
+                    records.append(_external_message_record(provider_kind, now, "New answer"))
+                    _write_external_records(path, records, now)
+                    mirror.sync_once()
+
+                    self.assertIsNotNone(store.get_setting(agent_key))
+                    self.assertEqual(gateway.parents, [])
+                    self.assertEqual(gateway.replies[-1][0], thread)
+                    self.assertEqual(gateway.replies[-1][1], "New answer")
+                finally:
+                    store.close()
+
     def test_session_dropped_by_discovery_frees_agent_when_idle(self):
         for idle_release_seconds in (None, self.IDLE_RELEASE_SECONDS):
             with (

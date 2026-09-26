@@ -1407,6 +1407,7 @@ class Store:
                 "external_session_activity.",
                 "external_session_summary.",
                 "external_session_card.",
+                "external_session_idle_released.",
                 "session_channel_notice.",
                 "codex_response_item_recovery.v1.",
             )
