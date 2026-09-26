@@ -479,10 +479,13 @@ which `slackgentic claude-channel --install` sets when the key is absent. If
 inbox delivery stops working, the thread gets one short warning and that
 session's replies go through the background resume.
 
-If you revive an ended session from its Slack thread, Slackgentic uses a free
-matching Codex or Claude seat to resume that exact session. If no matching seat
-is free, hire or free that provider; `somebody ...` can still start a new
-session in the same thread using the Slack context.
+When a session ends, its thread gets a note with two ways to pick it back up:
+reply in the thread and Slackgentic resumes that exact session, or run the
+posted `claude --resume` / `codex resume` command in a terminal. A reply uses a
+free matching Codex or Claude seat and hires one when none is free. Only when
+the team is at its size limit does it ask you to free or fire that provider;
+`somebody ...` can still start a new session in the same thread using the Slack
+context.
 
 ## Agent Skills
 

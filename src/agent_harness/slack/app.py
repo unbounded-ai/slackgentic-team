@@ -8982,20 +8982,45 @@ class SlackTeamController:
             and agent.kind in WORKER_KINDS
             and agent.agent_id not in external_busy_agent_ids
         ]
-        if not available:
+        agent = available[0] if available else self._hire_agent_to_revive_session(session)
+        if agent is None:
             self.gateway.post_thread_reply(
                 SlackThreadRef(channel_id, thread_ts),
                 (
                     f"No available {session.provider.value} agent can revive this "
-                    "session right now. Hire or free that provider, then reply "
+                    "session, and the team is at its size limit so I could not hire "
+                    f"one. Free or fire a {session.provider.value} agent, then reply "
                     "here again. Or reply with `somebody ...` to let another "
                     "agent start a new session using this thread as context."
                 ),
             )
             return False
-        self.store.set_setting(setting_key, available[0].agent_id)
+        self.store.set_setting(setting_key, agent.agent_id)
+        if not available:
+            self.gateway.post_thread_reply(
+                SlackThreadRef(channel_id, thread_ts),
+                (
+                    f"No free {session.provider.value} agent was available, so I hired "
+                    f"@{agent.handle} to resume this session."
+                ),
+            )
         self.refresh_or_post_roster(channel_id)
         return True
+
+    def _hire_agent_to_revive_session(self, session) -> TeamAgent | None:
+        """Hire a matching agent when no free one can resume an ended session.
+
+        Returns None when the team is at its size limit.
+        """
+        try:
+            return self.hire_agent_for_external_session(session.provider)
+        except Exception:
+            LOGGER.exception(
+                "failed to hire a %s agent to revive session %s",
+                session.provider.value,
+                session.session_id,
+            )
+            return None
 
     def _handle_external_thread_work_request(self, session, event: dict, text: str) -> bool:
         active_agents = self._regular_team_agents()

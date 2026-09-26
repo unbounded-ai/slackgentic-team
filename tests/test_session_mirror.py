@@ -25,6 +25,7 @@ from agent_harness.sessions.mirror import (
     SessionMirror,
     _cwd_matches_allowed_prefixes,
     _cwd_matches_ignored_patterns,
+    format_session_ended_notice,
     record_external_session_activity,
     render_session_event,
     render_session_event_chunk,
@@ -74,6 +75,12 @@ def _external_message_record(provider_kind, timestamp, text):
 def _write_external_records(path, records, timestamp):
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
     os.utime(path, (timestamp.timestamp(), timestamp.timestamp()))
+
+
+def _session_ended_notice(store, provider, session_id="s1"):
+    return format_session_ended_notice(
+        provider, session_id, store.get_session(provider, session_id)
+    )
 
 
 class FakeGateway:
@@ -932,7 +939,11 @@ class SessionMirrorTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         [reply[1] for reply in gateway.replies],
-                        ["Previous answer", "Session ended; freed up this agent.", "New answer"],
+                        [
+                            "Previous answer",
+                            _session_ended_notice(store, provider_kind),
+                            "New answer",
+                        ],
                     )
                     self.assertTrue(all(reply[0] == thread for reply in gateway.replies))
                     self.assertEqual(
@@ -2437,7 +2448,7 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertEqual(store.get_session(Provider.CODEX, "s1").status, SessionStatus.DONE)
                 self.assertEqual(
                     [reply[1] for reply in gateway.replies],
-                    ["Session ended; freed up this agent."],
+                    [_session_ended_notice(store, Provider.CODEX)],
                 )
                 self.assertEqual(refreshed_channels, ["C1"])
             finally:
@@ -2867,7 +2878,9 @@ class SessionMirrorTests(unittest.TestCase):
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_live_target.codex.s1"))
                 self.assertIsNone(store.get_setting("external_session_missing_target.codex.s1"))
-                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(
+                    gateway.replies[-1][1], _session_ended_notice(store, Provider.CODEX)
+                )
                 self.assertEqual(refreshed_channels, ["C1"])
             finally:
                 store.close()
@@ -4566,7 +4579,9 @@ class SessionMirrorTests(unittest.TestCase):
                 mirror.sync_once()
 
                 self.assertIsNone(store.get_setting("external_session_agent.codex.s1"))
-                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(
+                    gateway.replies[-1][1], _session_ended_notice(store, Provider.CODEX)
+                )
             finally:
                 store.close()
 
@@ -4785,7 +4800,7 @@ class SessionMirrorTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [reply[1] for reply in gateway.replies],
-                    ["Session ended; freed up this agent."],
+                    [_session_ended_notice(store, Provider.CLAUDE)],
                 )
             finally:
                 store.close()
@@ -5701,7 +5716,9 @@ class ObservedSessionIdleReleaseTests(unittest.TestCase):
                 mirror.sync_once()
 
                 self.assertIsNone(store.get_setting("external_session_agent.claude.s1"))
-                self.assertEqual(gateway.replies[-1][1], "Session ended; freed up this agent.")
+                self.assertEqual(
+                    gateway.replies[-1][1], _session_ended_notice(store, Provider.CLAUDE)
+                )
                 self.assertEqual(gateway.updates[-1][3][0]["status"], "complete")
             finally:
                 store.close()
@@ -5858,6 +5875,44 @@ class ClaudeDesktopSessionIndexTests(unittest.TestCase):
             path.write_text(json.dumps({"cliSessionId": "b", "isArchived": True}))
             os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
             self.assertEqual(index.archived_session_ids(), frozenset({"a", "b"}))
+
+
+class SessionEndedNoticeTests(unittest.TestCase):
+    def test_notice_offers_slack_takeover_and_terminal_resume_command(self):
+        claude = AgentSession(
+            provider=Provider.CLAUDE,
+            session_id="abc-123",
+            transcript_path=Path("/tmp/example.jsonl"),
+            cwd=Path("/workspace/repos/example project"),
+        )
+
+        self.assertEqual(
+            format_session_ended_notice(Provider.CLAUDE, "abc-123", claude),
+            "Session ended; freed up this agent.\n"
+            "Reply here and Slackgentic takes the session over, or resume it in a terminal:\n"
+            "`cd '/workspace/repos/example project' && claude --resume abc-123`",
+        )
+
+    def test_notice_uses_codex_resume_for_codex_sessions(self):
+        codex = AgentSession(
+            provider=Provider.CODEX,
+            session_id="abc-123",
+            transcript_path=Path("/tmp/example.jsonl"),
+            cwd=Path("/workspace/repos/example-project"),
+        )
+
+        notice = format_session_ended_notice(Provider.CODEX, "abc-123", codex)
+
+        self.assertTrue(notice.startswith("Session ended; freed up this agent.\n"))
+        self.assertTrue(
+            notice.endswith("`cd /workspace/repos/example-project && codex resume abc-123`")
+        )
+
+    def test_notice_omits_cd_when_the_session_cwd_is_unknown(self):
+        notice = format_session_ended_notice(Provider.CLAUDE, "abc-123", None)
+
+        self.assertTrue(notice.endswith("`claude --resume abc-123`"))
+        self.assertNotIn("cd ", notice)
 
 
 if __name__ == "__main__":
