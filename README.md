@@ -272,9 +272,11 @@ notification always means real signal. New loops are quiet by default; ask for
 "post every run" when creating one, untick *Only post when a run needs attention*
 in **Edit**, or use `loop quiet: off` to post every run instead. So the panel's thread does not grow forever,
 a quiet loop clears it every 120 runs (change it under **Edit** → *Clear the run
-log every*): the old panel and its thread are deleted, one message in the channel
-records the dates, run counts, and the agent's short note on the period, and a
-fresh panel is pinned. Loops that post every run have no shared log to clear.
+log every*): the thread's replies are deleted and one note at its top records the
+dates, run counts, and the agent's short note on the period, until the next
+clearing replaces it. Nothing is posted to the channel, and the panel names its
+owner without @mentioning them, so Slack never subscribes the owner to the run
+log. Loops that post every run have no shared log to clear.
 The bot can only delete its own messages, so to also remove replies you wrote in
 that thread, give Slackgentic a token that acts as you: in your Slack app's
 **OAuth & Permissions**, add the User Token Scope `chat:write`, reinstall the

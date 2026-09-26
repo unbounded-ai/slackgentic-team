@@ -53,8 +53,8 @@ LOOP_MEMORY_CHAR_BUDGET = 24_000
 LOOP_COMPACTION_TRIGGER_CHARS = 48_000
 LOOP_COMPACT_SNAPSHOT_MAX_CHARS = 6_000
 LOOP_THREAD_SUMMARY_MAX_CHARS = 500
-# Quiet runs work inside the pinned panel's thread. After this many runs the
-# thread is replaced by a fresh panel and one summary message in the channel.
+# Quiet runs work inside the pinned panel's thread. After this many runs its
+# replies are deleted, leaving one summary note at the top of the thread.
 LOOP_THREAD_ROLLOVER_DEFAULT_RUNS = 120
 LOOP_THREAD_ROLLOVER_MIN_RUNS = 10
 LOOP_THREAD_ROLLOVER_MAX_RUNS = 1_000
@@ -1294,10 +1294,11 @@ def build_loop_compaction_prompt(
         rollover_lines = [
             "",
             f"The pinned panel's thread now holds {thread_rollover_runs} quiet runs, so the "
-            "harness is archiving it: the thread is deleted and replaced by one summary message "
-            "in the channel. The harness adds the dates and run counts itself; thread_summary "
-            "is your short note for posterity (notable findings, trends, anything the owner "
-            "should remember from this stretch). Use plain sentences, no headings.",
+            "harness is clearing it: the older replies are deleted and one summary note stays "
+            "at the top of the thread. The harness adds the dates and run counts itself; "
+            "thread_summary is your short note for posterity (notable findings, trends, "
+            "anything the owner should remember from this stretch). Use plain sentences, no "
+            "headings.",
         ]
     return "\n".join(
         [

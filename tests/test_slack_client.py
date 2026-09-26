@@ -154,6 +154,32 @@ class RateLimitedReactionsClient(FakeSlackClient):
         return {"ok": True}
 
 
+class RateLimitedRepliesClient(FakeSlackClient):
+    """conversations.replies refuses each page once, then answers in two pages."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def conversations_replies(self, **kwargs):
+        self.calls.append(kwargs)
+        same_page = [call for call in self.calls if call.get("cursor") == kwargs.get("cursor")]
+        if len(same_page) == 1:
+            raise SlackApiError(
+                "rate limited",
+                FakeSlackResponse(
+                    {"ok": False, "error": "ratelimited"},
+                    headers={"Retry-After": "0"},
+                ),
+            )
+        if kwargs.get("cursor"):
+            return {"messages": [{"ts": "171.000003"}], "response_metadata": {}}
+        return {
+            "messages": [{"ts": "171.000001"}, {"ts": "171.000002"}],
+            "response_metadata": {"next_cursor": "page2"},
+        }
+
+
 class AlreadyPinnedClient(FakeSlackClient):
     def pins_add(self, **kwargs):
         self.pins.append(kwargs)
@@ -540,6 +566,20 @@ class SlackGatewayTests(unittest.TestCase):
 
         self.assertEqual(gateway.client.remove_calls, 2)
         self.assertEqual(gateway.client.removed[0]["name"], "eyes")
+
+    def test_thread_messages_wait_out_a_rate_limit_on_every_page(self):
+        gateway = object.__new__(SlackGateway)
+        gateway.client = RateLimitedRepliesClient()
+
+        messages = gateway.thread_messages("C1", "171.000001", limit=5_000)
+
+        self.assertEqual(
+            [message["ts"] for message in messages], ["171.000001", "171.000002", "171.000003"]
+        )
+        # Each page was refused once and then asked for again with the same cursor.
+        self.assertEqual(
+            [call.get("cursor") for call in gateway.client.calls], [None, None, "page2", "page2"]
+        )
 
 
 if __name__ == "__main__":

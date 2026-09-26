@@ -1107,10 +1107,23 @@ class LoopLifecycle(RuleBasedStateMachine):
             for reply in self.gateway.thread_replies
             if reply["thread"].thread_ts in quiet_threads
         ]
-        for text in replies:
+        # Clearing the log leaves one archive note in the thread as well. The fake
+        # gateway lists no thread, so nothing is ever deleted and every note stays.
+        notes = [text for text in replies if text.startswith("Run log archived:")]
+        lines = [text for text in replies if not text.startswith("Run log archived:")]
+        for text in lines:
             assert any(marker in text for marker in logged), text
         for marker, expected in logged.items():
-            assert sum(marker in text for text in replies) == expected, (marker, replies)
+            assert sum(marker in text for text in lines) == expected, (marker, lines)
+        if self.loop_id is not None:
+            journal = self.store.list_loop_journal(
+                self.loop_id, include_superseded=True, limit=10_000
+            )
+            clearings = sum(
+                entry.kind == "system" and entry.content.startswith("cleared the run log")
+                for entry in journal
+            )
+            assert len(notes) == clearings, (notes, clearings)
 
     def _record_coverage(self):
         """Report which states this example reached (see --hypothesis-show-statistics)."""
@@ -1132,7 +1145,7 @@ class LoopLifecycle(RuleBasedStateMachine):
             ("excused loss", any(excused for _, excused in self.runtime.lost)),
             ("worker restarted", any(starts > 1 for starts in self.runtime.starts.values())),
             ("owner replied", self.owner_messages > 0),
-            ("thread rolled over", self._loop().charter_message_ts != "100.000002"),
+            ("thread rolled over", "thread_archive_ts" in self._loop().metadata),
             ("quiet and loud runs", len({model.quiet for model in self.runs.values()}) > 1),
         ):
             if reached:
