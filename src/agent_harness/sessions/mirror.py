@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
@@ -1002,11 +1003,11 @@ class SessionMirror:
                     channel_id,
                 )
                 if thread is not None:
+                    session = self.store.get_session(provider, session_id)
                     self.gateway.post_thread_reply(
                         thread,
-                        "Session ended; freed up this agent.",
+                        format_session_ended_notice(provider, session_id, session),
                     )
-                    session = self.store.get_session(provider, session_id)
                     if session is not None:
                         self._refresh_session_card(session, thread)
         for provider in providers_to_refresh:
@@ -1659,6 +1660,39 @@ def format_session_parent(session: AgentSession, summary: str | None = None) -> 
     if session.model:
         parts.append(f"model: `{session.model}`")
     return "\n".join(parts)
+
+
+SESSION_ENDED_TEXT = "Session ended; freed up this agent."
+
+
+def format_session_ended_notice(
+    provider: Provider,
+    session_id: str,
+    session: AgentSession | None = None,
+) -> str:
+    """Tell the thread both ways to pick an ended session back up.
+
+    A reply in the thread makes Slackgentic resume that exact session on a
+    matching agent, hiring one when none is free. The command resumes it in a
+    terminal instead.
+    """
+    cwd = session.cwd if session is not None else None
+    return (
+        f"{SESSION_ENDED_TEXT}\n"
+        "Reply here and Slackgentic takes the session over, or resume it in a terminal:\n"
+        f"`{terminal_resume_command(provider, session_id, cwd)}`"
+    )
+
+
+def terminal_resume_command(provider: Provider, session_id: str, cwd: Path | None) -> str:
+    """The command a person runs to reopen the session interactively."""
+    if provider == Provider.CODEX:
+        resume = f"codex resume {session_id}"
+    else:
+        resume = f"claude --resume {session_id}"
+    if cwd is None:
+        return resume
+    return f"cd {shlex.quote(str(cwd))} && {resume}"
 
 
 def summarize_session_chunks(
