@@ -513,7 +513,10 @@ class SlackGateway:
                 kwargs["inclusive"] = False
             if cursor:
                 kwargs["cursor"] = cursor
-            response = self.client.conversations_replies(**kwargs)
+            # Thread listings share the rate budget with every other reader of the
+            # workspace; a long run log pages through it, so wait out a ratelimit
+            # instead of failing the whole listing.
+            response = self._call_with_ratelimit_retry(self.client.conversations_replies, **kwargs)
             page = list(response.get("messages") or [])
             messages.extend(page)
             remaining -= len(page)
@@ -668,7 +671,7 @@ class SlackGateway:
         from slack_sdk.errors import SlackApiError
 
         try:
-            self._call_reaction_with_retry(
+            self._call_with_ratelimit_retry(
                 self.client.reactions_add,
                 channel=channel_id,
                 timestamp=ts,
@@ -684,7 +687,7 @@ class SlackGateway:
         from slack_sdk.errors import SlackApiError
 
         try:
-            self._call_reaction_with_retry(
+            self._call_with_ratelimit_retry(
                 self.client.reactions_remove,
                 channel=channel_id,
                 timestamp=ts,
@@ -696,10 +699,12 @@ class SlackGateway:
             raise
         return True
 
-    def _call_reaction_with_retry(self, call, **kwargs):
-        # Without this retry, a transient ratelimit on reactions.remove leaves
-        # stale status reactions on a message (e.g. :eyes: lingering after the
-        # next add(:hourglass:) succeeds) and the message looks stuck in Slack.
+    def _call_with_ratelimit_retry(self, call, **kwargs):
+        """Call a Web API method, waiting out ``ratelimited`` a few times.
+
+        Without this retry, a transient ratelimit on reactions.remove leaves
+        stale status reactions on a message (e.g. :eyes: lingering after the
+        next add(:hourglass:) succeeds) and the message looks stuck in Slack."""
         from slack_sdk.errors import SlackApiError
 
         attempts = 0

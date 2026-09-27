@@ -528,6 +528,7 @@ def build_loop_panel_blocks(
     context: str = "panel",
     quiet: bool = False,
     last_check_text: str | None = None,
+    owner_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """The loop's control panel: pinned in its channel and reused by `loop status`."""
     icon = f"{icon_emoji} " if icon_emoji else ""
@@ -604,6 +605,11 @@ def build_loop_panel_blocks(
     if remembered_approvals:
         suffix = "s" if remembered_approvals != 1 else ""
         permissions += f" · {remembered_approvals} remembered approval{suffix}"
+    byline = f"{describe_loop_engine(loop)} · {_mrkdwn_escape(bot_name)} · {permissions}"
+    # The owner is named, never @mentioned: Slack subscribes anyone mentioned in a
+    # message to its thread, and this thread is the quiet run log.
+    if owner_name:
+        byline += f" · owner {_mrkdwn_escape(owner_name)}"
     blocks.append(
         {
             "type": "context",
@@ -613,11 +619,9 @@ def build_loop_panel_blocks(
                 {
                     "type": "mrkdwn",
                     "text": (
-                        f"{describe_loop_engine(loop)} · {_mrkdwn_escape(bot_name)} · "
-                        f"{permissions} · "
-                        f"owner <@{loop.owner_slack_user_id}>. Only the owner can instruct this "
-                        "bot; other messages are never shown to it. Reply in a run's thread to "
-                        "follow up, or post in the channel to leave a standing note."
+                        f"{byline}. Only the owner can instruct this bot; other messages are "
+                        "never shown to it. Reply in a run's thread to follow up, or post in "
+                        "the channel to leave a standing note."
                     )[:2900],
                 },
             ],
@@ -841,8 +845,8 @@ def _loop_thread_rollover_block(*, quiet: bool, runs: int) -> dict[str, Any]:
         "hint": {
             "type": "plain_text",
             "text": (
-                "Quiet runs log to the pinned panel's thread. After this many runs that "
-                "thread is deleted and replaced by one summary message and a fresh panel. "
+                "Quiet runs log to the pinned panel's thread. After this many runs its "
+                "replies are deleted and one summary note is left at the top of the thread. "
                 f"Default {LOOP_THREAD_ROLLOVER_DEFAULT_RUNS}."
             ),
         },
@@ -867,7 +871,7 @@ def build_loop_thread_archive_blocks(
     failed: int,
     agent_note: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """The one message a quiet loop leaves behind when its panel thread is archived."""
+    """The note a quiet loop leaves at the top of its run log when older replies are cleared."""
     run_word = "run" if runs == 1 else "runs"
     counts = [f"{runs} quiet {run_word}", f"✅ {succeeded} succeeded"]
     if flagged:
@@ -888,7 +892,7 @@ def build_loop_thread_archive_blocks(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": "The old log was cleared; the pinned panel below starts a fresh one.",
+                    "text": "Older replies were cleared; the run log continues below this note.",
                 }
             ],
         },

@@ -65,11 +65,13 @@ from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
     LOOP_QUIET_CHOICE_KEY,
     LOOP_RUN_IDLE_GRACE,
+    LOOP_THREAD_ARCHIVE_TS_KEY,
     SLACK_SOCKET_DELIVERY_READY_EVENT_KEY,
     LoopRunner,
     SlackMessageBackfill,
     SlackTeamController,
 )
+from agent_harness.slack.client import SlackUserProfile
 from agent_harness.storage.store import Store
 from agent_harness.team import create_agent_task, pick_idle_agent, provider_logo_url
 from tests.polling import POLL_TIMEOUT_SECONDS, poll_attempts, shut_down_runtime
@@ -2565,7 +2567,10 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("Cloud Billing Watch", rendered)
         self.assertIn("loop.run_now", rendered)
         self.assertIn("loop.edit.open", rendered)
-        self.assertIn("<@UOWNER>", rendered)
+        # The owner is named, not @mentioned: a mention would subscribe them to the
+        # panel's thread, which is the quiet run log.
+        self.assertNotIn("<@UOWNER>", rendered)
+        self.assertIn("Only the owner can instruct this bot", rendered)
 
     def test_finished_run_turns_parent_message_into_report_card(self):
         loop = self._activate_loop()
@@ -3235,14 +3240,14 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.controller.handle_runtime_task_done(task, agent, thread)
         return run
 
-    def test_quiet_loop_thread_rolls_over_into_a_summary_and_fresh_panel(self):
+    def test_quiet_loop_run_log_clears_into_one_note_in_the_panel_thread(self):
         loop = self._activate_quiet_loop()
         metadata = dict(loop.metadata)
         metadata[LOOP_THREAD_ROLLOVER_RUNS_KEY] = 10
         metadata[LOOP_THREAD_RUN_COUNT_KEY] = 8
         self.store.update_loop_metadata(loop.loop_id, metadata)
         loop = self.store.get_loop(loop.loop_id)
-        old_charter = loop.charter_message_ts
+        panel_ts = loop.charter_message_ts
 
         self._run_quiet_loop_once(loop)
         after_nine = self.store.get_loop(loop.loop_id)
@@ -3255,6 +3260,7 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertTrue(pending.metadata[LOOP_THREAD_ROLLOVER_PENDING_KEY])
 
         posts_before = len(self.gateway.posts)
+        pins_before, unpins_before = list(self.gateway.pins), list(self.gateway.unpins)
         LoopRunner(self.store, self.controller, poll_seconds=0.01).sync_once()
         compacting = self.store.running_loop_run(loop.loop_id)
         self.assertEqual(compacting.kind, LoopRunKind.COMPACTION)
@@ -3264,6 +3270,12 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertIn("thread now holds 10 quiet runs", task.prompt)
         agent = self.store.get_team_agent(loop.agent_id)
         thread = SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts)
+        old_log = [
+            reply["ts"]
+            for reply in self.gateway.thread_replies
+            if reply["thread"].thread_ts == panel_ts
+        ]
+        self.assertGreaterEqual(len(old_log), 2)
 
         class InlineThread:
             def __init__(self, target, args=(), **_):
@@ -3276,7 +3288,7 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.gateway.delete_message = lambda channel, ts, as_owner=False: (
             deleted.append((channel, ts)) or True
         )
-        # Accepting the snapshot ends the compaction run, which rolls the thread over.
+        # Accepting the snapshot ends the compaction run, which clears the run log.
         with (
             patch("agent_harness.slack.app.threading.Thread", InlineThread),
             patch("agent_harness.slack.app.LOOP_THREAD_DELETE_INTERVAL_SECONDS", 0),
@@ -3289,60 +3301,89 @@ class LoopCreationFlowTests(unittest.TestCase):
                 + json.dumps({"snapshot": "memory", "thread_summary": "Quiet week; one flake."}),
             )
 
-        rolled = self.store.get_loop(loop.loop_id)
-        self.assertNotEqual(rolled.charter_message_ts, old_charter)
-        self.assertEqual(rolled.metadata[LOOP_THREAD_RUN_COUNT_KEY], 0)
-        self.assertNotIn(LOOP_THREAD_ROLLOVER_PENDING_KEY, rolled.metadata)
-        new_posts = self.gateway.posts[posts_before:]
-        self.assertEqual(len(new_posts), 2)
-        archive = str(new_posts[0]["blocks"])
+        cleared = self.store.get_loop(loop.loop_id)
+        # Nothing reaches the channel: Slack has no silent post, and a new panel or
+        # an archive message would each mark the channel unread.
+        self.assertEqual(cleared.charter_message_ts, panel_ts)
+        self.assertEqual(self.gateway.posts[posts_before:], [])
+        self.assertEqual(self.gateway.pins, pins_before)
+        self.assertEqual(self.gateway.unpins, unpins_before)
+        self.assertEqual(cleared.metadata[LOOP_THREAD_RUN_COUNT_KEY], 0)
+        self.assertNotIn(LOOP_THREAD_ROLLOVER_PENDING_KEY, cleared.metadata)
+        note = self.gateway.thread_replies[-1]
+        self.assertEqual(note["thread"].thread_ts, panel_ts)
+        self.assertEqual(cleared.metadata[LOOP_THREAD_ARCHIVE_TS_KEY], note["ts"])
+        archive = str(note["blocks"])
         self.assertIn("Run log archived", archive)
         self.assertIn("2 quiet runs", archive)
         self.assertIn("✅ 2 succeeded", archive)
         self.assertIn("🔎 1 flagged", archive)
         self.assertIn("Quiet week; one flake.", archive)
-        self.assertEqual(new_posts[1]["ts"], rolled.charter_message_ts)
-        self.assertIn((loop.channel_id, rolled.charter_message_ts), self.gateway.pins)
-        self.assertIn((loop.channel_id, old_charter), self.gateway.unpins)
-        self.assertEqual(deleted[-1], (loop.channel_id, old_charter))
+        # Only the replies older than the note go, newest first; the note and the
+        # panel stay.
+        self.assertEqual(deleted, [(loop.channel_id, ts) for ts in reversed(old_log)])
 
-        # The next quiet run works in the fresh panel's thread.
-        self.controller.fire_loop_now(rolled)
-        next_task, *_ = self._running_task_and_run(rolled)
-        self.assertEqual(next_task.thread_ts, rolled.charter_message_ts)
+        # The next quiet run logs to the same panel thread, after the note.
+        self.controller.fire_loop_now(cleared)
+        next_task, *_ = self._running_task_and_run(cleared)
+        self.assertEqual(next_task.thread_ts, panel_ts)
 
-    def test_run_log_cleanup_deletes_owner_replies_with_the_owner_token(self):
-        self.gateway.thread_history_messages[("CNEW", "900.panel")] = [
-            {"ts": "900.panel", "bot_id": "B1", "text": "panel"},
-            {"ts": "901.1", "bot_id": "B1", "text": "run notes"},
-            {"ts": "902.1", "user": "UOWNER", "text": "why?"},
-            {"ts": "903.1", "user": "UOTHER", "text": "hmm"},
+    def test_loop_panel_names_the_owner_without_mentioning_them(self):
+        loop = self._activate_quiet_loop()
+        profile_requests = []
+
+        def user_profile(user_id):
+            profile_requests.append(user_id)
+            return SlackUserProfile(display_name="Dana")
+
+        self.gateway.user_profile = user_profile
+        _, blocks = self.controller._loop_panel(loop)
+        rendered = json.dumps(blocks, ensure_ascii=False)
+        # A mention would subscribe the owner to the panel's thread, the run log.
+        self.assertNotIn(f"<@{loop.owner_slack_user_id}>", rendered)
+        self.assertIn("owner Dana. Only the owner can instruct this bot", rendered)
+        # The name is fetched once and remembered.
+        self.controller._loop_panel(loop)
+        self.assertEqual(profile_requests, [loop.owner_slack_user_id])
+
+    def test_run_log_cleanup_keeps_the_panel_and_the_note_and_uses_the_owner_token(self):
+        self.gateway.thread_history_messages[("CNEW", "900.000000")] = [
+            {"ts": "900.000000", "bot_id": "B1", "text": "panel"},
+            {"ts": "901.000000", "bot_id": "B1", "text": "Run log archived: earlier"},
+            {"ts": "902.000000", "bot_id": "B1", "text": "run notes"},
+            {"ts": "903.000000", "user": "UOWNER", "text": "why?"},
+            {"ts": "904.000000", "user": "UOTHER", "text": "hmm"},
+            {"ts": "905.000000", "bot_id": "B1", "text": "Run log archived: now"},
+            {"ts": "906.000000", "bot_id": "B1", "text": "✅ Run #11 · All clear"},
         ]
         attempts = []
 
         def delete_message(channel, ts, as_owner=False):
             attempts.append((ts, as_owner))
             # The bot can delete only its own messages; the owner token only the owner's.
-            return ts in {"900.panel", "901.1"} or (as_owner and ts == "902.1")
+            return ts in {"901.000000", "902.000000"} or (as_owner and ts == "903.000000")
 
         self.gateway.thread_messages = lambda channel, ts, limit=20, oldest=None: (
             self.gateway.thread_history_messages[(channel, ts)]
         )
         self.gateway.delete_message = delete_message
+        unpins_before = list(self.gateway.unpins)
         with patch("agent_harness.slack.app.LOOP_THREAD_DELETE_INTERVAL_SECONDS", 0):
-            self.controller._delete_loop_thread("CNEW", "900.panel", "UOWNER")
+            self.controller._clear_loop_thread("CNEW", "900.000000", "UOWNER", "905.000000")
 
+        # Newest first, up to the new note. The earlier note goes with the runs it
+        # covered; the panel, the new note, and a run logged after it stay.
         self.assertEqual(
             attempts,
             [
-                ("903.1", False),
-                ("902.1", False),
-                ("902.1", True),
-                ("901.1", False),
-                ("900.panel", False),
+                ("904.000000", False),
+                ("903.000000", False),
+                ("903.000000", True),
+                ("902.000000", False),
+                ("901.000000", False),
             ],
         )
-        self.assertIn(("CNEW", "900.panel"), self.gateway.unpins)
+        self.assertEqual(self.gateway.unpins, unpins_before)
 
     def test_loops_that_post_every_run_never_roll_over_their_panel_thread(self):
         loop = self._activate_loop()
