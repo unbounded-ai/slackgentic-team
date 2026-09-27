@@ -2,12 +2,14 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_harness.models import AgentSession, Provider
 from agent_harness.sessions.terminal import (
     TERMINAL_KEYBOARD_MODE_RESET,
     SessionTerminalNotifier,
     TerminalTarget,
+    _list_process_rows,
 )
 
 
@@ -125,6 +127,109 @@ class SessionTerminalNotifierTests(unittest.TestCase):
             self.assertIsNotNone(target)
             self.assertEqual(target.pid, 101)
             self.assertEqual(target.cwd, Path(tmp))
+
+    def _claude_session(self, tmp):
+        return AgentSession(
+            provider=Provider.CLAUDE,
+            session_id="abcdef123456",
+            transcript_path=Path(tmp) / "session.jsonl",
+            cwd=Path(tmp),
+        )
+
+    def test_failed_cwd_lookup_keeps_the_remembered_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd_answers = [Path(tmp)]
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: ["101 ttys002 claude --dangerously-skip-permissions"],
+                cwd_resolver=lambda pid: cwd_answers.pop(0) if cwd_answers else None,
+                start_resolver=lambda pid: datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+                process_cache_seconds=0,
+            )
+            session = self._claude_session(tmp)
+
+            self.assertEqual([t.pid for t in notifier.targets_for_session(session)], [101])
+            # `lsof` timed out on this scan; it is still the same process.
+            targets = notifier.targets_for_session(session)
+
+            self.assertEqual([(t.pid, t.cwd) for t in targets], [(101, Path(tmp))])
+
+    def test_failed_start_lookup_keeps_the_remembered_start_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            started = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+            start_answers = [started]
+
+            def start_resolver(pid):
+                if start_answers:
+                    return start_answers.pop(0)
+                raise TimeoutError("ps timed out")
+
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: ["101 ttys002 claude --dangerously-skip-permissions"],
+                cwd_resolver=lambda pid: Path(tmp),
+                start_resolver=start_resolver,
+                process_cache_seconds=0,
+            )
+            session = self._claude_session(tmp)
+
+            notifier.targets_for_session(session)
+            targets = notifier.targets_for_session(session)
+
+            self.assertEqual([t.started_at for t in targets], [started])
+
+    def test_remembered_facts_are_dropped_when_the_process_exits_or_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [["101 ttys002 claude --dangerously-skip-permissions"]]
+            cwd_answers = [Path(tmp)]
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: rows[0],
+                cwd_resolver=lambda pid: cwd_answers.pop(0) if cwd_answers else None,
+                start_resolver=lambda pid: None,
+                process_cache_seconds=0,
+            )
+            session = self._claude_session(tmp)
+
+            self.assertEqual([t.pid for t in notifier.targets_for_session(session)], [101])
+
+            # The pid now runs a different command: nothing is remembered for it.
+            rows[0] = ["101 ttys002 claude --resume other"]
+            self.assertEqual(notifier.targets_for_session(session), [])
+
+            # The process exits; a later process with the same pid starts fresh.
+            rows[0] = []
+            self.assertEqual(notifier.targets_for_session(session), [])
+            rows[0] = ["101 ttys002 claude --dangerously-skip-permissions"]
+            self.assertEqual(notifier.targets_for_session(session), [])
+
+    def test_failed_process_listing_reuses_the_recent_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [100.0]
+            listings = [["101 ttys002 claude --dangerously-skip-permissions"]]
+            notifier = SessionTerminalNotifier(
+                process_lister=lambda: listings.pop(0) if listings else None,
+                cwd_resolver=lambda pid: Path(tmp),
+                start_resolver=lambda pid: None,
+                process_cache_seconds=0,
+                stale_scan_seconds=300.0,
+                clock=lambda: now[0],
+            )
+            session = self._claude_session(tmp)
+
+            self.assertEqual([t.pid for t in notifier.targets_for_session(session)], [101])
+
+            # `ps` failed: the scan from a moment ago still stands.
+            now[0] += 60.0
+            self.assertEqual([t.pid for t in notifier.targets_for_session(session)], [101])
+
+            # But not indefinitely.
+            now[0] += 300.0
+            self.assertEqual(notifier.targets_for_session(session), [])
+
+    def test_list_process_rows_reports_a_failed_listing_as_none(self):
+        with patch(
+            "agent_harness.sessions.terminal.subprocess.run",
+            side_effect=OSError("ps unavailable"),
+        ):
+            self.assertIsNone(_list_process_rows())
 
     def test_restore_keyboard_mode_writes_kitty_keyboard_mode_pop(self):
         tty_writes = []

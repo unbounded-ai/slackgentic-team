@@ -84,6 +84,12 @@ EXTERNAL_SESSION_LIVE_TARGET_PREFIX = "external_session_live_target."
 EXTERNAL_SESSION_MISSING_TARGET_PREFIX = "external_session_missing_target."
 EXTERNAL_SESSION_SUMMARY_PREFIX = "external_session_summary."
 PENDING_EXTERNAL_SESSION_PREFIX = "external_session_pending."
+# Set when idle release frees a tracked session's seat, cleared once the session
+# is in use again. Until then only new activity claims a seat: matching a session
+# to a running process is unreliable when several sessions share a directory and
+# `lsof` or `ps` time out under load, and a match that comes and goes must not
+# re-claim the seat and post the release notice again on every sync.
+IDLE_RELEASED_EXTERNAL_SESSION_PREFIX = "external_session_idle_released."
 CAPACITY_NOTICE_TS_PREFIX = "external_session_capacity_notice_ts."
 EXTERNAL_SESSION_START_MATCH_SECONDS = 300
 # How long a tracked session may go without a matching provider process before we
@@ -1049,6 +1055,7 @@ class SessionMirror:
                 continue
             provider = self._providers_by_kind.get(provider_kind)
             if self._session_in_use(provider, session, now):
+                self._clear_idle_release(session)
                 continue
             if self._release_idle_external_session(session, channel_id):
                 released.add(provider_kind)
@@ -1070,6 +1077,7 @@ class SessionMirror:
         if session.status not in {SessionStatus.ACTIVE, SessionStatus.IDLE}:
             return False
         if self._session_in_use(provider, session, utc_now()):
+            self._clear_idle_release(session)
             return False
         self._release_idle_external_session(session, channel_id)
         return True
@@ -1082,9 +1090,19 @@ class SessionMirror:
     ) -> bool:
         # A terminal that is still open keeps its session, however long it sits
         # at the prompt. Idle release is only for sessions nothing is running.
-        if self._session_owns_live_process(session):
+        # Once released, though, only new activity brings the session back; a
+        # process match on its own does not.
+        if not self._idle_released(session) and self._session_owns_live_process(session):
             return True
         return self._session_recently_active(provider, session, now)
+
+    def _idle_released(self, session: AgentSession) -> bool:
+        return bool(self.store.get_setting(_idle_released_external_session_key(session)))
+
+    def _clear_idle_release(self, session: AgentSession) -> None:
+        key = _idle_released_external_session_key(session)
+        if self.store.get_setting(key):
+            self.store.delete_setting(key)
 
     def _session_owns_live_process(self, session: AgentSession) -> bool:
         if session.provider not in {Provider.CLAUDE, Provider.CODEX}:
@@ -1146,6 +1164,10 @@ class SessionMirror:
     def _release_idle_external_session(self, session: AgentSession, channel_id: str) -> bool:
         if not self._holds_external_tracking(session):
             return False
+        if not self._idle_released(session):
+            self.store.set_setting(
+                _idle_released_external_session_key(session), utc_now().isoformat()
+            )
         held_agent = bool(self.store.get_setting(_external_session_agent_setting_key(session)))
         thread = self._thread_for_session(session, channel_id) if held_agent else None
         self._clear_external_tracking(session, channel_id, preserve_history=True)
@@ -1739,6 +1761,11 @@ def _int_setting(value: str | None) -> int | None:
 
 def _ignored_external_session_key(session: AgentSession) -> str:
     return f"{EXTERNAL_SESSION_IGNORED_PREFIX}{_external_session_key(session.provider, session.session_id)}"
+
+
+def _idle_released_external_session_key(session: AgentSession) -> str:
+    suffix = _external_session_key(session.provider, session.session_id)
+    return f"{IDLE_RELEASED_EXTERNAL_SESSION_PREFIX}{suffix}"
 
 
 def _external_session_key(provider: Provider, session_id: str) -> str:
