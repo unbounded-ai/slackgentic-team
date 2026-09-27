@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,10 +22,14 @@ from agent_harness.permissions import CLAUDE_CHANNEL_PERMISSION_MODE_ENV
 from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
     CODEX_MCP_INSTRUCTIONS,
+    NATIVE_INPUT_ABANDONED_TEXT,
+    NATIVE_INPUT_HOOK_TIMEOUT_SECONDS,
+    NATIVE_INPUT_WAIT_SECONDS,
     SLACK_THREAD_CHANNEL_ENV,
     SLACK_THREAD_TS_ENV,
     SLACKGENTIC_MCP_PERMISSION_ALLOW,
     ClaudeChannelServer,
+    _native_input_stop_event,
     ensure_claude_cross_session_inbound,
     ensure_claude_mcp_permissions,
     ensure_claude_native_input_hook,
@@ -81,6 +86,44 @@ class FakeRequestHandler:
             }
         )
         return self.response
+
+
+def _native_input_store(tmp: Path) -> Store:
+    store = Store(tmp / "state.sqlite")
+    store.init_schema()
+    store.upsert_session(
+        AgentSession(
+            provider=Provider.CLAUDE,
+            session_id="s1",
+            transcript_path=tmp / "claude.jsonl",
+            status=SessionStatus.ACTIVE,
+        )
+    )
+    store.upsert_slack_thread_for_session(
+        Provider.CLAUDE,
+        "s1",
+        "T1",
+        SlackThreadRef("C1", "171.000001", "171.000001"),
+    )
+    return store
+
+
+def _native_input_payload() -> dict:
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu_question",
+        "session_id": "s1",
+        "tool_input": {
+            "questions": [
+                {
+                    "header": "Scope",
+                    "question": "How much should run?",
+                    "options": [{"label": "Cheap set"}, {"label": "Everything runnable"}],
+                }
+            ]
+        },
+    }
 
 
 class ClaudeChannelTests(unittest.TestCase):
@@ -1608,6 +1651,12 @@ class ClaudeChannelTests(unittest.TestCase):
                 native["hooks"][0]["command"],
                 "/opt/slackgentic claude-channel --native-input-hook",
             )
+            # Claude Code kills a command hook after 600 seconds unless the
+            # entry says otherwise, and a killed hook cannot deliver an answer,
+            # so the entry must outlive the time the hook itself waits.
+            self.assertEqual(native["hooks"][0]["timeout"], NATIVE_INPUT_HOOK_TIMEOUT_SECONDS)
+            self.assertGreater(NATIVE_INPUT_HOOK_TIMEOUT_SECONDS, NATIVE_INPUT_WAIT_SECONDS)
+            self.assertGreater(NATIVE_INPUT_WAIT_SECONDS, 600)
 
     def test_install_registers_native_input_hook_before_user_wildcards(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1722,6 +1771,10 @@ class ClaudeChannelTests(unittest.TestCase):
                 pre_tool_use[1]["hooks"][0]["command"],
                 "/opt/slackgentic claude-channel --native-input-hook",
             )
+            # An entry from an earlier release had no timeout; the reinstall adds it.
+            self.assertEqual(
+                pre_tool_use[1]["hooks"][0]["timeout"], NATIVE_INPUT_HOOK_TIMEOUT_SECONDS
+            )
 
             before = settings.stat().st_mtime_ns
             ensure_claude_native_input_hook("/opt/slackgentic", home)
@@ -1830,6 +1883,98 @@ class ClaudeChannelTests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_native_input_hook_gives_up_after_its_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _native_input_store(Path(tmp))
+            try:
+                gateway = FakeGateway()
+
+                result = handle_native_input_hook(
+                    _native_input_payload(),
+                    store,
+                    gateway,
+                    poll_seconds=0.01,
+                    wait_seconds=0.01,
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertEqual(
+                    store.list_pending_slack_agent_requests("item/tool/requestUserInput"), []
+                )
+                self.assertEqual(gateway.updates[-1]["text"], "Claude request timed out.")
+            finally:
+                store.close()
+
+    def test_native_input_hook_closes_the_slack_question_when_claude_stops_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _native_input_store(Path(tmp))
+            try:
+                gateway = FakeGateway()
+                stop = threading.Event()
+                result = {}
+
+                def run_hook():
+                    result["value"] = handle_native_input_hook(
+                        _native_input_payload(),
+                        store,
+                        gateway,
+                        poll_seconds=0.01,
+                        stop=stop,
+                    )
+
+                worker = threading.Thread(target=run_hook)
+                worker.start()
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
+                rows = store.list_pending_slack_agent_requests("item/tool/requestUserInput")
+                self.assertEqual(len(rows), 1)
+                token = rows[0]["token"]
+
+                stop.set()
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
+
+                self.assertFalse(worker.is_alive())
+                self.assertIsNone(result["value"])
+                resolved, response = store.get_slack_agent_request_response(token)
+                self.assertTrue(resolved)
+                self.assertEqual(response, {"answers": {}})
+                self.assertEqual(gateway.updates[-1]["text"], NATIVE_INPUT_ABANDONED_TEXT)
+                self.assertIsNone(gateway.updates[-1]["blocks"])
+
+                # A click that lands after the hook is gone must not claim the
+                # question was answered.
+                updates_before = len(gateway.updates)
+                value = gateway.replies[0]["blocks"][2]["elements"][0]["value"]
+                daemon = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+                self.assertTrue(
+                    daemon.handle_block_action(
+                        decode_action_value(value), "C1", gateway.replies[0]["ts"]
+                    )
+                )
+                self.assertEqual(len(gateway.updates), updates_before)
+                self.assertEqual(
+                    store.get_slack_agent_request_response(token), (True, {"answers": {}})
+                )
+            finally:
+                store.close()
+
+    def test_native_input_stop_event_is_set_by_sigterm(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.skipTest("signal handlers can only be installed from the main thread")
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            stop = _native_input_stop_event()
+            handler = signal.getsignal(signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            self.assertFalse(stop.is_set())
+
+            handler(signal.SIGTERM, None)
+
+            self.assertTrue(stop.is_set())
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
     def test_native_input_hook_resolves_from_slack_actions_with_valid_hook_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

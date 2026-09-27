@@ -182,7 +182,13 @@ class SlackAgentRequestHandler:
         token: str,
         *,
         timeout_seconds: float | None = None,
+        stop: threading.Event | None = None,
     ) -> Any:
+        """Poll until the request is answered, its wait runs out, or ``stop`` is set.
+
+        A set ``stop`` returns ``None`` and leaves the request open, so the
+        caller can decide what the Slack message should say about it.
+        """
         if self.store is None:
             return None
         deadline = time.monotonic() + (
@@ -192,6 +198,8 @@ class SlackAgentRequestHandler:
             resolved, response = self.store.get_slack_agent_request_response(token)
             if resolved:
                 return response
+            if stop is not None and stop.is_set():
+                return None
             time.sleep(self.poll_seconds)
         resolved, response = self.store.get_slack_agent_request_response(token)
         if resolved:
@@ -200,9 +208,34 @@ class SlackAgentRequestHandler:
         if row is None:
             return None
         pending = _pending_from_row(row, fallback_channel_id=row["thread_channel_id"])
+        return self._close_unanswered_request(
+            pending, f"{pending.provider_label} request timed out."
+        )
+
+    def abandon_persistent_request(self, token: str, text: str) -> bool:
+        """Close a request that nobody is waiting on any more.
+
+        The Slack message loses its buttons and shows ``text``, so a later
+        click cannot look like an answer that reached the agent. Returns
+        ``False`` when the request was already resolved or does not exist.
+        """
+        if self.store is None:
+            return False
+        resolved, _ = self.store.get_slack_agent_request_response(token)
+        if resolved:
+            return False
+        row = self.store.get_slack_agent_request(token)
+        if row is None:
+            return False
+        pending = _pending_from_row(row, fallback_channel_id=row["thread_channel_id"])
+        self._close_unanswered_request(pending, text)
+        return True
+
+    def _close_unanswered_request(self, pending: PendingAgentRequest, text: str) -> Any:
         response = _timeout_response(pending.method)
-        self.store.resolve_slack_agent_request(token, response)
-        self._update_request_message(pending, f"{pending.provider_label} request timed out.")
+        if self.store is not None:
+            self.store.resolve_slack_agent_request(pending.token, response)
+        self._update_request_message(pending, text)
         return response
 
     def handle_block_action(

@@ -49,7 +49,100 @@ class FailingFullRequestGateway(FakeGateway):
         )
 
 
+def _choice_params() -> dict:
+    return {
+        "questions": [
+            {
+                "id": "choice",
+                "header": "Choice",
+                "question": "Pick one",
+                "options": [{"label": "A"}, {"label": "B"}],
+            }
+        ]
+    }
+
+
 class SlackAgentRequestHandlerTests(unittest.TestCase):
+    def test_wait_for_persistent_request_returns_when_stopped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(
+                    gateway,
+                    timeout_seconds=POLL_TIMEOUT_SECONDS,
+                    store=store,
+                    provider_label="Claude",
+                    poll_seconds=0.01,
+                )
+                pending = handler.create_persistent_request(
+                    "item/tool/requestUserInput",
+                    _choice_params(),
+                    SlackThreadRef("C1", "171.000001"),
+                )
+                stop = threading.Event()
+                stop.set()
+
+                self.assertIsNone(handler.wait_for_persistent_request(pending.token, stop=stop))
+
+                # Stopping leaves the request open; the caller decides its fate.
+                resolved, _ = store.get_slack_agent_request_response(pending.token)
+                self.assertFalse(resolved)
+                self.assertEqual(gateway.updates, [])
+            finally:
+                store.close()
+
+    def test_abandon_persistent_request_closes_an_unanswered_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+                pending = handler.create_persistent_request(
+                    "item/tool/requestUserInput",
+                    _choice_params(),
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                self.assertTrue(handler.abandon_persistent_request(pending.token, "Moved on."))
+
+                resolved, response = store.get_slack_agent_request_response(pending.token)
+                self.assertTrue(resolved)
+                self.assertEqual(response, {"answers": {}})
+                self.assertEqual(gateway.updates[-1]["text"], "Moved on.")
+                self.assertIsNone(gateway.updates[-1]["blocks"])
+
+                self.assertFalse(handler.abandon_persistent_request(pending.token, "Again."))
+                self.assertEqual(len(gateway.updates), 1)
+            finally:
+                store.close()
+
+    def test_abandon_persistent_request_keeps_an_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+                pending = handler.create_persistent_request(
+                    "item/tool/requestUserInput",
+                    _choice_params(),
+                    SlackThreadRef("C1", "171.000001"),
+                )
+                answer = {"answers": {"choice": {"answers": ["A"]}}}
+                store.resolve_slack_agent_request(pending.token, answer)
+
+                self.assertFalse(handler.abandon_persistent_request(pending.token, "Moved on."))
+
+                self.assertEqual(
+                    store.get_slack_agent_request_response(pending.token), (True, answer)
+                )
+                self.assertEqual(gateway.updates, [])
+            finally:
+                store.close()
+
     def test_persistent_request_can_be_resolved_by_another_handler(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
