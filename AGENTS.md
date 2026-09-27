@@ -8,7 +8,8 @@ Always work in a dedicated git worktree branched from the latest `origin/main`,
 not the shared checkout. The shared checkout is reused across agents, and
 working there directly causes one agent's changes to be stashed or overwritten
 by another's. See the **Worktrees** section of `CONTRIBUTING.md` for the
-commands.
+commands. Once the branch has merged on the remote, remove the worktree from
+the main checkout with `git worktree remove ../<repo>-<task-slug>`.
 
 ## Identifiable Information
 

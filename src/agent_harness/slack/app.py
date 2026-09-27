@@ -470,6 +470,8 @@ LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
 LOOP_REMEMBERED_TOOLS_KEY = "allowed_tools"
 LOOP_QUIET_CHOICE_KEY = "quiet_choice"
 LOOP_THREAD_ROLLOVER_SUMMARY_KEY = "thread_rollover_summary"
+# The ts of the note at the top of the run log; the runs since it are the next note's.
+LOOP_THREAD_ARCHIVE_TS_KEY = "thread_archive_ts"
 # Pace thread cleanup under chat.delete's rate limit (Tier 3, ~50/minute).
 LOOP_THREAD_DELETE_INTERVAL_SECONDS = 1.3
 # Anyone in a loop channel may run or pause it; editing and deleting stay owner-only.
@@ -2080,8 +2082,31 @@ class SlackTeamController:
             context=context,
             quiet=_loop_is_quiet(latest),
             last_check_text=self._loop_last_check_text(latest, runs),
+            owner_name=self._loop_owner_name(latest),
         )
         return f"{latest.title}: {latest.status.value}; next run {next_run_text}.", blocks
+
+    def _loop_owner_name(self, loop: Loop) -> str | None:
+        """The owner's display name, so the panel can name them without an @mention.
+
+        Slack subscribes anyone mentioned in a message to its thread, and the panel's
+        thread is the quiet run log: a mention there would notify the owner on every
+        all-clear run. The name is fetched once and remembered."""
+        owner_id = loop.owner_slack_user_id
+        if not owner_id:
+            return None
+        known = self._display_name_for_slack_user(owner_id)
+        if known:
+            return known
+        try:
+            name = self.gateway.user_profile(owner_id).display_name
+        except Exception:
+            LOGGER.debug("failed to fetch the loop owner's display name", exc_info=True)
+            return None
+        if not isinstance(name, str) or not name.strip():
+            return None
+        self.store.set_setting(_human_user_display_name_key(owner_id), name.strip())
+        return name.strip()
 
     def refresh_loop_panels_after_upgrade(self) -> int:
         """Re-render pinned panels once per version so older loops get the current design."""
@@ -4463,10 +4488,10 @@ class SlackTeamController:
         self.store.update_loop_metadata(latest.loop_id, metadata)
 
     def _queue_loop_thread_rollover_if_needed(self, loop: Loop) -> None:
-        """Quiet runs pile up in the pinned panel's thread; archive it every N runs.
+        """Quiet runs pile up in the pinned panel's thread; clear it every N runs.
 
         The rollover rides on a memory compaction run so the agent can leave a short
-        note for posterity, then _rollover_loop_thread swaps in a fresh panel."""
+        note for posterity, then _rollover_loop_thread clears the thread."""
         latest = self.store.get_loop(loop.loop_id) or loop
         if (
             not _loop_is_quiet(latest)
@@ -4498,19 +4523,25 @@ class SlackTeamController:
             LOGGER.warning("failed to roll over loop thread %s", latest.loop_id, exc_info=True)
 
     def _rollover_loop_thread(self, loop: Loop) -> None:
-        """Replace the pinned panel (and its thread of quiet runs) with a fresh one.
+        """Clear the pinned panel's thread of quiet runs, leaving one archive note.
 
-        One summary message stays in the channel for posterity; the old panel and
-        every reply the bot can delete are removed in the background."""
-        old_ts = loop.charter_message_ts
+        The panel stays where it is: Slack has no silent channel message, so an
+        archive message and a fresh panel would each mark the channel unread. The
+        note goes into the thread as its first reply instead, which notifies
+        nobody. Every older reply is deleted in the background, and the note
+        itself goes the next time the log is cleared."""
+        panel_ts = loop.charter_message_ts
         agent = self.store.get_team_agent(loop.agent_id, include_fired=True)
         metadata = dict(loop.metadata)
         agent_note = metadata.pop(LOOP_THREAD_ROLLOVER_SUMMARY_KEY, None)
         metadata.pop(LOOP_THREAD_ROLLOVER_PENDING_KEY, None)
-        if not loop.channel_id or not old_ts or agent is None:
+        if not loop.channel_id or not panel_ts or agent is None:
             self.store.update_loop_metadata(loop.loop_id, metadata)
             return
-        started_at = _slack_ts_datetime(old_ts)
+        previous_note = metadata.get(LOOP_THREAD_ARCHIVE_TS_KEY)
+        started_at = _slack_ts_datetime(
+            previous_note if isinstance(previous_note, str) else panel_ts
+        )
         runs = [
             run
             for run in self.store.list_loop_runs(loop.loop_id, limit=10_000)
@@ -4525,56 +4556,48 @@ class SlackTeamController:
             failed=sum(1 for run in runs if run.status == LoopRunStatus.FAILED),
             agent_note=agent_note if isinstance(agent_note, str) else None,
         )
-        self.gateway.post_session_parent(
-            loop.channel_id,
+        note = self.gateway.post_thread_reply(
+            SlackThreadRef(loop.channel_id, panel_ts),
             text,
             persona=agent,
             icon_url=self._agent_icon_url(agent),
             blocks=blocks,
         )
-        panel_text, panel_blocks = self._loop_panel(loop)
-        charter = self.gateway.post_session_parent(
-            loop.channel_id,
-            panel_text,
-            persona=agent,
-            icon_url=self._agent_icon_url(agent),
-            blocks=panel_blocks,
-        )
-        self._pin_message(loop.channel_id, charter.ts, "loop panel")
         metadata[LOOP_THREAD_RUN_COUNT_KEY] = 0
+        metadata[LOOP_THREAD_ARCHIVE_TS_KEY] = note.ts
         self.store.update_loop_metadata(loop.loop_id, metadata)
-        self.store.update_loop_channel(
-            loop.loop_id,
-            channel_id=loop.channel_id,
-            channel_name=loop.channel_name or "",
-            charter_message_ts=charter.ts,
-        )
-        self._append_loop_system_entry(
-            loop, f"archived the panel thread after {len(runs)} quiet runs"
-        )
+        self._append_loop_system_entry(loop, f"cleared the run log after {len(runs)} quiet runs")
         self._refresh_loop_panel(loop)
         threading.Thread(
-            target=self._delete_loop_thread,
-            args=(loop.channel_id, old_ts, loop.owner_slack_user_id),
+            target=self._clear_loop_thread,
+            args=(loop.channel_id, panel_ts, loop.owner_slack_user_id, note.ts),
             name=f"loop-thread-cleanup-{loop.loop_id}",
             daemon=True,
         ).start()
 
-    def _delete_loop_thread(self, channel_id: str, thread_ts: str, owner_id: str) -> None:
-        with suppress(Exception):
-            self.gateway.unpin_message(channel_id, thread_ts)
+    def _clear_loop_thread(
+        self, channel_id: str, thread_ts: str, owner_id: str, note_ts: str
+    ) -> None:
+        """Delete the run log's replies older than the archive note; the panel stays.
+
+        Slack has no "delete thread", so the replies go one by one, newest first.
+        The note and everything after it are the fresh log (a run that finishes
+        meanwhile lands after the note). The bot can only delete its own messages;
+        the owner's replies need the optional owner token. If Slack refuses to list
+        the thread even after the gateway's retries, nothing is deleted now: these
+        replies are still older than the next note, so the next clearing takes them."""
         try:
             messages = self.gateway.thread_messages(channel_id, thread_ts, limit=5_000)
         except Exception:
             LOGGER.warning("failed to list loop thread %s for cleanup", thread_ts, exc_info=True)
-            messages = []
+            return
         replies = [
-            message for message in messages if message.get("ts") and message.get("ts") != thread_ts
+            message
+            for message in messages
+            if message.get("ts")
+            and message.get("ts") != thread_ts
+            and _slack_ts_before(str(message["ts"]), note_ts)
         ]
-        # Slack has no "delete thread": removing only the parent leaves a "This
-        # message was deleted" placeholder with every reply still reachable. So
-        # replies go first, then the parent. The bot can only delete its own
-        # messages; the owner's replies need the optional owner token.
         kept = 0
         for message in reversed(replies):
             ts = str(message["ts"])
@@ -4583,7 +4606,6 @@ class SlackTeamController:
                 deleted = self.gateway.delete_message(channel_id, ts, as_owner=True)
             kept += 0 if deleted else 1
             time.sleep(LOOP_THREAD_DELETE_INTERVAL_SECONDS)
-        self.gateway.delete_message(channel_id, thread_ts)
         if kept:
             LOGGER.warning(
                 "loop thread %s cleanup left %d replies; set SLACK_USER_TOKEN so the "
@@ -16549,6 +16571,12 @@ def _slack_ts_datetime(ts: str) -> datetime | None:
         return datetime.fromtimestamp(float(ts), tz=UTC)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _slack_ts_before(ts: str, cutoff: str) -> bool:
+    """Whether message ``ts`` was posted before ``cutoff``; unreadable stamps never are."""
+    posted, limit = _slack_ts_datetime(ts), _slack_ts_datetime(cutoff)
+    return posted is not None and limit is not None and posted < limit
 
 
 def _loop_run_succeeded(run: LoopRun) -> bool:
