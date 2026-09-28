@@ -282,6 +282,7 @@ from agent_harness.sessions.mirror import (
     session_parent_blocks,
 )
 from agent_harness.slack import (
+    HUMAN_USER_ID_SETTING,
     IDLE_RELEASE_PROMPT_TEXT,
     LOOP_NO_REPORT_STATUS,
     LOOP_RESULT_STYLES,
@@ -415,7 +416,7 @@ SETTING_USAGE_TS_PREFIX = "slack.usage_ts."
 SETTING_CLAUDE_QUOTA = "usage.claude_quota"
 # A status request reuses a quota reading this recent instead of probing again.
 CLAUDE_QUOTA_FRESH_SECONDS = 120
-SETTING_HUMAN_USER_ID = "slack.human_user_id"
+SETTING_HUMAN_USER_ID = HUMAN_USER_ID_SETTING
 SETTING_HUMAN_USER_DISPLAY_NAME_PREFIX = "slack.user_display_name."
 SETTING_REPO_ROOT = TASK_RUNTIME_REPO_ROOT_SETTING
 SETTING_EXTERNAL_SESSION_DELIVERY_PREFIX = "external_session_delivery."

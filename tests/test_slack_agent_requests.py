@@ -2,9 +2,10 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
-from agent_harness.models import SlackThreadRef
+from agent_harness.models import AgentTask, AgentTaskKind, AgentTaskStatus, SlackThreadRef
 from agent_harness.slack import decode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.client import PostedMessage
@@ -62,7 +63,126 @@ def _choice_params() -> dict:
     }
 
 
+def _terminal_button(blocks: list[dict]) -> dict | None:
+    for block in blocks:
+        if block.get("type") != "actions":
+            continue
+        for element in block.get("elements", []):
+            if decode_action_value(element["value"]).get("decision") == "terminal":
+                return element
+    return None
+
+
 class SlackAgentRequestHandlerTests(unittest.TestCase):
+    def test_input_request_tags_the_thread_requester(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                store.set_setting("slack.human_user_id", "U_HUMAN")
+                now = datetime.now(UTC)
+                store.upsert_agent_task(
+                    AgentTask(
+                        task_id="task-1",
+                        agent_id="agent-1",
+                        prompt="do the thing",
+                        channel_id="C1",
+                        kind=AgentTaskKind.WORK,
+                        status=AgentTaskStatus.ACTIVE,
+                        created_at=now,
+                        updated_at=now,
+                        requested_by_slack_user="U_REQUESTER",
+                        thread_ts="171.000001",
+                    )
+                )
+                handler = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+
+                handler.create_persistent_request(
+                    "item/tool/requestUserInput",
+                    _choice_params(),
+                    SlackThreadRef("C1", "171.000001"),
+                )
+
+                # The requester outranks the configured human.
+                self.assertEqual(gateway.replies[0]["text"], "<@U_REQUESTER> Claude needs input.")
+                self.assertTrue(
+                    gateway.replies[0]["blocks"][0]["text"]["text"].startswith(
+                        "<@U_REQUESTER> *Claude needs input.*"
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_input_request_tags_the_configured_human_for_observed_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+                thread = SlackThreadRef("C1", "171.000001")
+
+                handler.create_persistent_request(
+                    "item/tool/requestUserInput", _choice_params(), thread
+                )
+                self.assertEqual(gateway.replies[0]["text"], "Claude needs input.")
+
+                store.set_setting("slack.human_user_id", "U_HUMAN")
+                handler.create_persistent_request(
+                    "item/tool/requestUserInput", _choice_params(), thread
+                )
+                self.assertEqual(gateway.replies[1]["text"], "<@U_HUMAN> Claude needs input.")
+            finally:
+                store.close()
+
+    def test_terminal_handoff_button_moves_the_question_to_the_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            gateway = FakeGateway()
+            try:
+                store.init_schema()
+                handler = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+                thread = SlackThreadRef("C1", "171.000001")
+
+                plain = handler.create_persistent_request(
+                    "item/tool/requestUserInput", _choice_params(), thread
+                )
+                plain_blocks = gateway.replies[0]["blocks"]
+                self.assertIsNone(_terminal_button(plain_blocks))
+                self.assertEqual(plain_blocks[-1]["type"], "actions")
+
+                params = {**_choice_params(), "terminal_handoff": True, "footer": "Press Esc."}
+                pending = handler.create_persistent_request(
+                    "item/tool/requestUserInput", params, thread
+                )
+                blocks = gateway.replies[1]["blocks"]
+                self.assertEqual(blocks[-1]["type"], "context")
+                self.assertEqual(blocks[-1]["elements"][0]["text"], "Press Esc.")
+                button = _terminal_button(blocks)
+                self.assertIsNotNone(button)
+                assert button is not None
+                self.assertEqual(button["text"]["text"], "Answer in the terminal")
+
+                handled = handler.handle_block_action(
+                    decode_action_value(button["value"]), "C1", gateway.replies[1]["ts"]
+                )
+
+                self.assertTrue(handled)
+                self.assertEqual(
+                    store.get_slack_agent_request_response(pending.token),
+                    (True, {"answers": {}, "handoff": "terminal"}),
+                )
+                self.assertEqual(gateway.updates[-1]["text"], "Moved to the Claude terminal.")
+                self.assertEqual(
+                    handler.wait_for_persistent_request(pending.token),
+                    {"answers": {}, "handoff": "terminal"},
+                )
+                resolved, _ = store.get_slack_agent_request_response(plain.token)
+                self.assertFalse(resolved)
+            finally:
+                store.close()
+
     def test_wait_for_persistent_request_returns_when_stopped(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")

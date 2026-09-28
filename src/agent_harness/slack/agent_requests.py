@@ -11,7 +11,7 @@ from secrets import token_urlsafe
 from typing import Any
 
 from agent_harness.models import LOOP_ID_METADATA_KEY, SlackThreadRef
-from agent_harness.slack import encode_action_value
+from agent_harness.slack import HUMAN_USER_ID_SETTING, encode_action_value
 from agent_harness.slack.client import SlackGateway
 from agent_harness.storage.store import Store
 
@@ -34,6 +34,8 @@ class PendingAgentRequest:
     response: Any = None
     message_ts: str | None = None
     answers: dict[str, str] = field(default_factory=dict)
+    # The person the request message tags so it reads as something to act on.
+    mention_slack_user_id: str | None = None
 
 
 class SlackAgentRequestHandler:
@@ -83,6 +85,7 @@ class SlackAgentRequestHandler:
             params=params,
             thread=thread,
             action_name=self.action_name,
+            mention_slack_user_id=self._mention_slack_user_id(thread),
         )
         with self._lock:
             self._pending[pending.token] = pending
@@ -136,6 +139,7 @@ class SlackAgentRequestHandler:
             params=params,
             thread=thread,
             action_name=self.action_name,
+            mention_slack_user_id=self._mention_slack_user_id(thread),
         )
         self.store.create_slack_agent_request(
             pending.token,
@@ -176,6 +180,26 @@ class SlackAgentRequestHandler:
             return None
         loop = self.store.get_loop(loop_id)
         return loop.owner_slack_user_id if loop is not None else None
+
+    def _mention_slack_user_id(self, thread: SlackThreadRef) -> str | None:
+        """Who a request should tag.
+
+        The thread's requester when Slack started the work, else the loop
+        owner, else the person this instance serves, which is who an observed
+        terminal session belongs to.
+        """
+        if self.store is None:
+            return None
+        task = self.store.get_managed_thread_task(thread.channel_id, thread.thread_ts)
+        if task is None:
+            task = self.store.get_agent_task_by_thread(thread.channel_id, thread.thread_ts)
+        if task is not None and task.requested_by_slack_user:
+            return task.requested_by_slack_user
+        owner = self._allowed_slack_user_id(thread)
+        if owner:
+            return owner
+        configured = self.store.get_setting(HUMAN_USER_ID_SETTING)
+        return configured.strip() if configured and configured.strip() else None
 
     def wait_for_persistent_request(
         self,
@@ -298,6 +322,7 @@ class SlackAgentRequestHandler:
                 )
             return True
         pending = _pending_from_row(row, fallback_channel_id=channel_id)
+        pending.mention_slack_user_id = self._mention_slack_user_id(pending.thread)
         if row["resolved_at"]:
             return True
         if pending.method == "item/tool/requestUserInput":
@@ -392,9 +417,11 @@ def _compact_request_message(
 
 def _input_request_message(pending: PendingAgentRequest) -> tuple[str, list[dict[str, Any]]]:
     questions = _questions(pending.params)
-    text = f"{pending.provider_label} needs input."
+    mention = f"<@{pending.mention_slack_user_id}> " if pending.mention_slack_user_id else ""
+    headline = f"{pending.provider_label} needs input."
+    text = f"{mention}{headline}"
     blocks: list[dict[str, Any]] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{text}*"}}
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"{mention}*{headline}*"}}
     ]
     for question_index, question in enumerate(questions):
         question_id = str(question.get("id") or "")
@@ -426,21 +453,41 @@ def _input_request_message(pending: PendingAgentRequest) -> tuple[str, list[dict
                     "elements": elements,
                 }
             )
+    closing: list[dict[str, Any]] = []
+    if pending.params.get("terminal_handoff") is True:
+        # Only a question that also has a terminal picker can be handed to it.
+        closing.append(
+            _button(
+                "Answer in the terminal",
+                "agent.request.terminal",
+                pending,
+                decision="terminal",
+            )
+        )
+    closing.append(
+        _button(
+            "Cancel",
+            "agent.request.cancel",
+            pending,
+            decision="cancel",
+            style="danger",
+        )
+    )
     blocks.append(
         {
             "type": "actions",
             "block_id": f"agent.input.cancel.{pending.token}"[:255],
-            "elements": [
-                _button(
-                    "Cancel",
-                    "agent.request.cancel",
-                    pending,
-                    decision="cancel",
-                    style="danger",
-                )
-            ],
+            "elements": closing,
         }
     )
+    footer = pending.params.get("footer")
+    if isinstance(footer, str) and footer.strip():
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": _truncate(footer.strip(), 2000)}],
+            }
+        )
     return text, blocks[:50]
 
 
@@ -749,6 +796,8 @@ def _resolved_text(
 def _input_resolved_text(pending: PendingAgentRequest, payload: dict[str, Any]) -> str:
     if payload.get("decision") == "cancel":
         return f"Cancelled {pending.provider_label} input request."
+    if payload.get("decision") == "terminal":
+        return f"Moved to the {pending.provider_label} terminal."
     return f"Answered {pending.provider_label} input request."
 
 
@@ -758,6 +807,8 @@ def _user_input_response(
 ) -> tuple[Any | None, dict[str, str]]:
     if payload.get("decision") == "cancel":
         return {"answers": {}}, dict(pending.answers)
+    if payload.get("decision") == "terminal":
+        return {"answers": {}, "handoff": "terminal"}, dict(pending.answers)
     answers = dict(pending.answers)
     question_id = str(payload.get("question_id") or "")
     answer = str(payload.get("answer") or "")

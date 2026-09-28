@@ -23,7 +23,9 @@ from agent_harness.sessions.claude_channel import (
     CHANNEL_NAME,
     CODEX_MCP_INSTRUCTIONS,
     NATIVE_INPUT_ABANDONED_TEXT,
+    NATIVE_INPUT_FOOTER_TEXT,
     NATIVE_INPUT_HOOK_TIMEOUT_SECONDS,
+    NATIVE_INPUT_NOTIFICATION_TEXT,
     NATIVE_INPUT_WAIT_SECONDS,
     SLACK_THREAD_CHANNEL_ENV,
     SLACK_THREAD_TS_ENV,
@@ -1956,6 +1958,63 @@ class ClaudeChannelTests(unittest.TestCase):
                 self.assertEqual(len(gateway.updates), updates_before)
                 self.assertEqual(
                     store.get_slack_agent_request_response(token), (True, {"answers": {}})
+                )
+            finally:
+                store.close()
+
+    def test_native_input_hook_tags_the_human_notifies_and_hands_off_to_the_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _native_input_store(Path(tmp))
+            try:
+                store.set_setting("slack.human_user_id", "U_HUMAN")
+                gateway = FakeGateway()
+                notifications: list[tuple[str, str, str]] = []
+                result = {}
+
+                def run_hook():
+                    result["value"] = handle_native_input_hook(
+                        _native_input_payload(),
+                        store,
+                        gateway,
+                        poll_seconds=0.01,
+                        notify=lambda *args: notifications.append(args),
+                    )
+
+                worker = threading.Thread(target=run_hook)
+                worker.start()
+                self.assertTrue(wait_until(lambda: bool(gateway.replies)))
+                reply = gateway.replies[0]
+                self.assertEqual(reply["text"], "<@U_HUMAN> Claude needs input.")
+                self.assertEqual(reply["blocks"][-1]["type"], "context")
+                self.assertEqual(
+                    reply["blocks"][-1]["elements"][0]["text"], NATIVE_INPUT_FOOTER_TEXT
+                )
+                self.assertIn("Esc", NATIVE_INPUT_FOOTER_TEXT)
+                self.assertTrue(wait_until(lambda: bool(notifications)))
+                self.assertEqual(
+                    notifications, [("Slackgentic", "Scope", NATIVE_INPUT_NOTIFICATION_TEXT)]
+                )
+
+                terminal_button = next(
+                    element
+                    for block in reply["blocks"]
+                    if block.get("type") == "actions"
+                    for element in block["elements"]
+                    if decode_action_value(element["value"]).get("decision") == "terminal"
+                )
+                self.assertEqual(terminal_button["text"]["text"], "Answer in the terminal")
+                daemon = SlackAgentRequestHandler(gateway, store=store, provider_label="Claude")
+                daemon.handle_block_action(
+                    decode_action_value(terminal_button["value"]), "C1", reply["ts"]
+                )
+                worker.join(timeout=POLL_TIMEOUT_SECONDS)
+
+                self.assertFalse(worker.is_alive())
+                # No decision: Claude Code goes on to show its own picker.
+                self.assertIsNone(result["value"])
+                self.assertEqual(
+                    [update["text"] for update in gateway.updates],
+                    ["Moved to the Claude terminal."],
                 )
             finally:
                 store.close()
