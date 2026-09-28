@@ -451,6 +451,31 @@ class ClaudeUserRecordAuthorshipTests(unittest.TestCase):
         self.assertTrue(is_human_claude_user_record(launched, provenance_labelled=True))
         self.assertFalse(is_human_claude_user_record(injected, provenance_labelled=True))
 
+    def test_an_interactive_hosts_own_sdk_turns_are_not_the_persons(self):
+        from agent_harness.providers.claude import is_human_claude_user_record
+
+        typed = _prompt(
+            "merge it for me",
+            origin={"kind": "human"},
+            promptSource="sdk",
+            turnOrigin="human",
+            entrypoint="claude-desktop",
+        )
+        host_event = _prompt(
+            "<ci-monitor-event>The app is watching example-org/example-repo PR #1."
+            "</ci-monitor-event>",
+            promptSource="sdk",
+            turnOrigin="sdk",
+            entrypoint="claude-desktop",
+        )
+        launched = _prompt(
+            "review the diff", promptSource="sdk", turnOrigin="sdk", entrypoint="sdk-cli"
+        )
+
+        self.assertTrue(is_human_claude_user_record(typed, provenance_labelled=True))
+        self.assertFalse(is_human_claude_user_record(host_event, provenance_labelled=True))
+        self.assertTrue(is_human_claude_user_record(launched, provenance_labelled=True))
+
     def test_cli_written_flags_win_over_any_origin(self):
         from agent_harness.providers.claude import is_human_claude_user_record
 
@@ -574,6 +599,43 @@ class ClaudeEventAuthorshipTests(unittest.TestCase):
         self.assertEqual(
             [event.metadata["message"]["content"] for event in events if event.human_authored],
             ["take over the rollout", "keep going"],
+        )
+
+    def test_desktop_app_ci_events_are_not_mirrored_as_the_persons_messages(self):
+        from agent_harness.sessions.mirror import render_session_event_chunk
+
+        desktop = {"version": "2.1.277", "entrypoint": "claude-desktop", "promptSource": "sdk"}
+        typed = {"origin": {"kind": "human"}, "turnOrigin": "human", **desktop}
+        records = [
+            _prompt(
+                "<system-reminder>\nYour working directory is a scratch workspace: "
+                "/workspace/scratch/example\n</system-reminder>\n\nmerge it for me",
+                **typed,
+            ),
+            {"type": "assistant", **desktop, "message": {"content": "Watching the PR."}},
+            _prompt(
+                "<ci-monitor-event>The app is watching example-org/example-repo PR #1."
+                "\n\n1 new review comment.</ci-monitor-event>",
+                turnOrigin="sdk",
+                **desktop,
+            ),
+            _prompt(
+                "<bash-input>git status</bash-input><bash-stdout>clean</bash-stdout>"
+                "<bash-stderr></bash-stderr>",
+                **typed,
+            ),
+            _prompt("thanks &amp; ship it", **typed),
+        ]
+
+        rendered = [render_session_event_chunk(event) for event in self._events(records)]
+
+        self.assertEqual(
+            [(chunk.author, chunk.text) for chunk in rendered if chunk is not None],
+            [
+                ("user", "merge it for me"),
+                ("assistant", "Watching the PR."),
+                ("user", "thanks &amp; ship it"),
+            ],
         )
 
     def test_resumed_transcript_that_opens_with_a_summary_is_not_human_authored(self):

@@ -125,8 +125,15 @@ adapter sets `AgentEvent.human_authored`, and adapters set it only from the
 CLI's own record that someone submitted input:
 
 - Claude Code labels each prompt with `origin.kind`; only `human` counts, plus
-  the launcher-supplied prompt of a headless run (`promptSource: sdk`). Records
-  the CLI writes for itself carry no label and are dropped.
+  the launcher-supplied prompt of a headless run (`promptSource: sdk` with an
+  `sdk-*` entrypoint). Records the CLI writes for itself carry no label and are
+  dropped. An interactive host such as the desktop app also submits over the
+  SDK, but it gives what a person typed a human origin, so its unlabelled SDK
+  turns (CI events, for one) are its own and are dropped too.
+- The desktop app can put its own text inside a human-labelled turn: it
+  prepends `<system-reminder>` context to a person's prompt, which the mirror
+  strips, and it labels `!` shell-mode commands and their output as human,
+  which the mirror drops as the CLI already does.
 - Codex records a submission event (`user_message`, or an `item_completed`
   event with a `UserMessage` item) for each prompt; role `user` response items
   are model input and are never attributed to the person.
