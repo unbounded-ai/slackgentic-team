@@ -118,6 +118,36 @@ request; the owner can change permissions from the loop channel after creation.
 - Up to 25 loops can be active or pending at once. Each loop gets its own
   dedicated bot; it does not take one of the user's roster agents.
 
+## Change a loop's mission
+
+When the user asks you to change what an existing loop does, propose the new
+mission yourself; do not hand them text to paste into Slack.
+
+1. Read the current mission: `slackgentic loop list --json` (the `mission`
+   field of the loop, matched by `loop_id`, `channel_name`, or `title`).
+2. Write the complete new mission, not a list of edits. It is stored exactly as
+   you write it, so keep every definition the loop depends on (queries,
+   thresholds, carry rules) word for word unless the user asked to change it.
+3. Show the user the diff first. Call Slackgentic's `update_loop` tool
+   (`mcp__slackgentic__update_loop`) with `{"loop": "<id or #channel>",
+   "mission": "<new mission>", "dry_run": true}`, or run
+   `slackgentic loop update <loop> --mission-file <path> --dry-run`, and relay
+   the diff it returns.
+4. Submit it: the same call without `dry_run`, plus an optional one-line
+   `note` explaining why. The CLI form is
+   `slackgentic loop update <loop> --mission-file <path> --note "<why>"`
+   (`--mission-file -` reads stdin).
+5. Tell the user what happens next: Slackgentic posts the change in the loop's
+   channel as a colored diff, with the full proposed mission in its thread.
+   Nothing changes until they tap **Apply**; **Cancel** discards it. If the
+   mission is edited some other way before they tap Apply, the proposal is
+   refused as stale and you must read the mission again and resubmit.
+
+Check a proposal later with `slackgentic loop request-status <request-id>`.
+Only the mission can be changed this way; schedule, quiet mode, permissions,
+and the rest stay with the owner in the loop channel. Loop runs cannot propose
+changes.
+
 ## Manage existing loops
 
 List loops from a terminal:
@@ -127,8 +157,9 @@ slackgentic loop list          # active, paused, and pending loops
 slackgentic loop list --json
 ```
 
-Loop control happens in Slack, and only the owner can do it. Give the user the
-exact text to send, in the **loop's channel**:
+For anything other than the mission, loop control happens in Slack, and only
+the owner can do it. Give the user the exact text to send, in the **loop's
+channel**:
 
 | Send in the loop channel | Effect |
 |---|---|

@@ -32,6 +32,8 @@ from agent_harness.models import (
     LoopRunKind,
     LoopRunStatus,
     LoopStatus,
+    LoopUpdateQueueRequest,
+    LoopUpdateRequestStatus,
     LoopVisibility,
     PendingWorkRequest,
     PendingWorkRequestStatus,
@@ -291,6 +293,28 @@ CREATE TABLE IF NOT EXISTS loop_create_requests (
 
 CREATE INDEX IF NOT EXISTS idx_loop_create_requests_status_created
   ON loop_create_requests(status, created_at);
+
+CREATE TABLE IF NOT EXISTS loop_update_requests (
+  request_id TEXT NOT NULL PRIMARY KEY,
+  loop_id TEXT NOT NULL,
+  mission TEXT NOT NULL,
+  base_mission TEXT NOT NULL,
+  note TEXT,
+  source TEXT,
+  status TEXT NOT NULL,
+  channel_id TEXT,
+  message_ts TEXT,
+  resolved_by TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_update_requests_status_created
+  ON loop_update_requests(status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_loop_update_requests_loop_status
+  ON loop_update_requests(loop_id, status);
 
 CREATE TABLE IF NOT EXISTS scheduled_work_requests (
   schedule_id TEXT NOT NULL PRIMARY KEY,
@@ -2009,6 +2033,174 @@ class Store:
                 ),
             )
             self.conn.commit()
+
+    def enqueue_loop_update_request(
+        self,
+        *,
+        loop_id: str,
+        mission: str,
+        base_mission: str,
+        note: str | None = None,
+        source: str | None = None,
+    ) -> LoopUpdateQueueRequest:
+        now = utc_now()
+        request = LoopUpdateQueueRequest(
+            request_id=f"loopupd_{uuid.uuid4().hex[:12]}",
+            loop_id=loop_id,
+            mission=mission,
+            base_mission=base_mission,
+            status=LoopUpdateRequestStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+            note=note,
+            source=source,
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO loop_update_requests (
+                  request_id, loop_id, mission, base_mission, note, source, status,
+                  channel_id, message_ts, resolved_by, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request.loop_id,
+                    request.mission,
+                    request.base_mission,
+                    request.note,
+                    request.source,
+                    request.status.value,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            self.conn.commit()
+        return request
+
+    def get_loop_update_request(self, request_id: str) -> LoopUpdateQueueRequest | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM loop_update_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return _loop_update_request_from_row(row) if row else None
+
+    def count_pending_loop_update_requests(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM loop_update_requests WHERE status IN (?, ?)",
+                (
+                    LoopUpdateRequestStatus.PENDING.value,
+                    LoopUpdateRequestStatus.CLAIMED.value,
+                ),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def list_posted_loop_update_requests(self, loop_id: str) -> list[LoopUpdateQueueRequest]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM loop_update_requests
+                WHERE loop_id = ? AND status = ?
+                ORDER BY created_at, request_id
+                """,
+                (loop_id, LoopUpdateRequestStatus.POSTED.value),
+            ).fetchall()
+        return [_loop_update_request_from_row(row) for row in rows]
+
+    def claim_pending_loop_update_requests(self, *, limit: int = 5) -> list[LoopUpdateQueueRequest]:
+        claimed: list[LoopUpdateQueueRequest] = []
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT request_id
+                FROM loop_update_requests
+                WHERE status = ?
+                ORDER BY created_at, request_id
+                LIMIT ?
+                """,
+                (LoopUpdateRequestStatus.PENDING.value, limit),
+            ).fetchall()
+            for row in rows:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE loop_update_requests
+                    SET status = ?, updated_at = ?
+                    WHERE request_id = ? AND status = ?
+                    """,
+                    (
+                        LoopUpdateRequestStatus.CLAIMED.value,
+                        utc_now().isoformat(),
+                        row["request_id"],
+                        LoopUpdateRequestStatus.PENDING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                current = self.conn.execute(
+                    "SELECT * FROM loop_update_requests WHERE request_id = ?",
+                    (row["request_id"],),
+                ).fetchone()
+                if current:
+                    claimed.append(_loop_update_request_from_row(current))
+            self.conn.commit()
+        return claimed
+
+    def finish_loop_update_request(
+        self,
+        request_id: str,
+        status: LoopUpdateRequestStatus,
+        *,
+        channel_id: str | None = None,
+        message_ts: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE loop_update_requests
+                SET status = ?, channel_id = ?, message_ts = ?, error = ?, updated_at = ?
+                WHERE request_id = ?
+                """,
+                (
+                    status.value,
+                    channel_id,
+                    message_ts,
+                    error,
+                    utc_now().isoformat(),
+                    request_id,
+                ),
+            )
+            self.conn.commit()
+
+    def resolve_loop_update_request(
+        self,
+        request_id: str,
+        status: LoopUpdateRequestStatus,
+        *,
+        resolved_by: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Move a posted request to its final status; False if it was already resolved."""
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE loop_update_requests
+                SET status = ?, resolved_by = ?, error = ?, updated_at = ?
+                WHERE request_id = ? AND status = ?
+                """,
+                (
+                    status.value,
+                    resolved_by,
+                    error,
+                    utc_now().isoformat(),
+                    request_id,
+                    LoopUpdateRequestStatus.POSTED.value,
+                ),
+            )
+            self.conn.commit()
+        return cursor.rowcount == 1
 
     def list_due_scheduled_timers(self, *, now=None, limit: int = 20) -> list[ScheduledTimer]:
         reference = now or utc_now()
@@ -3851,6 +4043,24 @@ def _loop_create_request_from_row(row: sqlite3.Row) -> LoopCreateQueueRequest:
         source=row["source"],
         channel_id=row["channel_id"],
         message_ts=row["message_ts"],
+        error=row["error"],
+    )
+
+
+def _loop_update_request_from_row(row: sqlite3.Row) -> LoopUpdateQueueRequest:
+    return LoopUpdateQueueRequest(
+        request_id=row["request_id"],
+        loop_id=row["loop_id"],
+        mission=row["mission"],
+        base_mission=row["base_mission"],
+        status=LoopUpdateRequestStatus(row["status"]),
+        created_at=parse_timestamp(row["created_at"]) or utc_now(),
+        updated_at=parse_timestamp(row["updated_at"]) or utc_now(),
+        note=row["note"],
+        source=row["source"],
+        channel_id=row["channel_id"],
+        message_ts=row["message_ts"],
+        resolved_by=row["resolved_by"],
         error=row["error"],
     )
 

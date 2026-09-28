@@ -36,6 +36,11 @@ from agent_harness.deferred import (
 from agent_harness.internal_notifications import is_internal_task_notification_text
 from agent_harness.loop_guard import read_guard_events
 from agent_harness.loop_icons import write_loop_badge
+from agent_harness.loop_updates import (
+    LOOP_UPDATE_EDITABLE_STATUSES,
+    LOOP_UPDATE_STALE_ERROR,
+    diff_loop_missions,
+)
 from agent_harness.loops import (
     AGENT_LOOP_COMPACT_SIGNAL_PREFIX,
     AGENT_LOOP_FETCH_SIGNAL_PREFIX,
@@ -139,6 +144,7 @@ from agent_harness.models import (
     LoopRunKind,
     LoopRunStatus,
     LoopStatus,
+    LoopUpdateRequestStatus,
     LoopVisibility,
     PendingWorkRequest,
     PendingWorkRequestStatus,
@@ -315,6 +321,9 @@ from agent_harness.slack import (
     build_loop_run_running_blocks,
     build_loop_stop_confirmation_blocks,
     build_loop_thread_archive_blocks,
+    build_loop_update_continuation_messages,
+    build_loop_update_full_mission_blocks,
+    build_loop_update_message,
     build_repo_root_modal,
     build_settings_blocks,
     build_setup_modal,
@@ -2841,6 +2850,155 @@ class SlackTeamController:
             return True
         self._mark_message_in_progress(channel_id, event.get("ts"))
         return True
+
+    def process_queued_loop_update_requests(self) -> int:
+        """Post mission changes queued by local agents for the loop owner to apply.
+
+        Nothing changes here: the proposal is posted as a diff in the loop's
+        channel, and only the owner's Apply stores the new mission.
+        """
+
+        processed = 0
+        for request in self.store.claim_pending_loop_update_requests(limit=5):
+            processed += 1
+            loop = self.store.get_loop(request.loop_id)
+            if (
+                loop is None
+                or loop.status not in LOOP_UPDATE_EDITABLE_STATUSES
+                or not loop.channel_id
+            ):
+                self.store.finish_loop_update_request(
+                    request.request_id,
+                    LoopUpdateRequestStatus.FAILED,
+                    error="the loop is no longer active or paused",
+                )
+                continue
+            if loop.mission != request.base_mission:
+                self.store.finish_loop_update_request(
+                    request.request_id,
+                    LoopUpdateRequestStatus.STALE,
+                    channel_id=loop.channel_id,
+                    error=LOOP_UPDATE_STALE_ERROR,
+                )
+                continue
+            diff = diff_loop_missions(request.base_mission, request.mission)
+            text, blocks, attachments = build_loop_update_message(loop, request, diff)
+            try:
+                posted = self.gateway.post_message(
+                    loop.channel_id, text, blocks=blocks, attachments=attachments
+                )
+            except Exception as exc:
+                LOGGER.exception("failed to post a queued loop change")
+                self.store.finish_loop_update_request(
+                    request.request_id,
+                    LoopUpdateRequestStatus.FAILED,
+                    channel_id=loop.channel_id,
+                    error=f"could not post to Slack: {exc}",
+                )
+                continue
+            self.store.finish_loop_update_request(
+                request.request_id,
+                LoopUpdateRequestStatus.POSTED,
+                channel_id=loop.channel_id,
+                message_ts=posted.ts,
+            )
+            try:
+                for (
+                    page_text,
+                    page_blocks,
+                    page_attachments,
+                ) in build_loop_update_continuation_messages(diff):
+                    self.gateway.post_message(
+                        loop.channel_id,
+                        page_text,
+                        blocks=page_blocks,
+                        attachments=page_attachments,
+                        thread_ts=posted.ts,
+                    )
+                self.gateway.post_message(
+                    loop.channel_id,
+                    f"Full proposed mission for {loop.title}.",
+                    blocks=build_loop_update_full_mission_blocks(request.mission),
+                    thread_ts=posted.ts,
+                )
+            except Exception:
+                LOGGER.warning("failed to post the rest of the proposed change", exc_info=True)
+        return processed
+
+    def _resolve_loop_update(
+        self,
+        loop: Loop,
+        payload: dict,
+        actor: str,
+        channel_id: str,
+        *,
+        apply: bool,
+    ) -> None:
+        request = self.store.get_loop_update_request(str(payload.get("request_id") or ""))
+        if request is None or request.loop_id != loop.loop_id:
+            return
+        if request.status != LoopUpdateRequestStatus.POSTED:
+            self.gateway.post_ephemeral(
+                channel_id, actor, f"This change was already {request.status.value}."
+            )
+            return
+        if not apply:
+            if self.store.resolve_loop_update_request(
+                request.request_id, LoopUpdateRequestStatus.CANCELLED, resolved_by=actor
+            ):
+                self._refresh_loop_update_message(loop, request.request_id, "cancelled")
+            return
+        latest = self.store.get_loop(loop.loop_id)
+        if latest is None or latest.status not in LOOP_UPDATE_EDITABLE_STATUSES:
+            if self.store.resolve_loop_update_request(
+                request.request_id,
+                LoopUpdateRequestStatus.FAILED,
+                resolved_by=actor,
+                error="the loop is no longer active or paused",
+            ):
+                self._refresh_loop_update_message(loop, request.request_id, "failed")
+            return
+        if latest.mission != request.base_mission:
+            if self.store.resolve_loop_update_request(
+                request.request_id,
+                LoopUpdateRequestStatus.STALE,
+                resolved_by=actor,
+                error=LOOP_UPDATE_STALE_ERROR,
+            ):
+                self._refresh_loop_update_message(latest, request.request_id, "stale")
+            return
+        # Claim the request before writing so a double tap applies it once.
+        if not self.store.resolve_loop_update_request(
+            request.request_id, LoopUpdateRequestStatus.APPLIED, resolved_by=actor
+        ):
+            return
+        self._update_loop_identity_values(latest, mission=request.mission)
+        updated = self.store.get_loop(loop.loop_id) or latest
+        diff = diff_loop_missions(request.base_mission, request.mission)
+        self._append_loop_system_entry(
+            updated,
+            f"mission replaced by an agent-proposed change the owner applied ({diff.summary()})",
+        )
+        self._refresh_loop_update_message(updated, request.request_id, "applied")
+        for other in self.store.list_posted_loop_update_requests(loop.loop_id):
+            if self.store.resolve_loop_update_request(
+                other.request_id,
+                LoopUpdateRequestStatus.STALE,
+                error="another change to this mission was applied first",
+            ):
+                self._refresh_loop_update_message(updated, other.request_id, "stale")
+
+    def _refresh_loop_update_message(self, loop: Loop, request_id: str, state: str) -> None:
+        request = self.store.get_loop_update_request(request_id)
+        if request is None or not request.channel_id or not request.message_ts:
+            return
+        diff = diff_loop_missions(request.base_mission, request.mission)
+        text, blocks, attachments = build_loop_update_message(
+            loop, request, diff, state=state, actor=request.resolved_by
+        )
+        self._try_update_message(
+            request.channel_id, request.message_ts, text, blocks=blocks, attachments=attachments
+        )
 
     def process_queued_loop_create_requests(self) -> int:
         """Post loop requests queued by local agents as owner loop requests.
@@ -6958,9 +7116,15 @@ class SlackTeamController:
         text: str,
         *,
         blocks: list[dict] | None = None,
+        attachments: list[dict] | None = None,
     ) -> bool:
         try:
-            self.gateway.update_message(channel_id, ts, text, blocks=blocks)
+            if attachments is None:
+                self.gateway.update_message(channel_id, ts, text, blocks=blocks)
+            else:
+                self.gateway.update_message(
+                    channel_id, ts, text, blocks=blocks, attachments=attachments
+                )
         except Exception:
             # A failed card update leaves a stale card up in Slack; keep it visible.
             LOGGER.warning("failed to update Slack message %s in %s", ts, channel_id, exc_info=True)
@@ -8031,6 +8195,11 @@ class SlackTeamController:
                 )
             return
         surface = _loop_action_surface(slack_payload)
+        if action in {"loop.update.apply", "loop.update.cancel"}:
+            self._resolve_loop_update(
+                loop, payload, actor, channel_id, apply=action == "loop.update.apply"
+            )
+            return
         if action == "loop.pause":
             self._pause_loop(loop)
             self._refresh_loop_action_card(loop.loop_id, channel_id, message_ts, surface)
@@ -14122,6 +14291,7 @@ class LoopRunner:
 
     def sync_once(self) -> int:
         self.controller.process_queued_loop_create_requests()
+        self.controller.process_queued_loop_update_requests()
         self.controller.reconcile_loop_runs()
         fired = 0
         for loop in self.store.list_due_loops(limit=20):

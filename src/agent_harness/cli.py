@@ -136,8 +136,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     loop_create.add_argument("--db", type=Path)
     loop_create.add_argument("--json", action="store_true")
+    loop_update = loop_sub.add_parser(
+        "update",
+        help="Propose a new mission for a loop; the owner applies it from a diff in Slack",
+    )
+    loop_update.add_argument("loop", help="Loop id, channel name, or exact title")
+    loop_update.add_argument(
+        "--mission-file",
+        required=True,
+        help="File holding the complete new mission, or - to read it from stdin",
+    )
+    loop_update.add_argument("--note", help="One-line reason shown to the owner above the diff")
+    loop_update.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the diff against the current mission without queueing anything",
+    )
+    loop_update.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Return right after queueing instead of waiting for the service",
+    )
+    loop_update.add_argument("--db", type=Path)
+    loop_update.add_argument("--json", action="store_true")
     loop_request = loop_sub.add_parser(
-        "request-status", help="Show what happened to a queued loop request"
+        "request-status", help="Show what happened to a queued loop request or change"
     )
     loop_request.add_argument("request_id")
     loop_request.add_argument("--db", type=Path)
@@ -812,12 +835,20 @@ def _loop_store(args: argparse.Namespace) -> Store:
 
 
 def _loop(args: argparse.Namespace) -> int:
+    from agent_harness.loop_updates import (
+        LOOP_UPDATE_REQUEST_ID_PREFIX,
+        describe_agent_loop_update_request,
+        enqueue_agent_loop_update_request,
+        preview_agent_loop_update,
+        render_mission_diff_text,
+        wait_for_agent_loop_update_request,
+    )
     from agent_harness.loops import (
         describe_agent_loop_create_request,
         enqueue_agent_loop_create_request,
         wait_for_agent_loop_create_request,
     )
-    from agent_harness.models import LoopCreateRequestStatus, LoopStatus
+    from agent_harness.models import LoopCreateRequestStatus, LoopStatus, LoopUpdateRequestStatus
 
     store = _loop_store(args)
     try:
@@ -842,7 +873,48 @@ def _loop(args: argparse.Namespace) -> int:
                 print(f"request: {request.request_id}")
                 print(describe_agent_loop_create_request(request))
             return 1 if request.status == LoopCreateRequestStatus.FAILED else 0
+        if args.loop_command == "update":
+            if args.mission_file == "-":
+                mission = sys.stdin.read()
+            else:
+                try:
+                    mission = Path(args.mission_file).expanduser().read_text(encoding="utf-8")
+                except OSError as exc:
+                    print(f"error: could not read {args.mission_file}: {exc}", file=sys.stderr)
+                    return 2
+            if args.dry_run:
+                preview = preview_agent_loop_update(store, args.loop, mission)
+                if preview.diff is None:
+                    print(f"error: {preview.error}", file=sys.stderr)
+                    return 2
+                print(render_mission_diff_text(preview.diff))
+                return 0
+            result = enqueue_agent_loop_update_request(
+                store, args.loop, mission, note=args.note, source="cli"
+            )
+            if result.request is None:
+                print(f"error: {result.error}", file=sys.stderr)
+                return 2
+            update = result.request
+            if not args.no_wait:
+                update = wait_for_agent_loop_update_request(store, update.request_id) or update
+            if args.json:
+                print(json.dumps(_jsonable(update), indent=2, sort_keys=True))
+            else:
+                print(f"request: {update.request_id}")
+                if result.diff is not None:
+                    print(result.diff.summary())
+                print(describe_agent_loop_update_request(update))
+            failed = {LoopUpdateRequestStatus.FAILED, LoopUpdateRequestStatus.STALE}
+            return 1 if update.status in failed else 0
         if args.loop_command == "request-status":
+            if args.request_id.startswith(LOOP_UPDATE_REQUEST_ID_PREFIX):
+                change = store.get_loop_update_request(args.request_id)
+                if args.json:
+                    print(json.dumps(_jsonable(change), indent=2, sort_keys=True))
+                else:
+                    print(describe_agent_loop_update_request(change))
+                return 0 if change is not None else 1
             request = store.get_loop_create_request(args.request_id)
             if args.json:
                 print(json.dumps(_jsonable(request), indent=2, sort_keys=True))

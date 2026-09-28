@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_harness.loop_updates import MissionDiff, MissionDiffChunk
 from agent_harness.loops import (
     LOOP_THREAD_ROLLOVER_DEFAULT_RUNS,
     LOOP_THREAD_ROLLOVER_MAX_RUNS,
@@ -25,6 +26,7 @@ from agent_harness.models import (
     AgentTask,
     Loop,
     LoopStatus,
+    LoopUpdateQueueRequest,
     LoopVisibility,
     PermissionMode,
     Provider,
@@ -1376,6 +1378,334 @@ def build_loop_stop_confirmation_blocks(loop: Loop, *, archive: bool) -> list[di
             ],
         },
     ]
+
+
+LOOP_UPDATE_DIFF_COLORS = {
+    "same": "#DDDDDD",
+    "removed": "#E01E5A",
+    "added": "#2EB67D",
+    "changed": "#ECB22E",
+}
+LOOP_UPDATE_DIFF_LABELS = {"removed": "Removed", "added": "Added", "changed": "Edited"}
+# Slack shows the first 10 attachments of a message and folds the rest behind
+# "+ N more attachments", so every message stays at 10: the card holds the first
+# diff blocks, a note, and the buttons, and the rest of the diff pages into the
+# thread. Long runs split across blocks instead of being cut.
+LOOP_UPDATE_SLACK_VISIBLE_ATTACHMENTS = 10
+LOOP_UPDATE_CARD_DIFF_ATTACHMENTS = LOOP_UPDATE_SLACK_VISIBLE_ATTACHMENTS - 2
+LOOP_UPDATE_PAGE_TEXT_BUDGET = 12_000
+LOOP_UPDATE_CHUNK_TEXT_MAX = 2_500
+LOOP_UPDATE_FULL_TEXT_CHUNK = 2_800
+LOOP_UPDATE_STATES = ("pending", "applied", "cancelled", "stale", "failed")
+
+
+def build_loop_update_message(
+    loop: Loop,
+    request: LoopUpdateQueueRequest,
+    diff: MissionDiff,
+    *,
+    state: str = "pending",
+    actor: str | None = None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Text, blocks, and colored diff attachments for a proposed mission change.
+
+    Attachments carry the diff because only they draw a colored bar; the Apply
+    and Cancel buttons sit in the last attachment so they read after the diff.
+    """
+
+    if state not in LOOP_UPDATE_STATES:
+        raise ValueError(f"unknown loop update state: {state}")
+    title = _mrkdwn_escape(loop.title)
+    owner = loop.owner_slack_user_id
+    who = f"<@{actor}>" if actor else "The owner"
+    header, intro, text = {
+        "pending": (
+            "✏️ Proposed mission change",
+            f"<@{owner}>, a local agent proposed a new mission for *{title}*. "
+            "Nothing changes until you tap *Apply*.",
+            f"<@{owner}> proposed mission change for {loop.title}: review and Apply or Cancel.",
+        ),
+        "applied": (
+            "✅ Mission change applied",
+            f"{who} applied this change to *{title}*. Runs that start from now on use the "
+            "new mission.",
+            f"Mission change applied to {loop.title}.",
+        ),
+        "cancelled": (
+            "✖️ Mission change cancelled",
+            f"{who} cancelled this change. The mission of *{title}* is unchanged.",
+            f"Mission change for {loop.title} cancelled.",
+        ),
+        "stale": (
+            "⚠️ Mission change not applied",
+            f"Not applied: {_mrkdwn_escape(request.error or 'the mission changed after this was proposed')}. "
+            f"The mission of *{title}* is unchanged.",
+            f"Mission change for {loop.title} not applied.",
+        ),
+        "failed": (
+            "⚠️ Mission change not applied",
+            f"Not applied: {_mrkdwn_escape(request.error or 'Slackgentic could not apply it')}. "
+            f"The mission of *{title}* is unchanged.",
+            f"Mission change for {loop.title} not applied.",
+        ),
+    }[state]
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": header, "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
+    ]
+    if request.note:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "plain_text", "text": f"Why: {request.note}"[:2000]}],
+            }
+        )
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"🟥 *-{diff.words_removed}* words   🟩 *+{diff.words_added}* words   ·   "
+                        f"{diff.sentences_before} sentences before, {diff.sentences_after} after   ·   "
+                        "🟨 edited: ~struck~ removed, *bold* added"
+                    ),
+                }
+            ],
+        }
+    )
+    pages = _loop_update_diff_pages(diff)
+    attachments = list(pages[0]) if pages else []
+    if len(pages) > 1:
+        remaining = sum(len(page) for page in pages[1:])
+        attachments.append(
+            _loop_update_note_attachment(
+                f"⋯ The diff continues in this message's thread ({remaining} more "
+                f"block{'s' if remaining != 1 else ''}, {len(pages) - 1} "
+                f"message{'s' if len(pages) > 2 else ''})."
+            )
+        )
+    if state == "pending":
+        attachments.append(
+            {
+                "fallback": "Apply or Cancel this mission change in Slack.",
+                "blocks": [
+                    {
+                        "type": "actions",
+                        "block_id": f"loop.update.{request.request_id}",
+                        "elements": [
+                            _button(
+                                "Apply",
+                                "loop.update.apply",
+                                encode_action_value(
+                                    "loop.update.apply",
+                                    loop_id=loop.loop_id,
+                                    request_id=request.request_id,
+                                ),
+                                "primary",
+                            ),
+                            _button(
+                                "Cancel",
+                                "loop.update.cancel",
+                                encode_action_value(
+                                    "loop.update.cancel",
+                                    loop_id=loop.loop_id,
+                                    request_id=request.request_id,
+                                ),
+                            ),
+                        ],
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": (
+                                    "Only the loop owner can apply it. A run already in progress "
+                                    "finishes on the old mission. The full proposed mission is "
+                                    f"in this message's thread. `{request.request_id}`"
+                                ),
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+    return text, blocks, attachments
+
+
+def build_loop_update_continuation_messages(
+    diff: MissionDiff,
+) -> list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]]:
+    """Thread replies that carry the diff blocks the card itself has no room for."""
+
+    pages = _loop_update_diff_pages(diff)
+    total = len(pages)
+    messages: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]] = []
+    for number, page in enumerate(pages[1:], start=2):
+        label = f"Diff continued, part {number} of {total}"
+        blocks = [{"type": "context", "elements": [{"type": "mrkdwn", "text": f"*{label}*"}]}]
+        messages.append((f"{label}.", blocks, page))
+    return messages
+
+
+def build_loop_update_full_mission_blocks(mission: str) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Full proposed mission*"}}
+    ]
+    for chunk in _split_text(mission, LOOP_UPDATE_FULL_TEXT_CHUNK):
+        blocks.append(
+            {
+                "type": "rich_text",
+                "elements": [
+                    {"type": "rich_text_section", "elements": [{"type": "text", "text": chunk}]}
+                ],
+            }
+        )
+    return blocks
+
+
+def _loop_update_diff_pages(diff: MissionDiff) -> list[list[dict[str, Any]]]:
+    pages: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    size = 0
+    limit = LOOP_UPDATE_CARD_DIFF_ATTACHMENTS
+    for attachment in _loop_update_diff_attachments(diff):
+        attachment_size = len(attachment.get("fallback") or "")
+        if current and (
+            len(current) >= limit or size + attachment_size > LOOP_UPDATE_PAGE_TEXT_BUDGET
+        ):
+            pages.append(current)
+            current, size = [], 0
+            limit = LOOP_UPDATE_SLACK_VISIBLE_ATTACHMENTS
+        current.append(attachment)
+        size += attachment_size
+    if current:
+        pages.append(current)
+    return pages
+
+
+def _loop_update_diff_attachments(diff: MissionDiff) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    for chunk in diff.chunks:
+        if chunk.kind == "same":
+            count = len(chunk.sentences)
+            attachments.append(
+                _loop_update_note_attachment(
+                    f"⋯ _{count} unchanged sentence{'s' if count != 1 else ''}_"
+                )
+            )
+            continue
+        label = LOOP_UPDATE_DIFF_LABELS[chunk.kind]
+        parts = (
+            [_loop_update_changed_elements(chunk)]
+            if chunk.kind == "changed"
+            else [
+                [{"type": "text", "text": part}]
+                for part in _group_sentences(chunk.sentences, LOOP_UPDATE_CHUNK_TEXT_MAX)
+            ]
+        )
+        for index, elements in enumerate(parts):
+            elements, shortened = _cap_elements(elements, LOOP_UPDATE_CHUNK_TEXT_MAX)
+            title = label if index == 0 else f"{label} (continued)"
+            if shortened:
+                title += " · shortened here, full text in the thread"
+            text = "".join(element["text"] for element in elements)
+            attachments.append(
+                {
+                    "color": LOOP_UPDATE_DIFF_COLORS[chunk.kind],
+                    "fallback": f"{label}: {text}",
+                    "blocks": [
+                        {
+                            "type": "context",
+                            "elements": [{"type": "mrkdwn", "text": f"*{title}*"}],
+                        },
+                        {
+                            "type": "rich_text",
+                            "elements": [{"type": "rich_text_section", "elements": elements}],
+                        },
+                    ],
+                }
+            )
+    return attachments
+
+
+def _loop_update_changed_elements(chunk: MissionDiffChunk) -> list[dict[str, Any]]:
+    elements: list[dict[str, Any]] = []
+    previous_op = None
+    for segment in chunk.segments:
+        if (
+            segment.op == "insert"
+            and previous_op == "delete"
+            and not segment.text[:1].isspace()
+            and segment.text[:1] not in ",.;:!?)]}"
+            and not elements[-1]["text"][-1:].isspace()
+        ):
+            # Keep a struck word and its replacement apart ("Run Source", not "RunSource").
+            elements.append({"type": "text", "text": " "})
+        element: dict[str, Any] = {"type": "text", "text": segment.text}
+        if segment.op == "delete":
+            element["style"] = {"strike": True}
+        elif segment.op == "insert":
+            element["style"] = {"bold": True}
+        elements.append(element)
+        previous_op = segment.op
+    return elements or [{"type": "text", "text": " "}]
+
+
+def _group_sentences(sentences: tuple[str, ...], limit: int) -> list[str]:
+    groups: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current}\n{sentence}" if current else sentence
+        if current and len(candidate) > limit:
+            groups.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _cap_elements(elements: list[dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], bool]:
+    capped: list[dict[str, Any]] = []
+    budget = limit
+    for element in elements:
+        if budget <= 0:
+            return capped, True
+        text = element["text"]
+        if len(text) > budget:
+            capped.append({**element, "text": text[: max(1, budget - 1)].rstrip() + "…"})
+            return capped, True
+        capped.append(element)
+        budget -= len(text)
+    return capped, False
+
+
+def _loop_update_note_attachment(text: str) -> dict[str, Any]:
+    return {
+        "color": LOOP_UPDATE_DIFF_COLORS["same"],
+        "fallback": text,
+        "blocks": [{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}],
+    }
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > limit:
+        cut = max(remaining.rfind("\n", 0, limit), remaining.rfind(". ", 0, limit) + 1)
+        if cut <= 0:
+            cut = remaining.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def build_loop_dangerous_confirmation_blocks(loop: Loop) -> list[dict[str, Any]]:

@@ -329,6 +329,14 @@ mode. The running service posts the request in the agent channel as if you had t
 `loop create`, and you still review the preview and click Create. Agent-requested loops always start
 read-only. `slackgentic loop list` shows loops from a terminal.
 
+Agents can also propose a new mission for an existing loop with the
+`update_loop` MCP tool (or `slackgentic loop update <loop> --mission-file
+<path>`). The running service posts the change in the loop's channel as a
+colored diff with the full proposed mission in its thread, and stores the new
+mission verbatim only when you tap **Apply**. A proposal written against a
+mission that has since changed is refused as stale, and loop runs cannot
+propose changes.
+
 Use `loops` or `loop list` in the main agent channel to see every loop in one
 message, with its latest result and Pause/Resume, Edit, and Delete buttons; click
 the channel name to open it. Loops intentionally cannot delegate to roster

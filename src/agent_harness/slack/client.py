@@ -352,11 +352,14 @@ class SlackGateway:
         thread_ts: str | None = None,
         unfurl_links: bool | None = None,
         unfurl_media: bool | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> PostedMessage:
         kwargs: dict[str, Any] = {
             "channel": channel_id,
             "text": normalize_slack_mrkdwn(text),
         }
+        if attachments is not None:
+            kwargs["attachments"] = attachments
         if unfurl_links is not None:
             kwargs["unfurl_links"] = unfurl_links
         if unfurl_media is not None:
