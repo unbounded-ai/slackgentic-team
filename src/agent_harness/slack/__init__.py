@@ -2402,6 +2402,8 @@ def _short_plain_text(value: str, limit: int) -> str:
     return f"{cleaned[: max(0, limit - 1)].rstrip()}..."
 
 
+# The Slack user this instance works for; the app records it at setup.
+HUMAN_USER_ID_SETTING = "slack.human_user_id"
 IDLE_RELEASE_PROMPT_TEXT = (
     "_Idle. Reply in this thread with anything else you need, "
     "or use the button to free up this agent._"

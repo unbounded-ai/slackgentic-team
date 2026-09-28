@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -98,6 +100,23 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 PR_URL_RE = re.compile(r"https://github\.com/[^\s>/]+/[^\s>/]+/pull/\d+[^\s>]*")
 CREATE_PULL_REQUEST_TIMEOUT_SECONDS = 120
 NATIVE_INPUT_HOOK_MARKER = "slackgentic.native_input.v1"
+# How long a question stays open in Slack. Claude Code kills a command hook
+# after 600 seconds unless the hook entry carries its own timeout, and a killed
+# hook can no longer hand an answer to Claude, so the installed entry sets a
+# deadline that lands after this wait and the hook always ends on its own terms.
+NATIVE_INPUT_WAIT_SECONDS = 24 * 60 * 60
+NATIVE_INPUT_HOOK_TIMEOUT_SECONDS = NATIVE_INPUT_WAIT_SECONDS + 60 * 60
+NATIVE_INPUT_ABANDONED_TEXT = (
+    "Claude stopped waiting for this answer in Slack. Continue in the Claude terminal."
+)
+NATIVE_INPUT_FOOTER_TEXT = (
+    f"Open here for {NATIVE_INPUT_WAIT_SECONDS // 3600} hours. At the Claude terminal, press "
+    "Esc and type your answer there, or click *Answer in the terminal* for the picker."
+)
+NATIVE_INPUT_NOTIFICATION_TITLE = "Slackgentic"
+NATIVE_INPUT_NOTIFICATION_TEXT = (
+    "Claude is waiting for your answer in Slack. Press Esc in the terminal to answer there."
+)
 CLAUDE_CROSS_SESSION_INBOUND_SETTING = "crossSessionInbound"
 
 
@@ -557,6 +576,7 @@ def run_native_input_hook(db_path: Path | None = None) -> int:
     config = load_config_from_env()
     if not config.slack.bot_token:
         return 0
+    stop = _native_input_stop_event()
     store = Store(db_path or config.state_db)
     try:
         store.init_schema()
@@ -567,6 +587,8 @@ def run_native_input_hook(db_path: Path | None = None) -> int:
             store,
             SlackGateway(config.slack.bot_token),
             poll_seconds=0.2,
+            stop=stop,
+            notify=_notify_desktop,
         )
     finally:
         store.close()
@@ -576,12 +598,68 @@ def run_native_input_hook(db_path: Path | None = None) -> int:
     return 0
 
 
+def _native_input_stop_event() -> threading.Event:
+    """Return an event that Claude Code's termination signal sets.
+
+    Claude Code sends SIGTERM when it stops a hook, whether the hook's timeout
+    ran out or the person interrupted the turn, and escalates to SIGKILL five
+    seconds later. Turning the signal into an event lets the hook close its
+    Slack question before it exits instead of leaving buttons that answer
+    nothing.
+    """
+    stop = threading.Event()
+
+    def handle(signum: int, frame: object) -> None:
+        stop.set()
+
+    # Outside the main thread the handler cannot be installed, and the hook
+    # then ends the way it did before.
+    with contextlib.suppress(ValueError):
+        signal.signal(signal.SIGTERM, handle)
+    return stop
+
+
+def _notify_desktop(title: str, subtitle: str, body: str) -> None:
+    """Show a macOS notification, best effort.
+
+    A hook cannot draw in the terminal while it runs, so this is the one cue
+    that reaches the person wherever they are looking.
+    """
+    if sys.platform != "darwin":
+        return
+    script = (
+        f"display notification {_applescript_string(body)} with title {_applescript_string(title)}"
+    )
+    if subtitle:
+        script += f" subtitle {_applescript_string(subtitle)}"
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["osascript", "-e", script], check=False, capture_output=True, timeout=5)
+
+
+def _applescript_string(value: str) -> str:
+    cleaned = "".join(ch for ch in value if ch == "\n" or ch >= " ")
+    return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _first_question_header(params: dict[str, Any]) -> str:
+    questions = params.get("questions")
+    for question in questions if isinstance(questions, list) else []:
+        if isinstance(question, dict):
+            header = question.get("header")
+            if isinstance(header, str) and header.strip():
+                return header.strip()[:80]
+    return ""
+
+
 def handle_native_input_hook(
     payload: dict[str, Any],
     store: Store,
     gateway: Any,
     *,
     poll_seconds: float = 0.05,
+    wait_seconds: float = NATIVE_INPUT_WAIT_SECONDS,
+    stop: threading.Event | None = None,
+    notify: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any] | None:
     if payload.get("hook_event_name") != "PreToolUse":
         return None
@@ -593,6 +671,8 @@ def handle_native_input_hook(
     params = slack_request_params_for_claude_ask_user_question(tool_input)
     if params is None:
         return None
+    params["terminal_handoff"] = True
+    params["footer"] = NATIVE_INPUT_FOOTER_TEXT
     session_id = str(payload.get("session_id") or "")
     tool_use_id = str(payload.get("tool_use_id") or "")
     thread = _native_input_thread(payload, store)
@@ -605,16 +685,37 @@ def handle_native_input_hook(
         )
     handler = SlackAgentRequestHandler(
         gateway,
+        timeout_seconds=wait_seconds,
         store=store,
         provider_label="Claude",
         poll_seconds=poll_seconds,
     )
-    response = handler.handle_persistent_request(
+    pending = handler.create_persistent_request(
         "item/tool/requestUserInput",
         params,
         thread,
         provider_label="Claude",
     )
+    if notify is not None:
+        with contextlib.suppress(Exception):
+            notify(
+                NATIVE_INPUT_NOTIFICATION_TITLE,
+                _first_question_header(params),
+                NATIVE_INPUT_NOTIFICATION_TEXT,
+            )
+    try:
+        response = handler.wait_for_persistent_request(pending.token, stop=stop)
+    except BaseException:
+        handler.abandon_persistent_request(pending.token, NATIVE_INPUT_ABANDONED_TEXT)
+        raise
+    if response is None:
+        # Claude Code stopped the hook before an answer arrived.
+        handler.abandon_persistent_request(pending.token, NATIVE_INPUT_ABANDONED_TEXT)
+        return None
+    if isinstance(response, dict) and response.get("handoff") == "terminal":
+        # The person moved the question to the terminal, where Claude Code
+        # shows its own picker once the hook returns without a decision.
+        return None
     updated_input = claude_ask_user_question_updated_input(tool_input, response)
     if updated_input is None:
         return {
@@ -877,6 +978,7 @@ def _ensure_claude_native_input_hook_at_path(
             {
                 "type": "command",
                 "command": hook_command,
+                "timeout": NATIVE_INPUT_HOOK_TIMEOUT_SECONDS,
                 "_slackgentic": NATIVE_INPUT_HOOK_MARKER,
             }
         ],
