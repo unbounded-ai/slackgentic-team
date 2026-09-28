@@ -83,6 +83,8 @@ MANAGED_RUN_STALL_RECOVERIES_METADATA_KEY = "managed_run_stall_recoveries"
 MANAGED_RUN_ORIGINAL_PROMPT_METADATA_KEY = "managed_run_original_prompt"
 MANAGED_RUN_EMPTY_TEXT_BLOCK_API_RETRIES_METADATA_KEY = "managed_run_empty_text_block_api_retries"
 MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY = "managed_run_transient_provider_retries"
+# Why the runtime stopped a run on a provider error: {"message": str, "transient": bool}.
+MANAGED_RUN_PROVIDER_FAILURE_METADATA_KEY = "managed_run_provider_failure"
 MANAGED_RUN_MAX_RESUMES = 3
 MANAGED_RUN_MAX_STALL_RECOVERIES = 2
 MANAGED_RUN_MAX_EMPTY_TEXT_BLOCK_API_RETRIES = 2
@@ -1615,6 +1617,13 @@ class ManagedTaskRuntime:
         attempts = managed_run_transient_provider_retries(completed_task)
         self._clear_managed_run_started(task_id)
         self._clear_managed_session_for_task(task_id)
+        current = self.store.get_agent_task(task_id) or completed_task
+        metadata = dict(current.metadata)
+        metadata[MANAGED_RUN_PROVIDER_FAILURE_METADATA_KEY] = {
+            "message": running.provider_failure_message or "",
+            "transient": bool(running.transient_provider_failure),
+        }
+        self.store.upsert_agent_task(replace(current, metadata=metadata, updated_at=utc_now()))
         self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
         self.store.delete_managed_thread_task(task_id)
         if running.transient_provider_failure:
@@ -2692,6 +2701,14 @@ def managed_run_empty_text_block_api_retries(task: AgentTask) -> int:
     return 0
 
 
+def managed_run_provider_failure(task: AgentTask) -> tuple[str, bool] | None:
+    """The provider error that stopped this run and whether it was transient, if any."""
+    value = task.metadata.get(MANAGED_RUN_PROVIDER_FAILURE_METADATA_KEY)
+    if not isinstance(value, dict):
+        return None
+    return str(value.get("message") or ""), value.get("transient") is True
+
+
 def managed_run_transient_provider_retries(task: AgentTask) -> int:
     value = task.metadata.get(MANAGED_RUN_TRANSIENT_PROVIDER_RETRIES_METADATA_KEY)
     if isinstance(value, int) and value >= 0:
@@ -3505,9 +3522,21 @@ _RETRYABLE_PROVIDER_STATUS_RE = re.compile(
     r"(?:^|\D)(?:408|409|425|429|500|502|503|504|529)(?:\D|$)"
 )
 _RETRYABLE_PROVIDER_ERROR_MARKERS = (
+    "connection error",
+    "connection refused",
     "connection reset",
     "connection timed out",
+    "dns error",
+    "eai_again",
+    "econnrefused",
+    "econnreset",
+    "enotfound",
+    "etimedout",
+    "failed to lookup address",
+    "getaddrinfo",
+    "network is unreachable",
     "rate limit",
+    "reach the api server",
     "request timeout",
     "server overloaded",
     "service unavailable",

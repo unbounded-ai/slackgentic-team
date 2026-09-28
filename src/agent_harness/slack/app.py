@@ -51,6 +51,7 @@ from agent_harness.loops import (
     LOOP_FETCH_MAX_PER_RUN,
     LOOP_IGNORED_NOTICE_INTERVAL_SECONDS,
     LOOP_MAX_CONSECUTIVE_FAILURES,
+    LOOP_PROVIDER_OUTAGE_ERROR_PREFIX,
     LOOP_RUNNER_POLL_FLOOR_SECONDS,
     LOOP_SUMMARY_NUDGE_ATTEMPTS,
     LOOP_SUMMARY_STATUS_CHOICES,
@@ -238,6 +239,7 @@ from agent_harness.runtime.tasks import (
     MANAGED_RUN_STARTED_METADATA_KEY,
     ManagedTaskRuntime,
     claude_session_turn_in_progress,
+    managed_run_provider_failure,
     managed_run_resume_attempts,
     managed_run_stall_recoveries,
     managed_run_started_age,
@@ -4313,6 +4315,17 @@ class SlackTeamController:
         current_task = self.store.get_agent_task(task.task_id) or task
         loop = self._remember_loop_run_approvals(loop, current_task)
         if current_task.status == AgentTaskStatus.CANCELLED:
+            provider_failure = managed_run_provider_failure(current_task)
+            if provider_failure is not None and provider_failure[1]:
+                detail = provider_failure[0] or "the provider was unavailable"
+                self._record_loop_failure(
+                    loop,
+                    current_run,
+                    f"{LOOP_PROVIDER_OUTAGE_ERROR_PREFIX} ({detail}). This run does not count "
+                    "toward auto-pause; the next run retries.",
+                    counts_toward_pause=False,
+                )
+                return True
             self._record_loop_failure(
                 loop,
                 current_run,
@@ -4401,12 +4414,26 @@ class SlackTeamController:
         )
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
 
-    def _publish_loop_run_card(self, loop: Loop, run: LoopRun) -> None:
-        """Turn the run's parent message into the report itself."""
+    def _loop_provider_outage_streak(self, loop_id: str) -> int:
+        streak = 0
+        for item in self.store.list_loop_runs(loop_id, limit=LOOP_MAX_CONSECUTIVE_FAILURES * 4):
+            if item.kind == LoopRunKind.COMPACTION or item.status == LoopRunStatus.RUNNING:
+                continue
+            if item.status != LoopRunStatus.FAILED or not (item.error or "").startswith(
+                LOOP_PROVIDER_OUTAGE_ERROR_PREFIX
+            ):
+                break
+            streak += 1
+        return streak
+
+    def _publish_loop_run_card(self, loop: Loop, run: LoopRun, *, notify: bool = True) -> None:
+        """Turn the run's parent message into the report itself.
+
+        ``notify=False`` keeps a quiet loop's failed run in the run log only."""
         if not loop.channel_id or run.kind == LoopRunKind.COMPACTION:
             return
         if not run.thread_ts:
-            self._publish_quiet_loop_run(loop, run)
+            self._publish_quiet_loop_run(loop, run, notify=notify)
             return
         text, blocks = self._loop_run_card_payload(loop, run)
         self._try_update_message(loop.channel_id, run.thread_ts, text, blocks=blocks)
@@ -4474,7 +4501,7 @@ class SlackTeamController:
                 )
         return text, blocks
 
-    def _publish_quiet_loop_run(self, loop: Loop, run: LoopRun) -> None:
+    def _publish_quiet_loop_run(self, loop: Loop, run: LoopRun, *, notify: bool = True) -> None:
         """A quiet run posts a card (and so notifies) only when it needs attention.
 
         The run decides, not the loop's current setting: turning quiet mode off
@@ -4483,7 +4510,9 @@ class SlackTeamController:
         if not latest.channel_id:
             return
         summary = loop_summary_from_json(run.summary_json)
-        noteworthy = run.status == LoopRunStatus.FAILED or summary is None or summary.status != "ok"
+        noteworthy = notify and (
+            run.status == LoopRunStatus.FAILED or summary is None or summary.status != "ok"
+        )
         agent = self.store.get_team_agent(latest.agent_id, include_fired=True)
         if agent is None:
             return
@@ -4785,7 +4814,14 @@ class SlackTeamController:
         metadata["compaction_pending"] = True
         self.store.update_loop_metadata(loop.loop_id, metadata)
 
-    def _record_loop_failure(self, loop: Loop, run: LoopRun, error: str) -> None:
+    def _record_loop_failure(
+        self,
+        loop: Loop,
+        run: LoopRun,
+        error: str,
+        *,
+        counts_toward_pause: bool = True,
+    ) -> None:
         key = f"{SETTING_LOOP_FAILURE_RECORDED_PREFIX}{run.run_id}"
         if self.store.get_setting(key):
             return
@@ -4818,6 +4854,18 @@ class SlackTeamController:
                     thread_ts=run.thread_ts,
                 )
             )
+        if not counts_toward_pause:
+            self.store.set_setting(key, utc_now().isoformat())
+            outage_runs = self._loop_provider_outage_streak(loop.loop_id)
+            # A quiet loop stays quiet through a short outage and notifies once it
+            # has lasted as many runs as would otherwise have paused the loop.
+            self._publish_loop_run_card(
+                loop,
+                self.store.get_loop_run(run.run_id) or run,
+                notify=outage_runs == LOOP_MAX_CONSECUTIVE_FAILURES,
+            )
+            self._refresh_loop_panel(loop)
+            return
         failures = self.store.record_loop_failure(loop.loop_id, message)
         self.store.set_setting(key, utc_now().isoformat())
         loop = self._remember_loop_run_approvals(

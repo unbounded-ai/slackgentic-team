@@ -106,6 +106,9 @@ request; the owner can change permissions from the loop channel after creation.
   blocked, and unclear calls go to a judge that fails closed. Blocked calls are
   counted on the report card. Each run works in a private scratch directory
   with the configured directory attached read-only.
+- A loop pauses itself after three failed runs in a row. Runs that fail because
+  the model provider cannot be reached (network, DNS, overload, rate limits) do
+  not count; the loop keeps running and retries on its next run.
 - Loops keep a journal of run summaries and owner notes, so later runs see
   earlier results and trends. 👍/👎 on a report teaches the loop what the owner
   finds useful.
