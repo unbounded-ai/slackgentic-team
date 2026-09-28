@@ -277,7 +277,14 @@ class FakeGateway:
         self.views.append((trigger_id, view))
 
     def post_message(
-        self, channel_id, text, blocks=None, thread_ts=None, unfurl_links=None, unfurl_media=None
+        self,
+        channel_id,
+        text,
+        blocks=None,
+        thread_ts=None,
+        unfurl_links=None,
+        unfurl_media=None,
+        attachments=None,
     ):
         ts = f"1712345678.{len(self.posts):06d}"
         self.posts.append(
@@ -285,6 +292,7 @@ class FakeGateway:
                 "channel_id": channel_id,
                 "text": text,
                 "blocks": blocks,
+                "attachments": attachments,
                 "thread_ts": thread_ts,
                 "ts": ts,
             }

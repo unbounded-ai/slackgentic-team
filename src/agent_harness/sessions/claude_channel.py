@@ -17,6 +17,13 @@ from typing import Any, NamedTuple
 
 from agent_harness.config import load_config_from_env
 from agent_harness.internal_notifications import is_internal_task_notification_text
+from agent_harness.loop_updates import (
+    describe_agent_loop_update_request,
+    enqueue_agent_loop_update_request,
+    preview_agent_loop_update,
+    render_mission_diff_text,
+    wait_for_agent_loop_update_request,
+)
 from agent_harness.loops import (
     AGENT_LOOP_REQUEST_WAIT_SECONDS,
     describe_agent_loop_create_request,
@@ -74,7 +81,10 @@ CHANNEL_INSTRUCTIONS = (
     "channel. When the user asks you to create a Slackgentic loop, a recurring "
     "report or check that runs in its own Slack channel, call the `create_loop` "
     "tool with the task and schedule; loops are quiet unless you pass `quiet: false`. "
-    "The owner approves the resulting preview in Slack."
+    "The owner approves the resulting preview in Slack. To change an existing loop's "
+    "mission, read it with `slackgentic loop list --json`, show the user the diff from "
+    "`update_loop` with `dry_run: true`, then call `update_loop` with the complete new "
+    "mission; the owner taps Apply on the diff Slackgentic posts in the loop's channel."
 )
 CODEX_MCP_INSTRUCTIONS = (
     "Slackgentic provides MCP tools for Slack-mediated workflows. When opening a "
@@ -86,7 +96,9 @@ CODEX_MCP_INSTRUCTIONS = (
     "you to create a Slackgentic loop, a recurring report or check that runs in "
     "its own Slack channel, call `create_loop` with the task and schedule; loops are "
     "quiet unless you pass `quiet: false`. The owner approves the resulting preview in "
-    "Slack."
+    "Slack. To change an existing loop's mission, show the user the diff from "
+    "`update_loop` with `dry_run: true`, then call `update_loop` with the complete new "
+    "mission; the owner taps Apply on the diff Slackgentic posts in the loop's channel."
 )
 SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__create_loop",
@@ -94,6 +106,7 @@ SLACKGENTIC_MCP_TOOL_NAMES = {
     f"mcp__{CHANNEL_NAME}__read_thread",
     f"mcp__{CHANNEL_NAME}__request_approval",
     f"mcp__{CHANNEL_NAME}__request_user_input",
+    f"mcp__{CHANNEL_NAME}__update_loop",
 }
 SLACKGENTIC_MCP_PERMISSION_ALLOW = tuple(sorted(SLACKGENTIC_MCP_TOOL_NAMES))
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -276,6 +289,8 @@ class ClaudeChannelServer:
             return self._handle_read_thread_tool(arguments)
         if name == "create_loop":
             return self._handle_create_loop_tool(arguments)
+        if name == "update_loop":
+            return self._handle_update_loop_tool(arguments)
         return _tool_result(f"Unknown Slackgentic tool: {name}", is_error=True)
 
     def _handle_create_loop_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -300,6 +315,41 @@ class ClaudeChannelServer:
         return _tool_result(
             describe_agent_loop_create_request(request),
             is_error=request.status == LoopCreateRequestStatus.FAILED,
+        )
+
+    def _handle_update_loop_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        loop_ref = _string_arg(arguments, "loop")
+        mission = _string_arg(arguments, "mission")
+        if arguments.get("dry_run") is True:
+            preview = preview_agent_loop_update(self.store, loop_ref, mission)
+            if preview.diff is None:
+                return _tool_result(f"update_loop failed: {preview.error}", is_error=True)
+            return _tool_result(
+                "Dry run; nothing was queued. Show the user this diff before proposing it.\n\n"
+                + render_mission_diff_text(preview.diff)
+            )
+        result = enqueue_agent_loop_update_request(
+            self.store,
+            loop_ref,
+            mission,
+            note=_string_arg(arguments, "note") or None,
+            source="mcp",
+        )
+        if result.request is None:
+            return _tool_result(f"update_loop failed: {result.error}", is_error=True)
+        request = (
+            wait_for_agent_loop_update_request(
+                self.store,
+                result.request.request_id,
+                timeout_seconds=self.loop_request_wait_seconds,
+            )
+            or result.request
+        )
+        summary = result.diff.summary() if result.diff is not None else ""
+        return _tool_result(
+            f"request: {request.request_id} ({summary})\n"
+            + describe_agent_loop_update_request(request),
+            is_error=request.status.value in {"failed", "stale"},
         )
 
     def _handle_read_thread_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1241,6 +1291,44 @@ def _tools() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["request"],
+            },
+        },
+        {
+            "name": "update_loop",
+            "description": (
+                "Propose a new mission for an existing Slackgentic loop. Slackgentic posts the "
+                "change as a diff in the loop's channel and stores the new mission verbatim only "
+                "when the owner taps Apply. Pass the complete replacement mission, not a "
+                "summary of the edits. Use dry_run first to get the diff and show it to the "
+                "user. Loop runs cannot use this tool."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "loop": {
+                        "type": "string",
+                        "description": (
+                            "The loop's id, channel name (for example #loop-ci-watch), or "
+                            "exact title, as shown by `slackgentic loop list`."
+                        ),
+                    },
+                    "mission": {
+                        "type": "string",
+                        "description": (
+                            "The complete new mission, exactly as it should be stored. Read "
+                            "the current one with `slackgentic loop list --json`."
+                        ),
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional one-line reason shown to the owner above the diff.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Return the diff without queueing anything.",
+                    },
+                },
+                "required": ["loop", "mission"],
             },
         },
         {

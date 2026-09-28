@@ -116,6 +116,16 @@ class LoopCreateRequestStatus(StrEnum):
     FAILED = "failed"
 
 
+class LoopUpdateRequestStatus(StrEnum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    POSTED = "posted"
+    APPLIED = "applied"
+    CANCELLED = "cancelled"
+    STALE = "stale"
+    FAILED = "failed"
+
+
 class ScheduledWorkStatus(StrEnum):
     PENDING = "pending"
     CLAIMED = "claimed"
@@ -387,6 +397,29 @@ class LoopCreateQueueRequest:
     source: str | None = None
     channel_id: str | None = None
     message_ts: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class LoopUpdateQueueRequest:
+    """A mission change for an existing loop, proposed by a local agent.
+
+    ``base_mission`` is the mission the proposal was written against; the owner's
+    Apply only takes effect while the loop still has exactly that mission.
+    """
+
+    request_id: str
+    loop_id: str
+    mission: str
+    base_mission: str
+    status: LoopUpdateRequestStatus
+    created_at: datetime
+    updated_at: datetime
+    note: str | None = None
+    source: str | None = None
+    channel_id: str | None = None
+    message_ts: str | None = None
+    resolved_by: str | None = None
     error: str | None = None
 
 

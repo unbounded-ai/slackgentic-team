@@ -227,6 +227,8 @@ def evaluate_tool_call(
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     if tool_name in _READ_TOOLS:
         return GuardDecision(ALLOW, "read-only tool")
+    if tool_name == "mcp__slackgentic__update_loop":
+        return _deny("loop runs cannot change loops; report the suggestion to the owner instead")
     if tool_name.startswith("mcp__slackgentic__"):
         return GuardDecision(ALLOW, "Slackgentic channel tool")
     if tool_name.startswith("mcp__talos__"):
