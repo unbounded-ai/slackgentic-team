@@ -1900,6 +1900,73 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(self.runtime.sent[-1][0], latest_task.task_id)
         self.assertIn("Anything new?", self.runtime.sent[-1][1])
 
+    def test_an_owner_question_after_a_quiet_run_is_answered_in_the_thread(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        task, _, _, _ = self._finish_loop_run(loop, quiet=True)
+        started_before = len(self.runtime.started)
+
+        # The run's worker has exited, so the question resumes its session.
+        with patch.object(self.runtime, "send_to_task", return_value=False):
+            self._send_loop_command(
+                loop, "Who cut v3?", "400.000001", thread_ts=loop.charter_message_ts
+            )
+
+        self.assertEqual(len(self.runtime.started), started_before + 1)
+        resumed, _, thread = self.runtime.started[-1]
+        self.assertEqual(resumed.task_id, task.task_id)
+        self.assertEqual(thread.thread_ts, loop.charter_message_ts)
+        # The owner is waiting on the answer: this turn posts, and the agent knows it.
+        self.assertNotIn(LOOP_QUIET_OUTPUT_METADATA_KEY, resumed.metadata)
+        self.assertIn("Who cut v3?", resumed.prompt)
+        self.assertIn("is posted to them there", resumed.prompt)
+        self.assertIn("do not emit a LOOP_SUMMARY", resumed.prompt)
+
+    def test_an_owner_question_during_a_quiet_run_lifts_its_quiet_output(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        task, _, _, _ = self._running_task_and_run(loop)
+
+        self._send_loop_command(
+            loop, "Why is prod behind?", "400.000001", thread_ts=loop.charter_message_ts
+        )
+
+        self.assertEqual(self.runtime.quiet_output_lifted, [task.task_id])
+        self.assertEqual(self.runtime.sent[-1][0], task.task_id)
+        self.assertIn("Why is prod behind?", self.runtime.sent[-1][1])
+        self.assertIn("carry on with the run", self.runtime.sent[-1][1])
+
+    def test_an_owner_question_skips_a_compaction_in_the_panel_thread(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        run_task, _, _, _ = self._finish_loop_run(loop, quiet=True)
+        loop = self.store.get_loop(loop.loop_id)
+        self.store.update_loop_metadata(loop.loop_id, {**loop.metadata, "compaction_pending": True})
+        LoopRunner(self.store, self.controller, poll_seconds=0.01).sync_once()
+        compacting = self.store.running_loop_run(loop.loop_id)
+        assert compacting is not None
+        self.assertEqual(compacting.kind, LoopRunKind.COMPACTION)
+
+        self._send_loop_command(
+            loop, "Anything new?", "400.000001", thread_ts=loop.charter_message_ts
+        )
+
+        # Compaction output is dropped, so the run the owner last heard from answers.
+        self.assertEqual(self.runtime.sent[-1][0], run_task.task_id)
+
+    def test_a_summary_nudge_for_a_quiet_run_stays_quiet(self):
+        loop = self._activate_quiet_loop()
+        self.controller.fire_loop_now(loop)
+        task, agent, _, thread = self._running_task_and_run(loop)
+        started_before = len(self.runtime.started)
+
+        with patch.object(self.runtime, "send_to_task", return_value=False):
+            self.controller.handle_runtime_task_done(task, agent, thread)
+
+        self.assertEqual(len(self.runtime.started), started_before + 1)
+        nudged, _, _ = self.runtime.started[-1]
+        self.assertIs(nudged.metadata.get(LOOP_QUIET_OUTPUT_METADATA_KEY), True)
+
     def test_turning_quiet_off_mid_run_still_posts_the_runs_alert(self):
         loop = self._activate_quiet_loop()
         self.controller.fire_loop_now(loop)

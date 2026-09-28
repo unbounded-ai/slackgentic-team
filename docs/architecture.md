@@ -403,7 +403,13 @@ at most five earlier run threads per occurrence, from the same loop channel
 only. `LOOP_COMPACT` replaces redundant run/system memory while owner notes are
 never superseded. Compaction is also queued automatically when un-superseded
 memory crosses the configured threshold. Compaction runs post nothing: they run
-against the pinned panel's thread with their visible output dropped. A rejected
+against the pinned panel's thread with their visible output dropped. An owner
+reply in a loop thread goes to the latest run in that thread that is not a
+compaction. That reply turn posts what the agent writes even when the run is
+quiet: a live run stops withholding its text from then on, and a finished run
+resumes without the quiet flag and is told not to re-emit `LOOP_SUMMARY`, which
+the harness would ignore once the run has ended. The summary nudge resumes a
+quiet run with the flag kept. A rejected
 `LOOP_SUMMARY` or `LOOP_COMPACT` line is sent back to the running agent with the
 reason so it can re-emit, rather than being posted to Slack. Quiet loops count
 the runs that share the panel's thread; at the configured threshold (default 120)

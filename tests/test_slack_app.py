@@ -436,6 +436,7 @@ class FakeRuntime:
         self.stopped = []
         self.interrupted = []
         self.resumed = []
+        self.quiet_output_lifted = []
         self.running_task_ids: set[str] = set()
 
     def start_task(self, task, agent, thread):
@@ -444,6 +445,10 @@ class FakeRuntime:
 
     def send_to_task(self, task_id, message):
         self.sent.append((task_id, message))
+        return True
+
+    def lift_quiet_output(self, task_id):
+        self.quiet_output_lifted.append(task_id)
         return True
 
     def send_to_interrupted_task(self, task_id, message):

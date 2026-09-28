@@ -1795,12 +1795,10 @@ class SlackTeamController:
             task = self.store.get_original_agent_task_by_thread(loop.channel_id or "", thread_ts)
             if task is not None:
                 # Quiet runs all work in the pinned panel's thread, so its original
-                # task is the oldest run; the owner is asking the latest one.
-                task = (
-                    self._latest_task_for_agent_thread(
-                        task.agent_id, loop.channel_id or "", thread_ts
-                    )
-                    or task
+                # task is the oldest run; the owner is asking the latest one. Compaction
+                # runs share that thread but post nothing, so they cannot answer.
+                task = self._latest_task_for_agent_thread(
+                    task.agent_id, loop.channel_id or "", thread_ts, include_silent=False
                 )
             if (
                 task is not None
@@ -1822,10 +1820,19 @@ class SlackTeamController:
         message_ts = event.get("ts")
         self._mark_message_acknowledged(loop.channel_id, message_ts)
         active = self._active_thread_task_for_agent(task, loop.channel_id, task.thread_ts) or task
-        if self.runtime and self.runtime.send_to_task(
-            active.task_id,
-            _live_thread_followup_prompt(text),
-        ):
+        if active.metadata.get(LOOP_SILENT_OUTPUT_METADATA_KEY) is True:
+            # A compaction running in this thread cannot answer; the last run can.
+            active = task
+        run_id = active.metadata.get(LOOP_RUN_ID_METADATA_KEY)
+        run = self.store.get_loop_run(run_id) if isinstance(run_id, str) else None
+        prompt = _loop_owner_reply_prompt(
+            text, run_in_progress=run is not None and run.status == LoopRunStatus.RUNNING
+        )
+        # The owner is waiting on this answer, so a quiet run posts from here on.
+        lift_quiet_output = getattr(self.runtime, "lift_quiet_output", None)
+        if callable(lift_quiet_output):
+            lift_quiet_output(active.task_id)
+        if self.runtime and self.runtime.send_to_task(active.task_id, prompt):
             self._remember_request_message_for_task(active, message_ts)
             self._mark_message_in_progress(loop.channel_id, message_ts)
             return True
@@ -1833,7 +1840,7 @@ class SlackTeamController:
         if agent is None:
             return True
         request = WorkRequest(
-            prompt=text,
+            prompt=prompt,
             assignment_mode=AssignmentMode.SPECIFIC,
             requested_handle=agent.handle,
         )
@@ -1845,6 +1852,7 @@ class SlackTeamController:
             requested_by_slack_user=loop.owner_slack_user_id,
             request_message_ts=message_ts,
             try_live_send=False,
+            lift_quiet_output=True,
         )
         if started:
             self._mark_message_in_progress(loop.channel_id, message_ts)
@@ -9994,6 +10002,7 @@ class SlackTeamController:
         requested_by_slack_user: str | None,
         request_message_ts: str | None = None,
         try_live_send: bool = True,
+        lift_quiet_output: bool = False,
     ) -> bool:
         previous_task = self._dismiss_idle_release_prompt(previous_task, thread)
         previous_task = self._record_task_pr_urls(previous_task, agent, thread, request.prompt)
@@ -10065,6 +10074,8 @@ class SlackTeamController:
                 self._post_followup_delivery_failed_notice(thread, agent)
                 return False
         metadata = self._thread_task_metadata(previous_task, thread.channel_id, thread.thread_ts)
+        if lift_quiet_output:
+            metadata.pop(LOOP_QUIET_OUTPUT_METADATA_KEY, None)
         metadata[ASSIGNMENT_PROMPT_METADATA_KEY] = _task_assignment_prompt(previous_task)
         metadata = metadata_with_pr_urls(metadata, request.prompt)
         for key in ("request_message_ts", "request_message_ts_history"):
@@ -10161,6 +10172,8 @@ class SlackTeamController:
         agent_id: str,
         channel_id: str,
         thread_ts: str,
+        *,
+        include_silent: bool = True,
     ) -> AgentTask | None:
         matches = [
             task
@@ -10168,6 +10181,7 @@ class SlackTeamController:
             if task.agent_id == agent_id
             and task.channel_id == channel_id
             and task.thread_ts == thread_ts
+            and (include_silent or task.metadata.get(LOOP_SILENT_OUTPUT_METADATA_KEY) is not True)
         ]
         if not matches:
             return None
@@ -15722,6 +15736,21 @@ def _latest_user_message_ts_for_reaction(metadata: dict[str, object]) -> str | N
             if isinstance(item, str) and item:
                 return item
     return None
+
+
+def _loop_owner_reply_prompt(text: str, *, run_in_progress: bool) -> str:
+    # A quiet run is told that nothing it writes reaches Slack. Its answer to the
+    # owner does, so say so, or the answer ends up only in hidden lines.
+    after = (
+        "Then carry on with the run and finish it as usual."
+        if run_in_progress
+        else "That run has already reported, so do not emit a LOOP_SUMMARY line for this reply."
+    )
+    return (
+        "The loop owner replied in the thread. What you write in reply is posted to them "
+        "there, even if your run instructions say nothing you write reaches Slack, so "
+        f"answer them directly in plain text. {after}\n\n{text}"
+    )
 
 
 def _live_thread_followup_prompt(prompt: str) -> str:

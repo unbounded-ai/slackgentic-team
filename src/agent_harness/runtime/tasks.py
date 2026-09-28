@@ -191,6 +191,9 @@ class RunningTask:
     # progress/stall watchdog is suppressed until the next user turn is sent.
     turn_complete: bool = False
     stop_requested: bool = False
+    # Set when the loop owner replies while this quiet run is live: the owner is
+    # waiting on an answer, so the run's text is posted from then on.
+    quiet_output_lifted: bool = False
     wake_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -441,6 +444,13 @@ class ManagedTaskRuntime:
 
     def send_to_interrupted_task(self, task_id: str, message: str) -> bool:
         return self._send_to_running_task(task_id, message, allow_cli=True)
+
+    def lift_quiet_output(self, task_id: str) -> bool:
+        running = self._get_running(task_id)
+        if running is None:
+            return False
+        running.quiet_output_lifted = True
+        return True
 
     def _send_to_running_task(self, task_id: str, message: str, *, allow_cli: bool) -> bool:
         running = self._get_running(task_id)
@@ -1135,7 +1145,10 @@ class ManagedTaskRuntime:
             running.progress_warning_monotonic = None
             handle_terminal_signals()
             return
-        if running.task.metadata.get(LOOP_QUIET_OUTPUT_METADATA_KEY) is True:
+        if (
+            running.task.metadata.get(LOOP_QUIET_OUTPUT_METADATA_KEY) is True
+            and not running.quiet_output_lifted
+        ):
             # A quiet loop run's narration is withheld, not missing (the harness
             # logs the run itself): count it so an exit without THREAD_DONE still
             # finalizes the run instead of being cancelled as a silent exit.

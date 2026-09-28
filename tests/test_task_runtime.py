@@ -2708,6 +2708,49 @@ class TaskRuntimeTests(unittest.TestCase):
                 shut_down_runtime(runtime)
                 store.close()
 
+    def test_a_quiet_loop_run_posts_once_its_owner_asks_it_something(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "quiet loop run", "C1")
+                task = replace(task, metadata={LOOP_QUIET_OUTPUT_METADATA_KEY: True})
+                store.upsert_agent_task(task)
+                gateway = FakeGateway()
+                runtime = ManagedTaskRuntime(
+                    store,
+                    gateway,
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                    on_agent_control=lambda *args: True,
+                )
+                running = RunningTask(
+                    task=task,
+                    agent=agent,
+                    process=OneShotProcess(None),
+                    thread=SlackThreadRef("C1", "171.panel"),
+                    worker=threading.Thread(),
+                )
+                runtime._running[task.task_id] = running
+
+                runtime._post_agent_chunk(running, "Now checking the log jump.")
+                self.assertEqual(gateway.replies, [])
+
+                self.assertTrue(runtime.lift_quiet_output(task.task_id))
+                runtime._post_agent_chunk(
+                    running, "Nobody cut it by hand.\nSLACKGENTIC: ROSTER Answering (3/4)"
+                )
+
+                self.assertEqual(gateway.replies, ["Nobody cut it by hand."])
+                self.assertFalse(runtime.lift_quiet_output("task_missing"))
+            finally:
+                runtime._running.pop(task.task_id, None)
+                shut_down_runtime(runtime)
+                store.close()
+
     def test_idle_seconds_count_only_a_live_worker_waiting_after_its_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.sqlite")
