@@ -68,6 +68,7 @@ from agent_harness.runtime.tasks import (
     build_task_prompt,
     claude_session_turn_in_progress,
     managed_run_empty_text_block_api_retries,
+    managed_run_provider_failure,
     managed_run_resume_attempts,
     managed_run_transient_provider_retries,
     parse_agent_reaction_signal,
@@ -613,6 +614,27 @@ class ClaudeOverloadedProcess(OneShotProcess):
                         "result": (
                             "API Error: 529 Overloaded. This is a server-side issue; "
                             "backend endpoint details must remain private."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+        return ""
+
+
+class ClaudeUnreachableProcess(OneShotProcess):
+    def read_available(self, max_reads=20, timeout=0.05):
+        if self.reads == 0:
+            self.reads += 1
+            return (
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": True,
+                        "result": (
+                            "API Error: Can't reach the API server \u2014 check your internet "
+                            "or DNS (ENOTFOUND)"
                         ),
                     }
                 )
@@ -2122,6 +2144,17 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertFalse(
             _is_retryable_managed_provider_failure("Claude error: API Error: 401 Unauthorized")
         )
+
+    def test_network_and_dns_failures_are_retryable(self):
+        for message in (
+            "Claude error: API Error: Can't reach the API server \u2014 check your internet "
+            "or DNS (ENOTFOUND)",
+            "Claude error: API Error: Connection error.",
+            "Codex error: stream error: dns error: failed to lookup address information",
+            "Codex error: request failed: connect ECONNREFUSED 127.0.0.1:443",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(_is_retryable_managed_provider_failure(message))
 
     def test_managed_run_transient_provider_retries_counter(self):
         agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
@@ -5323,6 +5356,48 @@ class TaskRuntimeTests(unittest.TestCase):
                 self.assertFalse(
                     any("backend endpoint details" in reply for reply in gateway.replies)
                 )
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_records_an_unreachable_provider_as_a_transient_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            completed = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeUnreachableProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "run the loop", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FakeGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    on_task_done=lambda done, _agent, _thread: completed.append(done),
+                    transient_provider_retry_delays=(0.0, 0.0),
+                )
+
+                runtime.start_task(task, agent, SlackThreadRef("C1", "172.000001"))
+                for _ in poll_attempts():
+                    if completed:
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(completed[0].status, AgentTaskStatus.CANCELLED)
+                failure = managed_run_provider_failure(completed[0])
+                assert failure is not None
+                self.assertTrue(failure[1])
+                self.assertIn("ENOTFOUND", failure[0])
             finally:
                 shut_down_runtime(runtime)
                 store.close()

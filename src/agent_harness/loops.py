@@ -75,6 +75,9 @@ LOOP_METRICS_MAX_ITEMS = 8
 LOOP_METRIC_FIELD_MAX_CHARS = 60
 LOOP_SUMMARY_NUDGE_ATTEMPTS = 1
 LOOP_MAX_CONSECUTIVE_FAILURES = 3
+# A run the model provider could not serve (network, DNS, overload, rate limit) says
+# nothing about the mission, so it never counts toward the pause above.
+LOOP_PROVIDER_OUTAGE_ERROR_PREFIX = "Could not reach the model provider"
 LOOP_IGNORED_NOTICE_INTERVAL_SECONDS = 86_400
 LOOP_RUNNER_POLL_FLOOR_SECONDS = 5.0
 

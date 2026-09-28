@@ -20,7 +20,9 @@ from agent_harness.loops import (
     LOOP_CARRY_MAX_CHARS,
     LOOP_COMPACT_SNAPSHOT_MAX_CHARS,
     LOOP_COMPACTION_TRIGGER_CHARS,
+    LOOP_MAX_CONSECUTIVE_FAILURES,
     LOOP_METRIC_FIELD_MAX_CHARS,
+    LOOP_PROVIDER_OUTAGE_ERROR_PREFIX,
     LOOP_THREAD_ROLLOVER_PENDING_KEY,
     LOOP_THREAD_ROLLOVER_RUNS_KEY,
     LOOP_THREAD_RUN_COUNT_KEY,
@@ -59,7 +61,10 @@ from agent_harness.models import (
     WorkRequest,
     utc_now,
 )
-from agent_harness.runtime.tasks import ManagedTaskRuntime
+from agent_harness.runtime.tasks import (
+    MANAGED_RUN_PROVIDER_FAILURE_METADATA_KEY,
+    ManagedTaskRuntime,
+)
 from agent_harness.slack import build_loop_edit_modal, encode_action_value
 from agent_harness.slack.agent_requests import SlackAgentRequestHandler
 from agent_harness.slack.app import (
@@ -3179,6 +3184,70 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(len(log), 1)
         self.assertTrue(log[0].startswith("🚫 Run #"), log[0])
         self.assertIn("|report>", log[0])
+
+    def _fail_quiet_loop_run(self, loop, *, provider_failure=None):
+        self.controller.fire_loop_now(loop)
+        task, agent, _, _ = self._running_task_and_run(loop)
+        if provider_failure is not None:
+            metadata = dict(task.metadata)
+            metadata[MANAGED_RUN_PROVIDER_FAILURE_METADATA_KEY] = provider_failure
+            self.store.upsert_agent_task(replace(task, metadata=metadata))
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        self.controller.handle_runtime_task_done(
+            self.store.get_agent_task(task.task_id),
+            agent,
+            SlackThreadRef(loop.channel_id, task.thread_ts, task.thread_ts),
+        )
+
+    def test_provider_outages_never_pause_a_loop_and_notify_once(self):
+        loop = self._activate_quiet_loop()
+        outage = {
+            "message": "Claude error: API Error: Can't reach the API server (ENOTFOUND)",
+            "transient": True,
+        }
+        posts_before = len(self.gateway.posts)
+
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES + 2):
+            self._fail_quiet_loop_run(loop, provider_failure=outage)
+
+        latest = self.store.get_loop(loop.loop_id)
+        assert latest is not None
+        self.assertEqual(latest.status, LoopStatus.ACTIVE)
+        self.assertEqual(latest.consecutive_failures, 0)
+        runs = self.store.list_loop_runs(loop.loop_id)
+        self.assertEqual(len(runs), LOOP_MAX_CONSECUTIVE_FAILURES + 2)
+        for run in runs:
+            self.assertEqual(run.status, LoopRunStatus.FAILED)
+            self.assertTrue(run.error.startswith(LOOP_PROVIDER_OUTAGE_ERROR_PREFIX), run.error)
+            self.assertIn("ENOTFOUND", run.error)
+        new_posts = self.gateway.posts[posts_before:]
+        cards = [post for post in new_posts if post["blocks"]]
+        self.assertEqual(len(cards), 1)
+        self.assertFalse(any("Paused after" in post["text"] for post in new_posts))
+
+    def test_an_outage_streak_restarts_after_a_successful_run(self):
+        loop = self._activate_quiet_loop()
+        outage = {"message": "Codex error: dns error: failed to lookup address", "transient": True}
+        posts_before = len(self.gateway.posts)
+
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES - 1):
+            self._fail_quiet_loop_run(loop, provider_failure=outage)
+        self._run_quiet_loop_once(loop)
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES - 1):
+            self._fail_quiet_loop_run(loop, provider_failure=outage)
+
+        self.assertEqual([post for post in self.gateway.posts[posts_before:] if post["blocks"]], [])
+
+    def test_unrecoverable_provider_failures_still_pause_the_loop(self):
+        loop = self._activate_quiet_loop()
+        failure = {"message": "Claude error: API Error: 401 Unauthorized", "transient": False}
+
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES):
+            self._fail_quiet_loop_run(loop, provider_failure=failure)
+
+        latest = self.store.get_loop(loop.loop_id)
+        assert latest is not None
+        self.assertEqual(latest.status, LoopStatus.PAUSED)
 
     def test_quiet_mode_is_set_from_the_spec_and_shown_in_the_edit_modal(self):
         spec = parse_agent_loop_signal(

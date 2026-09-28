@@ -298,6 +298,12 @@ for later runs.
 
 Run summaries and owner notes form a durable journal; older run detail is
 available through bounded retrieval, and long journals compact automatically.
+
+A loop pauses itself after three failed runs in a row and tells you in its
+channel. Runs that fail because the model provider cannot be reached (network or
+DNS trouble, overload, rate limits) do not count: they are recorded with the
+real cause, the loop keeps its schedule, and a quiet loop posts one card only if
+three runs in a row fail that way.
 Compaction runs silently: it never posts to the channel.
 
 Inside the loop channel, only the owner can instruct the bot. Other members'
