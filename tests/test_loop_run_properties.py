@@ -604,6 +604,10 @@ class LoopLifecycle(RuleBasedStateMachine):
     def _run_for_task(self, task_id: str):
         return next((run for run in self._all_runs() if run.task_id == task_id), None)
 
+    def _task_thread_ts(self, run) -> str | None:
+        task = self.store.get_agent_task(run.task_id) if run.task_id else None
+        return task.thread_ts if task is not None else None
+
     def _thread_for(self, task_id: str) -> SlackThreadRef:
         task = self.store.get_agent_task(task_id)
         assert task is not None and task.thread_ts is not None
@@ -947,13 +951,32 @@ class LoopLifecycle(RuleBasedStateMachine):
         if not pool:
             return
         run = max(pool, key=lambda item: item.run_number)
-        task = self.store.get_agent_task(run.task_id) if run.task_id else None
-        thread_ts = run.thread_ts or (task.thread_ts if task is not None else None)
+        thread_ts = run.thread_ts or self._task_thread_ts(run)
         if not thread_ts:
             return
         self.owner_messages += 1
-        if run.status != LoopRunStatus.RUNNING and run.task_id:
-            self.followups.add(run.task_id)
+        # A compaction posts nothing, so the latest other run in its thread answers.
+        answering = (
+            max(
+                (
+                    item
+                    for item in runs
+                    if item.kind != LoopRunKind.COMPACTION
+                    and item.task_id
+                    and self._task_thread_ts(item) == thread_ts
+                ),
+                key=lambda item: item.run_number,
+                default=None,
+            )
+            if run.kind == LoopRunKind.COMPACTION
+            else run
+        )
+        if (
+            answering is not None
+            and answering.status != LoopRunStatus.RUNNING
+            and answering.task_id
+        ):
+            self.followups.add(answering.task_id)
         self.controller.handle_event(
             {
                 "event": {
@@ -1084,8 +1107,9 @@ class LoopLifecycle(RuleBasedStateMachine):
 
     @invariant()
     def quiet_threads_hold_only_the_run_log(self):
-        # The only thing written into the panel thread quiet runs work in is the
-        # harness's run log: one line per finished run, none while it runs. A run
+        # The only thing the harness writes into the panel thread quiet runs work in
+        # is the run log: one line per finished run, none while it runs. (The agent
+        # also answers the owner's replies there.) A run
         # the owner's stop cut short is failed in place, without a card or a line.
         quiet_threads: set[str] = set()
         logged: dict[str, int] = {}

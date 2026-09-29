@@ -32,6 +32,7 @@ from agent_harness.models import (
 from agent_harness.providers.base import AgentProvider
 from agent_harness.providers.claude import (
     CLAUDE_LOCAL_COMMAND_MARKERS,
+    CLAUDE_SHELL_MODE_MARKERS,
     CLAUDE_SYNTHETIC_RECORD_FLAGS,
     ClaudeDesktopSessionIndex,
     is_synthetic_claude_assistant_record,
@@ -74,6 +75,12 @@ SLACKGENTIC_CHANNEL_BLOCK_RE = re.compile(
 )
 CROSS_SESSION_MESSAGE_BLOCK_RE = re.compile(
     r"<cross-session-message\b[^>]*>.*?</cross-session-message>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+# The desktop app can prepend context for the model to what a person typed, in
+# the same human-labelled turn.
+SYSTEM_REMINDER_BLOCK_RE = re.compile(
+    r"<system-reminder>.*?</system-reminder>",
     flags=re.IGNORECASE | re.DOTALL,
 )
 HUMAN_DISPLAY_NAME_SETTING = "slack.human_display_name"
@@ -2204,6 +2211,12 @@ def _render_claude_event(event: AgentEvent) -> RenderedSessionEvent | None:
         return None
     if event.event_type == "user" and _has_cross_session_message_block(text):
         return None
+    if event.event_type == "user" and any(marker in text for marker in CLAUDE_SHELL_MODE_MARKERS):
+        return None
+    if event.event_type == "user":
+        text = _remove_system_reminder_blocks(text)
+        if not text:
+            return None
     if event.event_type == "assistant":
         text = _remove_slackgentic_channel_blocks(text)
         if not text:
@@ -2402,6 +2415,13 @@ def _remove_slackgentic_channel_blocks(text: str) -> str:
     if not SLACKGENTIC_CHANNEL_BLOCK_RE.search(decoded):
         return text
     return SLACKGENTIC_CHANNEL_BLOCK_RE.sub("", decoded).strip()
+
+
+def _remove_system_reminder_blocks(text: str) -> str:
+    decoded = html.unescape(text)
+    if not SYSTEM_REMINDER_BLOCK_RE.search(decoded):
+        return text
+    return SYSTEM_REMINDER_BLOCK_RE.sub("", decoded).strip()
 
 
 def _has_claude_local_command_block(text: str) -> bool:

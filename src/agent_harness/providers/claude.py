@@ -37,6 +37,13 @@ CLAUDE_LOCAL_COMMAND_MARKERS = (
     "<local-command-stdout>",
     "<local-command-stderr>",
 )
+# A `!` shell-mode command and its output. The CLI leaves these unlabelled, but
+# the desktop app gives them a human origin.
+CLAUDE_SHELL_MODE_MARKERS = (
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
 
 # Claude Code labels where each prompt came from: `origin.kind` is "human" for
 # what a person typed, queued, or accepted, and something else ("task-notification",
@@ -49,6 +56,11 @@ CLAUDE_HUMAN_ORIGIN_KINDS = frozenset({"human"})
 # A headless run (`claude -p`, the SDK) records the prompt its launcher supplied
 # with this source and no origin. It is the operator's input, not CLI state.
 CLAUDE_OPERATOR_PROMPT_SOURCES = frozenset({"sdk"})
+# Headless runs record an entrypoint with this prefix (`sdk-cli`, `sdk-ts`, ...).
+# An interactive host such as the desktop app also submits over the SDK, but it
+# gives what a person typed a human origin; its unlabelled SDK turns are its own
+# notifications (CI events, for one), so they are not the operator's input.
+CLAUDE_HEADLESS_ENTRYPOINT_PREFIX = "sdk-"
 # The CLI sets these on records it writes for itself. They hold for every
 # release, so they are honoured before any provenance label is consulted.
 CLAUDE_SYNTHETIC_RECORD_FLAGS = (
@@ -66,9 +78,7 @@ _PROVENANCE_SCAN_RECORDS = 200
 # Plumbing an unlabelled legacy transcript writes under the "user" role.
 _CLAUDE_LEGACY_CLI_TEXT_MARKERS = (
     *CLAUDE_LOCAL_COMMAND_MARKERS,
-    "<bash-input>",
-    "<bash-stdout>",
-    "<bash-stderr>",
+    *CLAUDE_SHELL_MODE_MARKERS,
     "<task-notification>",
     "<system-reminder>",
 )
@@ -524,7 +534,11 @@ def is_human_claude_user_record(
         return isinstance(kind, str) and kind in CLAUDE_HUMAN_ORIGIN_KINDS
     prompt_source = record.get("promptSource")
     if isinstance(prompt_source, str):
-        return prompt_source in CLAUDE_OPERATOR_PROMPT_SOURCES
+        entrypoint = record.get("entrypoint")
+        headless = not isinstance(entrypoint, str) or entrypoint.startswith(
+            CLAUDE_HEADLESS_ENTRYPOINT_PREFIX
+        )
+        return headless and prompt_source in CLAUDE_OPERATOR_PROMPT_SOURCES
     if provenance_labelled or _claude_cli_labels_provenance(record):
         return False
     text = _claude_prompt_text(record)

@@ -125,8 +125,15 @@ adapter sets `AgentEvent.human_authored`, and adapters set it only from the
 CLI's own record that someone submitted input:
 
 - Claude Code labels each prompt with `origin.kind`; only `human` counts, plus
-  the launcher-supplied prompt of a headless run (`promptSource: sdk`). Records
-  the CLI writes for itself carry no label and are dropped.
+  the launcher-supplied prompt of a headless run (`promptSource: sdk` with an
+  `sdk-*` entrypoint). Records the CLI writes for itself carry no label and are
+  dropped. An interactive host such as the desktop app also submits over the
+  SDK, but it gives what a person typed a human origin, so its unlabelled SDK
+  turns (CI events, for one) are its own and are dropped too.
+- The desktop app can put its own text inside a human-labelled turn: it
+  prepends `<system-reminder>` context to a person's prompt, which the mirror
+  strips, and it labels `!` shell-mode commands and their output as human,
+  which the mirror drops as the CLI already does.
 - Codex records a submission event (`user_message`, or an `item_completed`
   event with a `UserMessage` item) for each prompt; role `user` response items
   are model input and are never attributed to the person.
@@ -403,7 +410,13 @@ at most five earlier run threads per occurrence, from the same loop channel
 only. `LOOP_COMPACT` replaces redundant run/system memory while owner notes are
 never superseded. Compaction is also queued automatically when un-superseded
 memory crosses the configured threshold. Compaction runs post nothing: they run
-against the pinned panel's thread with their visible output dropped. A rejected
+against the pinned panel's thread with their visible output dropped. An owner
+reply in a loop thread goes to the latest run in that thread that is not a
+compaction. That reply turn posts what the agent writes even when the run is
+quiet: a live run stops withholding its text from then on, and a finished run
+resumes without the quiet flag and is told not to re-emit `LOOP_SUMMARY`, which
+the harness would ignore once the run has ended. The summary nudge resumes a
+quiet run with the flag kept. A rejected
 `LOOP_SUMMARY` or `LOOP_COMPACT` line is sent back to the running agent with the
 reason so it can re-emit, rather than being posted to Slack. Quiet loops count
 the runs that share the panel's thread; at the configured threshold (default 120)
