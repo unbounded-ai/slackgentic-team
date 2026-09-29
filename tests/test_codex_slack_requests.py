@@ -72,7 +72,9 @@ class SlackCodexRequestHandlerTests(unittest.TestCase):
             result["value"],
             {"answers": {"provider": {"answers": ["Codex"]}}},
         )
-        self.assertEqual(gateway.updates[-1]["text"], "Answered Codex input request.")
+        self.assertEqual(
+            gateway.updates[-1]["text"], "Answered Codex input request.\nProvider: Codex"
+        )
 
     def test_permissions_approval_can_be_granted_for_session(self):
         gateway = FakeGateway()
