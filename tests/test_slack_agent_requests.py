@@ -317,7 +317,15 @@ class SlackAgentRequestHandlerTests(unittest.TestCase):
                     result["value"],
                     {"answers": {"choice": {"answers": ["B"]}}},
                 )
-                self.assertEqual(gateway.updates[-1]["text"], "Answered Claude input request.")
+                update = gateway.updates[-1]
+                self.assertEqual(update["text"], "Answered Claude input request.\nChoice: B")
+                self.assertEqual(
+                    [block["type"] for block in update["blocks"]], ["section", "section"]
+                )
+                self.assertEqual(
+                    update["blocks"][1]["text"]["text"],
+                    "*Choice*\nPick one\nSelected: `B`",
+                )
             finally:
                 store.close()
 

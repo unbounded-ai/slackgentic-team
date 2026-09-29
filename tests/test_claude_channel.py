@@ -2134,7 +2134,10 @@ class ClaudeChannelTests(unittest.TestCase):
                         },
                     },
                 )
-                self.assertEqual(gateway.updates[-1]["text"], "Answered Claude input request.")
+                self.assertEqual(
+                    gateway.updates[-1]["text"],
+                    "Answered Claude input request.\nScope: Everything runnable\nValidation: Yes",
+                )
             finally:
                 store.close()
 

@@ -336,11 +336,9 @@ class SlackAgentRequestHandler:
                 return True
             if self.store:
                 self.store.resolve_slack_agent_request(token, response)
-            self._update_request_message(
-                pending,
-                _input_resolved_text(pending, payload),
-                message_ts=message_ts,
-            )
+            pending.answers = answers
+            text, blocks = _input_resolved_message(pending, payload)
+            self._update_request_message(pending, text, blocks=blocks, message_ts=message_ts)
             return True
         decision = str(payload.get("decision") or "")
         response = _decision_response(pending.method, decision, pending.params)
@@ -364,7 +362,8 @@ class SlackAgentRequestHandler:
             return
         pending.response = response
         pending.event.set()
-        self._update_request_message(pending, _input_resolved_text(pending, payload))
+        text, blocks = _input_resolved_message(pending, payload)
+        self._update_request_message(pending, text, blocks=blocks)
 
     def _update_request_message(
         self,
@@ -426,12 +425,7 @@ def _input_request_message(pending: PendingAgentRequest) -> tuple[str, list[dict
     for question_index, question in enumerate(questions):
         question_id = str(question.get("id") or "")
         selected = pending.answers.get(question_id)
-        detail = (
-            f"*{_plain(question.get('header'), 'Question')}*\n{_plain(question.get('question'))}"
-        )
-        if selected:
-            detail = f"{detail}\nSelected: `{_truncate(selected, 80)}`"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _mrkdwn(detail)}})
+        blocks.append(_question_block(question, selected))
         options = question.get("options") if isinstance(question.get("options"), list) else []
         elements = [
             _button(
@@ -489,6 +483,13 @@ def _input_request_message(pending: PendingAgentRequest) -> tuple[str, list[dict
             }
         )
     return text, blocks[:50]
+
+
+def _question_block(question: dict[str, Any], selected: str | None) -> dict[str, Any]:
+    detail = f"*{_plain(question.get('header'), 'Question')}*\n{_plain(question.get('question'))}"
+    if selected:
+        detail = f"{detail}\nSelected: `{_truncate(selected, 80)}`"
+    return {"type": "section", "text": {"type": "mrkdwn", "text": _mrkdwn(detail)}}
 
 
 def _claude_permission_summary(
@@ -799,6 +800,29 @@ def _input_resolved_text(pending: PendingAgentRequest, payload: dict[str, Any]) 
     if payload.get("decision") == "terminal":
         return f"Moved to the {pending.provider_label} terminal."
     return f"Answered {pending.provider_label} input request."
+
+
+def _input_resolved_message(
+    pending: PendingAgentRequest,
+    payload: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """The closed input request, still showing what was chosen for each question."""
+    headline = _input_resolved_text(pending, payload)
+    if payload.get("decision") in {"cancel", "terminal"}:
+        return headline, None
+    lines = [headline]
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{headline}*"}}
+    ]
+    for question in _questions(pending.params):
+        selected = pending.answers.get(str(question.get("id") or ""))
+        if not selected:
+            continue
+        lines.append(f"{_plain(question.get('header'), 'Question')}: {selected}")
+        blocks.append(_question_block(question, selected))
+    if len(blocks) == 1:
+        return headline, None
+    return "\n".join(lines), blocks[:50]
 
 
 def _user_input_response(
