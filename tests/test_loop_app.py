@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -2048,17 +2049,44 @@ class LoopCreationFlowTests(unittest.TestCase):
         self.assertEqual(current.consecutive_failures, 1)
         self.assertIn("runtime could not start", current.last_error)
 
+    def _cancel_loop_run(self, loop):
+        current = self.store.get_loop(loop.loop_id)
+        assert current is not None
+        self.assertTrue(self.controller.fire_loop_now(current))
+        task, agent, run, thread = self._running_task_and_run(current)
+        self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
+        cancelled = self.store.get_agent_task(task.task_id)
+        assert cancelled is not None
+        return run, lambda: self.controller.handle_runtime_task_done(cancelled, agent, thread)
+
+    def _pause_notices(self, loop):
+        return [
+            post
+            for post in self.gateway.posts
+            if post["channel_id"] == loop.channel_id
+            and "paused after 3 failed runs in a row" in post["text"]
+        ]
+
+    def _click_pause_notice_resume(self, loop, notice_ts: str):
+        self.controller.handle_block_action(
+            {
+                "actions": [
+                    {
+                        "block_id": f"loop.paused.actions.{loop.loop_id}",
+                        "value": encode_action_value("loop.resume", loop_id=loop.loop_id),
+                    }
+                ],
+                "channel": {"id": loop.channel_id},
+                "message": {"ts": notice_ts},
+                "user": {"id": "UOWNER"},
+            }
+        )
+
     def test_three_cancelled_runs_pause_loop_and_notify_owner(self):
         loop = self._activate_loop()
         for expected_failures in range(1, 4):
-            current = self.store.get_loop(loop.loop_id)
-            assert current is not None
-            self.assertTrue(self.controller.fire_loop_now(current))
-            task, agent, run, thread = self._running_task_and_run(current)
-            self.store.update_agent_task_status(task.task_id, AgentTaskStatus.CANCELLED)
-            cancelled = self.store.get_agent_task(task.task_id)
-            assert cancelled is not None
-            self.controller.handle_runtime_task_done(cancelled, agent, thread)
+            run, finish = self._cancel_loop_run(loop)
+            finish()
             failed = self.store.get_loop_run(run.run_id)
             assert failed is not None
             self.assertEqual(failed.status, LoopRunStatus.FAILED)
@@ -2069,12 +2097,108 @@ class LoopCreationFlowTests(unittest.TestCase):
         paused = self.store.get_loop(loop.loop_id)
         assert paused is not None
         self.assertEqual(paused.status, LoopStatus.PAUSED)
-        self.assertTrue(
-            any(
-                "Paused after 3 consecutive failed runs" in post["text"]
-                for post in self.gateway.posts
-            )
-        )
+        notices = self._pause_notices(paused)
+        self.assertEqual(len(notices), 1)
+        notice = notices[0]
+        self.assertTrue(notice["text"].startswith("<@UOWNER>"), notice["text"])
+        self.assertIn("The run stopped before it finished.", notice["text"])
+        buttons = [
+            element
+            for block in notice["blocks"]
+            if block["type"] == "actions"
+            for element in block["elements"]
+        ]
+        self.assertEqual([button["action_id"] for button in buttons], ["loop.resume"])
+
+    def test_resume_from_the_pause_notice_resets_failures_and_retires_the_button(self):
+        loop = self._activate_loop()
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES):
+            _, finish = self._cancel_loop_run(loop)
+            finish()
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+        notice = self._pause_notices(paused)[0]
+
+        self._click_pause_notice_resume(paused, notice["ts"])
+
+        resumed = self.store.get_loop(loop.loop_id)
+        assert resumed is not None
+        self.assertEqual(resumed.status, LoopStatus.ACTIVE)
+        self.assertEqual(resumed.consecutive_failures, 0)
+        notice_updates = [update for update in self.gateway.updates if update["ts"] == notice["ts"]]
+        self.assertEqual(len(notice_updates), 1)
+        rendered = json.dumps(notice_updates[0]["blocks"])
+        self.assertIn("Resumed. Next run", rendered)
+        self.assertNotIn("loop.resume", rendered)
+        self.assertNotIn("<@UOWNER>", notice_updates[0]["text"])
+
+        # One more failure must not pause the resumed loop again.
+        _, finish = self._cancel_loop_run(resumed)
+        finish()
+        after = self.store.get_loop(loop.loop_id)
+        assert after is not None
+        self.assertEqual(after.status, LoopStatus.ACTIVE)
+        self.assertEqual(after.consecutive_failures, 1)
+
+    def test_a_pause_while_slack_is_unreachable_reaches_slack_once_it_is_back(self):
+        loop = self._activate_loop()
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES - 1):
+            _, finish = self._cancel_loop_run(loop)
+            finish()
+        _, finish = self._cancel_loop_run(loop)
+        offline = urllib.error.URLError("nodename nor servname provided, or not known")
+        with (
+            patch.object(self.gateway, "post_message", side_effect=offline),
+            patch.object(self.gateway, "update_message", side_effect=offline),
+            patch.object(self.gateway, "post_thread_reply", side_effect=offline),
+        ):
+            finish()
+            # Slack is still down on the next attempt, so nothing is delivered yet.
+            self.controller.retry_stale_loop_surfaces()
+
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+        self.assertEqual(paused.status, LoopStatus.PAUSED)
+        self.assertEqual(self._pause_notices(paused), [])
+        updates_before = len(self.gateway.updates)
+
+        self.controller._next_loop_surface_retry = 0.0
+        self.controller.retry_stale_loop_surfaces()
+
+        panel_updates = [
+            update
+            for update in self.gateway.updates[updates_before:]
+            if update["ts"] == paused.charter_message_ts
+        ]
+        self.assertEqual(len(panel_updates), 1)
+        self.assertIn("loop.resume", json.dumps(panel_updates[0]["blocks"]))
+        self.assertEqual(len(self._pause_notices(paused)), 1)
+
+        # Delivered surfaces are not sent again.
+        posts_before = len(self.gateway.posts)
+        updates_before = len(self.gateway.updates)
+        self.controller._next_loop_surface_retry = 0.0
+        self.assertEqual(self.controller.retry_stale_loop_surfaces(), 0)
+        self.assertEqual(len(self.gateway.posts), posts_before)
+        self.assertEqual(len(self.gateway.updates), updates_before)
+
+    def test_a_pending_pause_notice_is_dropped_once_the_loop_is_resumed(self):
+        loop = self._activate_loop()
+        for _ in range(LOOP_MAX_CONSECUTIVE_FAILURES - 1):
+            _, finish = self._cancel_loop_run(loop)
+            finish()
+        _, finish = self._cancel_loop_run(loop)
+        offline = urllib.error.URLError("nodename nor servname provided, or not known")
+        with patch.object(self.gateway, "post_message", side_effect=offline):
+            finish()
+        paused = self.store.get_loop(loop.loop_id)
+        assert paused is not None
+
+        self.controller.handle_block_action(self._action_payload("loop.resume", loop.loop_id))
+        self.controller._next_loop_surface_retry = 0.0
+        self.controller.retry_stale_loop_surfaces()
+
+        self.assertEqual(self._pause_notices(paused), [])
 
     def test_inline_compaction_supersedes_run_memory_but_preserves_owner_notes(self):
         loop = self._activate_loop()

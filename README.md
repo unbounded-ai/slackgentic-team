@@ -300,11 +300,14 @@ for later runs.
 Run summaries and owner notes form a durable journal; older run detail is
 available through bounded retrieval, and long journals compact automatically.
 
-A loop pauses itself after three failed runs in a row and tells you in its
-channel. Runs that fail because the model provider cannot be reached (network or
-DNS trouble, overload, rate limits) do not count: they are recorded with the
+A loop pauses itself after three failed runs in a row and posts a notice in its
+channel with the last error and a **Resume** button. Resuming gives the loop a
+fresh count of three. Runs that fail because the model provider cannot be reached (network or
+DNS trouble, overload, rate limits) do not count, including runs cut short when
+Slack is unreachable too: they are recorded with the
 real cause, the loop keeps its schedule, and a quiet loop posts one card only if
-three runs in a row fail that way.
+three runs in a row fail that way. If Slack is unreachable when the pinned panel
+or the pause notice changes, Slackgentic posts the update once Slack is back.
 Compaction runs silently: it never posts to the channel.
 
 Inside the loop channel, only the owner can instruct the bot. Other members'

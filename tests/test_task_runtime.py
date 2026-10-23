@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from itertools import product
@@ -127,6 +128,13 @@ class FakeGateway:
 class FailingGateway(FakeGateway):
     def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
         raise RuntimeError("Slack post failed")
+
+
+class OfflineGateway(FakeGateway):
+    """Slack as seen from a machine that has lost its network connection."""
+
+    def post_thread_reply(self, thread, text, persona=None, icon_url=None, blocks=None):
+        raise urllib.error.URLError("nodename nor servname provided, or not known")
 
 
 class OneShotProcess:
@@ -5441,6 +5449,107 @@ class TaskRuntimeTests(unittest.TestCase):
                 assert failure is not None
                 self.assertTrue(failure[1])
                 self.assertIn("ENOTFOUND", failure[0])
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_keeps_retrying_an_unreachable_provider_while_slack_is_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            requests = []
+            completed = []
+
+            def process_factory(request):
+                requests.append(request)
+                return ClaudeUnreachableProcess(request)
+
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=0, claude_count=1)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "run the loop", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    OfflineGateway(),
+                    AgentCommandConfig(),
+                    process_factory=process_factory,
+                    poll_seconds=0.01,
+                    on_task_done=lambda done, _agent, _thread: completed.append(done),
+                    transient_provider_retry_delays=(0.0, 0.0),
+                )
+
+                with self.assertLogs("agent_harness.runtime.tasks", level="WARNING"):
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "172.000001"))
+                    self.assertTrue(wait_until(lambda: bool(completed)))
+
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(completed[0].status, AgentTaskStatus.CANCELLED)
+                failure = managed_run_provider_failure(completed[0])
+                assert failure is not None
+                self.assertTrue(failure[1])
+                self.assertIn("ENOTFOUND", failure[0])
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_records_a_worker_crash_from_a_lost_network_as_an_outage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "run the loop", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    OfflineGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+
+                with self.assertLogs("agent_harness.runtime.tasks", level="ERROR"):
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "173.000001"))
+                    self.assertTrue(runtime.join_workers(POLL_TIMEOUT_SECONDS))
+
+                stopped = store.get_agent_task(task.task_id)
+                assert stopped is not None
+                self.assertEqual(stopped.status, AgentTaskStatus.CANCELLED)
+                failure = managed_run_provider_failure(stopped)
+                assert failure is not None
+                self.assertTrue(failure[1])
+                self.assertIn("network unreachable", failure[0])
+            finally:
+                shut_down_runtime(runtime)
+                store.close()
+
+    def test_runtime_does_not_treat_other_worker_crashes_as_outages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.sqlite")
+            try:
+                store.init_schema()
+                agent = build_initial_model_team(codex_count=1, claude_count=0)[0]
+                store.upsert_team_agent(agent)
+                task = create_agent_task(agent, "run the loop", "C1")
+                store.upsert_agent_task(task)
+                runtime = ManagedTaskRuntime(
+                    store,
+                    FailingGateway(),
+                    AgentCommandConfig(),
+                    process_factory=OneShotProcess,
+                    poll_seconds=0.01,
+                )
+
+                with self.assertLogs("agent_harness.runtime.tasks", level="ERROR"):
+                    runtime.start_task(task, agent, SlackThreadRef("C1", "174.000001"))
+                    self.assertTrue(runtime.join_workers(POLL_TIMEOUT_SECONDS))
+
+                stopped = store.get_agent_task(task.task_id)
+                assert stopped is not None
+                self.assertEqual(stopped.status, AgentTaskStatus.CANCELLED)
+                self.assertIsNone(managed_run_provider_failure(stopped))
             finally:
                 shut_down_runtime(runtime)
                 store.close()

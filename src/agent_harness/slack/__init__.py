@@ -515,6 +515,52 @@ def build_loop_run_error_blocks(
     return f"{LOOP_RUN_ERROR_EMOJI} {title}: run #{run_number} did not finish", blocks
 
 
+def build_loop_paused_notice_blocks(
+    loop: Loop,
+    *,
+    reason: str,
+    failures: int,
+    resolution: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Tell the owner why a loop paused itself, with a Resume button until it resumes."""
+    detail = " ".join(reason.split())[:1500]
+    headline = f"⏸ *{_mrkdwn_escape(loop.title)}* paused after {failures} failed runs in a row."
+    if resolution is None:
+        body = (
+            f"<@{loop.owner_slack_user_id}> {headline}\n"
+            f"*Last error:* {_mrkdwn_escape(detail)}\n"
+            "It will not run again until it is resumed."
+        )
+    else:
+        body = f"{headline}\n*Last error:* {_mrkdwn_escape(detail)}\n{resolution}"
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "block_id": f"loop.paused.text.{loop.loop_id}"[:255],
+            "text": {"type": "mrkdwn", "text": body[:3000]},
+        }
+    ]
+    if resolution is None:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"loop.paused.actions.{loop.loop_id}"[:255],
+                "elements": [
+                    _button(
+                        "▶ Resume",
+                        "loop.resume",
+                        encode_action_value("loop.resume", loop_id=loop.loop_id),
+                        "primary",
+                    )
+                ],
+            }
+        )
+    text = f"⏸ {loop.title} paused after {failures} failed runs in a row. Last error: {detail}"
+    if resolution is None:
+        text = f"<@{loop.owner_slack_user_id}> {text}"
+    return text[:3000], blocks
+
+
 def build_loop_panel_blocks(
     loop: Loop,
     *,

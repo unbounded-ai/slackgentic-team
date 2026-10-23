@@ -4,8 +4,10 @@ import json
 import logging
 import platform
 import re
+import socket
 import threading
 import time
+import urllib.error
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -714,9 +716,9 @@ class ManagedTaskRuntime:
     def _stream_task(self, task_id: str) -> None:
         try:
             self._stream_task_loop(task_id)
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("managed task worker failed for %s", task_id)
-            self._handle_task_worker_failure(task_id)
+            self._handle_task_worker_failure(task_id, exc)
         finally:
             running = self._get_running(task_id)
             if running is not None and running.worker is threading.current_thread():
@@ -1029,7 +1031,11 @@ class ManagedTaskRuntime:
             allowed_tools=running.allowed_tools,
         )
 
-    def _handle_task_worker_failure(self, task_id: str) -> None:
+    def _handle_task_worker_failure(
+        self,
+        task_id: str,
+        error: BaseException | None = None,
+    ) -> None:
         running = self._get_running(task_id)
         with self._lock:
             self._running.pop(task_id, None)
@@ -1054,6 +1060,16 @@ class ManagedTaskRuntime:
         }:
             self._clear_managed_run_started(task_id)
             self._clear_managed_session_for_task(task_id)
+            provider_failure = _worker_crash_provider_failure(running, error)
+            if provider_failure is not None:
+                # When this machine goes offline, Slack fails along with the provider
+                # and a Slack call can crash the worker. Keep the outage on record so
+                # loops do not count the stopped run toward auto-pause.
+                metadata = dict(current.metadata)
+                metadata[MANAGED_RUN_PROVIDER_FAILURE_METADATA_KEY] = provider_failure
+                self.store.upsert_agent_task(
+                    replace(current, metadata=metadata, updated_at=utc_now())
+                )
             self.store.update_agent_task_status(task_id, AgentTaskStatus.CANCELLED)
             self.store.delete_managed_thread_task(task_id)
         if running is None:
@@ -1586,14 +1602,12 @@ class ManagedTaskRuntime:
             updated_at=utc_now(),
         )
         self.store.upsert_agent_task(retry_task)
-        self.gateway.post_thread_reply(
-            running.thread,
+        self._post_provider_failure_notice(
+            running,
             (
                 "The provider is temporarily unavailable. Retrying automatically "
                 f"({next_attempt}/{len(self.transient_provider_retry_delays)})…"
             ),
-            persona=running.agent,
-            icon_url=self._agent_icon_url(running.agent),
         )
         delay = self.transient_provider_retry_delays[attempts]
         if delay > 0 and running.wake_event.wait(delay):
@@ -1651,12 +1665,7 @@ class ManagedTaskRuntime:
                 "returned an unrecoverable error. I stopped it; check the provider logs or "
                 "configuration, then retry."
             )
-        self.gateway.post_thread_reply(
-            running.thread,
-            message,
-            persona=running.agent,
-            icon_url=self._agent_icon_url(running.agent),
-        )
+        self._post_provider_failure_notice(running, message)
         cancelled = self.store.get_agent_task(task_id) or replace(
             completed_task,
             status=AgentTaskStatus.CANCELLED,
@@ -1664,6 +1673,23 @@ class ManagedTaskRuntime:
         )
         if self.on_task_done:
             self.on_task_done(cancelled, running.agent, running.thread)
+
+    def _post_provider_failure_notice(self, running: RunningTask, text: str) -> None:
+        # A provider outage often means this machine is offline and Slack is down
+        # too. A notice that cannot be posted must not stop the retry or the record.
+        try:
+            self.gateway.post_thread_reply(
+                running.thread,
+                text,
+                persona=running.agent,
+                icon_url=self._agent_icon_url(running.agent),
+            )
+        except Exception:
+            LOGGER.warning(
+                "failed to post provider failure notice for %s",
+                running.task.task_id,
+                exc_info=True,
+            )
 
     def _handle_claude_permission_denial(
         self,
@@ -3558,6 +3584,36 @@ _RETRYABLE_PROVIDER_ERROR_MARKERS = (
     "too many requests",
     "upstream connect error",
 )
+
+
+def _is_network_error(error: BaseException | None) -> bool:
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, urllib.error.HTTPError):
+            return False
+        if isinstance(
+            error,
+            (socket.gaierror, ConnectionError, TimeoutError, urllib.error.URLError),
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
+def _worker_crash_provider_failure(
+    running: RunningTask | None,
+    error: BaseException | None,
+) -> dict[str, object] | None:
+    network_error = _is_network_error(error)
+    if running is not None and running.provider_failure_message:
+        return {
+            "message": running.provider_failure_message,
+            "transient": running.transient_provider_failure or network_error,
+        }
+    if network_error:
+        return {"message": f"network unreachable: {error}", "transient": True}
+    return None
 
 
 def _is_retryable_managed_provider_failure(message: str | None) -> bool:

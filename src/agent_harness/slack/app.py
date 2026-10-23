@@ -317,6 +317,7 @@ from agent_harness.slack import (
     build_loop_edit_modal,
     build_loop_list_blocks,
     build_loop_panel_blocks,
+    build_loop_paused_notice_blocks,
     build_loop_preview_blocks,
     build_loop_run_error_blocks,
     build_loop_run_report_blocks,
@@ -474,6 +475,11 @@ SETTING_LOOP_THREAD_DONE_DEFERRED_PREFIX = "slack.loop_thread_done_deferred."
 LOOP_RUN_IDLE_GRACE = timedelta(minutes=15)
 SETTING_LOOP_FAILURE_RECORDED_PREFIX = "slack.loop_failure_recorded."
 SETTING_LOOP_PANELS_RENDERED_VERSION = "slack.loop_panels_rendered_version"
+# A pinned panel whose update could not reach Slack; redrawn once Slack is back.
+SETTING_LOOP_PANEL_STALE_PREFIX = "slack.loop_panel_stale."
+# JSON {"reason", "ts"} for a loop's auto-pause notice; no ts means not yet posted.
+SETTING_LOOP_PAUSE_NOTICE_PREFIX = "slack.loop_pause_notice."
+LOOP_SURFACE_RETRY_SECONDS = 60.0
 LOOP_FETCH_COUNT_METADATA_KEY = "loop_fetch_count"
 LOOP_SUMMARY_NUDGE_METADATA_KEY = "loop_summary_nudge"
 LOOP_UPDATE_KIND_METADATA_KEY = "loop_update_kind"
@@ -684,6 +690,7 @@ class SlackTeamController:
         self.update_runner: SlackgenticUpdateRunner | None = None
         self._slack_message_lock = threading.Lock()
         self._loop_fire_lock = threading.Lock()
+        self._next_loop_surface_retry = 0.0
         self._normalize_existing_agents()
         self._backfill_loop_models()
         self._backfill_user_timezone()
@@ -2150,7 +2157,103 @@ class SlackTeamController:
         if not latest.channel_id or not latest.charter_message_ts:
             return
         text, blocks = self._loop_panel(latest)
-        self._try_update_message(latest.channel_id, latest.charter_message_ts, text, blocks=blocks)
+        stale_key = f"{SETTING_LOOP_PANEL_STALE_PREFIX}{latest.loop_id}"
+        try:
+            self.gateway.update_message(
+                latest.channel_id,
+                latest.charter_message_ts,
+                text,
+                blocks=blocks,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "failed to update loop panel %s in %s",
+                latest.charter_message_ts,
+                latest.channel_id,
+                exc_info=True,
+            )
+            if _slack_error_code(exc) is None:
+                # Slack was unreachable, so the panel still shows the old state
+                # (an auto-pause would look active). Redraw it once Slack is back.
+                self.store.set_setting(stale_key, utc_now().isoformat())
+            return
+        if self.store.get_setting(stale_key) is not None:
+            self.store.delete_setting(stale_key)
+
+    def retry_stale_loop_surfaces(self) -> int:
+        """Redraw panels and post pause notices that Slack could not take earlier."""
+        now = time.monotonic()
+        if now < self._next_loop_surface_retry:
+            return 0
+        self._next_loop_surface_retry = now + LOOP_SURFACE_RETRY_SECONDS
+        retried = 0
+        for key in self.store.list_settings(SETTING_LOOP_PANEL_STALE_PREFIX):
+            loop = self.store.get_loop(key.removeprefix(SETTING_LOOP_PANEL_STALE_PREFIX))
+            if loop is None or loop.status not in {LoopStatus.ACTIVE, LoopStatus.PAUSED}:
+                self.store.delete_setting(key)
+                continue
+            self._refresh_loop_panel(loop)
+            retried += 1
+        for key in self.store.list_settings(SETTING_LOOP_PAUSE_NOTICE_PREFIX):
+            if self._post_loop_pause_notice(key.removeprefix(SETTING_LOOP_PAUSE_NOTICE_PREFIX)):
+                retried += 1
+        return retried
+
+    def _loop_pause_notice(self, loop_id: str) -> dict[str, str | None] | None:
+        raw = self.store.get_setting(f"{SETTING_LOOP_PAUSE_NOTICE_PREFIX}{loop_id}")
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict) or not isinstance(value.get("reason"), str):
+            return None
+        ts = value.get("ts")
+        return {"reason": value["reason"], "ts": ts if isinstance(ts, str) else None}
+
+    def _post_loop_pause_notice(self, loop_id: str) -> bool:
+        """Post a loop's pending auto-pause notice; False when there was nothing to post."""
+        key = f"{SETTING_LOOP_PAUSE_NOTICE_PREFIX}{loop_id}"
+        notice = self._loop_pause_notice(loop_id)
+        if notice is None or notice["ts"] is not None:
+            return False
+        loop = self.store.get_loop(loop_id)
+        if loop is None or loop.status != LoopStatus.PAUSED or not loop.channel_id:
+            self.store.delete_setting(key)
+            return False
+        text, blocks = build_loop_paused_notice_blocks(
+            loop,
+            reason=str(notice["reason"]),
+            failures=LOOP_MAX_CONSECUTIVE_FAILURES,
+        )
+        try:
+            posted = self.gateway.post_message(loop.channel_id, text, blocks=blocks)
+        except Exception as exc:
+            error_code = _slack_error_code(exc)
+            if error_code in _PM_DEAD_THREAD_SLACK_ERRORS:
+                self.store.delete_setting(key)
+                self._pause_loop_for_dead_channel(loop, error_code)
+            else:
+                # Kept pending: the retry pass posts it once Slack is reachable.
+                LOGGER.warning("failed to post loop pause notice for %s", loop_id, exc_info=True)
+            return True
+        self.store.set_setting(key, json.dumps({"reason": notice["reason"], "ts": posted.ts}))
+        return True
+
+    def _resolve_loop_pause_notice(self, loop: Loop, resolution: str) -> None:
+        """Replace the auto-pause notice's Resume button with what happened."""
+        notice = self._loop_pause_notice(loop.loop_id)
+        self.store.delete_setting(f"{SETTING_LOOP_PAUSE_NOTICE_PREFIX}{loop.loop_id}")
+        if notice is None or notice["ts"] is None or not loop.channel_id:
+            return
+        text, blocks = build_loop_paused_notice_blocks(
+            loop,
+            reason=str(notice["reason"]),
+            failures=LOOP_MAX_CONSECUTIVE_FAILURES,
+            resolution=resolution,
+        )
+        self._try_update_message(loop.channel_id, notice["ts"], text, blocks=blocks)
 
     def _loop_history_runs(self, loop_id: str) -> list[LoopRun]:
         return [
@@ -2288,10 +2391,17 @@ class SlackTeamController:
             timezone=loop.timezone,
             next_run_at=next_run_at,
         )
+        # A resumed loop gets a fresh failure budget; otherwise one more failed run
+        # would pause it again right away.
+        self.store.reset_loop_failures(loop.loop_id)
         self.store.update_loop_status(loop.loop_id, LoopStatus.ACTIVE)
         self._append_loop_system_entry(
             loop,
             f"loop resumed; next run {format_loop_timestamp(next_run_at, self._display_timezone(loop.timezone))}",
+        )
+        self._resolve_loop_pause_notice(
+            loop,
+            f"▶ Resumed. Next run {slack_loop_time(next_run_at, self._display_timezone(loop.timezone))}.",
         )
         if event is not None:
             self._post_loop_surface(
@@ -4896,19 +5006,12 @@ class SlackTeamController:
         )
         self._publish_loop_run_card(loop, self.store.get_loop_run(run.run_id) or run)
         self._refresh_loop_panel(loop)
-        text = (
-            f"<@{loop.owner_slack_user_id}> ⏸ Paused after "
-            f"{LOOP_MAX_CONSECUTIVE_FAILURES} consecutive failed runs. "
-            f"Last error: {message}. Use *Resume* on the pinned card when it is fixed."
+        # Stored before posting so a notice Slack cannot take now is posted later.
+        self.store.set_setting(
+            f"{SETTING_LOOP_PAUSE_NOTICE_PREFIX}{loop.loop_id}",
+            json.dumps({"reason": message, "ts": None}),
         )
-        try:
-            if loop.channel_id:
-                self.gateway.post_message(loop.channel_id, text)
-        except Exception as exc:
-            if _slack_error_code(exc) in _PM_DEAD_THREAD_SLACK_ERRORS:
-                self._pause_loop_for_dead_channel(loop, str(_slack_error_code(exc)))
-            else:
-                LOGGER.debug("failed to post loop failure pause notice", exc_info=True)
+        self._post_loop_pause_notice(loop.loop_id)
 
     def _add_loop_journal_once(
         self,
@@ -8475,6 +8578,7 @@ class SlackTeamController:
             )
         self.store.update_loop_status(loop.loop_id, LoopStatus.CANCELLED)
         self._append_loop_system_entry(loop, "loop stopped by owner")
+        self._resolve_loop_pause_notice(loop, "⏹ Stopped.")
         self.store.fire_team_agent(loop.agent_id)
         text = "Loop stopped."
         if archive and loop.channel_id:
@@ -14355,6 +14459,7 @@ class LoopRunner:
         self.controller.process_queued_loop_create_requests()
         self.controller.process_queued_loop_update_requests()
         self.controller.reconcile_loop_runs()
+        self.controller.retry_stale_loop_surfaces()
         fired = 0
         for loop in self.store.list_due_loops(limit=20):
             if self.controller.fire_due_loop(loop):
@@ -16857,7 +16962,7 @@ def _loop_owns_parent_message(task: AgentTask) -> bool:
 def _loop_action_surface(slack_payload: dict) -> str | None:
     action = _first_action(slack_payload) or {}
     block_id = str(action.get("block_id") or "")
-    for surface in ("list", "status", "panel"):
+    for surface in ("list", "status", "panel", "paused"):
         if block_id.startswith(f"loop.{surface}."):
             return surface
     return None
